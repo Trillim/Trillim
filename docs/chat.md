@@ -28,9 +28,9 @@ Type your message and press Enter. The model's response streams token-by-token:
 
 ```
 > What is the capital of France?
-Model Response: The capital of France is Paris.
+The capital of France is Paris.
 > Tell me more about it.
-Model Response: Paris is the largest city in France and serves as ...
+Paris is the largest city in France and serves as ...
 ```
 
 ## Commands

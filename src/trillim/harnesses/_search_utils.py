@@ -2,6 +2,7 @@
 """Search utilities — tag extraction, smart truncation, DuckDuckGo search."""
 
 import asyncio
+import os
 import re
 import urllib.request
 
@@ -215,7 +216,14 @@ class DuckDuckGoSearch:
         from ddgs import DDGS
 
         try:
-            results = DDGS().text(query, max_results=self.max_results)
+            # Suppress C-level stderr from primp's impersonation warnings
+            fd = os.dup(2)
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            try:
+                results = DDGS().text(query, max_results=self.max_results)
+            finally:
+                os.dup2(fd, 2)
+                os.close(fd)
         except Exception as exc:
             raise SearchError(f"Search unavailable: {exc}") from exc
 

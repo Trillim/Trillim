@@ -37,6 +37,7 @@ class SearchHarness(Harness):
         Yields sentinels ([Searching: ...], [Synthesizing...]) before model
         text so the CLI can distinguish them from the actual response.
         """
+        yield "[Spin-Jump-Spinning...]\n"
         for i in range(self.MAX_SEARCH_ITERATIONS - 1):
             full_text = await self._generate_buffered(messages, **sampling)
 
@@ -58,6 +59,9 @@ class SearchHarness(Harness):
                 results = await self._search.search(query)
             except SearchError:
                 yield "[Search unavailable]\n"
+                messages.append({"role": "assistant", "content": full_text})
+                messages.append({"role": "search", "content": "Search unavailable, please answer from your knowledge."})
+                self._update_cache(messages)
                 break
 
             messages.append({"role": "assistant", "content": full_text})
@@ -66,10 +70,10 @@ class SearchHarness(Harness):
 
             if self.DEBUG:
                 yield f"[Search results]\n{results}\n"
+                
+            yield "[Synthesizing...]\n"
 
         # Final iteration: stream token-by-token
-        yield "[Synthesizing...]\n"
-
         token_ids, prompt_str = self._prepare_tokens(messages)
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""

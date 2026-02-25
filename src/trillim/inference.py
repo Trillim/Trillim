@@ -156,7 +156,6 @@ def _run_chat_loop(loop, harness, sampling_params):
             harness.engine._cached_prompt_str = ""
             harness.engine.cached_token_ids = []
 
-        print("Model Response: ", end="", flush=True)
         loop.run_until_complete(_stream_response(harness, messages, sampling_params))
         print()
 
