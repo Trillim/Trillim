@@ -53,6 +53,8 @@ def _cmd_chat(args):
             argv.extend(["--unembed-quant", args.unembed_quant])
         if args.trust_remote_code:
             argv.append("--trust-remote-code")
+        if args.harness and args.harness != "default":
+            argv.extend(["--harness", args.harness])
         sys.argv = argv
 
         from trillim.inference import main
@@ -244,6 +246,7 @@ def main():
     p_chat.add_argument("--lora-quant", default=None, help="LoRA quantization (none|int8|q4_0|q5_0|q6_k|q8_0)")
     p_chat.add_argument("--unembed-quant", default=None, help="Unembed quantization (int8|q4_0|q5_0|q6_k|q8_0)")
     p_chat.add_argument("--trust-remote-code", action="store_true", help="Allow loading custom tokenizer code from model directory")
+    p_chat.add_argument("--harness", default="default", help="Inference harness (default, search)")
     p_chat.set_defaults(func=_cmd_chat)
 
     # --- serve ---
@@ -270,6 +273,7 @@ def main():
     p_serve.add_argument("--lora-quant", default=None, help="LoRA quantization (none|int8|q4_0|q5_0|q6_k|q8_0)")
     p_serve.add_argument("--unembed-quant", default=None, help="Unembed quantization (int8|q4_0|q5_0|q6_k|q8_0)")
     p_serve.add_argument("--trust-remote-code", action="store_true", help="Allow loading custom tokenizer code from model directory")
+    p_serve.add_argument("--harness", default="default", help="Inference harness (default, search)")
     p_serve.set_defaults(func=_cmd_serve)
 
     # --- pull ---
