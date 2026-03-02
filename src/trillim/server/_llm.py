@@ -28,6 +28,7 @@ from ._models import (
 )
 
 from trillim.engine import InferenceEngine
+from trillim.harnesses import Harness, get_harness
 
 
 # ---------------------------------------------------------------------------
@@ -39,14 +40,16 @@ class LLM(Component):
     """CPU inference component — manages the C++ subprocess and exposes
     /v1/models, /v1/models/load, /v1/chat/completions, /v1/completions."""
 
-    def __init__(self, model_dir: str, adapter_dir: str | None = None, num_threads: int = 0, trust_remote_code: bool = False, lora_quant: str | None = None, unembed_quant: str | None = None):
+    def __init__(self, model_dir: str, adapter_dir: str | None = None, num_threads: int = 0, trust_remote_code: bool = False, lora_quant: str | None = None, unembed_quant: str | None = None, harness_name: str = "default"):
         self._model_dir = model_dir
         self._adapter_dir = adapter_dir
         self._num_threads = num_threads
         self._trust_remote_code = trust_remote_code
         self._lora_quant = lora_quant
         self._unembed_quant = unembed_quant
+        self._harness_name = harness_name
         self.engine: InferenceEngine | None = None
+        self.harness: Harness | None = None
         self.model_name: str = "unknown"
         self.state: ServerState = ServerState.NO_MODEL
         self._swap_lock: asyncio.Lock | None = None
@@ -79,12 +82,15 @@ class LLM(Component):
             unembed_quant=self._unembed_quant,
         )
         await self.engine.start()
+        harness_cls = get_harness(self._harness_name)
+        self.harness = harness_cls(self.engine)
         self.state = ServerState.RUNNING
 
     async def stop(self) -> None:
         self.state = ServerState.NO_MODEL
         if self.engine is not None:
             await self.engine.stop()
+        self.harness = None
 
     # -- hot-swap ------------------------------------------------------------
 
@@ -193,6 +199,8 @@ class LLM(Component):
             )
 
         self.engine = new_engine
+        harness_cls = get_harness(self._harness_name)
+        self.harness = harness_cls(new_engine)
         self._adapter_dir = resolved_adapter
         self._num_threads = threads
         self._lora_quant = lora_quant
@@ -264,26 +272,12 @@ class LLM(Component):
         async def chat_completions(req: ChatCompletionRequest):
             if llm.state == ServerState.SWAPPING:
                 raise HTTPException(status_code=503, detail="Model swap in progress")
-            if llm.engine is None or llm.state != ServerState.RUNNING:
+            if llm.engine is None or llm.harness is None or llm.state != ServerState.RUNNING:
                 raise HTTPException(status_code=503, detail="No model loaded")
 
             tokenizer = llm.engine.tokenizer
-
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
-            has_chat_template = (
-                hasattr(tokenizer, "chat_template") and tokenizer.chat_template
-            )
-            if has_chat_template:
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                token_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            else:
-                prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-                prompt += "\nassistant:"
-                token_ids = tokenizer.encode(prompt)
+            token_ids, _ = llm.harness._prepare_tokens(messages)
 
             max_ctx = llm.engine.arch_config.max_position_embeddings
             if len(token_ids) >= max_ctx:
@@ -293,9 +287,7 @@ class LLM(Component):
                     "Start a new conversation with fewer messages.",
                 )
 
-            gen_kwargs = dict(
-                token_ids=token_ids,
-                prompt_str=prompt,
+            sampling = dict(
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
@@ -306,34 +298,18 @@ class LLM(Component):
             if req.stream:
                 return StreamingResponse(
                     _stream_chat(
-                        llm, gen_kwargs, req.model or llm.model_name, messages
+                        llm, messages, sampling, req.model or llm.model_name
                     ),
                     media_type="text/event-stream",
                 )
 
-            from trillim.token_utils import IncrementalDecoder
-
-            decoder = IncrementalDecoder(tokenizer)
             full_text = ""
-            completion_tokens = 0
-            async for token_id in llm.engine.generate(**gen_kwargs):
-                full_text += decoder.decode(token_id)
-                completion_tokens += 1
+            async for chunk in llm.harness.run(messages, **sampling):
+                full_text += chunk
+
+            completion_tokens = len(tokenizer.encode(full_text, add_special_tokens=False))
 
             cached_tokens = llm.engine._last_cache_hit
-
-            # Update cached prompt string for next turn's string-level matching
-            post_messages = messages + [{"role": "assistant", "content": full_text}]
-            if has_chat_template:
-                llm.engine._cached_prompt_str = tokenizer.apply_chat_template(
-                    post_messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-            else:
-                llm.engine._cached_prompt_str = "\n".join(
-                    f"{m['role']}: {m['content']}" for m in post_messages
-                )
 
             return ChatCompletionResponse(
                 id=make_id(),
@@ -420,11 +396,7 @@ class LLM(Component):
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chat(
-    llm: LLM, gen_kwargs: dict, model: str, messages: list[dict] | None = None
-):
-    from trillim.token_utils import IncrementalDecoder
-
+async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: str):
     req_id = make_id()
     created = now()
 
@@ -439,12 +411,7 @@ async def _stream_chat(
     }
     yield f"data: {json.dumps(chunk)}\n\n"
 
-    tokenizer = llm.engine.tokenizer
-    decoder = IncrementalDecoder(tokenizer)
-    full_text = ""
-    async for token_id in llm.engine.generate(**gen_kwargs):
-        text = decoder.decode(token_id)
-        full_text += text
+    async for text in llm.harness.run(messages, **sampling):
         chunk = {
             "id": req_id,
             "object": "chat.completion.chunk",
@@ -455,23 +422,6 @@ async def _stream_chat(
             ],
         }
         yield f"data: {json.dumps(chunk)}\n\n"
-
-    # Update cached prompt string for next turn's string-level matching
-    if messages is not None:
-        has_chat_template = (
-            hasattr(tokenizer, "chat_template") and tokenizer.chat_template
-        )
-        post_messages = messages + [{"role": "assistant", "content": full_text}]
-        if has_chat_template:
-            llm.engine._cached_prompt_str = tokenizer.apply_chat_template(
-                post_messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        else:
-            llm.engine._cached_prompt_str = "\n".join(
-                f"{m['role']}: {m['content']}" for m in post_messages
-            )
 
     chunk = {
         "id": req_id,

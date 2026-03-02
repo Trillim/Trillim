@@ -75,7 +75,7 @@ def _cmd_serve(args):
 
         from trillim import LLM, Server, TTS, Whisper
 
-        components = [LLM(args.model_dir, num_threads=args.threads or 0, trust_remote_code=args.trust_remote_code, lora_quant=args.lora_quant, unembed_quant=args.unembed_quant)]
+        components = [LLM(args.model_dir, num_threads=args.threads or 0, trust_remote_code=args.trust_remote_code, lora_quant=args.lora_quant, unembed_quant=args.unembed_quant, harness_name=args.harness)]
         if args.voice:
             components.append(Whisper(model_size=args.whisper_model))
             components.append(TTS(voices_dir=args.voices_dir))
