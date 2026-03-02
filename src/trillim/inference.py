@@ -37,7 +37,7 @@ def main():
         raise ValueError(
             "Usage: trillim chat <model_directory> [--lora <adapter_dir>] "
             "[--threads N] [--lora-quant TYPE] [--unembed-quant TYPE] "
-            "[--harness NAME]"
+            "[--harness NAME] [--search-provider NAME]"
         )
 
     MODEL_PATH = sys.argv[1].strip()
@@ -74,6 +74,11 @@ def main():
         idx = sys.argv.index("--harness")
         if idx + 1 < len(sys.argv):
             harness_name = sys.argv[idx + 1]
+    search_provider = "ddgs"
+    if "--search-provider" in sys.argv:
+        idx = sys.argv.index("--search-provider")
+        if idx + 1 < len(sys.argv):
+            search_provider = sys.argv[idx + 1]
 
     config_path = os.path.join(MODEL_PATH, "config.json")
 
@@ -105,7 +110,10 @@ def main():
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(engine.start())
-            harness = harness_cls(engine)
+            if harness_name == "search":
+                harness = harness_cls(engine, search_provider=search_provider)
+            else:
+                harness = harness_cls(engine)
             try:
                 _run_chat_loop(loop, harness, sampling_params)
             finally:

@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 from trillim.engine import InferenceEngine
 from trillim.token_utils import IncrementalDecoder
 from ._base import Harness
-from ._search_utils import DuckDuckGoSearch, SearchError, extract_search_query
+from ._search_utils import SearchClient, SearchError, extract_search_query
 
 
 class SearchHarness(Harness):
@@ -16,9 +16,9 @@ class SearchHarness(Harness):
     MAX_SEARCH_ITERATIONS = 3
     DEBUG: ClassVar[bool] = False
 
-    def __init__(self, engine: InferenceEngine):
+    def __init__(self, engine: InferenceEngine, search_provider: str = "ddgs"):
         super().__init__(engine)
-        self._search = DuckDuckGoSearch()
+        self._search = SearchClient(provider_name=search_provider)
 
     async def _generate_buffered(self, messages: list[dict], **sampling: Any) -> str:
         """Generate a full response non-streaming."""

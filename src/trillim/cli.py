@@ -55,6 +55,8 @@ def _cmd_chat(args):
             argv.append("--trust-remote-code")
         if args.harness and args.harness != "default":
             argv.extend(["--harness", args.harness])
+        if args.search_provider and args.search_provider != "ddgs":
+            argv.extend(["--search-provider", args.search_provider])
         sys.argv = argv
 
         from trillim.inference import main
@@ -247,6 +249,12 @@ def main():
     p_chat.add_argument("--unembed-quant", default=None, help="Unembed quantization (int8|q4_0|q5_0|q6_k|q8_0)")
     p_chat.add_argument("--trust-remote-code", action="store_true", help="Allow loading custom tokenizer code from model directory")
     p_chat.add_argument("--harness", default="default", help="Inference harness (default, search)")
+    p_chat.add_argument(
+        "--search-provider",
+        choices=["ddgs", "brave"],
+        default="ddgs",
+        help="Search provider for search harness (ddgs, brave)",
+    )
     p_chat.set_defaults(func=_cmd_chat)
 
     # --- serve ---

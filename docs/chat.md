@@ -57,10 +57,30 @@ Trillim uses incremental prompt caching to speed up multi-turn conversations. On
 Load a fine-tuned LoRA adapter on top of the base model:
 
 ```bash
-trillim chat Trillim/BitNet-TRNQ --lora Trillim/MyAdapter-TRNQ
+trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-GenZ-LoRA-TRNQ
 ```
 
 The adapter must have been quantized with `trillim quantize` first. If the adapter's tokenizer differs from the base model's, Trillim automatically uses the adapter's tokenizer.
+
+## Search Harness
+
+For search-tuned models, use the search harness:
+
+```bash
+trillim chat <model_dir> --harness search
+```
+
+Search provider defaults to DuckDuckGo (`ddgs`). To use another search provider (currently support only Brave):
+
+```bash
+trillim chat <model_dir> --harness search --search-provider brave
+```
+
+Note: Some search providers require an API key (like Brave). Please set your API key in your terminal before running the above command.
+
+```bash
+export SEARCH_API_KEY=<your_api_key>
+```
 
 ## Sampling Parameters
 

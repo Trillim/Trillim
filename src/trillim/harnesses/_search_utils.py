@@ -1,10 +1,15 @@
 # Copyright (c) 2026 Trillim. Licensed under the MIT License. See LICENSE.
-"""Search utilities — tag extraction, smart truncation, DuckDuckGo search."""
+"""Search utilities — tag extraction, smart truncation, and search providers."""
 
 import asyncio
+import json
 import os
 import re
+import urllib.parse
+import urllib.error
 import urllib.request
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Search tag extraction
@@ -197,22 +202,35 @@ def truncate_to_budget(text: str, query: str, budget: int = 2000) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DuckDuckGo search
+# Search providers + extraction pipeline
 # ---------------------------------------------------------------------------
 
 
-class DuckDuckGoSearch:
-    """DuckDuckGo search with trafilatura extraction and smart truncation."""
+@dataclass
+class SearchResult:
+    """Single search hit from a provider."""
 
-    def __init__(self, max_results: int = 3, char_budget: int = 2000):
+    title: str
+    href: str
+    body: str = ""
+
+
+class SearchProvider(ABC):
+    """Provider interface for search backends."""
+
+    def __init__(self, max_results: int = 3, api_key: str | None = None):
         self.max_results = max_results
-        self.char_budget = char_budget
+        self.api_key = api_key
 
-    async def search(self, query: str) -> str:
-        """Run search in a thread (ddgs and urllib are sync)."""
-        return await asyncio.to_thread(self._search_sync, query)
+    @abstractmethod
+    def search(self, query: str) -> list[SearchResult]:
+        """Return provider-native search hits normalized to SearchResult."""
 
-    def _search_sync(self, query: str) -> str:
+
+class DDGSSearchProvider(SearchProvider):
+    """DuckDuckGo provider via ddgs."""
+
+    def search(self, query: str) -> list[SearchResult]:
         from ddgs import DDGS
 
         try:
@@ -220,13 +238,133 @@ class DuckDuckGoSearch:
             fd = os.dup(2)
             os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
             try:
-                results = DDGS().text(query, max_results=self.max_results)
+                raw_results = DDGS().text(query, max_results=self.max_results)
             finally:
                 os.dup2(fd, 2)
                 os.close(fd)
         except Exception as exc:
             raise SearchError(f"Search unavailable: {exc}") from exc
 
+        if not raw_results:
+            return []
+
+        entries: list[SearchResult] = []
+        for item in raw_results:
+            title = item.get("title", "").strip()
+            href = item.get("href", "").strip()
+            body = item.get("body", "").strip()
+            if not href:
+                continue
+            entries.append(SearchResult(title=title, href=href, body=body))
+        return entries
+
+
+class BraveSearchProvider(SearchProvider):
+    """Brave provider via official Web Search API."""
+
+    _ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+    def search(self, query: str) -> list[SearchResult]:
+        api_key = self.api_key or os.environ.get("SEARCH_API_KEY")
+        if not api_key:
+            raise SearchError(
+                "Brave search requires SEARCH_API_KEY in the environment."
+            )
+
+        params = urllib.parse.urlencode(
+            {
+                "q": query,
+                "count": max(1, min(self.max_results, 20)),
+                "extra_snippets": "true",
+                "safesearch": "moderate",
+            }
+        )
+        req = urllib.request.Request(
+            f"{self._ENDPOINT}?{params}",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": api_key,
+                "User-Agent": "Trillim/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            if exc.code in (401, 403):
+                raise SearchError(
+                    "Brave authentication failed. Check SEARCH_API_KEY."
+                ) from exc
+            raise SearchError(
+                f"Brave search API error ({exc.code}). {detail}".strip()
+            ) from exc
+        except Exception as exc:
+            raise SearchError(f"Search unavailable: {exc}") from exc
+
+        web_obj = payload.get("web", {})
+        raw_results = web_obj.get("results", []) if isinstance(web_obj, dict) else []
+        entries: list[SearchResult] = []
+        for item in raw_results:
+            title = str(item.get("title", "")).strip()
+            href = str(item.get("url", "")).strip()
+            body = str(item.get("description", "")).strip()
+            extras = item.get("extra_snippets", [])
+            if isinstance(extras, list) and extras:
+                snippets = [str(x).strip() for x in extras if x]
+                body = "\n".join([body, *snippets]).strip()
+            if not href:
+                continue
+            entries.append(SearchResult(title=title, href=href, body=body))
+        return entries
+
+
+def get_search_provider(
+    name: str,
+    *,
+    max_results: int = 3,
+    api_key: str | None = None,
+) -> SearchProvider:
+    """Factory for concrete search providers."""
+    name_normalized = name.strip().lower()
+    providers: dict[str, type[SearchProvider]] = {
+        "ddgs": DDGSSearchProvider,
+        "brave": BraveSearchProvider,
+    }
+    if name_normalized not in providers:
+        available = ", ".join(sorted(providers))
+        raise ValueError(
+            f"Unknown search provider {name!r}. Available: {available}"
+        )
+    return providers[name_normalized](max_results=max_results, api_key=api_key)
+
+
+class SearchClient:
+    """Search + extraction + truncation pipeline over a provider."""
+
+    def __init__(
+        self,
+        provider_name: str = "ddgs",
+        max_results: int = 3,
+        char_budget: int = 2000,
+        api_key: str | None = None,
+    ):
+        self.provider = get_search_provider(
+            provider_name, max_results=max_results, api_key=api_key
+        )
+        self.char_budget = char_budget
+
+    async def search(self, query: str) -> str:
+        """Run search pipeline in a thread (providers + urllib are sync)."""
+        return await asyncio.to_thread(self._search_sync, query)
+
+    def _search_sync(self, query: str) -> str:
+        results = self.provider.search(query)
         if not results:
             raise SearchError("No search results found.")
 
@@ -235,21 +373,18 @@ class DuckDuckGoSearch:
         if year_match:
             year = year_match.group(1)
             results.sort(
-                key=lambda r: year not in r.get("title", "") + r.get("body", ""),
+                key=lambda r: year not in (r.title + r.body),
             )
 
         # Fetch and extract full page content for each result
         entries: list[tuple[str, str]] = []
         for r in results:
-            title = r.get("title", "")
-            href = r.get("href", "")
-            body = r.get("body", "")  # DDGS snippet as fallback
-
-            if href:
-                page_text = self._fetch_and_extract(href)
-                if page_text:
-                    body = page_text
-
+            title = r.title
+            href = r.href
+            body = r.body
+            page_text = self._fetch_and_extract(href)
+            if page_text:
+                body = page_text
             if body:
                 entries.append((title, body))
 

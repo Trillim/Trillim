@@ -40,6 +40,8 @@ trillim chat <model_dir> [options]
 | `--lora-quant <type>` | LoRA quantization level: `none`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0` |
 | `--unembed-quant <type>` | Unembed layer quantization: `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0` |
 | `--trust-remote-code` | Allow loading custom tokenizer code from the model directory |
+| `--harness <name>` | Inference harness: `default`, `search` |
+| `--search-provider <name>` | Search provider for `--harness search`: `ddgs` (default), `brave` |
 
 ### Examples
 
@@ -51,10 +53,15 @@ trillim chat Trillim/BitNet-TRNQ
 trillim chat ./my-model-TRNQ
 
 # Chat with a LoRA adapter
-trillim chat Trillim/BitNet-TRNQ --lora Trillim/MyAdapter-TRNQ
+trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-GenZ-LoRA-TRNQ
 
 # Use 4 threads
 trillim chat Trillim/BitNet-TRNQ --threads 4
+
+# Use Brave for search harness 
+# requires SEARCH_API_KEY env var
+# and a model trained to search
+trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-Search-LoRA-TRNQ --harness search --search-provider brave
 ```
 
 ## `trillim serve`
