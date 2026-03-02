@@ -102,14 +102,6 @@ LORA_TARGETS = [
     "mlp.down_proj",
 ]
 
-# Binary file format constants
-MAGIC_TENSORS = b"TRLM"
-MAGIC_ROPE    = b"TRRC"
-MAGIC_LORA    = b"TRLA"
-FORMAT_VERSION_TENSORS = 2
-FORMAT_VERSION_ROPE    = 1
-FORMAT_VERSION_LORA    = 2
-
 
 def _get_all_tensor_names(model_dir):
     """Get all tensor names from safetensors (handles sharding)."""
