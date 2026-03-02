@@ -55,18 +55,18 @@ class SearchHarness(Harness):
             # Yield sentinel BEFORE searching so the user sees it while waiting
             yield f"[Searching: {query}]\n"
 
+            # Keep cache aligned with model-generated state only.
+            messages.append({"role": "assistant", "content": full_text})
+            self._update_cache(messages)
+
             try:
                 results = await self._search.search(query)
             except SearchError:
                 yield "[Search unavailable]\n"
-                messages.append({"role": "assistant", "content": full_text})
                 messages.append({"role": "search", "content": "Search unavailable, please answer from your knowledge."})
-                self._update_cache(messages)
                 break
 
-            messages.append({"role": "assistant", "content": full_text})
             messages.append({"role": "search", "content": results})
-            self._update_cache(messages)
 
             if self.DEBUG:
                 yield f"[Search results]\n{results}\n"
