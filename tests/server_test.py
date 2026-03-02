@@ -3,7 +3,7 @@
 Test suite for the Trillim OpenAI-compatible API server.
 
 Start the server first:  trillim serve <model_dir> --voice
-Then run this:           uv run tests/server_test.py [--base-url URL] [--model-dir DIR] [--adapter-dir DIR]
+Then run this:           uv run tests/server_test.py [--base-url URL] [--model-dir DIR] [--adapter-dir DIR] [--search-provider NAME]
 
 Voice tests run automatically when the server has --voice enabled;
 otherwise they are skipped.  LoRA tests require --adapter-dir pointing to a
@@ -24,9 +24,20 @@ import uuid
 # Helpers
 # ---------------------------------------------------------------------------
 
+CHAT_SEARCH_PROVIDER: str | None = None
+
+
 def api(base_url: str, method: str, path: str, body=None, timeout: int = 300):
     """Make an API request and return (status_code, parsed_json | None)."""
     url = f"{base_url}{path}"
+    if (
+        CHAT_SEARCH_PROVIDER is not None
+        and path == "/v1/chat/completions"
+        and isinstance(body, dict)
+        and "search_provider" not in body
+    ):
+        body = dict(body)
+        body["search_provider"] = CHAT_SEARCH_PROVIDER
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
@@ -47,6 +58,13 @@ def stream_chunks(base_url: str, path: str, body: dict, timeout: int = 300):
     plus a boolean indicating whether the final ``data: [DONE]`` sentinel was
     received."""
     url = f"{base_url}{path}"
+    if (
+        CHAT_SEARCH_PROVIDER is not None
+        and path == "/v1/chat/completions"
+        and "search_provider" not in body
+    ):
+        body = dict(body)
+        body["search_provider"] = CHAT_SEARCH_PROVIDER
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -1065,6 +1083,8 @@ VOICE_TESTS = [
 
 
 def main():
+    global CHAT_SEARCH_PROVIDER
+
     parser = argparse.ArgumentParser(description="Trillim API server tests")
     parser.add_argument(
         "--base-url", default="http://127.0.0.1:8000",
@@ -1078,8 +1098,15 @@ def main():
         "--adapter-dir", default=None,
         help="LoRA adapter directory (separate from model dir) for adapter tests",
     )
+    parser.add_argument(
+        "--search-provider",
+        choices=["ddgs", "brave"],
+        default=None,
+        help="Inject search_provider into all /v1/chat/completions test requests",
+    )
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
+    CHAT_SEARCH_PROVIDER = args.search_provider
 
     # Check server is reachable
     try:
