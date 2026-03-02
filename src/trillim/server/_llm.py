@@ -276,8 +276,19 @@ class LLM(Component):
                 raise HTTPException(status_code=503, detail="No model loaded")
 
             tokenizer = llm.engine.tokenizer
+            harness = llm.harness
+            if req.search_provider is not None:
+                if llm._harness_name != "search":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="search_provider can only be used when server harness is 'search'.",
+                    )
+                harness = get_harness("search")(
+                    llm.engine, search_provider=req.search_provider
+                )
+
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
-            token_ids, _ = llm.harness._prepare_tokens(messages)
+            token_ids, _ = harness._prepare_tokens(messages)
 
             max_ctx = llm.engine.arch_config.max_position_embeddings
             if len(token_ids) >= max_ctx:
@@ -298,13 +309,13 @@ class LLM(Component):
             if req.stream:
                 return StreamingResponse(
                     _stream_chat(
-                        llm, messages, sampling, req.model or llm.model_name
+                        harness, messages, sampling, req.model or llm.model_name
                     ),
                     media_type="text/event-stream",
                 )
 
             full_text = ""
-            async for chunk in llm.harness.run(messages, **sampling):
+            async for chunk in harness.run(messages, **sampling):
                 full_text += chunk
 
             completion_tokens = len(tokenizer.encode(full_text, add_special_tokens=False))
@@ -396,7 +407,7 @@ class LLM(Component):
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: str):
+async def _stream_chat(harness: Harness, messages: list[dict], sampling: dict, model: str):
     req_id = make_id()
     created = now()
 
@@ -411,7 +422,7 @@ async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: st
     }
     yield f"data: {json.dumps(chunk)}\n\n"
 
-    async for text in llm.harness.run(messages, **sampling):
+    async for text in harness.run(messages, **sampling):
         chunk = {
             "id": req_id,
             "object": "chat.completion.chunk",

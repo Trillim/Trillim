@@ -56,6 +56,7 @@ class _SamplingValidators:
 class ChatCompletionRequest(_SamplingValidators, BaseModel):
     model: str = ""
     messages: list[ChatMessage]
+    search_provider: str | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
