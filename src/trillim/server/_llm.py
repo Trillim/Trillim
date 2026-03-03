@@ -355,7 +355,15 @@ class LLM(Component):
                 )
 
             full_text = ""
+            SENTINELS = ["[Spin-Jump-Spinning...]",
+                         "[Searching:", "[Synthesizing...]",
+                         "[Search unavailable]",
+                         "\n--- Step ",
+                         "[Search results]\n",
+            ]
             async for chunk in llm.harness.run(messages, **sampling):
+                if any(chunk.startswith(sentinel) for sentinel in SENTINELS):
+                    continue
                 full_text += chunk
 
             completion_tokens = len(tokenizer.encode(full_text, add_special_tokens=False))
