@@ -6,6 +6,7 @@ import gzip
 import json
 import os
 import re
+import sys
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -298,21 +299,23 @@ class SearchProvider(ABC):
 
 class DDGSSearchProvider(SearchProvider):
     """DuckDuckGo provider via ddgs."""
+    def __init__(
+        self,
+        max_results: int = 3,
+        token_budget: int = 1024,
+        api_key: str | None = None,
+    ):
+        super().__init__(max_results, token_budget, api_key)
+        print(
+            "Note: ddgs/primp may print an impersonation warning; this is harmless and can be ignored.",
+            file=sys.stderr,
+        )
 
     def search(self, query: str) -> list[SearchResult]:
         from ddgs import DDGS
 
         try:
-            # Suppress C-level stderr from primp's impersonation warnings
-            fd = os.dup(2)
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull_fd, 2)
-            os.close(devnull_fd)
-            try:
-                raw_results = DDGS().text(query, max_results=self.max_results)
-            finally:
-                os.dup2(fd, 2)
-                os.close(fd)
+            raw_results = DDGS().text(query, max_results=self.max_results)
         except Exception as exc:
             raise SearchError(f"Search unavailable: {exc}") from exc
 
