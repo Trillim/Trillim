@@ -56,7 +56,6 @@ class _SamplingValidators:
 class ChatCompletionRequest(_SamplingValidators, BaseModel):
     model: str = ""
     messages: list[ChatMessage]
-    search_provider: str | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -145,6 +144,8 @@ class ServerState(enum.Enum):
 class LoadModelRequest(BaseModel):
     model_dir: str
     adapter_dir: str | None = None
+    harness: str | None = None
+    search_provider: str | None = None
     threads: int | None = None  # None = keep server default, 0 = auto
     lora_quant: str | None = None
     unembed_quant: str | None = None

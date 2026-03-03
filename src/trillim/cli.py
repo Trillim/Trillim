@@ -75,7 +75,7 @@ def _cmd_serve(args):
 
         from trillim import LLM, Server, TTS, Whisper
 
-        components = [LLM(args.model_dir, num_threads=args.threads or 0, trust_remote_code=args.trust_remote_code, lora_quant=args.lora_quant, unembed_quant=args.unembed_quant, harness_name=args.harness)]
+        components = [LLM(args.model_dir, num_threads=args.threads or 0, trust_remote_code=args.trust_remote_code, lora_quant=args.lora_quant, unembed_quant=args.unembed_quant)]
         if args.voice:
             components.append(Whisper(model_size=args.whisper_model))
             components.append(TTS(voices_dir=args.voices_dir))
@@ -281,7 +281,6 @@ def main():
     p_serve.add_argument("--lora-quant", default=None, help="LoRA quantization (none|int8|q4_0|q5_0|q6_k|q8_0)")
     p_serve.add_argument("--unembed-quant", default=None, help="Unembed quantization (int8|q4_0|q5_0|q6_k|q8_0)")
     p_serve.add_argument("--trust-remote-code", action="store_true", help="Allow loading custom tokenizer code from model directory")
-    p_serve.add_argument("--harness", default="default", help="Inference harness (default, search)")
     p_serve.set_defaults(func=_cmd_serve)
 
     # --- pull ---

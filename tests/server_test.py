@@ -3,7 +3,7 @@
 Test suite for the Trillim OpenAI-compatible API server.
 
 Start the server first:  trillim serve <model_dir> --voice
-Then run this:           uv run tests/server_test.py [--base-url URL] [--model-dir DIR] [--adapter-dir DIR] [--search-provider NAME]
+Then run this:           uv run tests/server_test.py [--base-url URL] [--model-dir DIR] [--adapter-dir DIR]
 
 Voice tests run automatically when the server has --voice enabled;
 otherwise they are skipped.  LoRA tests require --adapter-dir pointing to a
@@ -24,20 +24,9 @@ import uuid
 # Helpers
 # ---------------------------------------------------------------------------
 
-CHAT_SEARCH_PROVIDER: str | None = None
-
-
 def api(base_url: str, method: str, path: str, body=None, timeout: int = 300):
     """Make an API request and return (status_code, parsed_json | None)."""
     url = f"{base_url}{path}"
-    if (
-        CHAT_SEARCH_PROVIDER is not None
-        and path == "/v1/chat/completions"
-        and isinstance(body, dict)
-        and "search_provider" not in body
-    ):
-        body = dict(body)
-        body["search_provider"] = CHAT_SEARCH_PROVIDER
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
@@ -58,13 +47,6 @@ def stream_chunks(base_url: str, path: str, body: dict, timeout: int = 300):
     plus a boolean indicating whether the final ``data: [DONE]`` sentinel was
     received."""
     url = f"{base_url}{path}"
-    if (
-        CHAT_SEARCH_PROVIDER is not None
-        and path == "/v1/chat/completions"
-        and "search_provider" not in body
-    ):
-        body = dict(body)
-        body["search_provider"] = CHAT_SEARCH_PROVIDER
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
@@ -250,6 +232,58 @@ def test_chat_streaming(base_url: str, **_):
 
     if not got_done:
         return "fail", "stream did not end with data: [DONE]"
+
+
+def test_load_model_with_search_harness_and_provider(base_url: str, model_dir: str | None = None, **_):
+    """POST /v1/models/load accepts harness=search + search_provider and chat still works."""
+    if model_dir is None:
+        return "skip", "no --model-dir provided"
+    if not _hot_swap_allowed(model_dir):
+        return "skip", "model not in ~/.trillim/models/ (use 'trillim pull' for hot-swap tests)"
+
+    payload = {"model_dir": model_dir, "harness": "search", "search_provider": "ddgs"}
+    status, body = api(base_url, "POST", "/v1/models/load", payload, timeout=600)
+    if status != 200:
+        return "fail", f"expected 200, got {status}: {body}"
+    if body["status"] != "success":
+        return "fail", f"expected success, got {body}"
+
+    chat_payload = {
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "max_tokens": 32,
+    }
+    status2, body2 = api(base_url, "POST", "/v1/chat/completions", chat_payload)
+    if status2 != 200:
+        return "fail", f"chat failed after enabling search harness: {status2}: {body2}"
+    content = body2["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or len(content) == 0:
+        return "fail", "empty chat content after enabling search harness"
+
+
+def test_load_model_with_default_harness_and_search_provider(base_url: str, model_dir: str | None = None, **_):
+    """POST /v1/models/load accepts harness=default with any search_provider and chat works."""
+    if model_dir is None:
+        return "skip", "no --model-dir provided"
+    if not _hot_swap_allowed(model_dir):
+        return "skip", "model not in ~/.trillim/models/ (use 'trillim pull' for hot-swap tests)"
+
+    payload = {"model_dir": model_dir, "harness": "default", "search_provider": "brave"}
+    status, body = api(base_url, "POST", "/v1/models/load", payload, timeout=600)
+    if status != 200:
+        return "fail", f"expected 200, got {status}: {body}"
+    if body["status"] != "success":
+        return "fail", f"expected success, got {body}"
+
+    chat_payload = {
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "max_tokens": 32,
+    }
+    status2, body2 = api(base_url, "POST", "/v1/chat/completions", chat_payload)
+    if status2 != 200:
+        return "fail", f"chat failed after setting default harness: {status2}: {body2}"
+    content = body2["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or len(content) == 0:
+        return "fail", "empty chat content after setting default harness"
 
 
 def test_completions_non_streaming(base_url: str, **_):
@@ -1042,6 +1076,8 @@ ALL_TESTS = [
     test_models_endpoint,
     test_chat_non_streaming,
     test_chat_streaming,
+    test_load_model_with_search_harness_and_provider,
+    test_load_model_with_default_harness_and_search_provider,
     test_completions_non_streaming,
     test_completions_streaming,
     test_greedy_decoding,
@@ -1083,8 +1119,6 @@ VOICE_TESTS = [
 
 
 def main():
-    global CHAT_SEARCH_PROVIDER
-
     parser = argparse.ArgumentParser(description="Trillim API server tests")
     parser.add_argument(
         "--base-url", default="http://127.0.0.1:8000",
@@ -1098,15 +1132,8 @@ def main():
         "--adapter-dir", default=None,
         help="LoRA adapter directory (separate from model dir) for adapter tests",
     )
-    parser.add_argument(
-        "--search-provider",
-        choices=["ddgs", "brave"],
-        default=None,
-        help="Inject search_provider into all /v1/chat/completions test requests",
-    )
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
-    CHAT_SEARCH_PROVIDER = args.search_provider
 
     # Check server is reachable
     try:

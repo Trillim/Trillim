@@ -48,11 +48,23 @@ class LLM(Component):
         self._lora_quant = lora_quant
         self._unembed_quant = unembed_quant
         self._harness_name = harness_name
+        self._search_provider = "ddgs"
         self.engine: InferenceEngine | None = None
         self.harness: Harness | None = None
         self.model_name: str = "unknown"
         self.state: ServerState = ServerState.NO_MODEL
         self._swap_lock: asyncio.Lock | None = None
+
+    def _create_harness(
+        self,
+        engine: InferenceEngine,
+        harness_name: str,
+        search_provider: str,
+    ) -> Harness:
+        harness_cls = get_harness(harness_name)
+        if harness_name == "search":
+            return harness_cls(engine, search_provider=search_provider)
+        return harness_cls(engine)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -82,8 +94,9 @@ class LLM(Component):
             unembed_quant=self._unembed_quant,
         )
         await self.engine.start()
-        harness_cls = get_harness(self._harness_name)
-        self.harness = harness_cls(self.engine)
+        self.harness = self._create_harness(
+            self.engine, self._harness_name, self._search_provider
+        )
         self.state = ServerState.RUNNING
 
     async def stop(self) -> None:
@@ -98,6 +111,8 @@ class LLM(Component):
         self,
         model_dir: str,
         adapter_dir: str | None = None,
+        harness_name: str | None = None,
+        search_provider: str | None = None,
         num_threads: int | None = None,
         lora_quant: str | None = None,
         unembed_quant: str | None = None,
@@ -119,6 +134,25 @@ class LLM(Component):
                 recompiled=False,
                 message=f"config.json not found in {model_dir}",
             )
+
+        next_harness = harness_name if harness_name is not None else self._harness_name
+        next_search_provider = (
+            search_provider
+            if search_provider is not None
+            else self._search_provider
+        )
+
+        # Validate harness/provider before stopping the old engine.
+        if self.engine is not None:
+            try:
+                self._create_harness(self.engine, next_harness, next_search_provider)
+            except Exception as exc:
+                return LoadModelResponse(
+                    status="error",
+                    model=self.model_name,
+                    recompiled=False,
+                    message=f"Invalid harness config: {exc}",
+                )
 
         # Validate LoRA adapter before stopping the old engine
         if resolved_adapter:
@@ -199,8 +233,23 @@ class LLM(Component):
             )
 
         self.engine = new_engine
-        harness_cls = get_harness(self._harness_name)
-        self.harness = harness_cls(new_engine)
+        try:
+            self.harness = self._create_harness(
+                new_engine, next_harness, next_search_provider
+            )
+        except Exception as exc:
+            await new_engine.stop()
+            self.engine = None
+            self.state = ServerState.NO_MODEL
+            return LoadModelResponse(
+                status="error",
+                model=new_name,
+                recompiled=False,
+                message=f"Invalid harness config: {exc}",
+            )
+
+        self._harness_name = next_harness
+        self._search_provider = next_search_provider
         self._adapter_dir = resolved_adapter
         self._num_threads = threads
         self._lora_quant = lora_quant
@@ -257,6 +306,8 @@ class LLM(Component):
                 result = await llm._swap_engine(
                     model_dir,
                     adapter_dir=req.adapter_dir,
+                    harness_name=req.harness,
+                    search_provider=req.search_provider,
                     num_threads=req.threads,
                     lora_quant=req.lora_quant,
                     unembed_quant=req.unembed_quant,
@@ -276,19 +327,8 @@ class LLM(Component):
                 raise HTTPException(status_code=503, detail="No model loaded")
 
             tokenizer = llm.engine.tokenizer
-            harness = llm.harness
-            if req.search_provider is not None:
-                if llm._harness_name != "search":
-                    raise HTTPException(
-                        status_code=400,
-                        detail="search_provider can only be used when server harness is 'search'.",
-                    )
-                harness = get_harness("search")(
-                    llm.engine, search_provider=req.search_provider
-                )
-
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
-            token_ids, _ = harness._prepare_tokens(messages)
+            token_ids, _ = llm.harness._prepare_tokens(messages)
 
             max_ctx = llm.engine.arch_config.max_position_embeddings
             if len(token_ids) >= max_ctx:
@@ -309,13 +349,13 @@ class LLM(Component):
             if req.stream:
                 return StreamingResponse(
                     _stream_chat(
-                        harness, messages, sampling, req.model or llm.model_name
+                        llm.harness, messages, sampling, req.model or llm.model_name
                     ),
                     media_type="text/event-stream",
                 )
 
             full_text = ""
-            async for chunk in harness.run(messages, **sampling):
+            async for chunk in llm.harness.run(messages, **sampling):
                 full_text += chunk
 
             completion_tokens = len(tokenizer.encode(full_text, add_special_tokens=False))
