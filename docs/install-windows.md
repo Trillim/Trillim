@@ -1,93 +1,100 @@
 # Install on Windows
 
-## Prerequisites
+## Requirements
 
-- Python 3.12+
-- x86_64 processor with AVX2
+- x86_64 CPU with AVX2
+- Python 3.12 or newer
 
-Check your Python version:
+## 1. Check your Python version
+
+In PowerShell:
 
 ```powershell
-python --version
+py --version
 ```
 
-If you don't have Python 3.12+, download it from [python.org](https://www.python.org/downloads/). During installation, make sure to check **"Add python.exe to PATH"**.
+If you see `Python 3.12.x` (or newer), continue to step 3.
+If not, install/upgrade Python in step 2.
 
-## Install with uv (recommended)
+## 2. Install or upgrade to Python 3.12+
 
-[uv](https://docs.astral.sh/uv/) is a fast Python package manager. Install it with:
+### Option A (recommended): install Python with winget
+
+```powershell
+winget install -e --id Python.Python.3.12
+py -3.12 --version
+```
+
+### Option B: install Python from python.org
+
+Download from [python.org](https://www.python.org/downloads/windows/), run the installer, and check:
+
+- `Add python.exe to PATH`
+- `Install launcher for all users (recommended)`
+
+Then verify:
+
+```powershell
+py -3.12 --version
+```
+
+## 3. Install Trillim with uv (recommended)
+
+Install `uv`:
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Then create a project and install Trillim:
+Open a new PowerShell window, then create a project and add Trillim:
 
 ```powershell
-uv init my-project
-cd my-project
+mkdir trillim-demo
+cd trillim-demo
+uv init
+uv python pin 3.12
 uv add trillim
 ```
 
-With uv, all `trillim` commands must be prefixed with `uv run`:
+If you want voice features (`--voice`), install the voice extra:
 
 ```powershell
-# List available models
+uv add "trillim[voice]"
+```
+
+## 4. Verify the install
+
+```powershell
+uv run python --version
+uv run trillim --help
 uv run trillim list
+```
 
-# Pull a pre-quantized model
+## 5. Run Trillim
+
+With `uv`, prefix commands with `uv run`:
+
+```powershell
 uv run trillim pull Trillim/BitNet-TRNQ
-
-# Chat
 uv run trillim chat Trillim/BitNet-TRNQ
-
-# Start the API server
 uv run trillim serve Trillim/BitNet-TRNQ
 ```
 
-## Install with pip
+## 6. pip alternative (venv)
 
-### Virtual environment (recommended)
+If you prefer `pip`:
 
 ```powershell
-# Create and activate a virtual environment
-python -m venv .venv
-.venv\Scripts\activate
-
-# Install trillim
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python --version
+python -m pip install --upgrade pip
 pip install trillim
 ```
 
-Once activated, `trillim` is on your PATH:
+Then run:
 
 ```powershell
-# List available models
+trillim --help
 trillim list
-
-# Pull a pre-quantized model
-trillim pull Trillim/BitNet-TRNQ
-
-# Chat
-trillim chat Trillim/BitNet-TRNQ
-
-# Start the API server
-trillim serve Trillim/BitNet-TRNQ
-```
-
-Remember to run `.venv\Scripts\activate` in each new terminal session.
-
-### Global install
-
-On Windows, pip installs globally by default (no externally-managed restriction):
-
-```powershell
-pip install trillim
-```
-
-`trillim` is then available in any terminal:
-
-```powershell
-trillim list
-trillim pull Trillim/BitNet-TRNQ
-trillim chat Trillim/BitNet-TRNQ
 ```

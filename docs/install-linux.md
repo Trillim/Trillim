@@ -1,109 +1,109 @@
 # Install on Linux
 
-## Prerequisites
+## Requirements
 
-- Python 3.12+
-- x86_64 (AVX2) or ARM64 (NEON) processor
+- x86_64 (AVX2) or ARM64 (NEON)
+- Python 3.12 or newer
 
-Check your Python version:
+## 1. Check your Python version
+
+Run:
 
 ```bash
 python3 --version
 ```
 
-If you don't have Python 3.12+, install it with your distro's package manager:
+If you see `Python 3.12.x` (or newer), continue to step 3.
+If not, install/upgrade Python in step 2.
 
-```bash
-# Ubuntu / Debian
-sudo apt update && sudo apt install python3 python3-venv python3-pip
+## 2. Install or upgrade to Python 3.12+
 
-# Fedora
-sudo dnf install python3 python3-pip
+### Option A (recommended): install Python with uv
 
-# Arch
-sudo pacman -S python python-pip
-```
-
-## Install with uv (recommended)
-
-[uv](https://docs.astral.sh/uv/) is a fast Python package manager. Install it with:
+Install `uv`:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then create a project and install Trillim:
+Open a new terminal, then install Python 3.12:
 
 ```bash
-uv init my-project && cd my-project
+uv python install 3.12
+uv run --python 3.12 python --version
+```
+
+### Option B: install Python from your distro packages
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install python3.12 python3.12-venv python3-pip
+
+# Fedora
+sudo dnf install python3.12 python3.12-pip
+
+# Arch Linux
+sudo pacman -S python python-pip
+```
+
+Then verify:
+
+```bash
+python3 --version
+```
+
+## 3. Install Trillim with uv (recommended)
+
+Create a project and add Trillim:
+
+```bash
+mkdir trillim-demo
+cd trillim-demo
+uv init .
+uv python pin 3.12
 uv add trillim
 ```
 
-With uv, all `trillim` commands must be prefixed with `uv run`:
+If you want voice features (`--voice`), install the voice extra:
 
 ```bash
-# List available models
+uv add "trillim[voice]"
+```
+
+## 4. Verify the install
+
+```bash
+uv run python --version
+uv run trillim --help
 uv run trillim list
+```
 
-# Pull a pre-quantized model
+## 5. Run Trillim
+
+With `uv`, prefix commands with `uv run`:
+
+```bash
 uv run trillim pull Trillim/BitNet-TRNQ
-
-# Chat
 uv run trillim chat Trillim/BitNet-TRNQ
-
-# Start the API server
 uv run trillim serve Trillim/BitNet-TRNQ
 ```
 
-## Install with pip
+## 6. pip alternative (venv)
 
-### Virtual environment (recommended)
+If you prefer `pip`:
 
 ```bash
-# Create and activate a virtual environment
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-
-# Install trillim
+python --version
+pip install --upgrade pip
 pip install trillim
 ```
 
-Once activated, `trillim` is on your PATH:
+Then run:
 
 ```bash
-# List available models
+trillim --help
 trillim list
-
-# Pull a pre-quantized model
-trillim pull Trillim/BitNet-TRNQ
-
-# Chat
-trillim chat Trillim/BitNet-TRNQ
-
-# Start the API server
-trillim serve Trillim/BitNet-TRNQ
-```
-
-Remember to run `source .venv/bin/activate` in each new terminal session.
-
-### Global install
-
-On many Linux distros, Python 3.12+ marks the system Python as externally managed. To install globally you need either `--break-system-packages` or `pipx`:
-
-```bash
-# Option 1: override the restriction
-pip install --break-system-packages trillim
-
-# Option 2: use pipx (installs into its own isolated environment)
-# Ubuntu/Debian: sudo apt install pipx
-# Fedora: sudo dnf install pipx
-pipx install trillim
-```
-
-With a global install (either method), `trillim` is available everywhere without activation:
-
-```bash
-trillim list
-trillim pull Trillim/BitNet-TRNQ
-trillim chat Trillim/BitNet-TRNQ
 ```
