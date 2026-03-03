@@ -2,6 +2,22 @@
 
 [What is Trillim?](docs/about-trillim.md)
 
+## Performance Highlights
+
+Darknet benchmark takeaways on consumer CPUs:
+
+- Prefill throughput improvements are most visible when `num_threads >= 4`.
+- Decode throughput is approximately equal to BitNet on average, while Darknet reaches higher peaks.
+- See [Benchmarks](docs/benchmarks.md) for full plots and benchmarking caveats.
+
+Prefill example:
+
+![Prefill benchmark example](docs/imgs/Q4_0A.png)
+
+Decode example:
+
+![Decode benchmark example](docs/imgs/DecodeA.png)
+
 ## Quick Start
 
 ### Installation
@@ -175,6 +191,7 @@ Thread count is auto-detected as `num_cores - 2`. Override by passing a `--threa
 - [CLI Reference](docs/cli.md) — all commands and flags
 - [Chat](docs/chat.md) — interactive chat interface
 - [Server](docs/server.md) — API endpoints, Python SDK, and OpenAI client usage
+- [Benchmarks](docs/benchmarks.md) — decode and quantization benchmark plots, interpretation, and caveats
 
 ## License
 
