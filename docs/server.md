@@ -20,6 +20,31 @@ To enable the voice pipeline (speech-to-text and text-to-speech):
 trillim serve Trillim/BitNet-TRNQ --voice
 ```
 
+## Voice Optional Dependencies
+
+Voice support is optional and is not installed by default.
+This guide is bundled with the package at `trillim/docs/server.md` in your environment.
+
+Install the `voice` extra with `uv`:
+
+```bash
+uv add "trillim[voice]"
+```
+
+Install the `voice` extra with `pip`:
+
+```bash
+pip install "trillim[voice]"
+```
+
+The `voice` extra includes all voice-related runtime dependencies, including multipart form parsing for audio upload endpoints.
+
+Then start the server with:
+
+```bash
+trillim serve Trillim/BitNet-TRNQ --voice
+```
+
 ## Endpoints
 
 ### Chat Completions

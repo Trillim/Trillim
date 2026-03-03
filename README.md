@@ -50,6 +50,8 @@ Trillim includes an OpenAI-compatible API server:
 trillim serve Trillim/BitNet-TRNQ
 
 # With voice pipeline (speech-to-text + text-to-speech)
+# Requires optional `voice` dependencies:
+# docs/server.md -> "Voice Optional Dependencies"
 trillim serve Trillim/BitNet-TRNQ --voice
 ```
 

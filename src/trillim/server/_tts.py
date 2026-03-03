@@ -117,7 +117,17 @@ class TTSEngine:
                     self._custom_voice_files[voice_id] = wav
 
     def _load(self):
-        from pocket_tts import TTSModel
+        try:
+            from pocket_tts import TTSModel
+        except ModuleNotFoundError as e:
+            docs_path = Path(__file__).resolve().parents[1] / "docs" / "server.md"
+            if not docs_path.exists():
+                docs_path = Path(__file__).resolve().parents[3] / "docs" / "server.md"
+            raise RuntimeError(
+                "Voice support is optional and requires the 'voice' extra. "
+                "Install with uv or pip using 'trillim[voice]'. "
+                f"Docs: {docs_path} (section: Voice Optional Dependencies)"
+            ) from e
 
         model = TTSModel.load_model()
         model.eval()
@@ -367,6 +377,18 @@ class TTS(Component):
         return self._engine
 
     def router(self) -> APIRouter:
+        docs_path = Path(__file__).resolve().parents[1] / "docs" / "server.md"
+        if not docs_path.exists():
+            docs_path = Path(__file__).resolve().parents[3] / "docs" / "server.md"
+        try:
+            import multipart  # noqa: F401
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "Voice support requires the optional 'voice' extra. "
+                "Install with uv or pip using 'trillim[voice]'. "
+                f"Docs: {docs_path} (section: Voice Optional Dependencies)"
+            ) from e
+
         r = APIRouter()
         tts = self
 

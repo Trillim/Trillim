@@ -34,6 +34,20 @@ uvicorn
 
 --------------------------------------------------------------------------------
 
+trafilatura
+  License:   Apache License 2.0
+  Copyright: Copyright 2019-present, Adrien Barbaresi
+  URL:       https://github.com/adbar/trafilatura
+
+--------------------------------------------------------------------------------
+
+ddgs
+  License:   MIT License
+  Copyright: Copyright (c) 2022 deedy5
+  URL:       https://github.com/deedy5/ddgs
+
+--------------------------------------------------------------------------------
+
 faster-whisper
   License:   MIT License
   Copyright: Copyright (c) 2023 SYSTRAN
@@ -49,6 +63,13 @@ pocket-tts
              may be subject to additional terms from Kyutai. Users
              must accept model weight licenses independently.
   URL:       https://github.com/rhasspy/pocket-tts
+
+--------------------------------------------------------------------------------
+
+python-multipart
+  License:   Apache License 2.0
+  Copyright: Copyright 2012, Andrew Dunham
+  URL:       https://github.com/Kludex/python-multipart
 
 --------------------------------------------------------------------------------
 

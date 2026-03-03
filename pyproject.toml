@@ -25,14 +25,13 @@ dependencies = [
     "jinja2==3.1.0",
     "fastapi==0.128.0",
     "uvicorn[standard]==0.40.0",
-    "faster-whisper==1.2.1",
-    "pocket-tts==1.0.3",
     "trafilatura==2.0.0",
     "ddgs==9.10.0",
 ]
 
 [project.optional-dependencies]
 dev = ["ruff==0.15.0"]
+voice = ["faster-whisper==1.2.1", "pocket-tts==1.0.3", "python-multipart==0.0.22"]
 
 [project.scripts]
 trillim = "trillim.cli:main"
@@ -51,3 +50,4 @@ exclude = ["src/trillim/_bin/**"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/trillim/_bin" = "trillim/_bin"
+"docs" = "trillim/docs"

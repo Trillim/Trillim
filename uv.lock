@@ -1874,10 +1874,8 @@ source = { editable = "." }
 dependencies = [
     { name = "ddgs" },
     { name = "fastapi" },
-    { name = "faster-whisper" },
     { name = "huggingface-hub" },
     { name = "jinja2" },
-    { name = "pocket-tts" },
     { name = "prompt-toolkit" },
     { name = "trafilatura" },
     { name = "transformers" },
@@ -1888,22 +1886,28 @@ dependencies = [
 dev = [
     { name = "ruff" },
 ]
+voice = [
+    { name = "faster-whisper" },
+    { name = "pocket-tts" },
+    { name = "python-multipart" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "ddgs", specifier = "==9.10.0" },
     { name = "fastapi", specifier = "==0.128.0" },
-    { name = "faster-whisper", specifier = "==1.2.1" },
+    { name = "faster-whisper", marker = "extra == 'voice'", specifier = "==1.2.1" },
     { name = "huggingface-hub", specifier = "==0.36.0" },
     { name = "jinja2", specifier = "==3.1.0" },
-    { name = "pocket-tts", specifier = "==1.0.3" },
+    { name = "pocket-tts", marker = "extra == 'voice'", specifier = "==1.0.3" },
     { name = "prompt-toolkit", specifier = "==3.0.52" },
+    { name = "python-multipart", marker = "extra == 'voice'", specifier = "==0.0.22" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.0" },
     { name = "trafilatura", specifier = "==2.0.0" },
     { name = "transformers", specifier = "==4.57.1" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.40.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "voice"]
 
 [[package]]
 name = "triton"
