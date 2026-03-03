@@ -41,6 +41,24 @@ Multi-turn conversations are supported with automatic prompt caching for fast fo
 
 See the [Chat guide](docs/chat.md) for details on LoRA adapters, sampling parameters, and performance tips.
 
+## Search-Augmented Chat
+
+Trillim supports pluggable inference harnesses. For web-search-enabled models, use:
+
+```bash
+trillim chat Trillim/BitNet-Search-TRNQ --harness search
+```
+
+By default, search uses DuckDuckGo (`ddgs`). To use Brave:
+
+```bash
+export SEARCH_API_KEY=<your_api_key>
+trillim chat Trillim/BitNet-Search-TRNQ --harness search --search-provider brave
+```
+
+The search harness emits status markers while it runs search and synthesis steps.
+See [Chat](docs/chat.md#search-mode) for full behavior and troubleshooting.
+
 ## API Server
 
 Trillim includes an OpenAI-compatible API server:
@@ -59,11 +77,13 @@ Endpoints:
 - `POST /v1/chat/completions` — chat completions (streaming supported)
 - `POST /v1/completions` — text completions
 - `GET /v1/models` — list loaded models
-- `POST /v1/models/load` — hot-swap models and LoRA adapters at runtime
+- `POST /v1/models/load` — hot-swap models, LoRA adapters, and harness/search settings at runtime
 - `POST /v1/audio/transcriptions` — speech-to-text (with `--voice`)
 - `POST /v1/audio/speech` — text-to-speech (with `--voice`)
 - `GET /v1/voices` — list available TTS voices
 - `POST /v1/voices` — register a custom voice from audio (see [Voice Cloning Setup](#voice-cloning-setup))
+
+For server-side search harness, start normally and then set `"harness": "search"` (plus optional `"search_provider"`) through `POST /v1/models/load`.
 
 Works with the OpenAI Python client out of the box:
 

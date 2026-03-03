@@ -62,25 +62,57 @@ trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-GenZ-LoRA-TRNQ
 
 The adapter must have been quantized with `trillim quantize` first. If the adapter's tokenizer differs from the base model's, Trillim automatically uses the adapter's tokenizer.
 
-## Search Harness
+## Search Mode
 
-For search-tuned models, use the search harness:
+Trillim chat supports harnesses. The `search` harness is designed for models that emit `<search>...</search>` tags during generation.
+
+Enable it with:
 
 ```bash
 trillim chat <model_dir> --harness search
 ```
 
-Search provider defaults to DuckDuckGo (`ddgs`). To use another search provider (currently support only Brave):
+If your model is not search-tuned, use the default harness instead:
 
 ```bash
-trillim chat <model_dir> --harness search --search-provider brave
+trillim chat <model_dir> --harness default
 ```
 
-Note: Some search providers require an API key (like Brave). Please set your API key in your terminal before running the above command.
+### Providers
+
+`--search-provider` is only used with `--harness search`.
+
+- `ddgs` (default): DuckDuckGo via `ddgs`
+- `brave`: Brave Search LLM Context API (requires `SEARCH_API_KEY`)
 
 ```bash
 export SEARCH_API_KEY=<your_api_key>
+trillim chat <model_dir> --harness search --search-provider brave
 ```
+
+### What You'll See During Search
+
+The search harness streams status markers while orchestrating tool use. Typical markers:
+
+- `[Spin-Jump-Spinning...]`
+- `[Searching: <query>]`
+- `[Synthesizing...]`
+- `[Search unavailable]` (when search fails)
+
+After orchestration, the final answer is streamed token-by-token.
+
+### How It Works
+
+- The model generates a draft response.
+- If a `<search>query</search>` tag is present, Trillim runs web search and adds results back into the conversation as a `search` role message.
+- The model then synthesizes the final response.
+- The harness allows up to 2 search rounds before the final streaming pass.
+
+### Debugging Search Behavior
+
+To inspect intermediate generations and fetched search context, set:
+
+- `SearchHarness.DEBUG = True` in `src/trillim/harnesses/_search.py`
 
 ## Sampling Parameters
 

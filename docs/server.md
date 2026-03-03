@@ -20,6 +20,19 @@ To enable the voice pipeline (speech-to-text and text-to-speech):
 trillim serve Trillim/BitNet-TRNQ --voice
 ```
 
+## Search Harness in Server Mode
+
+`trillim serve` starts with the default harness. To enable search orchestration on a running server, use `POST /v1/models/load` with:
+
+- `"harness": "search"`
+- optional `"search_provider": "ddgs"` or `"brave"`
+
+If you use `"search_provider": "brave"`, set:
+
+```bash
+export SEARCH_API_KEY=<your_api_key>
+```
+
 ## Voice Optional Dependencies
 
 Voice support is optional and is not installed by default.
@@ -76,6 +89,8 @@ curl http://localhost:8000/v1/chat/completions \
 | `repetition_penalty` | float | model default | Repetition penalty (>= 0) |
 | `stream` | bool | `false` | Enable server-sent events streaming |
 
+When the active harness is `search`, this endpoint can run multi-step search-augmented generation for search-tuned models.
+
 **Response:**
 
 ```json
@@ -125,6 +140,8 @@ data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1700000
 data: [DONE]
 ```
 
+With the `search` harness, streamed deltas may include orchestration markers such as `[Searching: ...]` and `[Synthesizing...]` before final answer text.
+
 ### Text Completions
 
 **`POST /v1/completions`**
@@ -142,6 +159,8 @@ curl http://localhost:8000/v1/completions \
 The request and response fields match the chat completions endpoint, except `messages` is replaced by a `prompt` string and the response uses `text` instead of `message`.
 
 Streaming is supported with `"stream": true`.
+
+`/v1/completions` is a direct prompt endpoint and does not use chat harness orchestration.
 
 ### List Models
 
@@ -166,7 +185,7 @@ curl http://localhost:8000/v1/models
 
 **`POST /v1/models/load`**
 
-Switch to a different model or LoRA adapter at runtime without restarting the server. Only models stored in `~/.trillim/models/` are allowed (use `trillim pull` first).
+Switch to a different model, LoRA adapter, or harness settings at runtime without restarting the server. Only models stored in `~/.trillim/models/` are allowed (use `trillim pull` first).
 
 ```bash
 curl http://localhost:8000/v1/models/load \
@@ -176,12 +195,26 @@ curl http://localhost:8000/v1/models/load \
   }'
 ```
 
+Enable search harness on a running server:
+
+```bash
+curl http://localhost:8000/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_dir": "Trillim/BitNet-Search-TRNQ",
+    "harness": "search",
+    "search_provider": "ddgs"
+  }'
+```
+
 **Request body:**
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `model_dir` | string | required | HuggingFace model ID or path under `~/.trillim/models/` |
 | `adapter_dir` | string | null | LoRA adapter directory to load |
+| `harness` | string | null | Harness override: `default` or `search` |
+| `search_provider` | string | null | Search provider override (used by `search` harness): `ddgs` or `brave` |
 | `threads` | int | null | Thread count override. `null` keeps the current setting, `0` auto-detects |
 | `lora_quant` | string | null | LoRA quantization level |
 | `unembed_quant` | string | null | Unembed quantization level |
@@ -325,8 +358,11 @@ LLM(
     trust_remote_code=False,
     lora_quant=None,           # "none", "int8", "q4_0", etc.
     unembed_quant=None,        # "int8", "q4_0", etc.
+    harness_name="default",    # "default" or "search"
 )
 ```
+
+`harness_name="search"` uses the default search provider (`ddgs`). To change provider on a running server, call `POST /v1/models/load` with `search_provider`.
 
 ### Whisper (Speech to Text) Component
 
