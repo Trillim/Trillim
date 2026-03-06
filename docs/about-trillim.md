@@ -13,7 +13,7 @@ Trillim takes advantage of this by:
 - **Quantizing to a compact binary format** — ternary weights are packed tightly, reducing memory usage and improving cache performance.
 - **Supporting LoRA adapters** — fine-tune a BitNet model with PEFT, then run the adapter on top of the ternary base model.
 - **Providing an OpenAI-compatible API** — drop Trillim into existing applications that use the OpenAI client library. Chat completions, text completions, and streaming all work out of the box.
-- **Including a voice pipeline** — speech-to-text (via Whisper) and text-to-speech are built-in server components. Enable them with a single flag.
+- **Including a voice pipeline** — speech-to-text (via Whisper) and text-to-speech are built-in components. Use them through the API server or import them directly in Python.
 
 ## Who is Trillim for?
 

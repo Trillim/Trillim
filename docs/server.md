@@ -327,7 +327,71 @@ curl -X DELETE http://localhost:8000/v1/voices/my-voice
 
 ## Python SDK
 
-The server is built on a composable SDK. Each capability is a standalone component that you can use programmatically:
+The server is built on a composable SDK. `LLM`, `Whisper`, and `TTS` are regular Python components:
+
+- Compose them into `Server(...)` when you want HTTP routes and an OpenAI-compatible API.
+- Import and use them directly when you want the underlying functionality without running a server.
+
+### Using Components Standalone
+
+Standalone usage is the same component API, just without `Server(...)`.
+
+- Call `await component.start()` before using `component.engine` or `llm.harness`.
+- Call `await component.stop()` when finished, ideally in a `finally` block.
+- Use `router()` only when you are mounting the component into a FastAPI app.
+
+Example: run the LLM directly in your own async code:
+
+```python
+import asyncio
+
+from trillim import LLM
+
+
+async def main():
+    llm = LLM("~/.trillim/models/Trillim/BitNet-TRNQ")
+    await llm.start()
+    try:
+        messages = [{"role": "user", "content": "Write a one-line haiku about CPUs."}]
+        async for chunk in llm.harness.run(messages):
+            print(chunk, end="", flush=True)
+        print()
+    finally:
+        await llm.stop()
+
+
+asyncio.run(main())
+```
+
+Example: use Whisper and TTS directly without exposing any HTTP endpoints:
+
+```python
+import asyncio
+from pathlib import Path
+
+from trillim import TTS, Whisper
+
+
+async def main():
+    whisper = Whisper(model_size="base.en")
+    tts = TTS()
+    await whisper.start()
+    await tts.start()
+    try:
+        text = await whisper.engine.transcribe(Path("recording.wav").read_bytes())
+        audio = await tts.engine.synthesize_full(text, voice="alba")
+        Path("speech.wav").write_bytes(audio)
+    finally:
+        await whisper.stop()
+        await tts.stop()
+
+
+asyncio.run(main())
+```
+
+### Composing a Server
+
+If you do want HTTP endpoints, use the same components inside `Server(...)`:
 
 ```python
 from trillim import Server, LLM, Whisper, TTS
@@ -362,6 +426,16 @@ LLM(
 )
 ```
 
+After `await llm.start()`, use `llm.harness.run(messages, ...)` for the high-level chat/completions flow.
+
+Use `llm.engine` when you want lower-level control over inference, for example:
+
+- Call `llm.engine.generate(token_ids=..., ...)` directly for raw token-in, token-out generation.
+- Use `llm.engine.tokenizer` to encode prompts, decode output, or apply a chat template yourself.
+- Inspect `llm.engine.arch_config`, `llm.engine.default_params`, and `llm.engine.stop_tokens` when you need model/runtime details in your own orchestration layer.
+
+In practice, `llm.harness` is the easier choice for normal chat-style use, while `llm.engine` is the lower-level path for custom prompting or custom generation loops.
+
 `harness_name="search"` uses the default search provider (`ddgs`). To change provider on a running server, call `POST /v1/models/load` with `search_provider`.
 
 ### Whisper (Speech to Text) Component
@@ -376,6 +450,8 @@ Whisper(
 )
 ```
 
+After `await whisper.start()`, call `await whisper.engine.transcribe(audio_bytes, language=...)`.
+
 ### TTS (Text to Speech) Component
 
 ```python
@@ -385,6 +461,8 @@ TTS(
     voices_dir="~/.trillim/voices",  # where custom voices are stored
 )
 ```
+
+After `await tts.start()`, use `tts.engine.list_voices()`, `await tts.engine.register_voice(...)`, `await tts.engine.synthesize_full(...)`, or `tts.engine.synthesize_stream(...)`.
 
 ### Custom Routes
 
