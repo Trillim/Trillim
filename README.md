@@ -114,7 +114,9 @@ response = client.chat.completions.create(
 )
 ```
 
-See the [Server guide](docs/server.md) for full endpoint documentation, request/response schemas, the Python SDK, and voice pipeline usage.
+For direct Python usage of `LLM`, `Whisper`, `TTS`, and `Server(...)` composition, see the [Components guide](docs/components.md).
+
+See the [Server guide](docs/server.md) for full endpoint documentation, request/response schemas, and voice pipeline usage.
 
 ## LoRA Adapters
 
@@ -190,7 +192,8 @@ Thread count is auto-detected as `num_cores - 2`. Override by passing a `--threa
 - Install — [macOS](docs/install-mac.md) | [Linux](docs/install-linux.md) | [Windows](docs/install-windows.md)
 - [CLI Reference](docs/cli.md) — all commands and flags
 - [Chat](docs/chat.md) — interactive chat interface
-- [Server](docs/server.md) — API endpoints, Python SDK, and OpenAI client usage
+- [Components](docs/components.md) — Python SDK, standalone usage, and `Server(...)` composition
+- [Server](docs/server.md) — API endpoints, server behavior, and OpenAI client usage
 - [Benchmarks](docs/benchmarks.md) — decode and quantization benchmark plots, interpretation, and caveats
 
 ## License
