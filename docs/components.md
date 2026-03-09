@@ -100,7 +100,7 @@ LLM(
     adapter_dir=None,          # optional LoRA adapter path
     num_threads=0,             # 0 = auto-detect
     trust_remote_code=False,
-    lora_quant=None,           # "none", "int8", "q4_0", etc.
+    lora_quant=None,           # "none", "bf16", "int8", "q4_0", etc.
     unembed_quant=None,        # "int8", "q4_0", etc.
     harness_name="default",    # "default" or "search"
 )

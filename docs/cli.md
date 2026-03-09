@@ -79,7 +79,7 @@ trillim chat <model_dir> [options]
 | `model_dir` | Local path or HuggingFace model ID resolved from `~/.trillim/models/` |
 | `--lora <dir>` | Quantized LoRA adapter directory |
 | `--threads <N>` | Inference thread count; `0` auto-detects as `num_cores - 2` |
-| `--lora-quant <type>` | LoRA quantization: `none`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0` |
+| `--lora-quant <type>` | LoRA quantization: `none`, `bf16`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0` |
 | `--unembed-quant <type>` | Unembed quantization: `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0` |
 | `--trust-remote-code` | Allow loading custom tokenizer code from the model directory |
 | `--harness <name>` | Harness name: `default` or `search` |

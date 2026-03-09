@@ -109,7 +109,7 @@ The same adapter settings can be changed at runtime through `POST /v1/models/loa
 
 Runtime quantization reduces memory use for selected layers during inference:
 
-- `--lora-quant <type>` for LoRA layers: `none`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`
+- `--lora-quant <type>` for LoRA layers: `none`, `bf16`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`
 - `--unembed-quant <type>` for the unembedding layer: `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`
 
 ```bash
