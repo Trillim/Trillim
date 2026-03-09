@@ -1,30 +1,37 @@
 # Interactive Chat
 
-The `trillim chat` command starts an interactive terminal session where you can have a multi-turn conversation with a model.
+Use `trillim chat` when you want a local multi-turn terminal conversation with a model.
 
-## Starting a Chat
+If you installed with `uv`, prefix each command on this page with `uv run`.
+
+## Before You Start
+
+- Pull a model first with `trillim pull Trillim/BitNet-TRNQ`
+- If you plan to use Brave search, set `SEARCH_API_KEY`
+
+## Start a Session
 
 ```bash
 trillim chat <model_dir>
 ```
 
-`model_dir` can be a local path or a HuggingFace model ID. If you've previously pulled a model with `trillim pull`, you can use the same ID:
+`model_dir` can be a local path or a HuggingFace model ID. A typical first run looks like:
 
 ```bash
 trillim pull Trillim/BitNet-TRNQ
 trillim chat Trillim/BitNet-TRNQ
 ```
 
-## The Chat Interface
+## Session Behavior
 
-Once the model loads, you'll see a prompt:
+Once the model loads, the prompt looks like:
 
 ```
 Talk to BitNet-TRNQ (Ctrl+D or 'q' to quit, '/new' for new conversation)
 >
 ```
 
-Type your message and press Enter. The model's response streams token-by-token:
+Responses stream token by token:
 
 ```
 > What is the capital of France?
@@ -33,7 +40,11 @@ The capital of France is Paris.
 Paris is the largest city in France and serves as ...
 ```
 
-## Commands
+Trillim keeps the full conversation history by default. When the conversation approaches the context limit, it automatically resets to the most recent message and continues.
+
+Prompt caching is enabled for normal multi-turn usage, so follow-up turns are faster than the first turn.
+
+## Session Controls
 
 | Command | Description |
 |---|---|
@@ -42,29 +53,20 @@ Paris is the largest city in France and serves as ...
 | `Ctrl+D` | Quit the chat |
 | `Ctrl+C` | Quit the chat |
 
-## Multi-Turn Conversations
+## Use a LoRA Adapter
 
-Trillim maintains full conversation history across turns. Each message you send includes all prior messages so the model has full context.
-
-When the conversation approaches the model's context window limit, Trillim automatically resets to just the last message and continues from there.
-
-### Prompt Caching
-
-Trillim uses incremental prompt caching to speed up multi-turn conversations. On each turn, only the new portion of the conversation is tokenized and sent to the engine — the KV cache from prior turns is reused. This means follow-up messages are faster than the first message.
-
-## Using LoRA Adapters
-
-Load a fine-tuned LoRA adapter on top of the base model:
+Quantize the adapter first, then pass it to `--lora`:
 
 ```bash
-trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-GenZ-LoRA-TRNQ
+trillim quantize <path-to-base-model> --adapter <path-to-adapter>
+trillim chat Trillim/BitNet-TRNQ --lora <adapter-dir>
 ```
 
-The adapter must have been quantized with `trillim quantize` first. If the adapter's tokenizer differs from the base model's, Trillim automatically uses the adapter's tokenizer.
+If the adapter tokenizer differs from the base model tokenizer, Trillim automatically uses the adapter tokenizer.
 
-## Search Mode
+## Use the Search Harness
 
-Trillim chat supports harnesses. The `search` harness is designed for models that emit `<search>...</search>` tags during generation.
+The `search` harness is intended for models that emit `<search>...</search>` tags during generation.
 
 Enable it with:
 
@@ -72,63 +74,48 @@ Enable it with:
 trillim chat <model_dir> --harness search
 ```
 
-If your model is not search-tuned, use the default harness instead:
+If the model is not search-tuned, stay on the default harness:
 
 ```bash
 trillim chat <model_dir> --harness default
 ```
 
-### Providers
+Providers for `--search-provider`:
 
-`--search-provider` is only used with `--harness search`.
-
-- `ddgs` (default): DuckDuckGo via `ddgs`
-- `brave`: Brave Search LLM Context API (requires `SEARCH_API_KEY`)
+- `ddgs` for DuckDuckGo via `ddgs`
+- `brave` for Brave Search, which requires `SEARCH_API_KEY`
 
 ```bash
 export SEARCH_API_KEY=<your_api_key>
 trillim chat <model_dir> --harness search --search-provider brave
 ```
 
-### What You'll See During Search
-
-The search harness streams status markers while orchestrating tool use. Typical markers:
+Typical status markers during search:
 
 - `[Spin-Jump-Spinning...]`
 - `[Searching: <query>]`
 - `[Synthesizing...]`
-- `[Search unavailable]` (when search fails)
+- `[Search unavailable]`
 
-After orchestration, the final answer is streamed token-by-token.
+The harness allows up to 2 search rounds before the final streamed answer.
 
-### How It Works
+To inspect intermediate generations and fetched search context, set `SearchHarness.DEBUG = True` in `src/trillim/harnesses/_search.py`.
 
-- The model generates a draft response.
-- If a `<search>query</search>` tag is present, Trillim runs web search and adds results back into the conversation as a `search` role message.
-- The model then synthesizes the final response.
-- The harness allows up to 2 search rounds before the final streaming pass.
+## Sampling and Performance
 
-### Debugging Search Behavior
-
-To inspect intermediate generations and fetched search context, set:
-
-- `SearchHarness.DEBUG = True` in `src/trillim/harnesses/_search.py`
-
-## Sampling Parameters
-
-The chat uses default sampling parameters from the model's configuration. These typically include:
+`trillim chat` uses the model's default sampling parameters. The relevant controls are:
 
 | Parameter | Description |
 |---|---|
-| `temperature` | Controls randomness. Lower values produce more deterministic output |
-| `top_k` | Limits sampling to the top K most likely tokens |
-| `top_p` | Nucleus sampling — limits to tokens whose cumulative probability exceeds P |
-| `repetition_penalty` | Penalizes repeated tokens to reduce repetitive output |
+| `temperature` | Lower values make output more deterministic |
+| `top_k` | Limits sampling to the top K tokens |
+| `top_p` | Nucleus sampling threshold |
+| `repetition_penalty` | Reduces repeated tokens |
 
-To customize sampling parameters, use the API server instead (see [Server](server.md)), which exposes these as request fields.
+If you need to override those values per request, start `trillim serve` and send them to `POST /v1/chat/completions`.
 
-## Performance Tips
+Performance tips:
 
-- **Thread count**: By default, Trillim uses `num_cores - 2` threads. Override with `--threads N` if needed.
-- **Quantization options**: Use `--lora-quant` and `--unembed-quant` to control how LoRA and unembed layers are quantized. Lower quantization (e.g. `q4_0`) uses less memory at a small quality cost.
-- **Context resets**: If responses slow down as the conversation gets long, use `/new` to start fresh.
+- Thread count defaults to `num_cores - 2`; override it with `--threads N`
+- `--lora-quant` and `--unembed-quant` trade quality for lower memory use
+- Use `/new` when long conversations start to slow down

@@ -1,108 +1,69 @@
 # Trillim
 
-[What is Trillim?](docs/about-trillim.md)
+Trillim is the platform for everything local AI. DarkNet is the CPU inference engine powering Trillim.
 
-## Performance Highlights
-
-Darknet benchmark takeaways on consumer CPUs:
-
-- Prefill throughput improvements are most visible when `num_threads >= 4`.
-- Decode throughput is approximately equal to BitNet on average, while Darknet reaches higher peaks.
-- See [Benchmarks](docs/benchmarks.md) for full plots and benchmarking caveats.
-
-Prefill example:
-
-![Prefill benchmark example](docs/imgs/Q4_0A.png)
-
-Decode example:
-
-![Decode benchmark example](docs/imgs/DecodeA.png)
-
-## Quick Start
-
-### Installation
+## Install
 
 - Python 3.12+ required
-- glibc 2.27+ required (if on Linux)
-- Install with [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Linux also requires glibc 2.27+
+- [uv](https://docs.astral.sh/uv/) is the recommended installer
 
-Pick your platform for full instructions:
+Platform guides:
 
 - [macOS](docs/install-mac.md)
 - [Linux](docs/install-linux.md)
 - [Windows](docs/install-windows.md)
 
-> **Note:** The rest of this README shows bare `trillim` commands. If you're using uv, prefix each command with `uv run` (e.g. `uv run trillim chat ...`).
+If you installed with `uv`, prefix the CLI examples below with `uv run`.
 
-### Quantize your own model
+## Common Workflows
 
-If you have a HuggingFace BitNet model with safetensors weights:
+### Pull a Model
 
 ```bash
-# Quantize model weights → qmodel.tensors + rope.cache
-trillim quantize <path-to-model> --model
-
-# Optionally extract a PEFT LoRA adapter → qmodel.lora
-trillim quantize <path-to-model> --adapter <path-to-adapter>
+trillim list
+trillim pull Trillim/BitNet-TRNQ
 ```
 
-## Chat
-
-Start an interactive conversation in your terminal:
+### Chat in the Terminal
 
 ```bash
 trillim chat Trillim/BitNet-TRNQ
 ```
 
-Multi-turn conversations are supported with automatic prompt caching for fast follow-ups. Use `/new` to start a fresh conversation, or `q` to quit.
+`trillim chat` keeps multi-turn history, reuses the KV cache for follow-up turns, and supports `/new` to reset the conversation or `q` to quit.
 
-See the [Chat guide](docs/chat.md) for details on LoRA adapters, sampling parameters, and performance tips.
+### Search-Augmented Chat
 
-## Search-Augmented Chat
-
-Trillim supports pluggable inference harnesses. For web-search-enabled models, use:
+Use the `search` harness with a search-tuned model:
 
 ```bash
 trillim chat Trillim/BitNet-Search-TRNQ --harness search
 ```
 
-By default, search uses DuckDuckGo (`ddgs`). To use Brave:
+DuckDuckGo (`ddgs`) is the default provider. To use Brave:
 
 ```bash
 export SEARCH_API_KEY=<your_api_key>
 trillim chat Trillim/BitNet-Search-TRNQ --harness search --search-provider brave
 ```
 
-The search harness emits status markers while it runs search and synthesis steps.
-See [Chat](docs/chat.md#search-mode) for full behavior and troubleshooting.
+### Serve an OpenAI-Compatible API
 
-## API Server
-
-Trillim includes an OpenAI-compatible API server:
+Start the server:
 
 ```bash
-# Start the server
 trillim serve Trillim/BitNet-TRNQ
-
-# With voice pipeline (speech-to-text + text-to-speech)
-# Requires optional `voice` dependencies:
-# docs/server.md -> "Voice Optional Dependencies"
-trillim serve Trillim/BitNet-TRNQ --voice
 ```
 
-Endpoints:
-- `POST /v1/chat/completions` — chat completions (streaming supported)
-- `POST /v1/completions` — text completions
-- `GET /v1/models` — list loaded models
-- `POST /v1/models/load` — hot-swap models, LoRA adapters, and harness/search settings at runtime
-- `POST /v1/audio/transcriptions` — speech-to-text (with `--voice`)
-- `POST /v1/audio/speech` — text-to-speech (with `--voice`)
-- `GET /v1/voices` — list available TTS voices
-- `POST /v1/voices` — register a custom voice from audio (see [Voice Cloning Setup](#voice-cloning-setup))
+Main endpoints:
 
-For server-side search harness, start normally and then set `"harness": "search"` (plus optional `"search_provider"`) through `POST /v1/models/load`.
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `GET /v1/models`
+- `POST /v1/models/load`
 
-Works with the OpenAI Python client out of the box:
+Example with the OpenAI Python client:
 
 ```python
 from openai import OpenAI
@@ -114,19 +75,27 @@ response = client.chat.completions.create(
 )
 ```
 
-For direct Python usage of `LLM`, `Whisper`, `TTS`, and `Server(...)` composition, see the [Components guide](docs/components.md).
+To switch a running server to the search harness, call `POST /v1/models/load` with `"harness": "search"` and optional `"search_provider": "ddgs" | "brave"`.
 
-See the [Server guide](docs/server.md) for full endpoint documentation, request/response schemas, and voice pipeline usage.
+### Quantize a Model or Adapter
 
-## LoRA Adapters
+If you have a HuggingFace model with safetensors weights (currently only supports BitNet models):
 
-Trillim supports PEFT LoRA adapters as bf16 corrections on top of the ternary base model. The adapter lives in its own directory (separate from the base model) and must be quantized first:
+```bash
+# Quantize model weights -> qmodel.tensors + rope.cache
+trillim quantize <path-to-model> --model
+
+# Extract a PEFT LoRA adapter -> qmodel.lora
+trillim quantize <path-to-model> --adapter <path-to-adapter>
+```
+
+### Use a LoRA Adapter
 
 ```bash
 # Quantize a PEFT adapter into Trillim's format
 trillim quantize <path-to-base-model> --adapter <path-to-adapter>
 
-# Chat with the base model + adapter
+# Run the base model with the adapter
 trillim chat Trillim/BitNet-TRNQ --lora <adapter-dir>
 
 # Or pull a pre-quantized adapter and use it by ID
@@ -134,48 +103,78 @@ trillim pull Trillim/BitNet-GenZ-LoRA-TRNQ
 trillim chat Trillim/BitNet-TRNQ --lora Trillim/BitNet-GenZ-LoRA-TRNQ
 ```
 
-Adapters can also be hot-swapped at runtime via the API server's `POST /v1/models/load` endpoint. See the [Server guide](docs/server.md) for details.
+The same adapter settings can be changed at runtime through `POST /v1/models/load`.
 
-## Runtime Quantization
+### Runtime Quantization
 
-Separately from the offline `trillim quantize` step (which converts model weights to ternary), Trillim can quantize specific layers at inference time to reduce memory usage. This is controlled with two flags available on both `chat` and `serve`:
+Runtime quantization reduces memory use for selected layers during inference:
 
-- **`--lora-quant <type>`** — quantize LoRA adapter layers. Options: `none`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`. Only applies when using `--lora`.
-- **`--unembed-quant <type>`** — quantize the unembedding (output projection) layer. Options: `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`.
+- `--lora-quant <type>` for LoRA layers: `none`, `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`
+- `--unembed-quant <type>` for the unembedding layer: `int8`, `q4_0`, `q5_0`, `q6_k`, `q8_0`
 
 ```bash
-# Quantize LoRA layers to int8 for lower memory
 trillim chat Trillim/BitNet-TRNQ --lora <adapter-dir> --lora-quant int8
-
-# Quantize the unembed layer to q4_0
 trillim chat Trillim/BitNet-TRNQ --unembed-quant q4_0
-
-# Both at once
 trillim serve Trillim/BitNet-TRNQ --lora-quant q8_0 --unembed-quant q4_0
 ```
 
-Lower quantization levels (e.g. `q4_0`) use less memory at a small quality cost. These options can also be set per-request when hot-swapping models via `POST /v1/models/load`. See the [CLI reference](docs/cli.md) for the full flag list.
+### Voice Support
 
-## Voice Cloning Setup
+Install the optional `voice` extra before using speech endpoints:
 
-The voice pipeline (`--voice`) includes 8 predefined voices that work out of the box: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`.
+```bash
+uv add "trillim[voice]"
+```
 
-To register **custom voices** (voice cloning via `POST /v1/voices`), you need to accept the PocketTTS model terms and authenticate with HuggingFace:
+Or with `pip`:
 
-1. Go to [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) on HuggingFace and accept the model's terms.
-2. Create a token on HuggingFace (under Access Tokens) with `Read` permissions.
-2. Log in locally so the token is available to download the voice cloning weights:
+```bash
+pip install "trillim[voice]"
+```
+
+Then start the server with:
+
+```bash
+trillim serve Trillim/BitNet-TRNQ --voice
+```
+
+Voice endpoints:
+
+- `POST /v1/audio/transcriptions`
+- `POST /v1/audio/speech`
+- `GET /v1/voices`
+- `POST /v1/voices`
+
+Predefined voices are `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, and `azelma`.
+
+For custom voice registration through `POST /v1/voices`, accept the terms for [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts), create a HuggingFace token with `Read` access, and run:
 
 ```bash
 hf auth login
 ```
 
-This only needs to be done once. After that, custom voice registration works automatically. If you skip this step, you'll get an error when trying to register a custom voice — predefined voices will still work fine.
+That setup is only required once. Predefined voices work without it.
+
+## Performance Highlights
+
+Benchmark takeaways for DarkNet on consumer CPUs:
+
+- Prefill throughput improvements are most visible when `num_threads >= 4`.
+- Decode throughput is broadly comparable to bitnet.cpp on average, while DarkNet reaches higher peaks.
+- Results are directional and depend on thermal behavior, boost policy, and memory bandwidth.
+
+Prefill example:
+
+![Prefill benchmark example](docs/imgs/Q4_0A.png)
+
+Decode example:
+
+![Decode benchmark example](docs/imgs/DecodeA.png)
 
 ## Supported Architectures
 
-- `BitnetForCausalLM` — BitNet with ternary weights and ReLU² activation
-- `LlamaForCausalLM` — Llama-style with SiLU activation
+- `BitnetForCausalLM` for ternary BitNet models with ReLU² activation
+- `LlamaForCausalLM` for Llama-style models with SiLU activation
 
 ## Platform Support
 
@@ -184,18 +183,18 @@ This only needs to be done once. After that, custom voice registration works aut
 | x86_64 (AVX2) | Supported |
 | ARM64 (NEON) | Supported |
 
-Thread count is auto-detected as `num_cores - 2`. Override by passing a `--threads N` CLI argument.
+Thread count defaults to `num_cores - 2`. Override it with `--threads N`.
 
 ## Documentation
 
-- [What is Trillim?](docs/about-trillim.md) — overview, motivation, and who it's for
-- Install — [macOS](docs/install-mac.md) | [Linux](docs/install-linux.md) | [Windows](docs/install-windows.md)
-- [CLI Reference](docs/cli.md) — all commands and flags
-- [Chat](docs/chat.md) — interactive chat interface
-- [Components](docs/components.md) — Python SDK, standalone usage, and `Server(...)` composition
-- [Server](docs/server.md) — API endpoints, server behavior, and OpenAI client usage
-- [Benchmarks](docs/benchmarks.md) — decode and quantization benchmark plots, interpretation, and caveats
+- [What Is Trillim?](docs/about-trillim.md)
+- Install: [macOS](docs/install-mac.md), [Linux](docs/install-linux.md), [Windows](docs/install-windows.md)
+- [CLI Reference](docs/cli.md)
+- [Interactive Chat](docs/chat.md)
+- [Python Components](docs/components.md)
+- [API Server](docs/server.md)
+- [Benchmarks](docs/benchmarks.md)
 
 ## License
 
-The Trillim Python SDK source code is MIT-licensed. The C++ inference engine binaries (`inference`, `trillim-quantize`) bundled in the pip package are **proprietary** — you may use them as part of Trillim but may not reverse-engineer or redistribute them separately. See [LICENSE](LICENSE) for full terms.
+The Trillim Python SDK source code is MIT-licensed. The C++ inference engine binaries (`inference`, `trillim-quantize`) bundled in the pip package are **proprietary**. You may use them as part of Trillim, but may not reverse-engineer or redistribute them separately. See [LICENSE](LICENSE) for the full terms.

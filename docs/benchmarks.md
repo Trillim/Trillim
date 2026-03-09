@@ -1,19 +1,17 @@
 # Benchmarks
 
-## Benchmark Methodology
+This page summarizes consumer CPU comparisons between bitnet.cpp and DarkNet, the inference engine behind Trillim.
 
-All runs in this page used the same repeatable process:
+## How These Runs Were Collected
 
-- Fresh system restart before benchmark sessions.
-- 5 warmup runs of both engines before recorded benchmark runs to bring the system to steady state.
-- Interleaved execution between compared models to reduce time-drift bias.
-- Cool-down between runs until CPU temperature returned to `45C`.
+All benchmark sessions used the same process:
 
-These controls reduce run-to-run noise, but consumer CPU measurements should still be treated as directional.
+- Fresh system restart before each benchmark session
+- 5 warmup runs for both engines before recording data
+- Interleaved execution between engines to reduce time-drift bias
+- Cool-down between runs until CPU temperature returned to `45C`
 
-## Results
-
-This page summarizes benchmark plots comparing BitNet and Darknet behavior across decode and runtime quantization scenarios.
+These controls reduce noise, but the results should still be treated as directional.
 
 ## Decode Throughput
 
@@ -25,11 +23,11 @@ Run B:
 
 ![Decode throughput run B](imgs/DecodeB.png)
 
-### Result Summary
+Takeaways:
 
-- Decode performance is broadly comparable to BitNet.
-- Darknet shows higher peak throughput values.
-- The advantage is most consistent once `num_threads >= 4`.
+- Decode throughput is broadly comparable to bitnet.cpp.
+- DarkNet reaches higher peaks.
+- The gap is most visible once `num_threads >= 4`.
 
 ## Runtime Quantization
 
@@ -73,20 +71,17 @@ Run B:
 
 ![Q8_0 run B](imgs/Q8_0B.png)
 
-## Where Darknet Is Better
+## Main Takeaways
 
-Darknet is better under these conditions:
+- DarkNet tends to pull ahead once the thread count reaches 4 or more.
+- Average decode rates are close to bitnet.cpp, but DarkNet shows higher peak throughput.
+- Runtime quantization behavior depends heavily on the CPU, thermal budget, and memory subsystem.
 
-- `num_threads >= 4`
-- Decode throughput is approximately equal to BitNet on average, but Darknet reaches higher peaks
+## Limits of This Data
 
-## Limitations (Consumer CPU Benchmarking)
-
-These results should be interpreted as directional rather than absolute:
-
-- Consumer CPUs vary heavily in boost behavior, thermal limits, and power settings.
-- Background processes and OS scheduling noise can materially affect short runs.
-- Memory bandwidth/cache differences can dominate results as thread count scales.
-- SMT/Hyper-Threading behavior differs by CPU generation and workload shape.
-- Results can change with compiler flags, kernel versions, and microcode updates.
-- Prompt mix, context length, and warm-up policy can shift measured decode rates.
+- Consumer CPUs vary in boost behavior, thermal limits, and power settings.
+- Background processes and OS scheduling can materially affect short runs.
+- Memory bandwidth and cache behavior can dominate results as thread count increases.
+- SMT and Hyper-Threading behavior differs by CPU generation and workload shape.
+- Compiler flags, kernel versions, and microcode updates can shift the results.
+- Prompt mix, context length, and warm-up policy also affect measured decode rates.

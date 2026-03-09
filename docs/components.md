@@ -1,17 +1,22 @@
 # Python Components
 
-Trillim's Python SDK is built from composable components. `LLM`, `Whisper`, and `TTS` can be used directly in your own async code, or composed into `Server(...)` when you want HTTP endpoints.
+Use these classes when you want to embed Trillim directly in Python instead of calling the CLI.
 
-## Usage Model
+## Before You Start
 
-- Import the component you need from `trillim`.
-- Call `await component.start()` before using `component.engine` or `llm.harness`.
-- Call `await component.stop()` when finished, ideally in a `finally` block.
-- Use `router()` only when you are mounting the component into a FastAPI app.
+- Any `LLM(...)` example on this page assumes `trillim pull Trillim/BitNet-TRNQ`
+- Any `Whisper(...)` or `TTS()` example requires `uv add "trillim[voice]"` or `pip install "trillim[voice]"`
+- `Whisper(model_size="base.en")` downloads its checkpoint on first start
+- `TTS()` works with built-in voices immediately and can also persist custom voices
 
-## Using Components Standalone
+## Component Lifecycle
 
-Example: run the LLM directly in your own async code:
+- Import the component you need from `trillim`
+- Call `await component.start()` before using `component.engine` or `llm.harness`
+- Call `await component.stop()` when finished, ideally in a `finally` block
+- Use `router()` only when mounting the component into your own FastAPI app
+
+## Use `LLM` Directly
 
 ```python
 import asyncio
@@ -34,7 +39,11 @@ async def main():
 asyncio.run(main())
 ```
 
-Example: use Whisper and TTS directly without exposing any HTTP endpoints:
+After `await llm.start()`, `llm.harness.run(...)` is the simplest interface for chat-style flows.
+
+Use `llm.engine` only when you need lower-level control, such as direct token generation, custom prompt assembly, or explicit tokenizer access.
+
+## Use `Whisper` and `TTS` Directly
 
 ```python
 import asyncio
@@ -60,11 +69,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`Whisper` and `TTS` require the optional `voice` extra. See [Server](server.md#voice-optional-dependencies) for installation details.
-
-## Composing a Server
-
-Use the same components inside `Server(...)` when you want HTTP routes and an OpenAI-compatible API:
+## Compose a Server in Python
 
 ```python
 from trillim import Server, LLM, Whisper, TTS
@@ -83,7 +88,9 @@ Server(
 Server(TTS()).run()
 ```
 
-## LLM Component
+## Constructor Reference
+
+### `LLM`
 
 ```python
 from trillim import LLM
@@ -99,25 +106,15 @@ LLM(
 )
 ```
 
-After `await llm.start()`, use `llm.harness.run(messages, ...)` for the high-level chat/completions flow.
+`harness_name="search"` uses `ddgs` by default. If you switch a running server to Brave search later, set `SEARCH_API_KEY` and call `POST /v1/models/load` with `search_provider`.
 
-Use `llm.engine` when you want lower-level control over inference, for example:
-
-- Call `llm.engine.generate(token_ids=..., ...)` directly for raw token-in, token-out generation.
-- Use `llm.engine.tokenizer` to encode prompts, decode output, or apply a chat template yourself.
-- Inspect `llm.engine.arch_config`, `llm.engine.default_params`, and `llm.engine.stop_tokens` when you need model/runtime details in your own orchestration layer.
-
-In practice, `llm.harness` is the easier choice for normal chat-style use, while `llm.engine` is the lower-level path for custom prompting or custom generation loops.
-
-`harness_name="search"` uses the default search provider (`ddgs`). To change provider on a running server, call `POST /v1/models/load` with `search_provider`.
-
-## Whisper Component
+## `Whisper`
 
 ```python
 from trillim import Whisper
 
 Whisper(
-    model_size="base.en",   # Whisper model size
+    model_size="base.en",
     compute_type="int8",
     cpu_threads=2,
 )
@@ -125,21 +122,19 @@ Whisper(
 
 After `await whisper.start()`, call `await whisper.engine.transcribe(audio_bytes, language=...)`.
 
-## TTS Component
+## `TTS`
 
 ```python
 from trillim import TTS
 
 TTS(
-    voices_dir="~/.trillim/voices",  # where custom voices are stored
+    voices_dir="~/.trillim/voices",
 )
 ```
 
 After `await tts.start()`, use `tts.engine.list_voices()`, `await tts.engine.register_voice(...)`, `await tts.engine.synthesize_full(...)`, or `tts.engine.synthesize_stream(...)`.
 
-## Custom Routes
-
-Access the underlying FastAPI app to add custom routes:
+## Add Custom Routes
 
 ```python
 from trillim import Server, LLM
