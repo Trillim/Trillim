@@ -234,6 +234,34 @@ def test_chat_streaming(base_url: str, **_):
         return "fail", "stream did not end with data: [DONE]"
 
 
+def test_chat_context_overflow(base_url: str, **_):
+    """POST /v1/chat/completions returns 400 for messages above the context limit."""
+    payload = {
+        "messages": [{"role": "user", "content": "token " * 50000}],
+        "max_tokens": 1,
+    }
+    status, body = api(base_url, "POST", "/v1/chat/completions", payload)
+    if status != 400:
+        return "fail", f"expected 400, got {status}"
+    detail = body.get("detail", "")
+    if "exceeds context window" not in detail:
+        return "fail", f"unexpected error detail: {detail!r}"
+
+
+def test_completion_context_overflow(base_url: str, **_):
+    """POST /v1/completions returns 400 for prompts above the context limit."""
+    payload = {
+        "prompt": "token " * 50000,
+        "max_tokens": 1,
+    }
+    status, body = api(base_url, "POST", "/v1/completions", payload)
+    if status != 400:
+        return "fail", f"expected 400, got {status}"
+    detail = body.get("detail", "")
+    if "exceeds context window" not in detail:
+        return "fail", f"unexpected error detail: {detail!r}"
+
+
 def test_load_model_with_search_harness_and_provider(base_url: str, model_dir: str | None = None, **_):
     """POST /v1/models/load accepts harness=search + search_provider and chat still works."""
     if model_dir is None:
@@ -1076,6 +1104,8 @@ ALL_TESTS = [
     test_models_endpoint,
     test_chat_non_streaming,
     test_chat_streaming,
+    test_chat_context_overflow,
+    test_completion_context_overflow,
     test_load_model_with_search_harness_and_provider,
     test_load_model_with_default_harness_and_search_provider,
     test_completions_non_streaming,
