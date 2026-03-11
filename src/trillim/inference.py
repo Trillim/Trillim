@@ -169,7 +169,19 @@ def _run_chat_loop(loop, harness, sampling_params):
 
 
 async def _stream_response(harness, messages, sampling_params):
-    """Drain the harness async generator, printing chunks as they arrive."""
+    """Drain harness output, printing status and text as events arrive."""
+    if hasattr(harness, "stream_events"):
+        async for event in harness.stream_events(messages, **sampling_params):
+            if event.type == "search_started":
+                print(f"[Searching: {event.query}]", flush=True)
+            elif event.type == "search_result" and not event.available:
+                print("[Search unavailable]", flush=True)
+            elif event.type == "search_result":
+                print("[Synthesizing...]", flush=True)
+            elif event.type == "token":
+                print(event.text, end="", flush=True)
+        return
+
     async for chunk in harness.run(messages, **sampling_params):
         print(chunk, end="", flush=True)
 

@@ -29,6 +29,13 @@ from ._models import (
 
 from trillim.errors import ContextOverflowError
 from trillim.engine import InferenceEngine
+from trillim.events import (
+    ChatDoneEvent,
+    ChatEvent,
+    ChatFinalTextEvent,
+    ChatTokenEvent,
+    ChatUsage,
+)
 from trillim.harnesses import Harness, get_harness
 
 
@@ -86,6 +93,118 @@ class LLM(Component):
         if token_count >= max_context_tokens:
             raise ContextOverflowError(token_count, max_context_tokens)
         return token_count
+
+    def _clone_messages(self, messages: list[dict]) -> list[dict]:
+        return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+    def _chat_sampling(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> dict:
+        return dict(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+        )
+
+    async def stream_chat(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[ChatEvent, None]:
+        engine, harness = self._require_started()
+        conversation = self._clone_messages(messages)
+        prompt_tokens = self.validate_context(conversation)
+        full_text = ""
+
+        async for event in harness.stream_events(
+            conversation,
+            **self._chat_sampling(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_tokens=max_tokens,
+            ),
+        ):
+            if isinstance(event, ChatTokenEvent):
+                full_text += event.text
+            elif isinstance(event, ChatFinalTextEvent):
+                full_text = event.text
+            yield event
+
+        usage = ChatUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=harness._last_completion_tokens,
+            total_tokens=prompt_tokens + harness._last_completion_tokens,
+            cached_tokens=engine._last_cache_hit,
+        )
+        yield ChatDoneEvent(text=full_text, usage=usage)
+
+    async def _collect_chat(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ChatUsage]:
+        full_text = ""
+        usage: ChatUsage | None = None
+
+        async for event in self.stream_chat(
+            messages,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+        ):
+            if isinstance(event, ChatTokenEvent):
+                full_text += event.text
+            elif isinstance(event, ChatFinalTextEvent):
+                full_text = event.text
+            elif isinstance(event, ChatDoneEvent):
+                full_text = event.text
+                usage = event.usage
+
+        if usage is None:
+            raise RuntimeError("Chat stream ended without a done event")
+        return full_text, usage
+
+    async def chat(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        full_text, _ = await self._collect_chat(
+            messages,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+        )
+        return full_text
 
     def _create_harness(
         self,
@@ -359,13 +478,6 @@ class LLM(Component):
                 raise HTTPException(status_code=503, detail="No model loaded")
 
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
-            try:
-                prompt_tokens = llm.validate_context(messages)
-            except ContextOverflowError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{exc} Start a new conversation with fewer messages.",
-                )
 
             sampling = dict(
                 temperature=req.temperature,
@@ -376,28 +488,27 @@ class LLM(Component):
             )
 
             if req.stream:
+                try:
+                    llm.validate_context(messages)
+                except ContextOverflowError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{exc} Start a new conversation with fewer messages.",
+                    )
                 return StreamingResponse(
                     _stream_chat(
-                        llm.harness, messages, sampling, req.model or llm.model_name
+                        llm, messages, sampling, req.model or llm.model_name
                     ),
                     media_type="text/event-stream",
                 )
 
-            full_text = ""
-            SENTINELS = ["[Spin-Jump-Spinning...]",
-                         "[Searching:", "[Synthesizing...]",
-                         "[Search unavailable]",
-                         "\n--- Step ",
-                         "[Search results]\n",
-            ]
-            async for chunk in llm.harness.run(messages, **sampling):
-                if any(chunk.startswith(sentinel) for sentinel in SENTINELS):
-                    continue
-                full_text += chunk
-
-            completion_tokens = llm.harness._last_completion_tokens
-
-            cached_tokens = llm.engine._last_cache_hit
+            try:
+                full_text, usage = await llm._collect_chat(messages, **sampling)
+            except ContextOverflowError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{exc} Start a new conversation with fewer messages.",
+                )
 
             return ChatCompletionResponse(
                 id=make_id(),
@@ -410,10 +521,10 @@ class LLM(Component):
                     )
                 ],
                 usage=UsageInfo(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                    cached_tokens=cached_tokens,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    total_tokens=usage.total_tokens,
+                    cached_tokens=usage.cached_tokens,
                 ),
             )
 
@@ -483,7 +594,7 @@ class LLM(Component):
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chat(harness: Harness, messages: list[dict], sampling: dict, model: str):
+async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: str):
     req_id = make_id()
     created = now()
 
@@ -498,14 +609,16 @@ async def _stream_chat(harness: Harness, messages: list[dict], sampling: dict, m
     }
     yield f"data: {json.dumps(chunk)}\n\n"
 
-    async for text in harness.run(messages, **sampling):
+    async for event in llm.stream_chat(messages, **sampling):
+        if not isinstance(event, ChatTokenEvent):
+            continue
         chunk = {
             "id": req_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [
-                {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                {"index": 0, "delta": {"content": event.text}, "finish_reason": None}
             ],
         }
         yield f"data: {json.dumps(chunk)}\n\n"

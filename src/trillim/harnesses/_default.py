@@ -4,6 +4,7 @@
 from collections.abc import AsyncIterator
 from typing import Any
 
+from trillim.events import ChatFinalTextEvent, ChatTokenEvent, ChatEvent
 from trillim.token_utils import IncrementalDecoder
 from ._base import Harness
 
@@ -11,7 +12,11 @@ from ._base import Harness
 class DefaultHarness(Harness):
     """Passthrough harness — single generation, no tool calls."""
 
-    async def run(self, messages: list[dict], **sampling: Any) -> AsyncIterator[str]:
+    async def stream_events(
+        self,
+        messages: list[dict],
+        **sampling: Any,
+    ) -> AsyncIterator[ChatEvent]:
         """Stream tokens directly from the engine."""
         self._last_completion_tokens = 0
         token_ids, prompt_str = self._prepare_tokens(messages)
@@ -23,7 +28,8 @@ class DefaultHarness(Harness):
             self._last_completion_tokens += 1
             chunk = decoder.decode(token_id)
             full_text += chunk
-            yield chunk
+            yield ChatTokenEvent(text=chunk)
 
         messages.append({"role": "assistant", "content": full_text})
         self._update_cache(messages)
+        yield ChatFinalTextEvent(text=full_text)

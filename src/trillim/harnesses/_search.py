@@ -5,6 +5,13 @@ from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
 from trillim.engine import InferenceEngine
+from trillim.events import (
+    ChatEvent,
+    ChatFinalTextEvent,
+    ChatSearchResultEvent,
+    ChatSearchStartedEvent,
+    ChatTokenEvent,
+)
 from trillim.token_utils import IncrementalDecoder
 from ._base import Harness
 from ._search_utils import SearchClient, SearchError, extract_search_query
@@ -33,31 +40,27 @@ class SearchHarness(Harness):
             full_text += decoder.decode(token_id)
         return full_text, completion_tokens
 
-    async def run(self, messages: list[dict], **sampling: Any) -> AsyncIterator[str]:
-        """Orchestration loop: intermediate steps buffered, final step streamed.
-
-        Yields sentinels ([Searching: ...], [Synthesizing...]) before model
-        text so the CLI can distinguish them from the actual response.
-        """
+    async def stream_events(
+        self,
+        messages: list[dict],
+        **sampling: Any,
+    ) -> AsyncIterator[ChatEvent]:
+        """Structured orchestration loop with explicit search and token events."""
         self._last_completion_tokens = 0
-        yield "[Spin-Jump-Spinning...]\n"
-        for i in range(self.MAX_SEARCH_ITERATIONS - 1):
+        for _ in range(self.MAX_SEARCH_ITERATIONS - 1):
             full_text, completion_tokens = await self._generate_buffered(messages, **sampling)
-
-            if self.DEBUG:
-                yield f"\n--- Step {i + 1} ---\n{full_text}\n"
 
             query = extract_search_query(full_text)
             if query is None:
                 # No search tag — yield buffered text as final response
                 self._last_completion_tokens = completion_tokens
-                yield full_text
+                yield ChatTokenEvent(text=full_text)
                 messages.append({"role": "assistant", "content": full_text})
                 self._update_cache(messages)
+                yield ChatFinalTextEvent(text=full_text)
                 return
 
-            # Yield sentinel BEFORE searching so the user sees it while waiting
-            yield f"[Searching: {query}]\n"
+            yield ChatSearchStartedEvent(query=query)
 
             # Keep cache aligned with model-generated state only.
             messages.append({"role": "assistant", "content": full_text})
@@ -66,16 +69,17 @@ class SearchHarness(Harness):
             try:
                 results = await self._search.search(query)
             except SearchError:
-                yield "[Search unavailable]\n"
-                messages.append({"role": "search", "content": "Search unavailable, please answer from your knowledge."})
+                results = "Search unavailable, please answer from your knowledge."
+                yield ChatSearchResultEvent(
+                    query=query,
+                    content=results,
+                    available=False,
+                )
+                messages.append({"role": "search", "content": results})
                 break
 
             messages.append({"role": "search", "content": results})
-
-            if self.DEBUG:
-                yield f"[Search results]\n{results}\n"
-                
-            yield "[Synthesizing...]\n"
+            yield ChatSearchResultEvent(query=query, content=results)
 
         # Final iteration: stream token-by-token
         token_ids, prompt_str = self._prepare_tokens(messages)
@@ -87,7 +91,8 @@ class SearchHarness(Harness):
             self._last_completion_tokens += 1
             chunk = decoder.decode(token_id)
             full_text += chunk
-            yield chunk
+            yield ChatTokenEvent(text=chunk)
 
         messages.append({"role": "assistant", "content": full_text})
         self._update_cache(messages)
+        yield ChatFinalTextEvent(text=full_text)

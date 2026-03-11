@@ -8,15 +8,13 @@ from collections.abc import AsyncIterator
 from typing import Any, ClassVar
 
 from trillim.engine import InferenceEngine
+from trillim.events import ChatEvent, ChatTokenEvent
 
 
 class Harness(abc.ABC):
     """Abstract base for inference harnesses that steer multi-step execution.
 
-    Subclasses implement run() for full orchestration.
-
-    Set DEBUG = True in source to print all intermediate generations.
-    When False, intermediate steps emit only short sentinels.
+    Subclasses implement stream_events() for full orchestration.
     """
 
     DEBUG: ClassVar[bool] = False
@@ -33,14 +31,19 @@ class Harness(abc.ABC):
     def arch_config(self):
         return self.engine.arch_config
 
-    @abc.abstractmethod
     async def run(self, messages: list[dict], **sampling: Any) -> AsyncIterator[str]:
-        """Full orchestration loop. Yields text chunks to display.
+        """Compatibility text stream built from structured chat events."""
+        async for event in self.stream_events(messages, **sampling):
+            if isinstance(event, ChatTokenEvent):
+                yield event.text
 
-        Streams the final generation token-by-token. Updates messages in
-        place (appends the final assistant response). Updates
-        engine._cached_prompt_str for KV cache reuse on the next turn.
-        """
+    @abc.abstractmethod
+    async def stream_events(
+        self,
+        messages: list[dict],
+        **sampling: Any,
+    ) -> AsyncIterator[ChatEvent]:
+        """Structured orchestration loop for app-facing streaming APIs."""
         ...
         yield  # type: ignore  # abstract async generator
 
