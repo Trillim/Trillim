@@ -12,7 +12,7 @@ Use these classes when you want to embed Trillim directly in Python instead of c
 ## Component Lifecycle
 
 - Import the component you need from `trillim`
-- Call `await component.start()` before using `component.engine` or `llm.harness`
+- Call `await component.start()` before using public component methods or advanced internals like `component.engine` and `llm.harness`
 - Call `await component.stop()` when finished, ideally in a `finally` block
 - Use `router()` only when mounting the component into your own FastAPI app
 
@@ -39,7 +39,21 @@ async def main():
 asyncio.run(main())
 ```
 
-After `await llm.start()`, `llm.harness.run(...)` is the simplest interface for chat-style flows.
+After `await llm.start()`, use `llm.count_tokens(messages)`, `llm.max_context_tokens`, and `llm.validate_context(messages)` to inspect prompt size safely from app code.
+
+```python
+from trillim import ContextOverflowError
+
+messages = [{"role": "user", "content": "Write a one-line haiku about CPUs."}]
+
+try:
+    prompt_tokens = llm.validate_context(messages)
+    print(f"{prompt_tokens=}, {llm.max_context_tokens=}")
+except ContextOverflowError as exc:
+    print(exc)
+```
+
+`llm.harness.run(...)` remains available as an advanced interface for chat-style flows.
 
 Use `llm.engine` only when you need lower-level control, such as direct token generation, custom prompt assembly, or explicit tokenizer access.
 

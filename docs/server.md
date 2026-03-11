@@ -106,6 +106,8 @@ Request body:
 
 When the active harness is `search`, this endpoint can run multi-step search-augmented generation for search-tuned models.
 
+If the rendered prompt reaches the model context limit, the server returns `400` with a detail message describing the token count and context window.
+
 Response:
 
 ```json
@@ -174,6 +176,8 @@ This endpoint uses the same sampling fields as `/v1/chat/completions`, but repla
 Streaming is supported with `"stream": true`.
 
 `/v1/completions` does not use chat harness orchestration.
+
+Requests that exceed the active model context window return `400`.
 
 ## `GET /v1/models`
 
