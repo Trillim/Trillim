@@ -2,6 +2,8 @@
 
 Use these classes when you want to embed Trillim directly in Python instead of calling the CLI.
 
+`Runtime(...)` is the recommended entry point for synchronous applications. It owns the event loop, starts components in order, stops them in reverse order, and exposes component methods synchronously as `runtime.llm`, `runtime.whisper`, and `runtime.tts`.
+
 ## Before You Start
 
 - Any `LLM(...)` example on this page assumes `trillim pull Trillim/BitNet-TRNQ`
@@ -9,7 +11,35 @@ Use these classes when you want to embed Trillim directly in Python instead of c
 - `Whisper(model_size="base.en")` downloads its checkpoint on first start
 - `TTS()` works with built-in voices immediately and can also persist custom voices
 
+## Use `Runtime`
+
+```python
+from trillim import LLM, Runtime, TTS, Whisper
+
+runtime = Runtime(
+    LLM("~/.trillim/models/Trillim/BitNet-TRNQ"),
+    Whisper(model_size="base.en"),
+    TTS(),
+)
+
+runtime.start()
+try:
+    messages = [{"role": "user", "content": "Write a one-line haiku about CPUs."}]
+    reply = runtime.llm.chat(messages)
+    print(reply)
+
+    for event in runtime.llm.stream_chat(messages):
+        if event.type == "token":
+            print(event.text, end="", flush=True)
+finally:
+    runtime.stop()
+```
+
+Use `with Runtime(...) as runtime:` when you want automatic teardown.
+
 ## Component Lifecycle
+
+Use direct async lifecycle management when you want full control over the event loop yourself.
 
 - Import the component you need from `trillim`
 - Call `await component.start()` before using public component methods or advanced internals like `component.engine` and `llm.harness`

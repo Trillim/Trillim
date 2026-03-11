@@ -4,7 +4,7 @@
 import os as _os
 _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-__all__ = ["Server", "LLM", "Whisper", "TTS", "ContextOverflowError"]
+__all__ = ["Server", "Runtime", "LLM", "Whisper", "TTS", "ContextOverflowError"]
 
 
 def __getattr__(name: str):
@@ -16,6 +16,10 @@ def __getattr__(name: str):
         from .server._server import Server
 
         return Server
+    if name == "Runtime":
+        from .runtime import Runtime
+
+        return Runtime
     if name == "TTS":
         from .server._tts import TTS
 
