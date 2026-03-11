@@ -117,7 +117,7 @@ async def main():
     await tts.start()
     try:
         text = await whisper.transcribe_wav(Path("recording.wav"), timeout=30)
-        audio = await tts.engine.synthesize_full(text, voice="alba")
+        audio = await tts.synthesize_wav(text, voice="alba")
         Path("speech.wav").write_bytes(audio)
     finally:
         await whisper.stop()
@@ -195,10 +195,37 @@ from trillim import TTS
 
 TTS(
     voices_dir="~/.trillim/voices",
+    default_voice="alba",
 )
 ```
 
-After `await tts.start()`, use `tts.engine.list_voices()`, `await tts.engine.register_voice(...)`, `await tts.engine.synthesize_full(...)`, or `tts.engine.synthesize_stream(...)`.
+After `await tts.start()`, use the public component methods:
+
+```python
+voices = tts.list_voices()
+tts.default_voice = "jean"
+sample_rate = tts.sample_rate
+
+await tts.register_voice("myvoice", wav_bytes)
+pcm_chunks = [chunk async for chunk in tts.synthesize_stream("Hello there")]
+wav_bytes = await tts.synthesize_wav("Hello there", voice="myvoice")
+await tts.delete_voice("myvoice")
+```
+
+`tts.engine` remains available as an advanced escape hatch.
+
+## `SentenceChunker`
+
+```python
+from trillim import SentenceChunker
+
+chunker = SentenceChunker()
+for piece in chunker.feed("Hello world. Another sentence"):
+    print(piece)
+print(chunker.flush())
+```
+
+Use `SentenceChunker` to split streaming LLM output into sentence-sized chunks before handing it to TTS.
 
 ## Add Custom Routes
 
