@@ -167,6 +167,7 @@ class SpeechRequest(BaseModel):
     model: str = ""
     input: str
     voice: str | None = None
+    speed: float = 1.0
     response_format: str = "wav"  # "wav" or "pcm"
 
 

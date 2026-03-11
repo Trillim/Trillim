@@ -20,6 +20,10 @@ from ._models import (
 )
 
 _DEFAULT_VOICES_DIR = Path.home() / ".trillim" / "voices"
+_DEFAULT_SPEED = 1.0
+_MIN_SPEED = 0.25
+_MAX_SPEED = 4.0
+_PCM_STREAM_CHUNK_BYTES = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +98,7 @@ class TTSEngine:
         self,
         voices_dir: Path | None = None,
         default_voice: str = DEFAULT_VOICE,
+        speed: float = _DEFAULT_SPEED,
     ):
         self._model = None
         self._voice_states: dict[str, dict] = {}
@@ -235,6 +240,7 @@ class TTSEngine:
         self,
         text: str,
         voice: str | None = None,
+        speed: float | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Yield PCM int16 audio chunks for the given text."""
         if self._model is None:
@@ -273,10 +279,15 @@ class TTSEngine:
                 pcm = (pcm * 32767).astype(np.int16)
                 yield pcm.tobytes()
 
-    async def synthesize_full(self, text: str, voice: str | None = None) -> bytes:
+    async def synthesize_full(
+        self,
+        text: str,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> bytes:
         """Synthesize text and return a complete WAV file as bytes."""
         chunks = []
-        async for chunk in self.synthesize_stream(text, voice):
+        async for chunk in self.synthesize_stream(text, voice, speed):
             chunks.append(chunk)
         pcm_data = b"".join(chunks)
         return wav_header(self.sample_rate, data_size=len(pcm_data)) + pcm_data
@@ -375,6 +386,7 @@ class TTS(Component):
         self,
         voices_dir: str | Path = _DEFAULT_VOICES_DIR,
         default_voice: str = TTSEngine.DEFAULT_VOICE,
+        speed: float = _DEFAULT_SPEED,
     ):
         self._voices_dir = Path(voices_dir)
         self._voices_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +397,7 @@ class TTS(Component):
         self._engine = TTSEngine(
             voices_dir=self._voices_dir,
             default_voice=self._default_voice,
+            speed=self._speed,
         )
         await self._engine.start()
 
@@ -427,6 +440,19 @@ class TTS(Component):
     def sample_rate(self) -> int:
         return self._require_started().sample_rate
 
+    @property
+    def speed(self) -> float:
+        if self._engine is not None:
+            return self._engine.speed
+        return self._speed
+
+    @speed.setter
+    def speed(self, speed: float) -> None:
+        validated = _validate_speed(speed)
+        if self._engine is not None:
+            self._engine.speed = validated
+        self._speed = validated
+
     def list_voices(self) -> list[dict]:
         return self._require_started().list_voices()
 
@@ -444,10 +470,15 @@ class TTS(Component):
         text: str,
         *,
         voice: str | None = None,
+        speed: float | None = None,
     ) -> AsyncGenerator[bytes, None]:
         self._validate_input_text(text)
         engine = self._require_started()
-        async for chunk in engine.synthesize_stream(text, voice=voice):
+        async for chunk in engine.synthesize_stream(
+            text,
+            voice=voice,
+            speed=speed,
+        ):
             yield chunk
 
     async def synthesize_wav(
@@ -455,9 +486,14 @@ class TTS(Component):
         text: str,
         *,
         voice: str | None = None,
+        speed: float | None = None,
     ) -> bytes:
         self._validate_input_text(text)
-        return await self._require_started().synthesize_full(text, voice=voice)
+        return await self._require_started().synthesize_full(
+            text,
+            voice=voice,
+            speed=speed,
+        )
 
     def router(self) -> APIRouter:
         docs_path = Path(__file__).resolve().parents[1] / "docs" / "server.md"
@@ -520,7 +556,11 @@ class TTS(Component):
 
             if req.response_format == "pcm":
                 return StreamingResponse(
-                    tts.synthesize_stream(req.input, voice=req.voice),
+                    tts.synthesize_stream(
+                        req.input,
+                        voice=req.voice,
+                        speed=speed,
+                    ),
                     media_type="audio/pcm",
                 )
 
@@ -529,6 +569,7 @@ class TTS(Component):
                 async for chunk in tts.synthesize_stream(
                     req.input,
                     voice=req.voice,
+                    speed=speed,
                 ):
                     yield chunk
 
