@@ -288,6 +288,45 @@ def test_load_model_with_search_harness_and_provider(base_url: str, model_dir: s
         return "fail", "empty chat content after enabling search harness"
 
 
+def test_search_harness_stream_hides_internal_markers(base_url: str, model_dir: str | None = None, **_):
+    """Search-harness streaming stays OpenAI-shaped and does not leak internal markers."""
+    if model_dir is None:
+        return "skip", "no --model-dir provided"
+    if not _hot_swap_allowed(model_dir):
+        return "skip", "model not in ~/.trillim/models/ (use 'trillim pull' for hot-swap tests)"
+
+    payload = {"model_dir": model_dir, "harness": "search", "search_provider": "ddgs"}
+    status, body = api(base_url, "POST", "/v1/models/load", payload, timeout=600)
+    if status != 200:
+        return "fail", f"expected 200, got {status}: {body}"
+
+    chunks, got_done = stream_chunks(
+        base_url,
+        "/v1/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "Say hi."}],
+            "max_tokens": 32,
+            "stream": True,
+        },
+    )
+    if not got_done:
+        return "fail", "stream did not end with data: [DONE]"
+
+    markers = (
+        "[Spin-Jump-Spinning...]",
+        "[Searching:",
+        "[Synthesizing...]",
+        "[Search unavailable]",
+        "[Search results]",
+        "--- Step ",
+    )
+    for chunk in chunks:
+        delta = chunk["choices"][0].get("delta", {})
+        content = delta.get("content", "")
+        if any(content.startswith(marker) for marker in markers):
+            return "fail", f"internal marker leaked into stream: {content!r}"
+
+
 def test_load_model_with_default_harness_and_search_provider(base_url: str, model_dir: str | None = None, **_):
     """POST /v1/models/load accepts harness=default with any search_provider and chat works."""
     if model_dir is None:
@@ -1107,6 +1146,7 @@ ALL_TESTS = [
     test_chat_context_overflow,
     test_completion_context_overflow,
     test_load_model_with_search_harness_and_provider,
+    test_search_harness_stream_hides_internal_markers,
     test_load_model_with_default_harness_and_search_provider,
     test_completions_non_streaming,
     test_completions_streaming,
