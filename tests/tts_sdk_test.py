@@ -3,6 +3,8 @@
 
 import unittest
 
+from trillim.server._models import SpeechRequest
+from trillim.server._tts import TTSEngine, _stretch_pcm_bytes
 import trillim
 from trillim import SentenceChunker
 from trillim.server import TTS
@@ -14,6 +16,7 @@ class _FakeTTSEngine:
     def __init__(self):
         self.default_voice = "alba"
         self.sample_rate = 24000
+        self.speed = 1.0
         self.calls: list[tuple] = []
         self._voices = [
             {"voice_id": "alba", "name": "alba", "type": "predefined"},
@@ -35,14 +38,46 @@ class _FakeTTSEngine:
         if self.default_voice == voice_id:
             self.default_voice = self.DEFAULT_VOICE
 
-    async def synthesize_stream(self, text: str, voice: str | None = None):
-        self.calls.append(("synthesize_stream", text, voice))
+    async def synthesize_stream(
+        self,
+        text: str,
+        voice: str | None = None,
+        speed: float | None = None,
+    ):
+        self.calls.append(("synthesize_stream", text, voice, speed))
         yield b"pcm-a"
         yield b"pcm-b"
 
-    async def synthesize_full(self, text: str, voice: str | None = None) -> bytes:
-        self.calls.append(("synthesize_full", text, voice))
+    async def synthesize_full(
+        self,
+        text: str,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> bytes:
+        self.calls.append(("synthesize_full", text, voice, speed))
         return b"RIFFdemo"
+
+
+class _FakeTensor:
+    def __init__(self, samples):
+        self._samples = samples
+
+    def numpy(self):
+        import numpy as np
+
+        return np.array(self._samples, dtype=np.float32)
+
+
+class _FakeStreamingModel:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def generate_audio_stream(self, **_):
+        for chunk in self._chunks:
+            yield _FakeTensor(chunk)
+
+    def get_state_for_audio_prompt(self, prompt, truncate=False):
+        return {"prompt": prompt, "truncate": truncate}
 
 
 class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
@@ -90,6 +125,29 @@ class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tts.sample_rate, 24000)
         self.assertEqual(tts.list_voices(), engine.list_voices())
 
+    async def test_speed_getter_and_setter_use_component_api(self):
+        tts, engine = self._make_tts()
+
+        self.assertEqual(tts.speed, 1.0)
+        tts.speed = 1.5
+
+        self.assertEqual(tts.speed, 1.5)
+        self.assertEqual(engine.speed, 1.5)
+
+    async def test_speed_can_be_set_before_start(self):
+        tts = TTS(speed=1.25)
+
+        self.assertEqual(tts.speed, 1.25)
+
+    async def test_speed_rejects_out_of_range_values(self):
+        tts = TTS()
+
+        with self.assertRaisesRegex(ValueError, "speed must be between 0.25 and 4.0"):
+            tts.speed = 0.2
+
+        with self.assertRaisesRegex(ValueError, "speed must be between 0.25 and 4.0"):
+            TTS(speed=4.5)
+
     async def test_register_and_delete_voice_use_public_wrappers(self):
         tts, engine = self._make_tts()
         tts.default_voice = "custom"
@@ -104,13 +162,20 @@ class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthesize_stream_and_wav_use_public_wrappers(self):
         tts, engine = self._make_tts()
 
-        chunks = [chunk async for chunk in tts.synthesize_stream("hello", voice="jean")]
-        wav_bytes = await tts.synthesize_wav("hello", voice="jean")
+        chunks = [
+            chunk
+            async for chunk in tts.synthesize_stream(
+                "hello",
+                voice="jean",
+                speed=1.5,
+            )
+        ]
+        wav_bytes = await tts.synthesize_wav("hello", voice="jean", speed=1.5)
 
         self.assertEqual(chunks, [b"pcm-a", b"pcm-b"])
         self.assertEqual(wav_bytes, b"RIFFdemo")
-        self.assertIn(("synthesize_stream", "hello", "jean"), engine.calls)
-        self.assertIn(("synthesize_full", "hello", "jean"), engine.calls)
+        self.assertIn(("synthesize_stream", "hello", "jean", 1.5), engine.calls)
+        self.assertIn(("synthesize_full", "hello", "jean", 1.5), engine.calls)
 
     async def test_synthesis_rejects_empty_input(self):
         tts, _ = self._make_tts()
@@ -147,6 +212,108 @@ class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(parts, ["Hello world."])
         self.assertEqual(remainder, "Another sentence")
+
+    async def test_speech_request_accepts_speed(self):
+        request = SpeechRequest(input="Hello", speed=1.5)
+
+        self.assertEqual(request.speed, 1.5)
+
+    async def test_pitch_preserving_speed_changes_duration(self):
+        sample_rate = 24000
+        pcm = _sine_pcm_bytes(sample_rate=sample_rate, frequency_hz=440.0, duration_s=1.0)
+
+        slower = _stretch_pcm_bytes(pcm, 0.5)
+        faster = _stretch_pcm_bytes(pcm, 2.0)
+
+        self.assertGreater(len(slower), len(pcm))
+        self.assertLess(len(faster), len(pcm))
+        self.assertAlmostEqual(
+            len(slower) / len(pcm),
+            2.0,
+            delta=0.2,
+        )
+        self.assertAlmostEqual(
+            len(faster) / len(pcm),
+            0.5,
+            delta=0.15,
+        )
+        self.assertAlmostEqual(
+            _dominant_frequency_hz(slower, sample_rate),
+            440.0,
+            delta=25.0,
+        )
+        self.assertAlmostEqual(
+            _dominant_frequency_hz(faster, sample_rate),
+            440.0,
+            delta=25.0,
+        )
+
+    async def test_pcm_stretcher_returns_original_bytes_for_identity_speed(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.2)
+
+        self.assertEqual(_stretch_pcm_bytes(pcm, 1.0), pcm)
+
+    async def test_pcm_stretcher_handles_empty_pcm(self):
+        self.assertEqual(_stretch_pcm_bytes(b"", 1.5), b"")
+
+    async def test_engine_synthesize_stream_applies_speed_after_full_synthesis(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.25)
+        chunk_a = _pcm_bytes_to_float_samples(pcm[: len(pcm) // 2])
+        chunk_b = _pcm_bytes_to_float_samples(pcm[len(pcm) // 2 :])
+        engine = TTSEngine(speed=1.0)
+        engine._model = _FakeStreamingModel([chunk_a, chunk_b])
+        engine._voice_states["alba"] = {"prompt": "alba"}
+
+        normal = b"".join(
+            [chunk async for chunk in engine.synthesize_stream("hello", speed=1.0)]
+        )
+        faster = b"".join(
+            [chunk async for chunk in engine.synthesize_stream("hello", speed=2.0)]
+        )
+
+        self.assertGreater(len(normal), len(faster))
+        self.assertAlmostEqual(
+            _dominant_frequency_hz(faster, 24000),
+            440.0,
+            delta=35.0,
+        )
+
+
+def _sine_pcm_bytes(
+    *,
+    sample_rate: int,
+    frequency_hz: float,
+    duration_s: float,
+) -> bytes:
+    import math
+    import struct
+
+    sample_count = int(sample_rate * duration_s)
+    samples = []
+    for index in range(sample_count):
+        value = math.sin((2.0 * math.pi * frequency_hz * index) / sample_rate)
+        samples.append(struct.pack("<h", int(value * 32767)))
+    return b"".join(samples)
+
+
+def _dominant_frequency_hz(pcm_bytes: bytes, sample_rate: int) -> float:
+    import numpy as np
+
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    window = np.hanning(samples.size).astype(np.float32)
+    spectrum = np.abs(np.fft.rfft(samples * window))
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / sample_rate)
+    return float(freqs[int(np.argmax(spectrum[1:]) + 1)])
+
+
+def _pcm_bytes_to_float_samples(pcm_bytes: bytes) -> list[float]:
+    import struct
+
+    sample_count = len(pcm_bytes) // 2
+    return [
+        struct.unpack_from("<h", pcm_bytes, offset * 2)[0] / 32767.0
+        for offset in range(sample_count)
+    ]
 
 
 if __name__ == "__main__":

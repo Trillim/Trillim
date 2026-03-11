@@ -944,6 +944,83 @@ def test_tts_voice_selection(base_url: str, **_):
         return "fail", f"WAV too small ({len(data)} bytes)"
 
 
+def test_tts_wav_speed(base_url: str, **_):
+    """POST /v1/audio/speech with a faster speed returns a shorter WAV."""
+    if not _voice_enabled(base_url):
+        return "skip", "voice pipeline not enabled"
+
+    text = "Speed test. " * 12
+    normal_payload = {"input": text, "speed": 1.0}
+    fast_payload = {"input": text, "speed": 2.0}
+
+    normal_status, normal_data, _ = api_binary(
+        base_url,
+        "POST",
+        "/v1/audio/speech",
+        normal_payload,
+    )
+    fast_status, fast_data, _ = api_binary(
+        base_url,
+        "POST",
+        "/v1/audio/speech",
+        fast_payload,
+    )
+    if normal_status != 200 or fast_status != 200:
+        return "fail", f"expected 200s, got {normal_status} and {fast_status}"
+    if not _is_valid_wav(normal_data) or not _is_valid_wav(fast_data):
+        return "fail", "speed responses are not valid WAV files"
+    if len(fast_data) >= len(normal_data):
+        return "fail", "speed=2.0 should produce a shorter WAV than speed=1.0"
+
+
+def test_tts_pcm_speed(base_url: str, **_):
+    """POST /v1/audio/speech with a slower speed returns more PCM bytes."""
+    if not _voice_enabled(base_url):
+        return "skip", "voice pipeline not enabled"
+
+    text = "PCM speed test. " * 12
+    normal_payload = {
+        "input": text,
+        "response_format": "pcm",
+        "speed": 1.0,
+    }
+    slow_payload = {
+        "input": text,
+        "response_format": "pcm",
+        "speed": 0.5,
+    }
+
+    normal_status, normal_data, _ = api_binary(
+        base_url,
+        "POST",
+        "/v1/audio/speech",
+        normal_payload,
+    )
+    slow_status, slow_data, _ = api_binary(
+        base_url,
+        "POST",
+        "/v1/audio/speech",
+        slow_payload,
+    )
+    if normal_status != 200 or slow_status != 200:
+        return "fail", f"expected 200s, got {normal_status} and {slow_status}"
+    if normal_data[:4] == b"RIFF" or slow_data[:4] == b"RIFF":
+        return "fail", "PCM speed responses should not have WAV headers"
+    if len(slow_data) <= len(normal_data):
+        return "fail", "speed=0.5 should produce more PCM than speed=1.0"
+
+
+def test_tts_invalid_speed(base_url: str, **_):
+    """POST /v1/audio/speech with an invalid speed returns 400."""
+    if not _voice_enabled(base_url):
+        return "skip", "voice pipeline not enabled"
+
+    payload = {"input": "Hello world.", "speed": 4.5}
+    status, _, _ = api_binary(base_url, "POST", "/v1/audio/speech", payload)
+    if status != 400:
+        return "fail", f"expected 400 for invalid speed, got {status}"
+
+
 def test_tts_empty_input(base_url: str, **_):
     """POST /v1/audio/speech with empty input returns 400."""
     if not _voice_enabled(base_url):
