@@ -27,6 +27,7 @@ from ._models import (
     UsageInfo,
 )
 
+from trillim.errors import ContextOverflowError
 from trillim.engine import InferenceEngine
 from trillim.harnesses import Harness, get_harness
 
@@ -54,6 +55,37 @@ class LLM(Component):
         self.model_name: str = "unknown"
         self.state: ServerState = ServerState.NO_MODEL
         self._swap_lock: asyncio.Lock | None = None
+
+    def _require_started(self) -> tuple[InferenceEngine, Harness]:
+        if (
+            self.engine is None
+            or self.harness is None
+            or self.state != ServerState.RUNNING
+        ):
+            raise RuntimeError("LLM not started")
+        return self.engine, self.harness
+
+    @property
+    def max_context_tokens(self) -> int:
+        """Return the active model context window in tokens."""
+        engine, _ = self._require_started()
+        return engine.arch_config.max_position_embeddings
+
+    def count_tokens(self, messages: list[dict]) -> int:
+        """Count prompt tokens for a chat-style message list."""
+        _, harness = self._require_started()
+        token_ids, _ = harness._prepare_tokens(messages)
+        return len(token_ids)
+
+    def validate_context(self, messages: list[dict]) -> int:
+        """Return prompt token count or raise if the context window is full."""
+        return self._validate_token_count(self.count_tokens(messages))
+
+    def _validate_token_count(self, token_count: int) -> int:
+        max_context_tokens = self.max_context_tokens
+        if token_count >= max_context_tokens:
+            raise ContextOverflowError(token_count, max_context_tokens)
+        return token_count
 
     def _create_harness(
         self,
@@ -326,16 +358,13 @@ class LLM(Component):
             if llm.engine is None or llm.harness is None or llm.state != ServerState.RUNNING:
                 raise HTTPException(status_code=503, detail="No model loaded")
 
-            tokenizer = llm.engine.tokenizer
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
-            token_ids, _ = llm.harness._prepare_tokens(messages)
-
-            max_ctx = llm.engine.arch_config.max_position_embeddings
-            if len(token_ids) >= max_ctx:
+            try:
+                prompt_tokens = llm.validate_context(messages)
+            except ContextOverflowError as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Prompt length ({len(token_ids)} tokens) exceeds context window ({max_ctx}). "
-                    "Start a new conversation with fewer messages.",
+                    detail=f"{exc} Start a new conversation with fewer messages.",
                 )
 
             sampling = dict(
@@ -381,9 +410,9 @@ class LLM(Component):
                     )
                 ],
                 usage=UsageInfo(
-                    prompt_tokens=len(token_ids),
+                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_tokens=len(token_ids) + completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                     cached_tokens=cached_tokens,
                 ),
             )
@@ -397,13 +426,12 @@ class LLM(Component):
 
             tokenizer = llm.engine.tokenizer
             token_ids = tokenizer.encode(req.prompt)
-
-            max_ctx = llm.engine.arch_config.max_position_embeddings
-            if len(token_ids) >= max_ctx:
+            try:
+                prompt_tokens = llm._validate_token_count(len(token_ids))
+            except ContextOverflowError as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Prompt length ({len(token_ids)} tokens) exceeds context window ({max_ctx}). "
-                    "Shorten your prompt and try again.",
+                    detail=f"{exc} Shorten your prompt and try again.",
                 )
 
             gen_kwargs = dict(
@@ -440,9 +468,9 @@ class LLM(Component):
                 model=req.model or llm.model_name,
                 choices=[CompletionChoice(text=full_text, finish_reason="stop")],
                 usage=UsageInfo(
-                    prompt_tokens=len(token_ids),
+                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_tokens=len(token_ids) + completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                     cached_tokens=cached_tokens,
                 ),
             )

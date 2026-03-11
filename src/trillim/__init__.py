@@ -4,7 +4,7 @@
 import os as _os
 _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-__all__ = ["Server", "LLM", "Whisper", "TTS"]
+__all__ = ["Server", "LLM", "Whisper", "TTS", "ContextOverflowError"]
 
 
 def __getattr__(name: str):
@@ -24,4 +24,8 @@ def __getattr__(name: str):
         from .server._whisper import Whisper
 
         return Whisper
+    if name == "ContextOverflowError":
+        from .errors import ContextOverflowError
+
+        return ContextOverflowError
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
