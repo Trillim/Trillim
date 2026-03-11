@@ -4,10 +4,14 @@
 import asyncio
 import functools
 import io
+import struct
+import wave
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+
+from trillim._timeouts import run_with_timeout
 
 from ._component import Component
 from ._models import TranscriptionResponse
@@ -118,6 +122,57 @@ class Whisper(Component):
     def engine(self):
         return self._engine
 
+    def _require_started(self) -> WhisperEngine:
+        if self._engine is None:
+            raise RuntimeError("Whisper not started")
+        return self._engine
+
+    async def transcribe_bytes(
+        self,
+        audio_bytes: bytes,
+        *,
+        language: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """Transcribe supported audio bytes to text."""
+        engine = self._require_started()
+        return await run_with_timeout(
+            engine.transcribe(audio_bytes, language=language),
+            timeout,
+            "Whisper transcription",
+        )
+
+    async def transcribe_wav(
+        self,
+        path: str | Path,
+        *,
+        language: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """Read a WAV file from disk and transcribe it."""
+        audio_bytes = Path(path).read_bytes()
+        return await self.transcribe_bytes(
+            audio_bytes,
+            language=language,
+            timeout=timeout,
+        )
+
+    async def transcribe_array(
+        self,
+        samples,
+        *,
+        sample_rate: int,
+        language: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """Encode an array-like audio buffer as WAV and transcribe it."""
+        audio_bytes = _wav_bytes_from_array(samples, sample_rate)
+        return await self.transcribe_bytes(
+            audio_bytes,
+            language=language,
+            timeout=timeout,
+        )
+
     def router(self) -> APIRouter:
         docs_path = Path(__file__).resolve().parents[1] / "docs" / "server.md"
         if not docs_path.exists():
@@ -148,9 +203,135 @@ class Whisper(Component):
             audio_bytes = await file.read(8 * 1024 * 1024 + 1)
             if len(audio_bytes) > 8 * 1024 * 1024:
                 raise HTTPException(status_code=413, detail="Upload exceeds 8 MB limit")
-            text = await whisper._engine.transcribe(audio_bytes, language=language)
+            text = await whisper.transcribe_bytes(audio_bytes, language=language)
             if response_format == "text":
                 return StreamingResponse(iter([text]), media_type="text/plain")
             return TranscriptionResponse(text=text)
 
         return r
+
+
+def _wav_bytes_from_array(samples, sample_rate: int) -> bytes:
+    """Convert an array-like audio buffer to mono 16-bit WAV bytes."""
+    if sample_rate < 1:
+        raise ValueError("sample_rate must be >= 1")
+
+    mono = _coerce_mono_samples(samples)
+    pcm = b"".join(struct.pack("<h", _float_to_int16(sample)) for sample in mono)
+
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm)
+        return buffer.getvalue()
+
+
+def _coerce_mono_samples(samples) -> list[float]:
+    if hasattr(samples, "tolist"):
+        samples = samples.tolist()
+    elif isinstance(samples, (bytes, bytearray, memoryview)):
+        raise TypeError("samples must be an array-like sequence, not raw bytes")
+
+    if not isinstance(samples, (list, tuple)):
+        samples = list(samples)
+    if not samples:
+        raise ValueError("samples must not be empty")
+
+    first = samples[0]
+    if _is_sequence(first):
+        return _collapse_channels(samples)
+    return [_normalize_scalar(sample, scale_hint=_infer_scale_hint(samples)) for sample in samples]
+
+
+def _collapse_channels(samples) -> list[float]:
+    rows = [list(row) if not hasattr(row, "tolist") else row.tolist() for row in samples]
+    if not rows or not rows[0]:
+        raise ValueError("samples must not be empty")
+    row_lengths = {len(row) for row in rows}
+    if len(row_lengths) != 1:
+        raise ValueError("multichannel samples must have a consistent shape")
+
+    if len(rows) <= 8 and len(rows) < len(rows[0]):
+        # Common channels-first layout: (channels, num_samples)
+        channels = rows
+        frame_count = len(rows[0])
+        scale_hint = _infer_scale_hint(channels)
+        return [
+            sum(_normalize_scalar(channel[i], scale_hint=scale_hint) for channel in channels)
+            / len(channels)
+            for i in range(frame_count)
+        ]
+
+    # Common frames-first layout: (num_samples, channels)
+    scale_hint = _infer_scale_hint(rows)
+    return [
+        sum(_normalize_scalar(value, scale_hint=scale_hint) for value in frame) / len(frame)
+        for frame in rows
+    ]
+
+
+def _infer_scale_hint(samples) -> float | None:
+    dtype = getattr(samples, "dtype", None)
+    kind = getattr(dtype, "kind", None)
+    itemsize = getattr(dtype, "itemsize", None)
+    if kind == "i" and itemsize:
+        return float(2 ** (8 * itemsize - 1))
+    if kind == "u" and itemsize:
+        return float(2 ** (8 * itemsize) - 1)
+
+    max_abs = 0.0
+    for value in _flatten(samples):
+        if isinstance(value, bool):
+            continue
+        try:
+            max_abs = max(max_abs, abs(float(value)))
+        except (TypeError, ValueError):
+            raise TypeError(f"Unsupported sample value: {value!r}") from None
+
+    if max_abs <= 1.0:
+        return None
+    if max_abs <= 32768:
+        return 32768.0
+    if max_abs <= 8388608:
+        return 8388608.0
+    if max_abs <= 2147483648:
+        return 2147483648.0
+    return max_abs
+
+
+def _flatten(samples):
+    if isinstance(samples, (list, tuple)):
+        for value in samples:
+            if _is_sequence(value):
+                yield from _flatten(value)
+            else:
+                yield value
+        return
+
+    if hasattr(samples, "tolist"):
+        yield from _flatten(samples.tolist())
+        return
+
+    yield samples
+
+
+def _normalize_scalar(value, *, scale_hint: float | None) -> float:
+    if isinstance(value, bool):
+        value = int(value)
+    sample = float(value)
+    if scale_hint is not None:
+        if sample >= 0:
+            sample = sample / scale_hint
+        else:
+            sample = sample / scale_hint
+    return max(-1.0, min(1.0, sample))
+
+
+def _float_to_int16(sample: float) -> int:
+    return max(-32768, min(32767, int(round(sample * 32767.0))))
+
+
+def _is_sequence(value) -> bool:
+    return isinstance(value, (list, tuple)) or hasattr(value, "tolist")
