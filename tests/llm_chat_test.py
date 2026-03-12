@@ -205,8 +205,71 @@ class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
         llm.state = ServerState.RUNNING
         llm.engine = engine
         llm.harness = DefaultHarness(engine)
+        restart_calls: list[tuple] = []
+
+        async def fake_swap_engine(
+            model_dir: str,
+            adapter_dir=None,
+            harness_name=None,
+            search_provider=None,
+            num_threads=None,
+            lora_quant=None,
+            unembed_quant=None,
+        ):
+            restart_calls.append(
+                (
+                    model_dir,
+                    adapter_dir,
+                    harness_name,
+                    search_provider,
+                    num_threads,
+                    lora_quant,
+                    unembed_quant,
+                )
+            )
+            recovered = _ScriptedEngine(["recovered"])
+            llm.engine = recovered
+            llm.harness = DefaultHarness(recovered)
+            llm.state = ServerState.RUNNING
+            return SimpleNamespace(status="success", model="fake", recompiled=False, message="")
+
+        llm._swap_engine = fake_swap_engine
 
         with self.assertRaisesRegex(TimeoutError, "LLM chat timed out"):
+            await llm.chat(
+                [{"role": "user", "content": "Say hi"}],
+                max_tokens=8,
+                timeout=0.001,
+            )
+
+        self.assertEqual(restart_calls, [("models/fake", None, "default", "ddgs", 0, None, None)])
+        self.assertEqual(
+            await llm.chat([{"role": "user", "content": "Try again"}], max_tokens=8),
+            "recovered",
+        )
+
+    async def test_chat_timeout_surfaces_restart_failures(self):
+        engine = _SlowScriptedEngine(["hello"])
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = engine
+        llm.harness = DefaultHarness(engine)
+
+        async def fake_swap_engine(*args, **kwargs):
+            llm.state = ServerState.NO_MODEL
+            return SimpleNamespace(
+                status="error",
+                model="fake",
+                recompiled=False,
+                message="boom",
+            )
+
+        llm._swap_engine = fake_swap_engine
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "LLM chat timed out and engine restart failed: boom",
+        ):
             await llm.chat(
                 [{"role": "user", "content": "Say hi"}],
                 max_tokens=8,

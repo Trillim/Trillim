@@ -514,6 +514,28 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(proc.killed)
 
+    async def test_generate_kills_process_when_consumer_abandons_request(self):
+        engine = self._make_engine()
+        proc = _FakeProcess(stdout_lines=[b"65\n"])
+        engine.process = proc
+        engine.cached_token_ids = [1, 2]
+        engine._last_cache_hit = 2
+        engine._cached_prompt_str = "cached"
+        utils_module = _module(
+            "trillim.utils",
+            _build_request_block=lambda *args, **kwargs: "request",
+        )
+
+        with patch.dict(sys.modules, {"trillim.utils": utils_module}):
+            iterator = engine.generate(token_ids=[1, 2, 3])
+            self.assertEqual(await anext(iterator), 65)
+            await iterator.aclose()
+
+        self.assertTrue(proc.killed)
+        self.assertEqual(engine.cached_token_ids, [])
+        self.assertEqual(engine._last_cache_hit, 0)
+        self.assertEqual(engine._cached_prompt_str, "")
+
     async def test_generate_times_out_while_waiting_for_kv_position(self):
         engine = self._make_engine()
         proc = _FakeProcess(stdout_lines=[b"0\n", b"1\n"])
