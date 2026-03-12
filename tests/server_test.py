@@ -3,18 +3,17 @@
 Test suite for the Trillim OpenAI-compatible API server.
 
 Start the server first:  trillim serve <model_dir> --voice
-Then run this:           uv run tests/server_test.py [--base-url URL] [--model-dir DIR] [--adapter-dir DIR]
+Then run this:           uv run python -m unittest tests.server_test
+Optional env vars:       MODEL_DIR=<path> ADAPTER_DIR=<path>
 
 Voice tests run automatically when the server has --voice enabled;
 otherwise they are skipped.  LoRA tests require --adapter-dir pointing to a
-directory with qmodel.lora (separate from --model-dir). Standard unittest
-selectors and flags may also be passed alongside the custom server arguments.
+directory with qmodel.lora (separate from MODEL_DIR).
 """
 
-import argparse
 import json
+import os
 import struct
-import sys
 import threading
 import unittest
 import urllib.error
@@ -1332,39 +1331,25 @@ def load_tests(loader, tests, pattern):
     return suite
 
 
-def _parse_args(argv: list[str]) -> list[str]:
-    parser = argparse.ArgumentParser(description="Trillim API server tests")
-    parser.add_argument(
-        "--base-url", default="http://127.0.0.1:8000",
-        help="Server base URL (default: http://127.0.0.1:8000)",
-    )
-    parser.add_argument(
-        "--model-dir", default=None,
-        help="Model directory for the load-model test",
-    )
-    parser.add_argument(
-        "--adapter-dir", default=None,
-        help="LoRA adapter directory (separate from model dir) for adapter tests",
-    )
-    args, remaining = parser.parse_known_args(argv[1:])
-    _TEST_CONFIG.base_url = args.base_url.rstrip("/")
-    _TEST_CONFIG.model_dir = args.model_dir
-    _TEST_CONFIG.adapter_dir = args.adapter_dir
-    return [argv[0], *remaining]
+def _load_test_config() -> None:
+    _TEST_CONFIG.model_dir = os.getenv("MODEL_DIR")
+    _TEST_CONFIG.adapter_dir = os.getenv("ADAPTER_DIR")
 
 
 def _ensure_server_reachable() -> None:
     base = _TEST_CONFIG.base_url
-    # Check server is reachable
     try:
         api(base, "GET", "/v1/models", timeout=5)
     except Exception:
-        print(f"Could not connect to {base}")
-        print("Start the server first:  make serve MODEL_DIR=<path>")
-        sys.exit(1)
+        raise RuntimeError(
+            f"Could not connect to {base}. Start the server first: make serve MODEL_DIR=<path>"
+        ) from None
+
+
+def setUpModule() -> None:
+    _load_test_config()
+    _ensure_server_reachable()
 
 
 if __name__ == "__main__":
-    unittest_argv = _parse_args(sys.argv)
-    _ensure_server_reachable()
-    unittest.main(argv=unittest_argv)
+    unittest.main()
