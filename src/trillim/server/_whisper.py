@@ -229,23 +229,40 @@ def _wav_bytes_from_array(samples, sample_rate: int) -> bytes:
 
 
 def _coerce_mono_samples(samples) -> list[float]:
-    if hasattr(samples, "tolist"):
-        samples = samples.tolist()
-    elif isinstance(samples, (bytes, bytearray, memoryview)):
+    if isinstance(samples, (bytes, bytearray, memoryview)):
         raise TypeError("samples must be an array-like sequence, not raw bytes")
+    if hasattr(samples, "tolist"):
+        scale_hint = _infer_scale_hint(samples)
+        zero_point = _infer_zero_point(samples)
+        samples = samples.tolist()
+    else:
+        if not isinstance(samples, (list, tuple)):
+            samples = list(samples)
+        scale_hint = _infer_scale_hint(samples)
+        zero_point = _infer_zero_point(samples)
 
-    if not isinstance(samples, (list, tuple)):
-        samples = list(samples)
     if not samples:
         raise ValueError("samples must not be empty")
 
     first = samples[0]
     if _is_sequence(first):
-        return _collapse_channels(samples)
-    return [_normalize_scalar(sample, scale_hint=_infer_scale_hint(samples)) for sample in samples]
+        return _collapse_channels(
+            samples,
+            scale_hint=scale_hint,
+            zero_point=zero_point,
+        )
+    return [
+        _normalize_scalar(sample, scale_hint=scale_hint, zero_point=zero_point)
+        for sample in samples
+    ]
 
 
-def _collapse_channels(samples) -> list[float]:
+def _collapse_channels(
+    samples,
+    *,
+    scale_hint: float | None = None,
+    zero_point: float = 0.0,
+) -> list[float]:
     rows = [list(row) if not hasattr(row, "tolist") else row.tolist() for row in samples]
     if not rows or not rows[0]:
         raise ValueError("samples must not be empty")
@@ -253,21 +270,38 @@ def _collapse_channels(samples) -> list[float]:
     if len(row_lengths) != 1:
         raise ValueError("multichannel samples must have a consistent shape")
 
+    if scale_hint is None:
+        scale_hint = _infer_scale_hint(samples)
+        zero_point = _infer_zero_point(samples)
+
     if len(rows) <= 8 and len(rows) < len(rows[0]):
         # Common channels-first layout: (channels, num_samples)
         channels = rows
         frame_count = len(rows[0])
-        scale_hint = _infer_scale_hint(channels)
         return [
-            sum(_normalize_scalar(channel[i], scale_hint=scale_hint) for channel in channels)
+            sum(
+                _normalize_scalar(
+                    channel[i],
+                    scale_hint=scale_hint,
+                    zero_point=zero_point,
+                )
+                for channel in channels
+            )
             / len(channels)
             for i in range(frame_count)
         ]
 
     # Common frames-first layout: (num_samples, channels)
-    scale_hint = _infer_scale_hint(rows)
     return [
-        sum(_normalize_scalar(value, scale_hint=scale_hint) for value in frame) / len(frame)
+        sum(
+            _normalize_scalar(
+                value,
+                scale_hint=scale_hint,
+                zero_point=zero_point,
+            )
+            for value in frame
+        )
+        / len(frame)
         for frame in rows
     ]
 
@@ -279,7 +313,7 @@ def _infer_scale_hint(samples) -> float | None:
     if kind == "i" and itemsize:
         return float(2 ** (8 * itemsize - 1))
     if kind == "u" and itemsize:
-        return float(2 ** (8 * itemsize) - 1)
+        return float(2 ** (8 * itemsize - 1))
 
     max_abs = 0.0
     for value in _flatten(samples):
@@ -301,6 +335,15 @@ def _infer_scale_hint(samples) -> float | None:
     return max_abs
 
 
+def _infer_zero_point(samples) -> float:
+    dtype = getattr(samples, "dtype", None)
+    kind = getattr(dtype, "kind", None)
+    itemsize = getattr(dtype, "itemsize", None)
+    if kind == "u" and itemsize:
+        return float(2 ** (8 * itemsize - 1))
+    return 0.0
+
+
 def _flatten(samples):
     if isinstance(samples, (list, tuple)):
         for value in samples:
@@ -317,15 +360,17 @@ def _flatten(samples):
     yield samples
 
 
-def _normalize_scalar(value, *, scale_hint: float | None) -> float:
+def _normalize_scalar(
+    value,
+    *,
+    scale_hint: float | None,
+    zero_point: float = 0.0,
+) -> float:
     if isinstance(value, bool):
         value = int(value)
     sample = float(value)
     if scale_hint is not None:
-        if sample >= 0:
-            sample = sample / scale_hint
-        else:
-            sample = sample / scale_hint
+        sample = (sample - zero_point) / scale_hint
     return max(-1.0, min(1.0, sample))
 
 
