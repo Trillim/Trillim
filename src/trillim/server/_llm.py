@@ -435,22 +435,32 @@ class LLM(Component):
         @r.post("/v1/models/load")
         async def load_model(req: LoadModelRequest):
             from trillim.model_store import resolve_model_dir, MODELS_DIR
-
-            try:
-                model_dir = resolve_model_dir(req.model_dir)
-            except RuntimeError as exc:
-                raise HTTPException(status_code=404, detail=str(exc))
             from pathlib import Path
 
-            resolved = Path(model_dir).resolve()
             allowed = Path(str(MODELS_DIR)).resolve()
-            try:
-                resolved.relative_to(allowed)
-            except ValueError:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Only models in ~/.trillim/models/ can be loaded. Use 'trillim pull' first.",
-                )
+
+            def resolve_allowed_dir(path_arg: str, *, kind: str) -> str:
+                try:
+                    resolved_dir = resolve_model_dir(path_arg)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+                resolved_path = Path(resolved_dir).resolve()
+                try:
+                    resolved_path.relative_to(allowed)
+                except ValueError as exc:
+                    detail = (
+                        "Only models in ~/.trillim/models/ can be loaded. Use 'trillim pull' first."
+                        if kind == "model"
+                        else "Only adapters in ~/.trillim/models/ can be loaded. Use 'trillim pull' first."
+                    )
+                    raise HTTPException(status_code=403, detail=detail) from exc
+                return resolved_dir
+
+            model_dir = resolve_allowed_dir(req.model_dir, kind="model")
+            adapter_dir = None
+            if req.adapter_dir is not None:
+                adapter_dir = resolve_allowed_dir(req.adapter_dir, kind="adapter")
 
             if llm._swap_lock is not None and llm._swap_lock.locked():
                 raise HTTPException(
@@ -462,7 +472,7 @@ class LLM(Component):
                 llm.state = ServerState.SWAPPING
                 result = await llm._swap_engine(
                     model_dir,
-                    adapter_dir=req.adapter_dir,
+                    adapter_dir=adapter_dir,
                     harness_name=req.harness,
                     search_provider=req.search_provider,
                     num_threads=req.threads,
