@@ -84,103 +84,201 @@ def _iter_pcm_chunks(
         yield pcm_bytes[start : start + chunk_size]
 
 
-def _select_frame_size(sample_count: int) -> int:
-    frame_size = 1024
-    while frame_size > sample_count and frame_size > 64:
-        frame_size //= 2
-    return max(32, min(frame_size, sample_count))
+class _StreamingPCMStretcher:
+    def __init__(self, speed: float):
+        import numpy as np
 
+        self._np = np
+        self.speed = _validate_speed(speed)
+        self.frame_size = 1024
+        self.hop_size = self.frame_size // 4
+        self._window = np.hanning(self.frame_size).astype(np.float32)
+        if not np.any(self._window):
+            self._window = np.ones(self.frame_size, dtype=np.float32)
+        self._window_sq = self._window**2
+        self._phase_advance = (
+            2.0
+            * np.pi
+            * self.hop_size
+            * np.arange(self.frame_size // 2 + 1, dtype=np.float32)
+            / self.frame_size
+        )
+        self._input = np.zeros(0, dtype=np.float32)
+        self._input_base = 0
+        self._total_samples = 0
+        self._next_analysis_frame = 0
+        self._spectra: deque = deque()
+        self._spectra_base = 0
+        self._phase = None
+        self._next_time_step = 0.0
+        self._processed_output_frames = 0
+        self._output = np.zeros(0, dtype=np.float32)
+        self._weights = np.zeros(0, dtype=np.float32)
+        self._output_base = 0
+        self._pending_byte = b""
 
-def _stretch_samples(samples, speed: float):
-    import numpy as np
+    def push(self, pcm_bytes: bytes) -> bytes:
+        self._append_pcm(pcm_bytes)
+        self._materialize_analysis_frames(final=False)
+        self._process_output_frames(final=False)
+        return self._emit_ready(final=False)
 
-    if samples.size < 32 or speed == _DEFAULT_SPEED:
-        return samples.copy()
+    def finish(self) -> bytes:
+        self._materialize_analysis_frames(final=True)
+        self._process_output_frames(final=True)
+        return self._emit_ready(final=True)
 
-    frame_size = _select_frame_size(int(samples.size))
-    if frame_size <= 1:
-        return samples.copy()
+    def _append_pcm(self, pcm_bytes: bytes) -> None:
+        np = self._np
+        data = self._pending_byte + pcm_bytes
+        if len(data) % 2 == 1:
+            self._pending_byte = data[-1:]
+            data = data[:-1]
+        else:
+            self._pending_byte = b""
+        if not data:
+            return
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        if self._input.size == 0:
+            self._input = samples.copy()
+        else:
+            self._input = np.concatenate((self._input, samples))
+        self._total_samples += samples.size
 
-    hop_size = max(1, frame_size // 4)
-    window = np.hanning(frame_size).astype(np.float32)
-    if not np.any(window):
-        window = np.ones(frame_size, dtype=np.float32)
+    def _final_frame_limit(self) -> int:
+        if self._total_samples == 0:
+            return 0
+        return max(1, self._total_samples - self.frame_size) + self.hop_size
 
-    expected_length = max(1, int(round(samples.size / speed)))
-    frame_count = max(1, int(np.ceil(max(1, samples.size - frame_size) / hop_size)) + 1)
-    if frame_count < 2:
-        if samples.size > expected_length:
-            return samples[:expected_length].copy()
-        if samples.size < expected_length:
-            return np.pad(samples, (0, expected_length - samples.size))
-        return samples.copy()
+    def _materialize_analysis_frames(self, final: bool) -> None:
+        np = self._np
+        available_end = self._input_base + self._input.size
+        final_limit = self._final_frame_limit()
+        while True:
+            start = self._next_analysis_frame * self.hop_size
+            end = start + self.frame_size
+            if end <= available_end:
+                local_start = start - self._input_base
+                frame = self._input[local_start : local_start + self.frame_size]
+            elif final and start < final_limit:
+                local_start = start - self._input_base
+                frame = self._input[local_start:]
+                if frame.size < self.frame_size:
+                    frame = np.pad(frame, (0, self.frame_size - frame.size))
+                else:
+                    frame = frame[: self.frame_size]
+            else:
+                break
 
-    stft = np.empty((frame_size // 2 + 1, frame_count), dtype=np.complex64)
-    for frame_index in range(frame_count):
-        start = frame_index * hop_size
-        frame = samples[start : start + frame_size]
-        if frame.size < frame_size:
-            frame = np.pad(frame, (0, frame_size - frame.size))
-        stft[:, frame_index] = np.fft.rfft(frame * window)
+            spectrum = np.fft.rfft(frame * self._window).astype(np.complex64)
+            self._spectra.append(spectrum)
+            self._next_analysis_frame += 1
 
-    time_steps = np.arange(0, frame_count, speed, dtype=np.float32)
-    stretched_spec = np.empty((stft.shape[0], time_steps.size), dtype=np.complex64)
-    phase_advance = (
-        2.0
-        * np.pi
-        * hop_size
-        * np.arange(stft.shape[0], dtype=np.float32)
-        / frame_size
-    )
-    phase = np.angle(stft[:, 0])
-    first_magnitude = np.abs(stft[:, 0])
-    stretched_spec[:, 0] = first_magnitude * np.exp(1j * phase)
+        trim_to = self._next_analysis_frame * self.hop_size
+        drop = max(0, min(self._input.size, trim_to - self._input_base))
+        if drop > 0:
+            self._input = self._input[drop:]
+            self._input_base += drop
 
-    for out_index, step in enumerate(time_steps[1:], start=1):
-        frame_index = min(int(step), frame_count - 1)
-        next_index = min(frame_index + 1, frame_count - 1)
-        fraction = step - frame_index
+    def _analysis_frame_count(self) -> int:
+        return self._spectra_base + len(self._spectra)
 
-        current = stft[:, frame_index]
-        following = stft[:, next_index]
-        magnitude = (1.0 - fraction) * np.abs(current) + fraction * np.abs(following)
+    def _get_spectrum(self, frame_index: int):
+        local_index = frame_index - self._spectra_base
+        if local_index < 0 or local_index >= len(self._spectra):
+            return None
+        return self._spectra[local_index]
 
-        phase_delta = np.angle(following) - np.angle(current) - phase_advance
-        phase_delta -= 2.0 * np.pi * np.round(phase_delta / (2.0 * np.pi))
-        phase += phase_advance + phase_delta
-        stretched_spec[:, out_index] = magnitude * np.exp(1j * phase)
+    def _process_output_frames(self, final: bool) -> None:
+        np = self._np
+        frame_count = self._analysis_frame_count()
+        while True:
+            if self._phase is None:
+                first = self._get_spectrum(0)
+                if first is None:
+                    return
+                self._phase = np.angle(first).astype(np.float32)
+                magnitude = np.abs(first)
+                stretched = magnitude * np.exp(1j * self._phase)
+                self._add_output_frame(
+                    np.fft.irfft(stretched, n=self.frame_size).real.astype(np.float32)
+                )
+                self._next_time_step = float(self.speed)
+                continue
 
-    out_len = frame_size + hop_size * max(0, stretched_spec.shape[1] - 1)
-    stretched = np.zeros(out_len, dtype=np.float32)
-    weights = np.zeros(out_len, dtype=np.float32)
-    for frame_index in range(stretched_spec.shape[1]):
-        start = frame_index * hop_size
-        frame = np.fft.irfft(stretched_spec[:, frame_index], n=frame_size).real
-        stretched[start : start + frame_size] += frame * window
-        weights[start : start + frame_size] += window**2
+            step = self._next_time_step
+            current_index = int(step)
+            if final:
+                if step >= frame_count:
+                    break
+            elif current_index + 1 >= frame_count:
+                break
 
-    nonzero = weights > 1e-6
-    stretched[nonzero] /= weights[nonzero]
+            next_index = min(current_index + 1, frame_count - 1)
+            current = self._get_spectrum(current_index)
+            following = self._get_spectrum(next_index)
+            if current is None or following is None:
+                break
 
-    if stretched.size > expected_length:
-        return stretched[:expected_length]
-    if stretched.size < expected_length:
-        return np.pad(stretched, (0, expected_length - stretched.size))
-    return stretched
+            fraction = step - current_index
+            magnitude = (1.0 - fraction) * np.abs(current) + fraction * np.abs(following)
+            phase_delta = np.angle(following) - np.angle(current) - self._phase_advance
+            phase_delta -= 2.0 * np.pi * np.round(phase_delta / (2.0 * np.pi))
+            self._phase += self._phase_advance + phase_delta
+            stretched = magnitude * np.exp(1j * self._phase)
+            self._add_output_frame(
+                np.fft.irfft(stretched, n=self.frame_size).real.astype(np.float32)
+            )
+            self._next_time_step += self.speed
 
+        trim_before = int(self._next_time_step)
+        while self._spectra and self._spectra_base < trim_before:
+            self._spectra.popleft()
+            self._spectra_base += 1
 
-def _stretch_pcm_bytes(pcm_bytes: bytes, speed: float) -> bytes:
-    import numpy as np
+    def _add_output_frame(self, frame) -> None:
+        start = self._processed_output_frames * self.hop_size
+        local_start = start - self._output_base
+        if local_start < 0:
+            raise RuntimeError("Streaming stretcher emitted samples out of order")
+        required = local_start + self.frame_size
+        if required > self._output.size:
+            pad = required - self._output.size
+            self._output = self._np.pad(self._output, (0, pad))
+            self._weights = self._np.pad(self._weights, (0, pad))
+        self._output[local_start : local_start + self.frame_size] += frame * self._window
+        self._weights[local_start : local_start + self.frame_size] += self._window_sq
+        self._processed_output_frames += 1
 
-    speed = _validate_speed(speed)
-    if speed == _DEFAULT_SPEED or not pcm_bytes:
-        return pcm_bytes
+    def _emit_ready(self, final: bool) -> bytes:
+        np = self._np
+        if final:
+            target_length = 0
+            if self._total_samples > 0:
+                target_length = max(1, int(round(self._total_samples / self.speed)))
+            ready_count = max(0, target_length - self._output_base)
+            if ready_count > self._output.size:
+                pad = ready_count - self._output.size
+                self._output = np.pad(self._output, (0, pad))
+                self._weights = np.pad(self._weights, (0, pad))
+        else:
+            ready_limit = self._processed_output_frames * self.hop_size
+            ready_count = max(0, min(self._output.size, ready_limit - self._output_base))
 
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    stretched = _stretch_samples(samples, speed)
-    clipped = np.clip(stretched, -1.0, 1.0)
-    return (clipped * 32767.0).astype(np.int16).tobytes()
+        if ready_count <= 0:
+            return b""
 
+        output = self._output[:ready_count].copy()
+        weights = self._weights[:ready_count]
+        nonzero = weights > 1e-6
+        output[nonzero] /= weights[nonzero]
+        output[~nonzero] = 0.0
+        clipped = np.clip(output, -1.0, 1.0)
+        pcm = (clipped * 32767.0).astype(np.int16).tobytes()
+        self._output = self._output[ready_count:]
+        self._weights = self._weights[ready_count:]
+        self._output_base += ready_count
+        return pcm
 
 # ---------------------------------------------------------------------------
 # TTSEngine
@@ -366,7 +464,9 @@ class TTSEngine:
 
         async with self._lock:
             loop = asyncio.get_running_loop()
-            raw_chunks: list[bytes] = []
+            stretcher = None
+            if effective_speed != _DEFAULT_SPEED:
+                stretcher = _StreamingPCMStretcher(effective_speed)
 
             # Ensure voice state is loaded
             voice_state = await loop.run_in_executor(
@@ -400,15 +500,17 @@ class TTSEngine:
                 if effective_speed == _DEFAULT_SPEED:
                     yield raw_chunk
                     continue
-                raw_chunks.append(raw_chunk)
-
-            if effective_speed != _DEFAULT_SPEED:
                 stretched = await loop.run_in_executor(
                     None,
-                    _stretch_pcm_bytes,
-                    b"".join(raw_chunks),
-                    effective_speed,
+                    stretcher.push,
+                    raw_chunk,
                 )
+                for chunk in _iter_pcm_chunks(stretched):
+                    if chunk:
+                        yield chunk
+
+            if stretcher is not None:
+                stretched = await loop.run_in_executor(None, stretcher.finish)
                 for chunk in _iter_pcm_chunks(stretched):
                     if chunk:
                         yield chunk
@@ -889,7 +991,7 @@ class TTS(Component):
                 try:
                     async with asyncio.timeout(session.timeout):
                         await self._drain_session(session, iterator)
-                except TimeoutError as exc:
+                except TimeoutError:
                     message = f"TTS session timed out after {session.timeout} seconds"
                     session._finish("failed", TimeoutError(message))
                     return
