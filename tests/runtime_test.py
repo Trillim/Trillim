@@ -3,6 +3,7 @@
 
 import asyncio
 from concurrent.futures import CancelledError as FutureCancelledError
+import threading
 import unittest
 
 from fastapi import APIRouter
@@ -96,25 +97,49 @@ class _TTSSession:
 
     def __init__(self, calls: list, text: str):
         self.calls = calls
+        self._loop = asyncio.get_running_loop()
         self.state = "running"
         self.speed = 1.0
         self._chunks = [text.encode(), b"!"]
 
     def pause(self) -> None:
+        self._schedule(self._pause)
+
+    def _pause(self) -> None:
         self.calls.append("session.pause")
         self.state = "paused"
 
     def resume(self) -> None:
+        self._schedule(self._resume)
+
+    def _resume(self) -> None:
         self.calls.append("session.resume")
         self.state = "running"
 
     def stop(self) -> None:
+        self._schedule(self._stop)
+
+    def _stop(self) -> None:
         self.calls.append("session.stop")
         self.state = "cancelled"
 
     def set_speed(self, speed: float) -> None:
+        self._schedule(self._set_speed, speed)
+
+    def _set_speed(self, speed: float) -> None:
         self.calls.append(("session.set_speed", speed))
         self.speed = speed
+
+    def _schedule(self, callback, *args) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self._loop:
+            callback(*args)
+            return
+        self._loop.call_soon_threadsafe(callback, *args)
 
     async def collect(self) -> bytes:
         self.calls.append("session.collect")
@@ -323,6 +348,20 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "is not iterable"):
             iter(proxy)
 
+    def test_runtime_object_proxy_rechecks_iterability_on_runtime_loop(self):
+        runtime = Runtime(LLM([]))
+        runtime.start()
+        try:
+            proxy = runtime_module._RuntimeObjectProxy(
+                runtime,
+                _ThreadBoundAsyncIterable(threading.get_ident()),
+            )
+
+            with self.assertRaisesRegex(TypeError, "is not iterable"):
+                iter(proxy)
+        finally:
+            runtime.stop()
+
     def test_invoke_attr_async_handles_noncallable_attributes(self):
         component = LLM([])
         runtime = Runtime(component)
@@ -332,6 +371,24 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "'started' is not callable"):
             asyncio.run(runtime._invoke_attr_async(component, "started", (1,), {}))
 
+    def test_invoke_helpers_require_started(self):
+        component = LLM([])
+        runtime = Runtime(component)
+
+        with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
+            runtime._invoke_component_attr(component, "count_tokens", ([],), {})
+
+        with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
+            runtime._invoke_object_attr(object(), "__str__", (), {})
+
+    def test_syncify_result_awaits_coroutines(self):
+        runtime = Runtime(LLM([]))
+        runtime.start()
+        try:
+            self.assertEqual(runtime._syncify_result(asyncio.sleep(0, result="done")), "done")
+        finally:
+            runtime.stop()
+
 
 class _AsyncIteratorStub:
     async def __anext__(self):
@@ -339,6 +396,22 @@ class _AsyncIteratorStub:
 
     async def aclose(self):
         return None
+
+
+class _ThreadBoundAsyncIterable:
+    def __init__(self, visible_thread_id: int):
+        self._visible_thread_id = visible_thread_id
+
+    def __getattribute__(self, name: str):
+        if name == "__aiter__":
+            visible_thread_id = object.__getattribute__(self, "_visible_thread_id")
+            if threading.get_ident() != visible_thread_id:
+                raise AttributeError(name)
+            return object.__getattribute__(self, "_aiter_impl")
+        return object.__getattribute__(self, name)
+
+    def _aiter_impl(self):
+        return _AsyncIteratorStub()
 
 
 def _raise_close():
