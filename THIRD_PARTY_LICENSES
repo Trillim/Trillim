@@ -66,6 +66,15 @@ pocket-tts
 
 --------------------------------------------------------------------------------
 
+numpy
+  License:   BSD 3-Clause License
+  Copyright: Copyright (c) 2005-2025, NumPy Developers
+  Note:      The NumPy distribution also bundles components under
+             0BSD, MIT, Zlib, and CC0-1.0.
+  URL:       https://numpy.org
+
+--------------------------------------------------------------------------------
+
 python-multipart
   License:   Apache License 2.0
   Copyright: Copyright 2012, Andrew Dunham

@@ -1894,6 +1894,7 @@ dev = [
 voice = [
     { name = "faster-whisper" },
     { name = "pocket-tts" },
+    { name = "numpy" },
     { name = "python-multipart" },
 ]
 
@@ -1904,6 +1905,7 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'voice'", specifier = "==1.2.1" },
     { name = "huggingface-hub", specifier = "==0.36.0" },
     { name = "jinja2", specifier = "==3.1.0" },
+    { name = "numpy", marker = "extra == 'voice'", specifier = "==2.4.2" },
     { name = "pocket-tts", marker = "extra == 'voice'", specifier = "==1.0.3" },
     { name = "prompt-toolkit", specifier = "==3.0.52" },
     { name = "python-multipart", marker = "extra == 'voice'", specifier = "==0.0.22" },
