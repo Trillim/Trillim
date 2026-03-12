@@ -230,6 +230,7 @@ await tts.delete_voice("myvoice")
 ```
 
 `tts.engine` remains available as an advanced escape hatch.
+`voices_dir` is only created when you register a custom voice; constructing or starting `TTS()` with built-in voices does not require that directory to exist yet.
 `speed` accepts values from `0.25` to `4.0` and uses pitch-preserving time stretching rather than naive resampling.
 Speed-adjusted synthesis streams progressively with bounded lookahead; it does not wait for the full utterance before yielding audio.
 `tts.speak(...)` returns a `TTSSession` that queues behind the active session by default. Pass `interrupt=True` to cancel the active and queued sessions before starting the new one.
