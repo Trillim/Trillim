@@ -97,6 +97,7 @@ class _TTSSession:
     def __init__(self, calls: list, text: str):
         self.calls = calls
         self.state = "running"
+        self.speed = 1.0
         self._chunks = [text.encode(), b"!"]
 
     def pause(self) -> None:
@@ -110,6 +111,10 @@ class _TTSSession:
     def stop(self) -> None:
         self.calls.append("session.stop")
         self.state = "cancelled"
+
+    def set_speed(self, speed: float) -> None:
+        self.calls.append(("session.set_speed", speed))
+        self.speed = speed
 
     async def collect(self) -> bytes:
         self.calls.append("session.collect")
@@ -178,6 +183,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(session.state, "paused")
             session.resume()
             self.assertEqual(session.state, "running")
+            session.set_speed(1.5)
+            self.assertEqual(session.speed, 1.5)
             self.assertEqual(list(session), [b"hello", b"!"])
             self.assertEqual(session.collect(), b"hello!")
             session.stop()
@@ -191,6 +198,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(("tts.speak", "hello"), calls)
         self.assertIn("session.pause", calls)
         self.assertIn("session.resume", calls)
+        self.assertIn(("session.set_speed", 1.5), calls)
         self.assertIn("session.collect", calls)
         self.assertIn("session.stop", calls)
 

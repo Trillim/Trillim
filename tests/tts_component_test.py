@@ -136,8 +136,8 @@ class _SessionEngine:
         self.speed = 1.0
         self.iterator_factory = iterator_factory
 
-    def synthesize_stream(self, text, voice=None, speed=None):
-        return self.iterator_factory(text, voice, speed)
+    def _synthesize_raw_stream(self, text, voice=None):
+        return self.iterator_factory(text, voice, None)
 
 
 class TTSEngineTests(unittest.IsolatedAsyncioTestCase):
@@ -319,6 +319,8 @@ class TTSSessionEdgeTests(unittest.IsolatedAsyncioTestCase):
         session._set_state("running")
         session._finish("completed")
         self.assertEqual(session.state, "failed")
+        tts._set_session_speed(session, 2.0)
+        self.assertEqual(session.speed, 1.0)
 
         with self.assertRaisesRegex(ValueError, "bad"):
             await session.collect()
@@ -452,6 +454,11 @@ class TTSComponentTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(session.state, "cancelled")
         self.assertTrue(iterator.closed)
+
+        tts._session_stream = lambda current: _IteratorStub([], aclose_error=RuntimeError("close failed"))
+        session = TTSSession(tts, text="hi", voice=None, speed=1.0, timeout=None)
+        await tts._run_session(session)
+        self.assertEqual(session.state, "completed")
 
 
 class TTSRouterTests(unittest.TestCase):

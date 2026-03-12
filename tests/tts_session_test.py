@@ -2,17 +2,22 @@
 """Unit tests for TTS session queueing, interruption, and flow control."""
 
 import asyncio
+import struct
 import unittest
 from collections import deque
 
 from trillim import TTS
 
 
+def _pcm_silence(sample_count: int, *, sample: int = 0) -> bytes:
+    return b"".join(struct.pack("<h", sample) for _ in range(sample_count))
+
+
 class _SessionEngine:
     def __init__(self, plans, gates=None):
         self.sample_rate = 24000
         self.speed = 1.0
-        self.calls: list[tuple[str, str | None, float | None]] = []
+        self.calls: list[tuple[str, str | None]] = []
         self._plans = plans
         self._gates = gates or {}
         self.stopped = False
@@ -20,13 +25,12 @@ class _SessionEngine:
     async def stop(self) -> None:
         self.stopped = True
 
-    async def synthesize_stream(
+    async def _synthesize_raw_stream(
         self,
         text: str,
         voice: str | None = None,
-        speed: float | None = None,
     ):
-        self.calls.append((text, voice, speed))
+        self.calls.append((text, voice))
         for index, chunk in enumerate(self._plans[text]):
             gate = self._gates.get((text, index))
             if gate is not None:
@@ -49,10 +53,13 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_speak_queues_sessions_until_active_completes(self):
         release_first = asyncio.Event()
+        first_chunk = _pcm_silence(256)
+        second_chunk = _pcm_silence(256, sample=10)
+        queued_chunk = _pcm_silence(128, sample=20)
         engine = _SessionEngine(
             {
-                "first": [b"f1", b"f2"],
-                "second": [b"s1"],
+                "first": [first_chunk, second_chunk],
+                "second": [queued_chunk],
             },
             gates={("first", 1): release_first},
         )
@@ -64,40 +71,45 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.state, "running")
         self.assertEqual(second.state, "queued")
         first_iter = first.__aiter__()
-        self.assertEqual(await anext(first_iter), b"f1")
+        self.assertEqual(await anext(first_iter), first_chunk)
         self.assertEqual(second.state, "queued")
 
         release_first.set()
-        self.assertEqual([chunk async for chunk in first_iter], [b"f2"])
-        self.assertEqual(await second.collect(), b"s1")
+        self.assertEqual([chunk async for chunk in first_iter], [second_chunk])
+        self.assertEqual(await second.collect(), queued_chunk)
         self.assertEqual(
             engine.calls,
             [
-                ("first", None, 1.0),
-                ("second", None, 1.0),
+                ("first", None),
+                ("second", None),
             ],
         )
 
     async def test_speak_snapshots_explicit_speed_per_session(self):
-        engine = _SessionEngine({"hello": [b"a"]})
+        raw_chunk = _pcm_silence(4096)
+        engine = _SessionEngine({"hello": [raw_chunk]})
         tts = self._make_tts(engine)
 
-        session = tts.speak("hello", speed=1.5)
+        session = tts.speak("hello", speed=2.0)
+        audio = await session.collect()
 
-        self.assertEqual(await session.collect(), b"a")
-        self.assertEqual(engine.calls, [("hello", None, 1.5)])
+        self.assertLess(len(audio), len(raw_chunk))
+        self.assertEqual(session.speed, 2.0)
+        self.assertEqual(engine.calls, [("hello", None)])
 
     async def test_pause_and_resume_gate_future_chunk_production(self):
         release_second = asyncio.Event()
+        first_chunk = _pcm_silence(256)
+        second_chunk = _pcm_silence(256, sample=30)
         engine = _SessionEngine(
-            {"hello": [b"a", b"b"]},
+            {"hello": [first_chunk, second_chunk]},
             gates={("hello", 1): release_second},
         )
         tts = self._make_tts(engine)
         session = tts.speak("hello")
         iterator = session.__aiter__()
 
-        self.assertEqual(await anext(iterator), b"a")
+        self.assertEqual(await anext(iterator), first_chunk)
         session.pause()
         await asyncio.sleep(0)
         self.assertEqual(session.state, "paused")
@@ -108,17 +120,74 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(next_chunk.done())
 
         session.resume()
-        self.assertEqual(await next_chunk, b"b")
+        self.assertEqual(await next_chunk, second_chunk)
         await session.wait()
         self.assertEqual(session.state, "completed")
 
-    async def test_interrupt_cancels_active_and_queued_sessions(self):
-        block_active = asyncio.Event()
+    async def test_set_speed_changes_future_running_chunks(self):
+        release_second = asyncio.Event()
+        first_chunk = _pcm_silence(4096)
+        second_chunk = _pcm_silence(4096, sample=50)
+        engine = _SessionEngine(
+            {"hello": [first_chunk, second_chunk]},
+            gates={("hello", 1): release_second},
+        )
+        tts = self._make_tts(engine)
+        session = tts.speak("hello")
+        iterator = session.__aiter__()
+
+        self.assertEqual(await anext(iterator), first_chunk)
+        session.set_speed(2.0)
+        await asyncio.sleep(0)
+        release_second.set()
+        remaining = b"".join([chunk async for chunk in iterator])
+
+        self.assertLess(len(remaining), len(second_chunk))
+        self.assertEqual(session.speed, 2.0)
+
+    async def test_set_speed_updates_queued_session_before_start(self):
+        release_active = asyncio.Event()
+        active_chunk = _pcm_silence(256, sample=60)
+        queued_chunk = _pcm_silence(4096, sample=70)
         engine = _SessionEngine(
             {
-                "active": [b"a"],
-                "queued": [b"q"],
-                "replacement": [b"r"],
+                "active": [active_chunk],
+                "queued": [queued_chunk],
+            },
+            gates={("active", 0): release_active},
+        )
+        tts = self._make_tts(engine)
+
+        active = tts.speak("active")
+        queued = tts.speak("queued")
+        queued.set_speed(0.5)
+        await asyncio.sleep(0)
+        self.assertEqual(queued.speed, 0.5)
+
+        release_active.set()
+        self.assertEqual(await active.collect(), active_chunk)
+        queued_audio = await queued.collect()
+
+        self.assertGreater(len(queued_audio), len(queued_chunk))
+
+    async def test_set_speed_rejects_invalid_values(self):
+        engine = _SessionEngine({"hello": [_pcm_silence(64)]})
+        tts = self._make_tts(engine)
+        session = tts.speak("hello")
+
+        with self.assertRaisesRegex(ValueError, "speed must be between 0.25 and 4.0"):
+            session.set_speed(5.0)
+
+    async def test_interrupt_cancels_active_and_queued_sessions(self):
+        block_active = asyncio.Event()
+        active_chunk = _pcm_silence(256, sample=80)
+        queued_chunk = _pcm_silence(128, sample=90)
+        replacement_chunk = _pcm_silence(128, sample=100)
+        engine = _SessionEngine(
+            {
+                "active": [active_chunk],
+                "queued": [queued_chunk],
+                "replacement": [replacement_chunk],
             },
             gates={("active", 0): block_active},
         )
@@ -132,14 +201,16 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
         await active.wait()
         self.assertEqual(active.state, "cancelled")
         self.assertEqual(queued.state, "cancelled")
-        self.assertEqual(await replacement.collect(), b"r")
+        self.assertEqual(await replacement.collect(), replacement_chunk)
 
     async def test_cancel_removes_queued_session(self):
         block_active = asyncio.Event()
+        active_chunk = _pcm_silence(256, sample=110)
+        queued_chunk = _pcm_silence(128, sample=120)
         engine = _SessionEngine(
             {
-                "active": [b"a"],
-                "queued": [b"q"],
+                "active": [active_chunk],
+                "queued": [queued_chunk],
             },
             gates={("active", 0): block_active},
         )
@@ -152,13 +223,13 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued.state, "cancelled")
 
         block_active.set()
-        self.assertEqual(await active.collect(), b"a")
+        self.assertEqual(await active.collect(), active_chunk)
         self.assertEqual(await queued.collect(), b"")
 
     async def test_session_timeout_marks_failure(self):
         never_release = asyncio.Event()
         engine = _SessionEngine(
-            {"slow": [b"s"]},
+            {"slow": [_pcm_silence(256, sample=5)]},
             gates={("slow", 0): never_release},
         )
         tts = self._make_tts(engine)
@@ -171,7 +242,7 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_cancels_sessions_and_stops_engine(self):
         never_release = asyncio.Event()
         engine = _SessionEngine(
-            {"slow": [b"s"]},
+            {"slow": [_pcm_silence(256, sample=6)]},
             gates={("slow", 0): never_release},
         )
         tts = self._make_tts(engine)
