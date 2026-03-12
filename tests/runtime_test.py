@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Trillim. Licensed under the MIT License. See LICENSE.
 """Unit tests for the Runtime lifecycle manager and sync bridges."""
 
+import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
 import unittest
 
 from fastapi import APIRouter
 
 from trillim import Runtime
+import trillim.runtime as runtime_module
 from trillim.server._component import Component
 
 
@@ -123,7 +126,17 @@ class BrokenWhisper(Whisper):
         raise RuntimeError("whisper start failed")
 
 
+class BrokenStopLLM(LLM):
+    async def stop(self) -> None:
+        self.calls.append("llm.stop")
+        raise RuntimeError("llm stop failed")
+
+
 class RuntimeTests(unittest.TestCase):
+    def test_runtime_requires_components(self):
+        with self.assertRaisesRegex(ValueError, "Runtime requires at least one component"):
+            Runtime()
+
     def test_runtime_starts_in_order_and_stops_in_reverse(self):
         calls: list = []
         runtime = Runtime(LLM(calls), Whisper(calls), TTS(calls))
@@ -146,9 +159,14 @@ class RuntimeTests(unittest.TestCase):
     def test_runtime_context_manager_and_sync_wrappers(self):
         calls: list = []
         messages = [{"role": "user", "content": "hello"}]
+        llm = LLM(calls)
+        whisper = Whisper(calls)
+        tts = TTS(calls)
 
-        with Runtime(LLM(calls), Whisper(calls), TTS(calls)) as runtime:
+        with Runtime(llm, whisper, tts) as runtime:
             self.assertTrue(runtime.started)
+            self.assertEqual(runtime.components, (llm, whisper, tts))
+            self.assertIn("llm", dir(runtime))
             self.assertEqual(runtime.llm.chat(messages), "reply")
             self.assertEqual(list(runtime.llm.stream_chat(messages)), ["event-1", "event-2"])
             self.assertEqual(runtime.llm.count_tokens(messages), 1)
@@ -176,6 +194,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("session.collect", calls)
         self.assertIn("session.stop", calls)
 
+    def test_runtime_start_is_idempotent(self):
+        calls: list = []
+        runtime = Runtime(LLM(calls), Whisper(calls))
+
+        self.assertIs(runtime.start(), runtime)
+        self.assertIs(runtime.start(), runtime)
+        runtime.stop()
+
+        self.assertEqual(calls, ["llm.start", "whisper.start", "whisper.stop", "llm.stop"])
+
     def test_runtime_rolls_back_started_components_when_start_fails(self):
         calls: list = []
         runtime = Runtime(LLM(calls), BrokenWhisper(calls), TTS(calls))
@@ -186,9 +214,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.started)
         self.assertEqual(calls, ["llm.start", "whisper.start", "llm.stop"])
 
+    def test_runtime_suppresses_rollback_stop_errors_after_start_failure(self):
+        calls: list = []
+        runtime = Runtime(BrokenStopLLM(calls), BrokenWhisper(calls))
+
+        with self.assertRaisesRegex(RuntimeError, "whisper start failed"):
+            runtime.start()
+
+        self.assertFalse(runtime.started)
+        self.assertEqual(calls, ["llm.start", "whisper.start", "llm.stop"])
+
     def test_runtime_rejects_duplicate_component_types(self):
         with self.assertRaisesRegex(ValueError, "Duplicate component type"):
             Runtime(LLM([]), LLM([]))
+
+    def test_runtime_rejects_unknown_component_attribute(self):
+        runtime = Runtime(LLM([]))
+
+        with self.assertRaisesRegex(AttributeError, "has no attribute 'missing'"):
+            runtime.missing
 
     def test_runtime_method_errors_propagate(self):
         runtime = Runtime(LLM([]))
@@ -204,6 +248,93 @@ class RuntimeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
             runtime.llm.max_context_tokens
+
+        coro = asyncio.sleep(0)
+        with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
+            runtime._submit_to_loop(coro)
+        coro.close()
+
+        coro = asyncio.sleep(0)
+        with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
+            runtime._submit_coroutine(coro)
+        coro.close()
+
+    def test_runtime_stop_is_safe_before_start_and_shutdown_loop_is_idempotent(self):
+        runtime = Runtime(LLM([]))
+
+        runtime.stop()
+        runtime._shutdown_loop()
+
+        self.assertFalse(runtime.started)
+        self.assertIsNone(runtime._loop)
+        self.assertIsNone(runtime._thread)
+
+    def test_runtime_stop_propagates_component_stop_errors(self):
+        calls: list = []
+        runtime = Runtime(BrokenStopLLM(calls), Whisper(calls))
+        runtime.start()
+
+        with self.assertRaisesRegex(RuntimeError, "llm stop failed"):
+            runtime.stop()
+
+        self.assertFalse(runtime.started)
+        self.assertEqual(calls, ["llm.start", "whisper.start", "whisper.stop", "llm.stop"])
+
+    def test_runtime_stop_cancels_pending_loop_tasks(self):
+        runtime = Runtime(LLM([]))
+        runtime.start()
+        try:
+            future = runtime._submit_to_loop(asyncio.sleep(60))
+        finally:
+            runtime.stop()
+
+        with self.assertRaises(FutureCancelledError):
+            future.result()
+
+    def test_sync_async_iterator_close_and_del_are_tolerant(self):
+        calls: list = []
+        runtime = Runtime(LLM(calls))
+        runtime.start()
+        iterator = runtime.llm.stream_chat([{"role": "user", "content": "hello"}])
+        self.assertEqual(next(iterator), "event-1")
+        runtime.stop()
+
+        iterator.close()
+        iterator.close()
+
+        with self.assertRaises(StopIteration):
+            next(iterator)
+
+        raw_iterator = runtime_module._SyncAsyncIterator(runtime, _AsyncIteratorStub())
+        raw_iterator.close = _raise_close
+        raw_iterator.__del__()
+
+    def test_runtime_object_proxy_rejects_non_async_iterables(self):
+        proxy = runtime_module._RuntimeObjectProxy(Runtime(LLM([])), object())
+
+        with self.assertRaisesRegex(TypeError, "is not iterable"):
+            iter(proxy)
+
+    def test_invoke_attr_async_handles_noncallable_attributes(self):
+        component = LLM([])
+        runtime = Runtime(component)
+
+        self.assertFalse(asyncio.run(runtime._invoke_attr_async(component, "started", (), {})))
+
+        with self.assertRaisesRegex(TypeError, "'started' is not callable"):
+            asyncio.run(runtime._invoke_attr_async(component, "started", (1,), {}))
+
+
+class _AsyncIteratorStub:
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        return None
+
+
+def _raise_close():
+    raise ValueError("boom")
 
 
 if __name__ == "__main__":
