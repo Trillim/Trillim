@@ -83,6 +83,39 @@ class TTS(Component):
         self.calls.append("tts.stop")
         self.started = False
 
+    def speak(self, text: str):
+        self.calls.append(("tts.speak", text))
+        return _TTSSession(self.calls, text)
+
+
+class _TTSSession:
+    _runtime_proxy = True
+
+    def __init__(self, calls: list, text: str):
+        self.calls = calls
+        self.state = "running"
+        self._chunks = [text.encode(), b"!"]
+
+    def pause(self) -> None:
+        self.calls.append("session.pause")
+        self.state = "paused"
+
+    def resume(self) -> None:
+        self.calls.append("session.resume")
+        self.state = "running"
+
+    def stop(self) -> None:
+        self.calls.append("session.stop")
+        self.state = "cancelled"
+
+    async def collect(self) -> bytes:
+        self.calls.append("session.collect")
+        return b"".join(self._chunks)
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
 
 class BrokenWhisper(Whisper):
     async def start(self) -> None:
@@ -121,12 +154,27 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.llm.count_tokens(messages), 1)
             self.assertEqual(runtime.llm.max_context_tokens, 128)
             self.assertEqual(runtime.whisper.transcribe(b"audio"), "audio")
+            session = runtime.tts.speak("hello")
+            self.assertEqual(session.state, "running")
+            session.pause()
+            self.assertEqual(session.state, "paused")
+            session.resume()
+            self.assertEqual(session.state, "running")
+            self.assertEqual(list(session), [b"hello", b"!"])
+            self.assertEqual(session.collect(), b"hello!")
+            session.stop()
+            self.assertEqual(session.state, "cancelled")
 
         self.assertFalse(runtime.started)
         self.assertIn(("llm.chat", ("hello",)), calls)
         self.assertIn(("llm.stream_chat", ("hello",)), calls)
         self.assertIn(("llm.count_tokens", 1), calls)
         self.assertIn(("whisper.transcribe", b"audio"), calls)
+        self.assertIn(("tts.speak", "hello"), calls)
+        self.assertIn("session.pause", calls)
+        self.assertIn("session.resume", calls)
+        self.assertIn("session.collect", calls)
+        self.assertIn("session.stop", calls)
 
     def test_runtime_rolls_back_started_components_when_start_fails(self):
         calls: list = []
