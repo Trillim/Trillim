@@ -75,10 +75,12 @@ class _RuntimeObjectProxy:
         self._obj = obj
 
     def __getattr__(self, name: str):
-        attr = getattr(self._obj, name)
+        attr = self._runtime._get_object_attr(self._obj, name)
         if callable(attr):
             def _call(*args, **kwargs):
-                result = attr(*args, **kwargs)
+                result = self._runtime._invoke_object_attr(
+                    self._obj, name, args, kwargs
+                )
                 return self._runtime._syncify_result(result)
 
             return _call
@@ -87,7 +89,11 @@ class _RuntimeObjectProxy:
     def __iter__(self):
         if not hasattr(self._obj, "__aiter__"):
             raise TypeError(f"{type(self._obj).__name__!r} is not iterable")
-        return _SyncAsyncIterator(self._runtime, self._obj.__aiter__())
+        try:
+            iterator = self._runtime._invoke_object_attr(self._obj, "__aiter__", (), {})
+        except AttributeError as exc:
+            raise TypeError(f"{type(self._obj).__name__!r} is not iterable") from exc
+        return _SyncAsyncIterator(self._runtime, iterator)
 
 
 class Runtime:
@@ -249,26 +255,32 @@ class Runtime:
             raise RuntimeError("Runtime not started")
         return self._submit_to_loop(coro)
 
-    async def _get_attr_async(self, component: Component, name: str):
-        return getattr(component, name)
+    async def _get_attr_async(self, obj, name: str):
+        return getattr(obj, name)
 
-    def _get_component_attr(self, component: Component, name: str):
+    def _get_managed_attr(self, obj, name: str):
         loop = self._loop
         thread = self._thread
         if loop is None or thread is None:
             raise RuntimeError("Runtime not started")
         return asyncio.run_coroutine_threadsafe(
-            self._get_attr_async(component, name), loop
+            self._get_attr_async(obj, name), loop
         ).result()
+
+    def _get_component_attr(self, component: Component, name: str):
+        return self._get_managed_attr(component, name)
+
+    def _get_object_attr(self, obj, name: str):
+        return self._get_managed_attr(obj, name)
 
     async def _invoke_attr_async(
         self,
-        component: Component,
+        obj,
         name: str,
         args: tuple,
         kwargs: dict,
     ):
-        attr = getattr(component, name)
+        attr = getattr(obj, name)
         if not callable(attr):
             if args or kwargs:
                 raise TypeError(f"{name!r} is not callable")
@@ -285,8 +297,23 @@ class Runtime:
         args: tuple,
         kwargs: dict,
     ):
-        return self._submit_coroutine(
+        if not self._started:
+            raise RuntimeError("Runtime not started")
+        return self._submit_to_loop(
             self._invoke_attr_async(component, name, args, kwargs)
+        ).result()
+
+    def _invoke_object_attr(
+        self,
+        obj,
+        name: str,
+        args: tuple,
+        kwargs: dict,
+    ):
+        if not self._started:
+            raise RuntimeError("Runtime not started")
+        return self._submit_to_loop(
+            self._invoke_attr_async(obj, name, args, kwargs)
         ).result()
 
     def _syncify_result(self, result):
