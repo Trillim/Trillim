@@ -386,8 +386,7 @@ class TTSEngine:
         self.sample_rate = self._model.sample_rate
 
         # Discover previously-saved custom voices (states loaded lazily)
-        if self._voices_dir is not None:
-            self._voices_dir.mkdir(parents=True, exist_ok=True)
+        if self._voices_dir is not None and self._voices_dir.exists():
             for wav in sorted(self._voices_dir.glob("*.wav")):
                 voice_id = wav.stem
                 if voice_id not in PREDEFINED_VOICES:
@@ -477,6 +476,7 @@ class TTSEngine:
 
         if not voice_id or voice_id in (".", "..") or "/" in voice_id or "\\" in voice_id or voice_id != Path(voice_id).name:
             raise ValueError(f"Invalid voice_id: {voice_id!r} (must be a simple filename)")
+        self._voices_dir.mkdir(parents=True, exist_ok=True)
         dest = self._voices_dir / f"{voice_id}.wav"
         with tempfile.NamedTemporaryFile(
             dir=self._voices_dir,
@@ -813,7 +813,6 @@ class TTS(Component):
         speed: float = _DEFAULT_SPEED,
     ):
         self._voices_dir = Path(voices_dir)
-        self._voices_dir.mkdir(parents=True, exist_ok=True)
         self._engine = None
         self._default_voice = default_voice
         self._speed = _validate_speed(speed)
