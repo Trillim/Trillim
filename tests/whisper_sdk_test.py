@@ -4,6 +4,7 @@
 import asyncio
 import builtins
 import io
+import struct
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -152,6 +153,42 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
             self.assertEqual(wav_file.getframerate(), 22050)
             self.assertEqual(wav_file.getnframes(), 3)
+
+    async def test_transcribe_array_centers_unsigned_mono_samples(self):
+        engine = _FakeWhisperEngine()
+        whisper = self._make_whisper(engine)
+
+        await whisper.transcribe_array(
+            _ArrayLike([128, 255, 0], kind="u", itemsize=1),
+            sample_rate=16000,
+        )
+
+        wav_bytes, _ = engine.calls[-1]
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            self.assertEqual(
+                struct.unpack("<3h", wav_file.readframes(3)),
+                (0, 32511, -32767),
+            )
+
+    async def test_transcribe_array_centers_unsigned_multichannel_samples(self):
+        engine = _FakeWhisperEngine()
+        whisper = self._make_whisper(engine)
+
+        await whisper.transcribe_array(
+            _ArrayLike(
+                [[128, 128, 255], [128, 0, 255]],
+                kind="u",
+                itemsize=1,
+            ),
+            sample_rate=16000,
+        )
+
+        wav_bytes, _ = engine.calls[-1]
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            self.assertEqual(
+                struct.unpack("<3h", wav_file.readframes(3)),
+                (0, -16384, 32511),
+            )
 
     async def test_transcribe_array_rejects_invalid_input(self):
         whisper = self._make_whisper(_FakeWhisperEngine())
@@ -315,8 +352,13 @@ class WhisperHelperEdgeCaseTests(unittest.TestCase):
         )
         self.assertEqual(
             whisper_module._infer_scale_hint(_ArrayLike([1], kind="u", itemsize=1)),
-            255.0,
+            128.0,
         )
+        self.assertEqual(
+            whisper_module._infer_zero_point(_ArrayLike([1], kind="u", itemsize=1)),
+            128.0,
+        )
+        self.assertEqual(whisper_module._infer_zero_point([1.0]), 0.0)
 
         with self.assertRaisesRegex(TypeError, "Unsupported sample value"):
             whisper_module._infer_scale_hint([True, object()])
@@ -340,6 +382,10 @@ class WhisperHelperEdgeCaseTests(unittest.TestCase):
         self.assertEqual(whisper_module._normalize_scalar(True, scale_hint=None), 1.0)
         self.assertEqual(whisper_module._normalize_scalar(10.0, scale_hint=2.0), 1.0)
         self.assertEqual(whisper_module._normalize_scalar(-10.0, scale_hint=2.0), -1.0)
+        self.assertEqual(
+            whisper_module._normalize_scalar(128, scale_hint=128.0, zero_point=128.0),
+            0.0,
+        )
         self.assertEqual(whisper_module._float_to_int16(2.0), 32767)
         self.assertEqual(whisper_module._float_to_int16(-2.0), -32768)
         self.assertTrue(whisper_module._is_sequence(_ArrayLike([1.0])))
