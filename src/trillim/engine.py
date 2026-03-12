@@ -125,6 +125,7 @@ class InferenceEngine:
             proc = self.process
             if proc is None or proc.returncode is not None:
                 raise RuntimeError("Inference process is not running")
+            completed = False
 
             async def _raise_engine_crash() -> None:
                 self.cached_token_ids = []
@@ -141,116 +142,137 @@ class InferenceEngine:
                     msg += f": {stderr}"
                 raise RuntimeError(msg)
 
-            # String-level prefix matching (mirrors CLI chat approach):
-            # Compare rendered prompt strings to avoid re-tokenization mismatches.
-            if (
-                prompt_str is not None
-                and self._cached_prompt_str
-                and prompt_str.startswith(self._cached_prompt_str)
-            ):
-                suffix = prompt_str[len(self._cached_prompt_str) :]
-                delta_tokens = self.tokenizer.encode(suffix, add_special_tokens=False)
-                all_token_ids = self.cached_token_ids + delta_tokens
-                reset_flag = 0
-                match_len = len(self.cached_token_ids)
-            elif prompt_str is not None:
-                # String mismatch — different conversation, full reset.
-                # Do NOT fall through to token-level matching: shared
-                # template-header tokens could trick it into reusing a
-                # stale KV cache from the previous conversation.
-                delta_tokens = token_ids
-                reset_flag = 1
-                match_len = 0
-                all_token_ids = token_ids
-            else:
-                # Token-level prefix matching (for /v1/completions with no template)
-                cached = self.cached_token_ids
-                match_len = 0
-                limit = min(len(token_ids), len(cached))
-                while match_len < limit and token_ids[match_len] == cached[match_len]:
-                    match_len += 1
-
-                if match_len > 0 and match_len == len(cached):
-                    delta_tokens = token_ids[match_len:]
+            try:
+                # String-level prefix matching (mirrors CLI chat approach):
+                # Compare rendered prompt strings to avoid re-tokenization mismatches.
+                if (
+                    prompt_str is not None
+                    and self._cached_prompt_str
+                    and prompt_str.startswith(self._cached_prompt_str)
+                ):
+                    suffix = prompt_str[len(self._cached_prompt_str) :]
+                    delta_tokens = self.tokenizer.encode(
+                        suffix, add_special_tokens=False
+                    )
+                    all_token_ids = self.cached_token_ids + delta_tokens
                     reset_flag = 0
-                else:
+                    match_len = len(self.cached_token_ids)
+                elif prompt_str is not None:
+                    # String mismatch — different conversation, full reset.
+                    # Do NOT fall through to token-level matching: shared
+                    # template-header tokens could trick it into reusing a
+                    # stale KV cache from the previous conversation.
                     delta_tokens = token_ids
                     reset_flag = 1
                     match_len = 0
-                all_token_ids = token_ids
+                    all_token_ids = token_ids
+                else:
+                    # Token-level prefix matching (for /v1/completions with no template)
+                    cached = self.cached_token_ids
+                    match_len = 0
+                    limit = min(len(token_ids), len(cached))
+                    while match_len < limit and token_ids[match_len] == cached[match_len]:
+                        match_len += 1
 
-            self._last_cache_hit = match_len
+                    if match_len > 0 and match_len == len(cached):
+                        delta_tokens = token_ids[match_len:]
+                        reset_flag = 0
+                    else:
+                        delta_tokens = token_ids
+                        reset_flag = 1
+                        match_len = 0
+                    all_token_ids = token_ids
 
-            # Build count-prefixed key=value request block
-            from trillim.utils import _build_request_block
+                self._last_cache_hit = match_len
 
-            req_block = _build_request_block(
-                delta_tokens, reset_flag,
-                temperature=temp, top_k=tk, top_p=tp,
-                repetition_penalty=rp, rep_penalty_lookback=rl,
-                max_tokens=mt or None,
-            )
-            try:
-                proc.stdin.write(req_block.encode())
-                await asyncio.wait_for(proc.stdin.drain(), timeout=_ENGINE_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise RuntimeError(
-                    f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
-                    "the model may be too large for available memory"
+                # Build count-prefixed key=value request block
+                from trillim.utils import _build_request_block
+
+                req_block = _build_request_block(
+                    delta_tokens,
+                    reset_flag,
+                    temperature=temp,
+                    top_k=tk,
+                    top_p=tp,
+                    repetition_penalty=rp,
+                    rep_penalty_lookback=rl,
+                    max_tokens=mt or None,
                 )
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                await _raise_engine_crash()
-
-            # Read generated tokens until EOS
-            generated_tokens: list[int] = []
-            while True:
                 try:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=_ENGINE_TIMEOUT
-                    )
+                    proc.stdin.write(req_block.encode())
+                    await asyncio.wait_for(proc.stdin.drain(), timeout=_ENGINE_TIMEOUT)
                 except asyncio.TimeoutError:
                     proc.kill()
                     raise RuntimeError(
                         f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
                         "the model may be too large for available memory"
                     )
-                if not line:
+                except (BrokenPipeError, ConnectionResetError, OSError):
                     await _raise_engine_crash()
-                try:
-                    token_id = int(line.strip())
-                except ValueError:
-                    proc.kill()
-                    raise RuntimeError(
-                        f"Protocol error: expected int token_id, got {line.strip()!r}"
-                    )
-                generated_tokens.append(token_id)
-                if token_id in self.stop_tokens:
-                    break
-                yield token_id
 
-            # Read kv_position and update cache state
-            try:
-                kv_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=_ENGINE_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                self.cached_token_ids = []
-                self._last_cache_hit = 0
-                self._cached_prompt_str = ""
-                raise RuntimeError(
-                    f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
-                    "the model may be too large for available memory"
-                )
-            if kv_line:
+                # Read generated tokens until EOS
+                generated_tokens: list[int] = []
+                while True:
+                    try:
+                        line = await asyncio.wait_for(
+                            proc.stdout.readline(), timeout=_ENGINE_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        raise RuntimeError(
+                            f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
+                            "the model may be too large for available memory"
+                        )
+                    if not line:
+                        await _raise_engine_crash()
+                    try:
+                        token_id = int(line.strip())
+                    except ValueError:
+                        proc.kill()
+                        raise RuntimeError(
+                            f"Protocol error: expected int token_id, got {line.strip()!r}"
+                        )
+                    generated_tokens.append(token_id)
+                    if token_id in self.stop_tokens:
+                        break
+                    yield token_id
+
+                # Read kv_position and update cache state
                 try:
-                    kv_position = int(kv_line.strip())
-                except ValueError:
-                    proc.kill()
-                    raise RuntimeError(
-                        f"Protocol error: expected int kv_position, got {kv_line.strip()!r}"
+                    kv_line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=_ENGINE_TIMEOUT
                     )
-                self.cached_token_ids = (all_token_ids + generated_tokens)[:kv_position]
-            else:
-                await _raise_engine_crash()
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    self.cached_token_ids = []
+                    self._last_cache_hit = 0
+                    self._cached_prompt_str = ""
+                    raise RuntimeError(
+                        f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
+                        "the model may be too large for available memory"
+                    )
+                if kv_line:
+                    try:
+                        kv_position = int(kv_line.strip())
+                    except ValueError:
+                        proc.kill()
+                        raise RuntimeError(
+                            "Protocol error: expected int kv_position, "
+                            f"got {kv_line.strip()!r}"
+                        )
+                    self.cached_token_ids = (all_token_ids + generated_tokens)[
+                        :kv_position
+                    ]
+                else:
+                    await _raise_engine_crash()
+                completed = True
+            finally:
+                if not completed:
+                    self.cached_token_ids = []
+                    self._last_cache_hit = 0
+                    self._cached_prompt_str = ""
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass

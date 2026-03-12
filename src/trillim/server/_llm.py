@@ -198,19 +198,44 @@ class LLM(Component):
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
-        full_text, _ = await run_with_timeout(
-            self._collect_chat(
-                messages,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                max_tokens=max_tokens,
-            ),
-            timeout,
-            "LLM chat",
-        )
+        try:
+            full_text, _ = await run_with_timeout(
+                self._collect_chat(
+                    messages,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    max_tokens=max_tokens,
+                ),
+                timeout,
+                "LLM chat",
+            )
+        except TimeoutError:
+            await self._restart_after_timeout("LLM chat")
+            raise
         return full_text
+
+    async def _restart_after_timeout(self, operation: str) -> None:
+        if self._swap_lock is None:
+            self._swap_lock = asyncio.Lock()
+
+        async with self._swap_lock:
+            self.state = ServerState.SWAPPING
+            result = await self._swap_engine(
+                self._model_dir,
+                adapter_dir=self._adapter_dir,
+                harness_name=self._harness_name,
+                search_provider=self._search_provider,
+                num_threads=self._num_threads,
+                lora_quant=self._lora_quant,
+                unembed_quant=self._unembed_quant,
+            )
+
+        if result.status == "error":
+            raise RuntimeError(
+                f"{operation} timed out and engine restart failed: {result.message}"
+            )
 
     def _create_harness(
         self,
