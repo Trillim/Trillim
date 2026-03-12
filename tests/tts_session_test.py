@@ -78,6 +78,15 @@ class TTSSessionTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_speak_snapshots_explicit_speed_per_session(self):
+        engine = _SessionEngine({"hello": [b"a"]})
+        tts = self._make_tts(engine)
+
+        session = tts.speak("hello", speed=1.5)
+
+        self.assertEqual(await session.collect(), b"a")
+        self.assertEqual(engine.calls, [("hello", None, 1.5)])
+
     async def test_pause_and_resume_gate_future_chunk_production(self):
         release_second = asyncio.Event()
         engine = _SessionEngine(

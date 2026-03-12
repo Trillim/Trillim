@@ -1,10 +1,12 @@
 # Copyright (c) 2026 Trillim. Licensed under the MIT License. See LICENSE.
 """Unit tests for the public TTS SDK helpers."""
 
+import asyncio
+import threading
 import unittest
 
 from trillim.server._models import SpeechRequest
-from trillim.server._tts import TTSEngine, _stretch_pcm_bytes
+from trillim.server._tts import TTSEngine, _StreamingPCMStretcher
 import trillim
 from trillim import SentenceChunker
 from trillim.server import TTS
@@ -78,6 +80,19 @@ class _FakeStreamingModel:
 
     def get_state_for_audio_prompt(self, prompt, truncate=False):
         return {"prompt": prompt, "truncate": truncate}
+
+
+class _GatedStreamingModel(_FakeStreamingModel):
+    def __init__(self, chunks, gates):
+        super().__init__(chunks)
+        self._gates = gates
+
+    def generate_audio_stream(self, **_):
+        for index, chunk in enumerate(self._chunks):
+            gate = self._gates.get(index)
+            if gate is not None:
+                gate.wait(timeout=1.0)
+            yield _FakeTensor(chunk)
 
 
 class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
@@ -222,8 +237,10 @@ class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
         sample_rate = 24000
         pcm = _sine_pcm_bytes(sample_rate=sample_rate, frequency_hz=440.0, duration_s=1.0)
 
-        slower = _stretch_pcm_bytes(pcm, 0.5)
-        faster = _stretch_pcm_bytes(pcm, 2.0)
+        slower_stretcher = _StreamingPCMStretcher(0.5)
+        slower = b"".join([slower_stretcher.push(pcm), slower_stretcher.finish()])
+        faster_stretcher = _StreamingPCMStretcher(2.0)
+        faster = b"".join([faster_stretcher.push(pcm), faster_stretcher.finish()])
 
         self.assertGreater(len(slower), len(pcm))
         self.assertLess(len(faster), len(pcm))
@@ -248,29 +265,68 @@ class TTSSdkTests(unittest.IsolatedAsyncioTestCase):
             delta=25.0,
         )
 
-    async def test_pcm_stretcher_returns_original_bytes_for_identity_speed(self):
-        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.2)
-
-        self.assertEqual(_stretch_pcm_bytes(pcm, 1.0), pcm)
-
     async def test_pcm_stretcher_handles_empty_pcm(self):
-        self.assertEqual(_stretch_pcm_bytes(b"", 1.5), b"")
+        stretcher = _StreamingPCMStretcher(1.5)
+        self.assertEqual(b"".join([stretcher.push(b""), stretcher.finish()]), b"")
 
-    async def test_engine_synthesize_stream_applies_speed_after_full_synthesis(self):
-        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.25)
-        chunk_a = _pcm_bytes_to_float_samples(pcm[: len(pcm) // 2])
-        chunk_b = _pcm_bytes_to_float_samples(pcm[len(pcm) // 2 :])
-        engine = TTSEngine(speed=1.0)
-        engine._model = _FakeStreamingModel([chunk_a, chunk_b])
-        engine._voice_states["alba"] = {"prompt": "alba"}
+    async def test_pcm_stretcher_handles_tiny_pcm(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.0008)
+
+        stretcher = _StreamingPCMStretcher(2.0)
+        stretched = b"".join([stretcher.push(pcm), stretcher.finish()])
+
+        self.assertTrue(stretched)
+        self.assertLessEqual(len(stretched), len(pcm))
+
+    async def test_pcm_stretcher_handles_short_pcm(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.03)
+        stretcher = _StreamingPCMStretcher(2.0)
+        stretched = b"".join([stretcher.push(pcm), stretcher.finish()])
+
+        self.assertTrue(stretched)
+        self.assertLess(len(stretched), len(pcm))
+
+    async def test_streaming_pcm_stretcher_handles_odd_byte_boundaries(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.15)
+        stretcher = _StreamingPCMStretcher(1.5)
+
+        pieces = [
+            stretcher.push(pcm[:101]),
+            stretcher.push(pcm[101:733]),
+            stretcher.push(pcm[733:]),
+            stretcher.finish(),
+        ]
+        stretched = b"".join(pieces)
+
+        self.assertTrue(stretched)
+        self.assertAlmostEqual(
+            _dominant_frequency_hz(stretched, 24000),
+            440.0,
+            delta=35.0,
+        )
+
+    async def test_engine_synthesize_stream_applies_speed_progressively(self):
+        pcm = _sine_pcm_bytes(sample_rate=24000, frequency_hz=440.0, duration_s=0.4)
+        release_second = threading.Event()
+        chunk_a = _pcm_bytes_to_float_samples(pcm[:4096])
+        chunk_b = _pcm_bytes_to_float_samples(pcm[4096:])
+        normal_engine = TTSEngine(speed=1.0)
+        normal_engine._model = _FakeStreamingModel([chunk_a, chunk_b])
+        normal_engine._voice_states["alba"] = {"prompt": "alba"}
+        fast_engine = TTSEngine(speed=1.0)
+        fast_engine._model = _GatedStreamingModel([chunk_a, chunk_b], {1: release_second})
+        fast_engine._voice_states["alba"] = {"prompt": "alba"}
 
         normal = b"".join(
-            [chunk async for chunk in engine.synthesize_stream("hello", speed=1.0)]
+            [chunk async for chunk in normal_engine.synthesize_stream("hello", speed=1.0)]
         )
-        faster = b"".join(
-            [chunk async for chunk in engine.synthesize_stream("hello", speed=2.0)]
-        )
+        iterator = fast_engine.synthesize_stream("hello", speed=2.0).__aiter__()
+        first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=0.5)
+        release_second.set()
+        remaining = [chunk async for chunk in iterator]
+        faster = b"".join([first_chunk, *remaining])
 
+        self.assertTrue(first_chunk)
         self.assertGreater(len(normal), len(faster))
         self.assertAlmostEqual(
             _dominant_frequency_hz(faster, 24000),
