@@ -516,11 +516,16 @@ class TTSRouterTests(unittest.TestCase):
         tts = TTS()
         tts._engine = _ManagedComponentEngine(voices_dir=Path(tempfile.mkdtemp()), default_voice="alba", speed=1.0)
         tts._loop = _LoopStub()
-        tts.list_voices = lambda: [{"voice_id": "alba", "name": "alba", "type": "predefined"}]
+        tts.list_voices = lambda: [
+            {"voice_id": "alba", "name": "alba", "type": "predefined"},
+            {"voice_id": "custom", "name": "custom", "type": "custom"},
+        ]
         tts.register_voice = AsyncMock(return_value=None)
         tts.delete_voice = AsyncMock(return_value=None)
+        synthesize_calls = []
 
         async def synthesize_stream(*args, **kwargs):
+            synthesize_calls.append((args, kwargs))
             yield b"pcm"
 
         tts.synthesize_stream = synthesize_stream
@@ -583,10 +588,30 @@ class TTSRouterTests(unittest.TestCase):
                 client.post("/v1/audio/speech", json={"input": "hi", "speed": 5.0}).status_code,
                 400,
             )
+            self.assertEqual(
+                client.post(
+                    "/v1/audio/speech",
+                    json={"input": "hi", "voice": "missing", "response_format": "pcm"},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.post(
+                    "/v1/audio/speech",
+                    json={"input": "hi", "voice": "missing"},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(synthesize_calls, [])
 
             response = client.post(
                 "/v1/audio/speech",
-                json={"input": "hi", "response_format": "pcm", "speed": 1.5},
+                json={
+                    "input": "hi",
+                    "voice": "custom",
+                    "response_format": "pcm",
+                    "speed": 1.5,
+                },
             )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.content, b"pcm")
@@ -598,6 +623,19 @@ class TTSRouterTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.content.startswith(b"RIFF"))
+            self.assertEqual(
+                synthesize_calls,
+                [
+                    (
+                        ("hi",),
+                        {"voice": "custom", "speed": 1.5},
+                    ),
+                    (
+                        ("hi",),
+                        {"voice": "alba", "speed": 1.0},
+                    ),
+                ],
+            )
 
 
 if __name__ == "__main__":

@@ -283,6 +283,7 @@ Request body:
 | `response_format` | string | `"wav"` | `"wav"` or `"pcm"` |
 
 `speed` is fixed for the lifetime of a single `/v1/audio/speech` request. Dynamic mid-stream speed changes are only available through the direct Python `TTS` component session API.
+Unknown `voice` IDs return `400` before the audio stream starts. Use `GET /v1/voices` to discover valid IDs.
 
 ### `GET /v1/voices`
 
