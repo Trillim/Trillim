@@ -145,19 +145,34 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(wav_file.getsampwidth(), 2)
             self.assertEqual(wav_file.getnframes(), 3)
 
-    async def test_transcribe_array_accepts_channels_first_layout(self):
+    async def test_transcribe_array_accepts_explicit_channels_first_layout(self):
         engine = _FakeWhisperEngine()
         whisper = self._make_whisper(engine)
 
         await whisper.transcribe_array(
             [[0.25, 0.5, 0.75], [-0.25, -0.5, -0.75]],
             sample_rate=22050,
+            channel_axis=0,
         )
 
         wav_bytes, _ = engine.calls[-1]
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
             self.assertEqual(wav_file.getframerate(), 22050)
             self.assertEqual(wav_file.getnframes(), 3)
+
+    async def test_transcribe_array_defaults_short_2d_input_to_frames_first(self):
+        engine = _FakeWhisperEngine()
+        whisper = self._make_whisper(engine)
+
+        await whisper.transcribe_array(
+            [[0.25, 0.5, 0.75], [-0.25, -0.5, -0.75]],
+            sample_rate=16000,
+        )
+
+        wav_bytes, _ = engine.calls[-1]
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            self.assertEqual(wav_file.getframerate(), 16000)
+            self.assertEqual(wav_file.getnframes(), 2)
 
     async def test_transcribe_array_centers_unsigned_mono_samples(self):
         engine = _FakeWhisperEngine()
@@ -186,6 +201,7 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
                 itemsize=1,
             ),
             sample_rate=16000,
+            channel_axis=0,
         )
 
         wav_bytes, _ = engine.calls[-1]
@@ -206,6 +222,13 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(TypeError, "array-like sequence"):
             await whisper.transcribe_array(b"raw-bytes", sample_rate=16000)
+
+        with self.assertRaisesRegex(ValueError, "channel_axis must be None, 0, or 1"):
+            await whisper.transcribe_array(
+                [[0.1, 0.2], [0.3, 0.4]],
+                sample_rate=16000,
+                channel_axis=2,
+            )
 
     async def test_transcribe_methods_support_timeout(self):
         whisper = self._make_whisper(_SlowWhisperEngine())
@@ -350,6 +373,16 @@ class WhisperHelperEdgeCaseTests(unittest.TestCase):
             whisper_module._collapse_channels([[]])
         with self.assertRaisesRegex(ValueError, "consistent shape"):
             whisper_module._collapse_channels([[1.0], [1.0, 2.0]])
+        with self.assertRaisesRegex(ValueError, "channel_axis must be None, 0, or 1"):
+            whisper_module._collapse_channels([[1.0, 2.0]], channel_axis=3)
+
+        self.assertEqual(
+            whisper_module._collapse_channels(
+                [[0.25, 0.5], [-0.25, -0.5]],
+                channel_axis=0,
+            ),
+            [0.0, 0.0],
+        )
 
         self.assertEqual(
             whisper_module._infer_scale_hint(_ArrayLike([1], kind="i", itemsize=2)),
