@@ -5,6 +5,7 @@ import asyncio
 import functools
 import re
 import struct
+from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -24,6 +25,7 @@ _DEFAULT_SPEED = 1.0
 _MIN_SPEED = 0.25
 _MAX_SPEED = 4.0
 _PCM_STREAM_CHUNK_BYTES = 4096
+_SESSION_END = object()
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +509,118 @@ class SentenceChunker:
 
 
 # ---------------------------------------------------------------------------
+# TTS sessions
+# ---------------------------------------------------------------------------
+
+
+class TTSSession:
+    """Application-facing TTS session.
+
+    Sessions are async iterable and expose flow-control methods for future
+    chunk production. They do not own speaker playback.
+    """
+
+    _runtime_proxy = True
+
+    def __init__(
+        self,
+        tts,
+        *,
+        text: str,
+        voice: str | None,
+        speed: float,
+        timeout: float | None,
+    ):
+        if tts._loop is None:
+            raise RuntimeError("TTS not started")
+        self._tts = tts
+        self._loop = tts._loop
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
+        self._chunks: asyncio.Queue[bytes | object] = asyncio.Queue()
+        self._done = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._state = "queued"
+        self._error: Exception | None = None
+        self.text = text
+        self.voice = voice
+        self.speed = speed
+        self.timeout = timeout
+        self.sample_rate = tts.sample_rate
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    @property
+    def error(self) -> Exception | None:
+        return self._error
+
+    def pause(self) -> None:
+        self._schedule(self._tts._pause_session, self)
+
+    def resume(self) -> None:
+        self._schedule(self._tts._resume_session, self)
+
+    def stop(self) -> None:
+        self.cancel()
+
+    def cancel(self) -> None:
+        self._schedule(self._tts._cancel_session, self)
+
+    def _schedule(self, callback, *args) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self._loop:
+            callback(*args)
+            return
+        self._loop.call_soon_threadsafe(callback, *args)
+
+    def _set_state(self, state: str) -> None:
+        if self._done.is_set():
+            return
+        self._state = state
+
+    def _finish(self, state: str, error: Exception | None = None) -> None:
+        if self._done.is_set():
+            return
+        self._state = state
+        self._error = error
+        self._chunks.put_nowait(_SESSION_END)
+        self._done.set()
+
+    def __aiter__(self):
+        return self._stream()
+
+    async def _stream(self):
+        while True:
+            item = await self._chunks.get()
+            if item is _SESSION_END:
+                break
+            yield item
+        if self._error is not None:
+            raise self._error
+
+    async def wait(self) -> None:
+        await self._done.wait()
+        if self._error is not None:
+            raise self._error
+
+    async def collect(self) -> bytes:
+        output = bytearray()
+        async for chunk in self:
+            output.extend(chunk)
+        return bytes(output)
+
+
+# ---------------------------------------------------------------------------
 # TTS component
 # ---------------------------------------------------------------------------
 
@@ -525,8 +639,14 @@ class TTS(Component):
         self._engine = None
         self._default_voice = default_voice
         self._speed = _validate_speed(speed)
+        self._loop = None
+        self._active_session = None
+        self._queued_sessions = deque()
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._active_session = None
+        self._queued_sessions.clear()
         self._engine = TTSEngine(
             voices_dir=self._voices_dir,
             default_voice=self._default_voice,
@@ -535,8 +655,22 @@ class TTS(Component):
         await self._engine.start()
 
     async def stop(self) -> None:
+        sessions: list[TTSSession] = []
+        if self._active_session is not None:
+            sessions.append(self._active_session)
+        sessions.extend(self._queued_sessions)
+        self._cancel_all_sessions()
+        if sessions:
+            await asyncio.gather(
+                *(session._done.wait() for session in sessions),
+                return_exceptions=True,
+            )
         if self._engine is not None:
             await self._engine.stop()
+            self._engine = None
+        self._loop = None
+        self._active_session = None
+        self._queued_sessions.clear()
 
     @property
     def engine(self):
@@ -551,6 +685,15 @@ class TTS(Component):
     def _validate_input_text(text: str) -> None:
         if not text.strip():
             raise ValueError("input text is empty")
+
+    @staticmethod
+    def _validate_timeout(timeout: float | None) -> float | None:
+        if timeout is None:
+            return None
+        timeout = float(timeout)
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        return timeout
 
     @property
     def default_voice(self) -> str:
@@ -627,6 +770,143 @@ class TTS(Component):
             voice=voice,
             speed=speed,
         )
+
+    def speak(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        speed: float | None = None,
+        timeout: float | None = None,
+        interrupt: bool = False,
+    ) -> TTSSession:
+        self._validate_input_text(text)
+        self._require_started()
+        resolved_speed = self.speed if speed is None else _validate_speed(speed)
+        resolved_timeout = self._validate_timeout(timeout)
+        session = TTSSession(
+            self,
+            text=text,
+            voice=voice,
+            speed=resolved_speed,
+            timeout=resolved_timeout,
+        )
+        if interrupt:
+            self._cancel_all_sessions()
+        if self._active_session is None:
+            self._start_session(session)
+        else:
+            self._queued_sessions.append(session)
+            session._set_state("queued")
+        return session
+
+    def _start_session(self, session: TTSSession) -> None:
+        if self._loop is None:
+            raise RuntimeError("TTS not started")
+        self._active_session = session
+        session._set_state(
+            "running" if session._resume_event.is_set() else "paused"
+        )
+        session._task = self._loop.create_task(self._run_session(session))
+
+    def _start_next_session(self) -> None:
+        if self._active_session is not None:
+            return
+        while self._queued_sessions:
+            session = self._queued_sessions.popleft()
+            if session.done:
+                continue
+            self._start_session(session)
+            return
+
+    def _pause_session(self, session: TTSSession) -> None:
+        if session.done:
+            return
+        session._resume_event.clear()
+        session._set_state("paused")
+
+    def _resume_session(self, session: TTSSession) -> None:
+        if session.done:
+            return
+        session._resume_event.set()
+        if self._active_session is session:
+            session._set_state("running")
+        elif session in self._queued_sessions:
+            session._set_state("queued")
+
+    def _cancel_session(self, session: TTSSession) -> None:
+        if session.done:
+            return
+        if session is self._active_session:
+            session._set_state("cancelled")
+            if session._task is not None:
+                session._task.cancel()
+                session._task.add_done_callback(
+                    lambda _task, current=session: current._finish("cancelled")
+                )
+            else:
+                session._finish("cancelled")
+            return
+        try:
+            self._queued_sessions.remove(session)
+        except ValueError:
+            pass
+        session._finish("cancelled")
+
+    def _cancel_all_sessions(self) -> None:
+        if self._active_session is not None:
+            active = self._active_session
+            self._cancel_session(active)
+            self._active_session = None
+        while self._queued_sessions:
+            self._queued_sessions.popleft()._finish("cancelled")
+
+    async def _drain_session(self, session: TTSSession, iterator) -> None:
+        while True:
+            await session._resume_event.wait()
+            if session.state == "cancelled":
+                return
+            try:
+                chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+            await session._resume_event.wait()
+            if session.state == "cancelled":
+                return
+            session._chunks.put_nowait(chunk)
+
+    async def _run_session(self, session: TTSSession) -> None:
+        engine = self._require_started()
+        iterator = engine.synthesize_stream(
+            session.text,
+            voice=session.voice,
+            speed=session.speed,
+        ).__aiter__()
+        try:
+            if session.timeout is None:
+                await self._drain_session(session, iterator)
+            else:
+                try:
+                    async with asyncio.timeout(session.timeout):
+                        await self._drain_session(session, iterator)
+                except TimeoutError as exc:
+                    message = f"TTS session timed out after {session.timeout} seconds"
+                    session._finish("failed", TimeoutError(message))
+                    return
+            if session.state != "cancelled":
+                session._finish("completed")
+        except asyncio.CancelledError:
+            session._finish("cancelled")
+        except Exception as exc:
+            session._finish("failed", exc)
+        finally:
+            try:
+                await iterator.aclose()
+            except Exception:
+                pass
+            if self._active_session is session:
+                self._active_session = None
+            self._start_next_session()
 
     def router(self) -> APIRouter:
         docs_path = Path(__file__).resolve().parents[1] / "docs" / "server.md"
