@@ -264,7 +264,7 @@ Response:
 
 ### `POST /v1/audio/speech`
 
-Convert text to speech. The response is a WAV or PCM audio stream.
+Convert text to speech. The response is a WAV or PCM audio stream. Speech starts streaming progressively even when `speed` is set, with bounded lookahead rather than full-utterance buffering.
 
 ```bash
 curl http://localhost:8000/v1/audio/speech \
