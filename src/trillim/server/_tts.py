@@ -5,6 +5,7 @@ import asyncio
 import functools
 import re
 import struct
+import tempfile
 import threading
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -477,15 +478,32 @@ class TTSEngine:
         if not voice_id or voice_id in (".", "..") or "/" in voice_id or "\\" in voice_id or voice_id != Path(voice_id).name:
             raise ValueError(f"Invalid voice_id: {voice_id!r} (must be a simple filename)")
         dest = self._voices_dir / f"{voice_id}.wav"
-        dest.write_bytes(audio_bytes)
+        with tempfile.NamedTemporaryFile(
+            dir=self._voices_dir,
+            prefix=f"{voice_id}.",
+            suffix=".wav",
+            delete=False,
+        ) as handle:
+            handle.write(audio_bytes)
+            temp_path = Path(handle.name)
 
-        # Evict stale cached state when re-registering the same id
-        self._voice_states.pop(voice_id, None)
-        self._custom_voice_files[voice_id] = dest
-
-        # Pre-compute voice state (blocking, run in executor)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._get_voice_state, voice_id)
+        try:
+            state = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._model.get_state_for_audio_prompt,
+                    temp_path,
+                    truncate=True,
+                ),
+            )
+            temp_path.replace(dest)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        self._custom_voice_files[voice_id] = dest
+        self._voice_states[voice_id] = state
 
     async def delete_voice(self, voice_id: str) -> None:
         """Remove a custom voice (both the cached state and the WAV file)."""

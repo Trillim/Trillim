@@ -243,6 +243,35 @@ class TTSEngineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Invalid voice_id"):
             await engine.register_voice("../bad", b"bytes")
 
+        voices_dir = Path(tempfile.mkdtemp())
+        engine = TTSEngine(voices_dir=voices_dir)
+        model = _FakePocketModel()
+
+        def fail_custom_voice(prompt, truncate=False):
+            model.state_calls.append((prompt, truncate))
+            if isinstance(prompt, Path):
+                raise ValueError("bad voice")
+            return {"prompt": prompt, "truncate": truncate}
+
+        model.get_state_for_audio_prompt = fail_custom_voice
+        engine._model = model
+        with self.assertRaisesRegex(ValueError, "bad voice"):
+            await engine.register_voice("voice", b"bytes")
+        self.assertFalse((voices_dir / "voice.wav").exists())
+        self.assertNotIn("voice", engine._custom_voice_files)
+        self.assertNotIn("voice", engine._voice_states)
+
+        existing_voice = voices_dir / "voice.wav"
+        existing_voice.write_bytes(b"old-bytes")
+        engine._custom_voice_files["voice"] = existing_voice
+        engine._voice_states["voice"] = {"prompt": "old", "truncate": True}
+        with self.assertRaisesRegex(ValueError, "bad voice"):
+            await engine.register_voice("voice", b"new-bytes")
+        self.assertEqual(existing_voice.read_bytes(), b"old-bytes")
+        self.assertEqual(engine._custom_voice_files["voice"], existing_voice)
+        self.assertEqual(engine._voice_states["voice"], {"prompt": "old", "truncate": True})
+        self.assertEqual(sorted(path.name for path in voices_dir.glob("*.wav")), ["voice.wav"])
+
         with self.assertRaisesRegex(ValueError, "cannot be deleted"):
             await engine.delete_voice("alba")
         with self.assertRaisesRegex(KeyError, "not found"):
