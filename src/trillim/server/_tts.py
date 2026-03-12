@@ -1178,6 +1178,15 @@ class TTS(Component):
                 speed = _validate_speed(req.speed)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
+            if req.voice is not None:
+                known_voices = {
+                    entry["voice_id"] for entry in tts.list_voices()
+                }
+                if req.voice not in known_voices:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown voice: {req.voice}",
+                    )
 
             if req.response_format == "pcm":
                 return StreamingResponse(
