@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 
 from trillim.events import ChatDoneEvent, ChatFinalTextEvent, ChatSearchResultEvent
+from trillim.harnesses._base import Harness
 from trillim.harnesses._default import DefaultHarness
 from trillim.harnesses._search import SearchHarness
 from trillim.server import LLM
@@ -20,6 +21,23 @@ class _FakeTokenizer:
 
     def decode(self, token_ids, skip_special_tokens: bool = True):
         return "".join(chr(token_id) for token_id in token_ids)
+
+
+class _TemplateTokenizer(_FakeTokenizer):
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.template_calls: list[tuple[tuple[tuple[str, str], ...], bool]] = []
+        self.encode_calls: list[tuple[str, bool]] = []
+
+    def apply_chat_template(self, messages, tokenize: bool = False, add_generation_prompt: bool = False):
+        normalized = tuple((m["role"], m["content"]) for m in messages)
+        self.template_calls.append((normalized, add_generation_prompt))
+        return "prompt-with-assistant" if add_generation_prompt else "cached-prompt"
+
+    def encode(self, text: str, add_special_tokens: bool = True):
+        self.encode_calls.append((text, add_special_tokens))
+        return [1, 2, 3]
 
 
 class _ScriptedEngine:
@@ -59,7 +77,46 @@ class _UnavailableSearch:
         raise SearchError(f"Search unavailable: {query}")
 
 
+class _HarnessProbe(Harness):
+    async def stream_events(self, messages: list[dict], **sampling):
+        yield ChatFinalTextEvent(text="done")
+
+
 class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_harness_base_helpers_cover_template_paths(self):
+        tokenizer = _TemplateTokenizer()
+        engine = SimpleNamespace(
+            tokenizer=tokenizer,
+            arch_config="arch",
+            _cached_prompt_str="",
+        )
+        harness = _HarnessProbe(engine)
+        messages = [{"role": "user", "content": "hello"}]
+
+        self.assertIs(harness.tokenizer, tokenizer)
+        self.assertEqual(harness.arch_config, "arch")
+        harness._update_cache(messages)
+        token_ids, prompt = harness._prepare_tokens(messages)
+
+        self.assertEqual(engine._cached_prompt_str, "cached-prompt")
+        self.assertEqual(token_ids, [1, 2, 3])
+        self.assertEqual(prompt, "prompt-with-assistant")
+        self.assertEqual(
+            tokenizer.template_calls,
+            [
+                ((("user", "hello"),), False),
+                ((("user", "hello"),), True),
+            ],
+        )
+        self.assertEqual(tokenizer.encode_calls, [("prompt-with-assistant", False)])
+
+    async def test_harness_base_abstract_stream_events_is_empty_async_generator(self):
+        harness = _HarnessProbe(_ScriptedEngine(["hi"]))
+
+        events = [event async for event in Harness.stream_events(harness, [{"role": "user", "content": "x"}])]
+
+        self.assertEqual(events, [None])
+
     async def test_default_harness_emits_token_and_final_text_events(self):
         harness = DefaultHarness(_ScriptedEngine(["hi"]))
         messages = [{"role": "user", "content": "hello"}]
