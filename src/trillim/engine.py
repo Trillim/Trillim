@@ -126,6 +126,21 @@ class InferenceEngine:
             if proc is None or proc.returncode is not None:
                 raise RuntimeError("Inference process is not running")
 
+            async def _raise_engine_crash() -> None:
+                self.cached_token_ids = []
+                self._last_cache_hit = 0
+                self._cached_prompt_str = ""
+                stderr = ""
+                try:
+                    stderr_bytes = await proc.stderr.read()
+                    stderr = stderr_bytes.decode().strip()
+                except Exception:
+                    pass
+                msg = "Inference engine crashed"
+                if stderr:
+                    msg += f": {stderr}"
+                raise RuntimeError(msg)
+
             # String-level prefix matching (mirrors CLI chat approach):
             # Compare rendered prompt strings to avoid re-tokenization mismatches.
             if (
@@ -185,16 +200,7 @@ class InferenceEngine:
                     "the model may be too large for available memory"
                 )
             except (BrokenPipeError, ConnectionResetError, OSError):
-                stderr = ""
-                try:
-                    stderr_bytes = await proc.stderr.read()
-                    stderr = stderr_bytes.decode().strip()
-                except Exception:
-                    pass
-                msg = "Inference engine crashed"
-                if stderr:
-                    msg += f": {stderr}"
-                raise RuntimeError(msg)
+                await _raise_engine_crash()
 
             # Read generated tokens until EOS
             generated_tokens: list[int] = []
@@ -210,7 +216,7 @@ class InferenceEngine:
                         "the model may be too large for available memory"
                     )
                 if not line:
-                    break
+                    await _raise_engine_crash()
                 try:
                     token_id = int(line.strip())
                 except ValueError:
@@ -231,6 +237,7 @@ class InferenceEngine:
             except asyncio.TimeoutError:
                 proc.kill()
                 self.cached_token_ids = []
+                self._last_cache_hit = 0
                 self._cached_prompt_str = ""
                 raise RuntimeError(
                     f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
@@ -246,5 +253,4 @@ class InferenceEngine:
                     )
                 self.cached_token_ids = (all_token_ids + generated_tokens)[:kv_position]
             else:
-                self.cached_token_ids = []
-                self._cached_prompt_str = ""
+                await _raise_engine_crash()
