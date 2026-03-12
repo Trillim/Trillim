@@ -62,7 +62,10 @@ def _load_from_path(model_path: str, trust_remote_code: bool = False):
                         return custom_tokenizer_cls.from_pretrained(model_path)
 
     # Fall back to AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_path)
+    return AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=trust_remote_code,
+    )
 
 
 def load_tokenizer(model_dir: str, adapter_dir: str | None = None, trust_remote_code: bool = False):
