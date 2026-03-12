@@ -98,6 +98,11 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
         await whisper.stop()
 
         self.assertEqual(engine.stop_calls, 1)
+        self.assertIsNone(whisper.engine)
+        with self.assertRaisesRegex(RuntimeError, "Whisper not started"):
+            whisper._require_started()
+        with self.assertRaisesRegex(RuntimeError, "Whisper not started"):
+            await whisper.transcribe_bytes(b"audio")
 
     async def test_transcribe_bytes_uses_active_engine(self):
         engine = _FakeWhisperEngine()

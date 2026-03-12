@@ -116,7 +116,11 @@ class Whisper(Component):
 
     async def stop(self) -> None:
         if self._engine is not None:
-            await self._engine.stop()
+            engine = self._engine
+            try:
+                await engine.stop()
+            finally:
+                self._engine = None
 
     @property
     def engine(self):
