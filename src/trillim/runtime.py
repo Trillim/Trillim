@@ -67,6 +67,29 @@ class _RuntimeComponentProxy:
         return self._runtime._syncify_result(attr)
 
 
+class _RuntimeObjectProxy:
+    """Expose runtime-managed objects, such as TTS sessions, synchronously."""
+
+    def __init__(self, runtime: Runtime, obj):
+        self._runtime = runtime
+        self._obj = obj
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._obj, name)
+        if callable(attr):
+            def _call(*args, **kwargs):
+                result = attr(*args, **kwargs)
+                return self._runtime._syncify_result(result)
+
+            return _call
+        return self._runtime._syncify_result(attr)
+
+    def __iter__(self):
+        if not hasattr(self._obj, "__aiter__"):
+            raise TypeError(f"{type(self._obj).__name__!r} is not iterable")
+        return _SyncAsyncIterator(self._runtime, self._obj.__aiter__())
+
+
 class Runtime:
     """Own a background event loop and expose components synchronously."""
 
@@ -267,6 +290,10 @@ class Runtime:
         ).result()
 
     def _syncify_result(self, result):
+        if inspect.isawaitable(result):
+            result = self._submit_coroutine(result).result()
         if hasattr(result, "__anext__"):
             return _SyncAsyncIterator(self, result)
+        if getattr(result, "_runtime_proxy", False):
+            return _RuntimeObjectProxy(self, result)
         return result
