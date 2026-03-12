@@ -241,6 +241,7 @@ await tts.delete_voice("myvoice")
 Speed-adjusted synthesis streams progressively with bounded lookahead; it does not wait for the full utterance before yielding audio.
 `tts.speak(...)` returns a `TTSSession` that queues behind the active session by default. Pass `interrupt=True` to cancel the active and queued sessions before starting the new one.
 `TTSSession` yields PCM chunks at `tts.sample_rate`.
+`TTSSession` keeps only a bounded amount of PCM buffered ahead of the consumer. If consumption stalls, synthesis backpressures until room is available.
 `pause()` and `resume()` control future chunk production only. They do not control speaker-device playback.
 `set_speed()` changes future chunk production only. Already emitted audio is unchanged, and already buffered audio may still arrive at the old speed for a short bounded window.
 For `Runtime`, dynamic speed control is effective when you consume a session progressively. If you call `session.collect()` and wait for the full utterance first, there is no opportunity to adjust speed mid-stream.
