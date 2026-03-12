@@ -42,6 +42,8 @@ finally:
 
 Use `with Runtime(...) as runtime:` when you want automatic teardown.
 
+`Runtime` currently exposes the supported first-party components only: `runtime.llm`, `runtime.whisper`, and `runtime.tts`. User-defined components are not a supported Runtime extension point today, and future built-in components will be documented explicitly when they are added.
+
 ## Component Lifecycle
 
 Use direct async lifecycle management when you want full control over the event loop yourself.
