@@ -27,44 +27,45 @@ class SearchHarness(Harness):
         super().__init__(engine)
         self._search = SearchClient(provider_name=search_provider)
 
-    async def _generate_buffered(self, messages: list[dict], **sampling: Any) -> tuple[str, int]:
+    async def _generate_buffered(self, session, **sampling: Any) -> tuple[str, list[int]]:
         """Generate a full response non-streaming."""
-        token_ids, prompt_str = self._prepare_tokens(messages)
+        token_ids, prompt_str = session._prepare_reply()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
-        completion_tokens = 0
+        generated_token_ids: list[int] = []
         async for token_id in self.engine.generate(
             token_ids=token_ids, prompt_str=prompt_str, **sampling,
         ):
-            completion_tokens += 1
+            generated_token_ids.append(token_id)
             full_text += decoder.decode(token_id)
-        return full_text, completion_tokens
+        return full_text, generated_token_ids
 
     async def stream_events(
         self,
-        messages: list[dict],
+        session,
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Structured orchestration loop with explicit search and token events."""
         self._last_completion_tokens = 0
         for _ in range(self.MAX_SEARCH_ITERATIONS - 1):
-            full_text, completion_tokens = await self._generate_buffered(messages, **sampling)
+            full_text, generated_token_ids = await self._generate_buffered(
+                session,
+                **sampling,
+            )
 
             query = extract_search_query(full_text)
             if query is None:
                 # No search tag — yield buffered text as final response
-                self._last_completion_tokens = completion_tokens
+                self._last_completion_tokens = len(generated_token_ids)
                 yield ChatTokenEvent(text=full_text)
-                messages.append({"role": "assistant", "content": full_text})
-                self._update_cache(messages)
+                session._finalize_assistant(full_text, generated_token_ids)
                 yield ChatFinalTextEvent(text=full_text)
                 return
 
             yield ChatSearchStartedEvent(query=query)
 
             # Keep cache aligned with model-generated state only.
-            messages.append({"role": "assistant", "content": full_text})
-            self._update_cache(messages)
+            session._finalize_assistant(full_text, generated_token_ids)
 
             try:
                 results = await self._search.search(query)
@@ -75,24 +76,25 @@ class SearchHarness(Harness):
                     content=results,
                     available=False,
                 )
-                messages.append({"role": "search", "content": results})
+                session._append_message("search", results)
                 break
 
-            messages.append({"role": "search", "content": results})
+            session._append_message("search", results)
             yield ChatSearchResultEvent(query=query, content=results)
 
         # Final iteration: stream token-by-token
-        token_ids, prompt_str = self._prepare_tokens(messages)
+        token_ids, prompt_str = session._prepare_reply()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
+        generated_token_ids: list[int] = []
         async for token_id in self.engine.generate(
             token_ids=token_ids, prompt_str=prompt_str, **sampling,
         ):
             self._last_completion_tokens += 1
+            generated_token_ids.append(token_id)
             chunk = decoder.decode(token_id)
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
 
-        messages.append({"role": "assistant", "content": full_text})
-        self._update_cache(messages)
+        session._finalize_assistant(full_text, generated_token_ids)
         yield ChatFinalTextEvent(text=full_text)

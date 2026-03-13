@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Trillim. Licensed under the MIT License. See LICENSE.
 """LLM component — wraps InferenceEngine and exposes inference routes."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -45,6 +47,265 @@ from trillim.harnesses import Harness, get_harness
 # ---------------------------------------------------------------------------
 
 
+class ChatSession:
+    """Append-only multi-turn chat state for a single active model."""
+
+    _runtime_proxy = True
+
+    def __init__(
+        self,
+        llm: LLM,
+        messages: list[dict] | None = None,
+    ):
+        self._llm = llm
+        self._llm_generation = llm._session_generation
+        self._messages: list[dict] = []
+        self._base_prompt_str = ""
+        self._base_token_ids: list[int] = []
+        self._prepared_prompt_str: str | None = None
+        self._prepared_token_ids: list[int] | None = None
+        for message in messages or []:
+            self._append_message(message["role"], message["content"])
+
+    def _require_active(self) -> tuple[InferenceEngine, Harness]:
+        engine, harness = self._llm._require_started()
+        if self._llm_generation != self._llm._session_generation:
+            raise RuntimeError(
+                "ChatSession is stale after the active model changed; create a new session"
+            )
+        return engine, harness
+
+    def _render_prompt(self, *, add_generation_prompt: bool) -> str:
+        engine, _ = self._require_active()
+        tokenizer = engine.tokenizer
+        has_template = hasattr(tokenizer, "chat_template") and tokenizer.chat_template
+        if has_template:
+            return tokenizer.apply_chat_template(
+                self._messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in self._messages)
+        if add_generation_prompt:
+            if prompt:
+                return f"{prompt}\nassistant: "
+            return "assistant: "
+        return prompt
+
+    def _encode_full_prompt(self, prompt_str: str) -> list[int]:
+        engine, _ = self._require_active()
+        tokenizer = engine.tokenizer
+        has_template = hasattr(tokenizer, "chat_template") and tokenizer.chat_template
+        return tokenizer.encode(prompt_str, add_special_tokens=not has_template)
+
+    def _encode_suffix(self, suffix: str) -> list[int]:
+        if not suffix:
+            return []
+        engine, _ = self._require_active()
+        return engine.tokenizer.encode(suffix, add_special_tokens=False)
+
+    def _append_only_tokens(
+        self,
+        prompt_str: str,
+        *,
+        context: str,
+    ) -> list[int]:
+        if not self._base_prompt_str and not self._base_token_ids:
+            return self._encode_full_prompt(prompt_str)
+        if not prompt_str.startswith(self._base_prompt_str):
+            raise RuntimeError(
+                f"ChatSession requires append-only prompt rendering; {context} rewrote earlier prompt content"
+            )
+        suffix = prompt_str[len(self._base_prompt_str):]
+        return list(self._base_token_ids) + self._encode_suffix(suffix)
+
+    def _require_turn_ready(self) -> None:
+        self._require_active()
+        if not self._messages:
+            raise ValueError("ChatSession has no messages")
+        if self._messages[-1]["role"] == "assistant":
+            raise ValueError(
+                "ChatSession already has an assistant reply; append a new message before chatting again"
+            )
+
+    def _append_message(self, role: str, content: str) -> None:
+        engine, _ = self._require_active()
+        self._prepared_prompt_str = None
+        self._prepared_token_ids = None
+        self._messages.append({"role": role, "content": content})
+        prompt_str = self._render_prompt(add_generation_prompt=False)
+        self._base_token_ids = self._append_only_tokens(
+            prompt_str,
+            context=f"appending {role!r} message",
+        )
+        self._base_prompt_str = prompt_str
+        engine._cached_prompt_str = prompt_str
+
+    def _prepare_reply(self) -> tuple[list[int], str]:
+        self._require_turn_ready()
+        if self._prepared_token_ids is not None and self._prepared_prompt_str is not None:
+            return list(self._prepared_token_ids), self._prepared_prompt_str
+        prompt_str = self._render_prompt(add_generation_prompt=True)
+        self._prepared_token_ids = self._append_only_tokens(
+            prompt_str,
+            context="preparing the next assistant turn",
+        )
+        self._prepared_prompt_str = prompt_str
+        return list(self._prepared_token_ids), self._prepared_prompt_str
+
+    def _finalize_assistant(self, text: str, token_ids: list[int]) -> None:
+        engine, _ = self._require_active()
+        if self._prepared_prompt_str is None or self._prepared_token_ids is None:
+            raise RuntimeError("ChatSession assistant turn was not prepared")
+        self._messages.append({"role": "assistant", "content": text})
+        prompt_str = self._render_prompt(add_generation_prompt=False)
+        generated_prefix = self._prepared_prompt_str + text
+        if not prompt_str.startswith(generated_prefix):
+            raise RuntimeError(
+                "ChatSession requires append-only prompt rendering; finalizing assistant output rewrote earlier prompt content"
+            )
+        tail = prompt_str[len(generated_prefix):]
+        self._base_token_ids = (
+            list(self._prepared_token_ids)
+            + list(token_ids)
+            + self._encode_suffix(tail)
+        )
+        self._base_prompt_str = prompt_str
+        self._prepared_prompt_str = None
+        self._prepared_token_ids = None
+        engine._cached_prompt_str = prompt_str
+
+    @property
+    def messages(self) -> tuple[dict, ...]:
+        self._require_active()
+        return tuple(
+            {"role": message["role"], "content": message["content"]}
+            for message in self._messages
+        )
+
+    @property
+    def max_context_tokens(self) -> int:
+        engine, _ = self._require_active()
+        return engine.arch_config.max_position_embeddings
+
+    @property
+    def prompt_tokens(self) -> int:
+        token_ids, _ = self._prepare_reply()
+        return len(token_ids)
+
+    @property
+    def remaining_context_tokens(self) -> int:
+        return self.max_context_tokens - self.prompt_tokens
+
+    def validate(self) -> int:
+        self._require_turn_ready()
+        token_count = self.prompt_tokens
+        if token_count >= self.max_context_tokens:
+            raise ContextOverflowError(token_count, self.max_context_tokens)
+        return token_count
+
+    def add_user(self, content: str) -> None:
+        self._append_message("user", content)
+
+    def add_system(self, content: str) -> None:
+        self._append_message("system", content)
+
+    async def stream_chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[ChatEvent, None]:
+        engine, harness = self._require_active()
+        prompt_tokens = self.validate()
+        full_text = ""
+
+        async for event in harness.stream_events(
+            self,
+            **self._llm._chat_sampling(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_tokens=max_tokens,
+            ),
+        ):
+            if isinstance(event, ChatTokenEvent):
+                full_text += event.text
+            elif isinstance(event, ChatFinalTextEvent):
+                full_text = event.text
+            yield event
+
+        usage = ChatUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=harness._last_completion_tokens,
+            total_tokens=prompt_tokens + harness._last_completion_tokens,
+            cached_tokens=engine._last_cache_hit,
+        )
+        yield ChatDoneEvent(text=full_text, usage=usage)
+
+    async def _collect_chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ChatUsage]:
+        full_text = ""
+        usage: ChatUsage | None = None
+
+        async for event in self.stream_chat(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+        ):
+            if isinstance(event, ChatTokenEvent):
+                full_text += event.text
+            elif isinstance(event, ChatFinalTextEvent):
+                full_text = event.text
+            elif isinstance(event, ChatDoneEvent):
+                full_text = event.text
+                usage = event.usage
+
+        if usage is None:
+            raise RuntimeError("Chat stream ended without a done event")
+        return full_text, usage
+
+    async def chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        try:
+            full_text, _ = await run_with_timeout(
+                self._collect_chat(
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    max_tokens=max_tokens,
+                ),
+                timeout,
+                "LLM chat",
+            )
+        except TimeoutError:
+            await self._llm._restart_after_timeout("LLM chat")
+            raise
+        return full_text
+
+
 class LLM(Component):
     """CPU inference component — manages the C++ subprocess and exposes
     /v1/models, /v1/models/load, /v1/chat/completions, /v1/completions."""
@@ -63,6 +324,7 @@ class LLM(Component):
         self.model_name: str = "unknown"
         self.state: ServerState = ServerState.NO_MODEL
         self._swap_lock: asyncio.Lock | None = None
+        self._session_generation = 0
 
     def _require_started(self) -> tuple[InferenceEngine, Harness]:
         if (
@@ -79,16 +341,6 @@ class LLM(Component):
         engine, _ = self._require_started()
         return engine.arch_config.max_position_embeddings
 
-    def count_tokens(self, messages: list[dict]) -> int:
-        """Count prompt tokens for a chat-style message list."""
-        _, harness = self._require_started()
-        token_ids, _ = harness._prepare_tokens(messages)
-        return len(token_ids)
-
-    def validate_context(self, messages: list[dict]) -> int:
-        """Return prompt token count or raise if the context window is full."""
-        return self._validate_token_count(self.count_tokens(messages))
-
     def _validate_token_count(self, token_count: int) -> int:
         max_context_tokens = self.max_context_tokens
         if token_count >= max_context_tokens:
@@ -97,6 +349,10 @@ class LLM(Component):
 
     def _clone_messages(self, messages: list[dict]) -> list[dict]:
         return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+    def session(self, messages: list[dict] | None = None) -> ChatSession:
+        self._require_started()
+        return ChatSession(self, self._clone_messages(messages or []))
 
     def _chat_sampling(
         self,
@@ -125,34 +381,15 @@ class LLM(Component):
         repetition_penalty: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncGenerator[ChatEvent, None]:
-        engine, harness = self._require_started()
-        conversation = self._clone_messages(messages)
-        prompt_tokens = self.validate_context(conversation)
-        full_text = ""
-
-        async for event in harness.stream_events(
-            conversation,
-            **self._chat_sampling(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                max_tokens=max_tokens,
-            ),
+        session = self.session(messages)
+        async for event in session.stream_chat(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
         ):
-            if isinstance(event, ChatTokenEvent):
-                full_text += event.text
-            elif isinstance(event, ChatFinalTextEvent):
-                full_text = event.text
             yield event
-
-        usage = ChatUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=harness._last_completion_tokens,
-            total_tokens=prompt_tokens + harness._last_completion_tokens,
-            cached_tokens=engine._last_cache_hit,
-        )
-        yield ChatDoneEvent(text=full_text, usage=usage)
 
     async def _collect_chat(
         self,
@@ -164,28 +401,13 @@ class LLM(Component):
         repetition_penalty: float | None = None,
         max_tokens: int | None = None,
     ) -> tuple[str, ChatUsage]:
-        full_text = ""
-        usage: ChatUsage | None = None
-
-        async for event in self.stream_chat(
-            messages,
+        return await self.session(messages)._collect_chat(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             max_tokens=max_tokens,
-        ):
-            if isinstance(event, ChatTokenEvent):
-                full_text += event.text
-            elif isinstance(event, ChatFinalTextEvent):
-                full_text = event.text
-            elif isinstance(event, ChatDoneEvent):
-                full_text = event.text
-                usage = event.usage
-
-        if usage is None:
-            raise RuntimeError("Chat stream ended without a done event")
-        return full_text, usage
+        )
 
     async def chat(
         self,
@@ -198,23 +420,14 @@ class LLM(Component):
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
-        try:
-            full_text, _ = await run_with_timeout(
-                self._collect_chat(
-                    messages,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    max_tokens=max_tokens,
-                ),
-                timeout,
-                "LLM chat",
-            )
-        except TimeoutError:
-            await self._restart_after_timeout("LLM chat")
-            raise
-        return full_text
+        return await self.session(messages).chat(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
 
     async def _restart_after_timeout(self, operation: str) -> None:
         if self._swap_lock is None:
@@ -280,12 +493,15 @@ class LLM(Component):
             self.engine, self._harness_name, self._search_provider
         )
         self.state = ServerState.RUNNING
+        self._session_generation += 1
 
     async def stop(self) -> None:
         self.state = ServerState.NO_MODEL
         if self.engine is not None:
             await self.engine.stop()
         self.harness = None
+        self.engine = None
+        self._session_generation += 1
 
     # -- hot-swap ------------------------------------------------------------
 
@@ -438,6 +654,7 @@ class LLM(Component):
         self._unembed_quant = unembed_quant
         self.model_name = new_name
         self.state = ServerState.RUNNING
+        self._session_generation += 1
 
         return LoadModelResponse(
             status="success",
@@ -529,23 +746,24 @@ class LLM(Component):
             )
 
             if req.stream:
+                session = llm.session(messages)
                 try:
-                    llm.validate_context(messages)
-                except ContextOverflowError as exc:
+                    session.validate()
+                except (ContextOverflowError, ValueError) as exc:
                     raise HTTPException(
                         status_code=400,
                         detail=f"{exc} Start a new conversation with fewer messages.",
                     )
                 return StreamingResponse(
                     _stream_chat(
-                        llm, messages, sampling, req.model or llm.model_name
+                        session, sampling, req.model or llm.model_name
                     ),
                     media_type="text/event-stream",
                 )
 
             try:
                 full_text, usage = await llm._collect_chat(messages, **sampling)
-            except ContextOverflowError as exc:
+            except (ContextOverflowError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,
                     detail=f"{exc} Start a new conversation with fewer messages.",
@@ -635,7 +853,7 @@ class LLM(Component):
 # ---------------------------------------------------------------------------
 
 
-async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: str):
+async def _stream_chat(session: ChatSession, sampling: dict, model: str):
     req_id = make_id()
     created = now()
 
@@ -650,7 +868,7 @@ async def _stream_chat(llm: LLM, messages: list[dict], sampling: dict, model: st
     }
     yield f"data: {json.dumps(chunk)}\n\n"
 
-    async for event in llm.stream_chat(messages, **sampling):
+    async for event in session.stream_chat(**sampling):
         if not isinstance(event, ChatTokenEvent):
             continue
         chunk = {
