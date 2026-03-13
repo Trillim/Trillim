@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Trillim. Licensed under the MIT License. See LICENSE.
-"""Unit tests for structured chat events and the public LLM chat API."""
+"""Unit tests for ChatSession orchestration and the public LLM chat API."""
 
 import asyncio
 from types import SimpleNamespace
@@ -23,27 +23,30 @@ class _FakeTokenizer:
         return "".join(chr(token_id) for token_id in token_ids)
 
 
-class _TemplateTokenizer(_FakeTokenizer):
+class _FinalizingRewriteTokenizer(_FakeTokenizer):
     chat_template = "{{ messages }}"
 
-    def __init__(self):
-        self.template_calls: list[tuple[tuple[tuple[str, str], ...], bool]] = []
-        self.encode_calls: list[tuple[str, bool]] = []
-
-    def apply_chat_template(self, messages, tokenize: bool = False, add_generation_prompt: bool = False):
-        normalized = tuple((m["role"], m["content"]) for m in messages)
-        self.template_calls.append((normalized, add_generation_prompt))
-        return "prompt-with-assistant" if add_generation_prompt else "cached-prompt"
-
-    def encode(self, text: str, add_special_tokens: bool = True):
-        self.encode_calls.append((text, add_special_tokens))
-        return [1, 2, 3]
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ):
+        if not add_generation_prompt and messages and messages[-1]["role"] == "assistant":
+            return "rewritten-final-output"
+        rendered = "".join(
+            f"<{message['role']}>{message['content']}</{message['role']}>"
+            for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return rendered
 
 
 class _ScriptedEngine:
-    def __init__(self, responses: list[str], *, max_context_tokens: int = 4096):
+    def __init__(self, responses: list[str], *, tokenizer=None, max_context_tokens: int = 4096):
         self._responses = list(responses)
-        self.tokenizer = _FakeTokenizer()
+        self.tokenizer = tokenizer or _FakeTokenizer()
         self.arch_config = SimpleNamespace(max_position_embeddings=max_context_tokens)
         self._cached_prompt_str = ""
         self._last_cache_hit = 3
@@ -78,63 +81,63 @@ class _UnavailableSearch:
 
 
 class _HarnessProbe(Harness):
-    async def stream_events(self, messages: list[dict], **sampling):
+    async def stream_events(self, session, **sampling):
         yield ChatFinalTextEvent(text="done")
 
 
 class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
-    async def test_harness_base_helpers_cover_template_paths(self):
-        tokenizer = _TemplateTokenizer()
-        engine = SimpleNamespace(
-            tokenizer=tokenizer,
-            arch_config="arch",
-            _cached_prompt_str="",
-        )
-        harness = _HarnessProbe(engine)
-        messages = [{"role": "user", "content": "hello"}]
-
-        self.assertIs(harness.tokenizer, tokenizer)
-        self.assertEqual(harness.arch_config, "arch")
-        harness._update_cache(messages)
-        token_ids, prompt = harness._prepare_tokens(messages)
-
-        self.assertEqual(engine._cached_prompt_str, "cached-prompt")
-        self.assertEqual(token_ids, [1, 2, 3])
-        self.assertEqual(prompt, "prompt-with-assistant")
-        self.assertEqual(
-            tokenizer.template_calls,
-            [
-                ((("user", "hello"),), False),
-                ((("user", "hello"),), True),
-            ],
-        )
-        self.assertEqual(tokenizer.encode_calls, [("prompt-with-assistant", False)])
-
     async def test_harness_base_abstract_stream_events_is_empty_async_generator(self):
-        harness = _HarnessProbe(_ScriptedEngine(["hi"]))
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["hi"])
+        llm.harness = _HarnessProbe(llm.engine)
+        session = llm.session([{"role": "user", "content": "x"}])
 
-        events = [event async for event in Harness.stream_events(harness, [{"role": "user", "content": "x"}])]
+        self.assertIs(llm.harness.arch_config, llm.engine.arch_config)
+        events = [event async for event in Harness.stream_events(llm.harness, session)]
 
         self.assertEqual(events, [None])
 
     async def test_default_harness_emits_token_and_final_text_events(self):
-        harness = DefaultHarness(_ScriptedEngine(["hi"]))
-        messages = [{"role": "user", "content": "hello"}]
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["hi"])
+        llm.harness = DefaultHarness(llm.engine)
+        session = llm.session([{"role": "user", "content": "hello"}])
 
-        events = [event async for event in harness.stream_events(messages)]
+        events = [event async for event in llm.harness.stream_events(session)]
 
         self.assertEqual([event.type for event in events], ["token", "token", "final_text"])
         self.assertEqual("".join(event.text for event in events[:-1]), "hi")
         self.assertIsInstance(events[-1], ChatFinalTextEvent)
         self.assertEqual(events[-1].text, "hi")
-        self.assertEqual(messages[-1], {"role": "assistant", "content": "hi"})
+        self.assertEqual(
+            session.messages,
+            (
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ),
+        )
+        self.assertEqual(llm.engine._cached_prompt_str, "user: hello\nassistant: hi")
+
+    async def test_default_harness_renders_empty_generation_prompt(self):
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["unused"])
+        llm.harness = DefaultHarness(llm.engine)
+        session = llm.session()
+
+        self.assertEqual(session._render_prompt(add_generation_prompt=True), "assistant: ")
 
     async def test_search_harness_emits_structured_search_events(self):
-        harness = SearchHarness(_ScriptedEngine(["<search>cats</search>", "answer"]))
-        harness._search = _SuccessfulSearch("curated cat result")
-        messages = [{"role": "user", "content": "Find cats"}]
+        llm = LLM("models/fake", harness_name="search")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["<search>cats</search>", "answer"])
+        llm.harness = SearchHarness(llm.engine)
+        llm.harness._search = _SuccessfulSearch("curated cat result")
+        session = llm.session([{"role": "user", "content": "Find cats"}])
 
-        events = [event async for event in harness.stream_events(messages)]
+        events = [event async for event in llm.harness.stream_events(session)]
 
         self.assertEqual(events[0].type, "search_started")
         self.assertEqual(events[0].query, "cats")
@@ -144,12 +147,25 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(event.text for event in events if event.type == "token"), "answer")
         self.assertEqual(events[-1].type, "final_text")
         self.assertEqual(events[-1].text, "answer")
+        self.assertEqual(
+            session.messages,
+            (
+                {"role": "user", "content": "Find cats"},
+                {"role": "assistant", "content": "<search>cats</search>"},
+                {"role": "search", "content": "curated cat result"},
+                {"role": "assistant", "content": "answer"},
+            ),
+        )
 
     async def test_search_harness_marks_unavailable_searches(self):
-        harness = SearchHarness(_ScriptedEngine(["<search>cats</search>", "fallback"]))
-        harness._search = _UnavailableSearch()
+        llm = LLM("models/fake", harness_name="search")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["<search>cats</search>", "fallback"])
+        llm.harness = SearchHarness(llm.engine)
+        llm.harness._search = _UnavailableSearch()
+        session = llm.session([{"role": "user", "content": "Find cats"}])
 
-        events = [event async for event in harness.stream_events([{"role": "user", "content": "Find cats"}])]
+        events = [event async for event in llm.harness.stream_events(session)]
 
         self.assertEqual(events[0].type, "search_started")
         self.assertIsInstance(events[1], ChatSearchResultEvent)
@@ -158,12 +174,36 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].text, "fallback")
 
     async def test_harness_run_remains_plain_text_only(self):
-        harness = SearchHarness(_ScriptedEngine(["<search>cats</search>", "answer"]))
-        harness._search = _SuccessfulSearch("curated cat result")
+        llm = LLM("models/fake", harness_name="search")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["<search>cats</search>", "answer"])
+        llm.harness = SearchHarness(llm.engine)
+        llm.harness._search = _SuccessfulSearch("curated cat result")
+        session = llm.session([{"role": "user", "content": "Find cats"}])
 
-        chunks = [chunk async for chunk in harness.run([{"role": "user", "content": "Find cats"}])]
+        chunks = [chunk async for chunk in llm.harness.run(session)]
 
         self.assertEqual("".join(chunks), "answer")
+
+    async def test_session_rejects_non_append_only_finalization(self):
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["broken"], tokenizer=_FinalizingRewriteTokenizer())
+        llm.harness = DefaultHarness(llm.engine)
+        session = llm.session([{"role": "user", "content": "hello"}])
+
+        with self.assertRaisesRegex(RuntimeError, "append-only prompt rendering"):
+            await session.chat()
+
+    async def test_finalize_assistant_requires_a_prepared_turn(self):
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = _ScriptedEngine(["unused"])
+        llm.harness = DefaultHarness(llm.engine)
+        session = llm.session([{"role": "user", "content": "hello"}])
+
+        with self.assertRaisesRegex(RuntimeError, "not prepared"):
+            session._finalize_assistant("oops", [])
 
 
 class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
@@ -178,7 +218,7 @@ class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_chat_emits_done_event_and_preserves_input_messages(self):
         llm = self._make_llm("ok")
         messages = [{"role": "user", "content": "hello"}]
-        prompt_tokens = llm.count_tokens(messages)
+        prompt_tokens = llm.session(messages).prompt_tokens
 
         events = [event async for event in llm.stream_chat(messages, max_tokens=8)]
 
@@ -198,6 +238,17 @@ class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
         result = await llm.chat([{"role": "user", "content": "Say hi"}], max_tokens=8)
 
         self.assertEqual(result, "hello")
+
+    async def test_collect_chat_returns_usage(self):
+        llm = self._make_llm("hello")
+
+        text, usage = await llm._collect_chat(
+            [{"role": "user", "content": "Say hi"}],
+            max_tokens=8,
+        )
+
+        self.assertEqual(text, "hello")
+        self.assertEqual(usage.completion_tokens, 5)
 
     async def test_chat_supports_timeout(self):
         engine = _SlowScriptedEngine(["hello"])
@@ -274,6 +325,17 @@ class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
                 [{"role": "user", "content": "Say hi"}],
                 max_tokens=8,
                 timeout=0.001,
+            )
+
+    async def test_llm_chat_is_one_turn_only(self):
+        llm = self._make_llm("ignored")
+
+        with self.assertRaisesRegex(ValueError, "assistant reply"):
+            await llm.chat(
+                [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "already answered"},
+                ]
             )
 
 

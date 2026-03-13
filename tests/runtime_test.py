@@ -38,9 +38,10 @@ class LLM(Component):
         yield "event-1"
         yield "event-2"
 
-    def count_tokens(self, messages: list[dict]) -> int:
-        self.calls.append(("llm.count_tokens", len(messages)))
-        return len(messages)
+    def session(self, messages: list[dict] | None = None):
+        copied = [{"role": m["role"], "content": m["content"]} for m in messages or []]
+        self.calls.append(("llm.session", tuple(m["content"] for m in copied)))
+        return _ChatSession(self.calls, copied)
 
     @property
     def max_context_tokens(self) -> int:
@@ -150,6 +151,50 @@ class _TTSSession:
             yield chunk
 
 
+class _ChatSession:
+    _runtime_proxy = True
+
+    def __init__(self, calls: list, messages: list[dict]):
+        self.calls = calls
+        self._messages = list(messages)
+
+    @property
+    def messages(self):
+        return tuple({"role": m["role"], "content": m["content"]} for m in self._messages)
+
+    @property
+    def prompt_tokens(self) -> int:
+        self.calls.append(("session.prompt_tokens", len(self._messages)))
+        return len(self._messages)
+
+    @property
+    def max_context_tokens(self) -> int:
+        return 128
+
+    @property
+    def remaining_context_tokens(self) -> int:
+        self.calls.append(("session.remaining_context_tokens", len(self._messages)))
+        return 128 - len(self._messages)
+
+    def validate(self) -> int:
+        self.calls.append(("session.validate", len(self._messages)))
+        return len(self._messages)
+
+    def add_user(self, content: str) -> None:
+        self.calls.append(("session.add_user", content))
+        self._messages.append({"role": "user", "content": content})
+
+    async def chat(self) -> str:
+        self.calls.append(("session.chat", tuple(m["content"] for m in self._messages)))
+        self._messages.append({"role": "assistant", "content": "session-reply"})
+        return "session-reply"
+
+    async def stream_chat(self):
+        self.calls.append(("session.stream_chat", tuple(m["content"] for m in self._messages)))
+        yield "session-event-1"
+        yield "session-event-2"
+
+
 class BrokenWhisper(Whisper):
     async def start(self) -> None:
         self.calls.append("whisper.start")
@@ -199,8 +244,16 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("llm", dir(runtime))
             self.assertEqual(runtime.llm.chat(messages), "reply")
             self.assertEqual(list(runtime.llm.stream_chat(messages)), ["event-1", "event-2"])
-            self.assertEqual(runtime.llm.count_tokens(messages), 1)
             self.assertEqual(runtime.llm.max_context_tokens, 128)
+            llm_session = runtime.llm.session(messages)
+            self.assertEqual(llm_session.messages, ({"role": "user", "content": "hello"},))
+            self.assertEqual(llm_session.prompt_tokens, 1)
+            self.assertEqual(llm_session.max_context_tokens, 128)
+            self.assertEqual(llm_session.remaining_context_tokens, 127)
+            self.assertEqual(llm_session.validate(), 1)
+            llm_session.add_user("again")
+            self.assertEqual(list(llm_session.stream_chat()), ["session-event-1", "session-event-2"])
+            self.assertEqual(llm_session.chat(), "session-reply")
             self.assertEqual(runtime.whisper.transcribe(b"audio"), "audio")
             session = runtime.tts.speak("hello")
             self.assertEqual(session.state, "running")
@@ -218,7 +271,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.started)
         self.assertIn(("llm.chat", ("hello",)), calls)
         self.assertIn(("llm.stream_chat", ("hello",)), calls)
-        self.assertIn(("llm.count_tokens", 1), calls)
+        self.assertIn(("llm.session", ("hello",)), calls)
+        self.assertIn(("session.prompt_tokens", 1), calls)
+        self.assertIn(("session.remaining_context_tokens", 1), calls)
+        self.assertIn(("session.validate", 1), calls)
+        self.assertIn(("session.add_user", "again"), calls)
+        self.assertIn(("session.stream_chat", ("hello", "again")), calls)
+        self.assertIn(("session.chat", ("hello", "again")), calls)
         self.assertIn(("whisper.transcribe", b"audio"), calls)
         self.assertIn(("tts.speak", "hello"), calls)
         self.assertIn("session.pause", calls)
@@ -376,7 +435,7 @@ class RuntimeTests(unittest.TestCase):
         runtime = Runtime(component)
 
         with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
-            runtime._invoke_component_attr(component, "count_tokens", ([],), {})
+            runtime._invoke_component_attr(component, "session", ([],), {})
 
         with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
             runtime._invoke_object_attr(object(), "__str__", (), {})

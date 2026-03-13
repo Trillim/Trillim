@@ -4,7 +4,7 @@
 import asyncio
 import tempfile
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -136,12 +136,18 @@ class LLMInternalTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ContextOverflowError):
             llm._validate_token_count(1)
 
+        llm = self._make_running_llm(max_context_tokens=2)
+        self.assertEqual(llm._validate_token_count(1), 1)
+
+        llm = self._make_running_llm()
+        session = llm.session([{"role": "user", "content": "hello"}])
+
         async def broken_stream():
             yield ChatTokenEvent(text="x")
 
-        llm.stream_chat = lambda *args, **kwargs: broken_stream()
+        session.stream_chat = lambda *args, **kwargs: broken_stream()
         with self.assertRaisesRegex(RuntimeError, "without a done event"):
-            await llm._collect_chat([{"role": "user", "content": "hello"}])
+            await session._collect_chat()
 
     async def test_create_harness_supports_default_and_search(self):
         llm = LLM("models/fake")
@@ -194,27 +200,28 @@ class LLMInternalTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_helpers_format_sse_chunks(self):
         llm = self._make_running_llm("unused")
 
-        async def stream_events(self, messages, **sampling):
-            yield ChatSearchStartedEvent(query="ignored")
-            yield ChatTokenEvent(text="O")
-            yield ChatFinalTextEvent(text="OK")
-            yield ChatDoneEvent(
-                text="OK",
-                usage=ChatUsage(
-                    prompt_tokens=1,
-                    completion_tokens=2,
-                    total_tokens=3,
-                    cached_tokens=0,
-                ),
-            )
+        class _SessionStub:
+            async def stream_chat(self, **sampling):
+                yield ChatSearchStartedEvent(query="ignored")
+                yield ChatTokenEvent(text="O")
+                yield ChatFinalTextEvent(text="OK")
+                yield ChatDoneEvent(
+                    text="OK",
+                    usage=ChatUsage(
+                        prompt_tokens=1,
+                        completion_tokens=2,
+                        total_tokens=3,
+                        cached_tokens=0,
+                    ),
+                )
 
-        llm.stream_chat = MethodType(stream_events, llm)
+        session = _SessionStub()
 
         with (
             patch("trillim.server._llm.make_id", return_value="chat-1"),
             patch("trillim.server._llm.now", return_value=123),
         ):
-            chunks = [chunk async for chunk in _stream_chat(llm, [{"role": "user", "content": "hi"}], {}, "chat-model")]
+            chunks = [chunk async for chunk in _stream_chat(session, {}, "chat-model")]
 
         self.assertEqual(
             chunks,
@@ -658,10 +665,11 @@ class LLMRouterTests(unittest.TestCase):
                 },
             )
 
-            def overflow_context(messages):
-                raise ContextOverflowError(5, 4)
+            class _OverflowSession:
+                def validate(self):
+                    raise ContextOverflowError(5, 4)
 
-            llm.validate_context = overflow_context
+            llm.session = lambda messages: _OverflowSession()
             response = client.post(
                 "/v1/chat/completions",
                 json={
@@ -671,19 +679,19 @@ class LLMRouterTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 400)
 
-            def ok_context(messages):
-                return 2
+            class _StreamingSession:
+                def validate(self):
+                    return 2
 
-            async def event_stream(*args, **kwargs):
-                yield ChatTokenEvent(text="O")
-                yield ChatFinalTextEvent(text="OK")
-                yield ChatDoneEvent(
-                    text="OK",
-                    usage=ChatUsage(1, 2, 3, 0),
-                )
+                async def stream_chat(self, **sampling):
+                    yield ChatTokenEvent(text="O")
+                    yield ChatFinalTextEvent(text="OK")
+                    yield ChatDoneEvent(
+                        text="OK",
+                        usage=ChatUsage(1, 2, 3, 0),
+                    )
 
-            llm.validate_context = ok_context
-            llm.stream_chat = MethodType(lambda self, *args, **kwargs: event_stream(), llm)
+            llm.session = lambda messages: _StreamingSession()
             with (
                 patch("trillim.server._llm.make_id", return_value="stream-id"),
                 patch("trillim.server._llm.now", return_value=654),
