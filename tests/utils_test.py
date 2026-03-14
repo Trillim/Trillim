@@ -317,6 +317,16 @@ class UtilsTests(unittest.TestCase):
         minimal = utils._build_request_block([], 0)
         self.assertEqual(minimal, "2\nreset=0\ntokens=\n")
 
+        zero_max = utils._build_request_block([], 0, max_tokens=0)
+        self.assertEqual(zero_max, "2\nreset=0\ntokens=\n")
+
+    def test_build_request_block_rejects_invalid_sampling_values(self):
+        with self.assertRaisesRegex(ValueError, "temperature must be >= 0"):
+            utils._build_request_block([], 0, temperature=-0.1)
+
+        with self.assertRaisesRegex(ValueError, "max_tokens must be >= 0"):
+            utils._build_request_block([], 0, max_tokens=-1)
+
     def test_compute_base_model_hash_handles_missing_invalid_and_valid_configs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.assertEqual(utils.compute_base_model_hash(temp_dir), "")

@@ -313,7 +313,7 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
                     "top_p": 0.9,
                     "repetition_penalty": 1.1,
                     "rep_penalty_lookback": 32,
-                    "max_tokens": None,
+                    "max_tokens": 0,
                 },
             )
         ])
@@ -406,6 +406,16 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
         self.assertIsNone(engine.cached_prompt_str)
+
+    async def test_generate_normalizes_sampling_validation_errors(self):
+        engine = self._make_engine()
+        proc = _FakeProcess()
+        engine.process = proc
+
+        with self.assertRaisesRegex(ValueError, "temperature must be >= 0"):
+            await self._collect(engine, token_ids=[1], temperature=-0.1)
+
+        self.assertEqual(proc.stdin.writes, [])
 
     async def test_generate_raises_on_unexpected_stdout_eof(self):
         engine = self._make_engine()
