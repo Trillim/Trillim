@@ -29,7 +29,6 @@ from ._models import (
     UsageInfo,
 )
 
-from trillim._timeouts import run_with_timeout
 from trillim.errors import ContextOverflowError
 from trillim.engine import InferenceEngine
 from trillim.events import (
@@ -255,24 +254,45 @@ class ChatSession:
         top_p: float | None = None,
         repetition_penalty: float | None = None,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> tuple[str, ChatUsage]:
         full_text = ""
         usage: ChatUsage | None = None
 
-        async for event in self.stream_chat(
+        events = self.stream_chat(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             max_tokens=max_tokens,
-        ):
-            if isinstance(event, ChatTokenEvent):
-                full_text += event.text
-            elif isinstance(event, ChatFinalTextEvent):
-                full_text = event.text
-            elif isinstance(event, ChatDoneEvent):
-                full_text = event.text
-                usage = event.usage
+        )
+
+        try:
+            while True:
+                try:
+                    if timeout is None:
+                        event = await events.__anext__()
+                    else:
+                        event = await asyncio.wait_for(
+                            events.__anext__(),
+                            timeout=timeout,
+                        )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        f"LLM chat timed out after {timeout} seconds."
+                    ) from exc
+
+                if isinstance(event, ChatTokenEvent):
+                    full_text += event.text
+                elif isinstance(event, ChatFinalTextEvent):
+                    full_text = event.text
+                elif isinstance(event, ChatDoneEvent):
+                    full_text = event.text
+                    usage = event.usage
+        finally:
+            await events.aclose()
 
         if usage is None:
             raise RuntimeError("Chat stream ended without a done event")
@@ -289,16 +309,13 @@ class ChatSession:
         timeout: float | None = None,
     ) -> str:
         try:
-            full_text, _ = await run_with_timeout(
-                self._collect_chat(
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    max_tokens=max_tokens,
-                ),
-                timeout,
-                "LLM chat",
+            full_text, _ = await self._collect_chat(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
         except TimeoutError:
             await self._llm._restart_after_timeout("LLM chat")
