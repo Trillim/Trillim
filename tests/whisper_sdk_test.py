@@ -22,9 +22,14 @@ from trillim.server import Whisper
 class _FakeWhisperEngine:
     def __init__(self):
         self.calls: list[tuple[bytes, str | None]] = []
+        self.path_calls: list[tuple[str, str | None]] = []
 
     async def transcribe(self, audio_bytes: bytes, language: str | None = None) -> str:
         self.calls.append((audio_bytes, language))
+        return "decoded"
+
+    async def transcribe_path(self, path: str, language: str | None = None) -> str:
+        self.path_calls.append((path, language))
         return "decoded"
 
 
@@ -32,6 +37,10 @@ class _SlowWhisperEngine(_FakeWhisperEngine):
     async def transcribe(self, audio_bytes: bytes, language: str | None = None) -> str:
         await asyncio.sleep(0.05)
         return await super().transcribe(audio_bytes, language=language)
+
+    async def transcribe_path(self, path: str, language: str | None = None) -> str:
+        await asyncio.sleep(0.05)
+        return await super().transcribe_path(path, language=language)
 
 
 class _ManagedWhisperEngine(_FakeWhisperEngine):
@@ -64,10 +73,11 @@ class _FakeSegment:
 
 class _FakeModel:
     def __init__(self):
-        self.calls: list[tuple[bytes, str | None, int]] = []
+        self.calls: list[tuple[bytes | str, str | None, int]] = []
 
     def transcribe(self, audio_file, language=None, beam_size=5):
-        self.calls.append((audio_file.read(), language, beam_size))
+        payload = audio_file.read() if hasattr(audio_file, "read") else audio_file
+        self.calls.append((payload, language, beam_size))
         return ([_FakeSegment(" hello "), _FakeSegment("world ")], None)
 
 
@@ -113,26 +123,19 @@ class WhisperSdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "decoded")
         self.assertEqual(engine.calls, [(b"audio", "en")])
 
-    async def test_transcribe_wav_reads_file_bytes_off_event_loop(self):
+    async def test_transcribe_wav_transcribes_directly_from_path(self):
         engine = _FakeWhisperEngine()
         whisper = self._make_whisper(engine)
-        executor_calls: list[tuple[object | None, object]] = []
-
-        class _LoopProbe:
-            async def run_in_executor(self, executor, callback):
-                executor_calls.append((executor, callback))
-                return callback()
 
         with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
             handle.write(b"RIFFdemo")
             handle.flush()
-            with patch("trillim.server._whisper.asyncio.get_running_loop", return_value=_LoopProbe()):
+            with patch("trillim.server._whisper.Path.read_bytes", side_effect=AssertionError("should not read bytes")):
                 result = await whisper.transcribe_wav(handle.name, language="fr")
 
         self.assertEqual(result, "decoded")
-        self.assertEqual(engine.calls, [(b"RIFFdemo", "fr")])
-        self.assertEqual(len(executor_calls), 1)
-        self.assertIsNone(executor_calls[0][0])
+        self.assertEqual(engine.calls, [])
+        self.assertEqual(engine.path_calls, [(handle.name, "fr")])
 
     async def test_transcribe_array_encodes_valid_wav_from_frames_first_audio(self):
         engine = _FakeWhisperEngine()
@@ -260,6 +263,14 @@ class WhisperEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(model.calls, [(b"audio", "fr", 5)])
 
+        with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
+            self.assertEqual(
+                await engine.transcribe_path(handle.name, language="en"),
+                "hello world",
+            )
+
+        self.assertEqual(model.calls[-1], (handle.name, "en", 5))
+
         await engine.stop()
         self.assertIsNone(engine._model)
 
@@ -268,6 +279,9 @@ class WhisperEngineTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "WhisperEngine not started"):
             await engine.transcribe(b"audio")
+
+        with self.assertRaisesRegex(RuntimeError, "WhisperEngine not started"):
+            await engine.transcribe_path("audio.wav")
 
     def test_engine_load_formats_import_errors_and_success(self):
         engine = whisper_module.WhisperEngine(model_size="tiny", compute_type="float32", cpu_threads=9)
@@ -358,7 +372,7 @@ class WhisperRouterTests(unittest.TestCase):
                 files={
                     "file": (
                         "sample.wav",
-                        b"x" * (8 * 1024 * 1024 + 1),
+                        b"x" * (10 * 1024 * 1024 + 1),
                         "audio/wav",
                     )
                 },
