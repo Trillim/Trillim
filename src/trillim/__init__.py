@@ -8,6 +8,7 @@ __all__ = [
     "Server",
     "Runtime",
     "LLM",
+    "ChatSession",
     "Whisper",
     "TTS",
     "SentenceChunker",
@@ -20,6 +21,10 @@ def __getattr__(name: str):
         from .server._llm import LLM
 
         return LLM
+    if name == "ChatSession":
+        from .chat_session import ChatSession
+
+        return ChatSession
     if name == "Server":
         from .server._server import Server
 

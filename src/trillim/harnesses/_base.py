@@ -11,7 +11,7 @@ from trillim.engine import InferenceEngine
 from trillim.events import ChatEvent, ChatTokenEvent
 
 if TYPE_CHECKING:
-    from trillim.server._llm import ChatSession
+    from trillim.chat_session import ChatSession
 
 
 class Harness(abc.ABC):
