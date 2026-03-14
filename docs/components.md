@@ -48,7 +48,7 @@ finally:
     runtime.stop()
 ```
 
-If `runtime.llm.chat(..., timeout=...)` expires, Trillim restarts the current inference subprocess before returning the timeout so later requests stay protocol-synchronized. This is a temporary safety measure until cooperative mid-request cancellation exists in the inference engine.
+For `runtime.llm.chat(..., timeout=...)` and `runtime.llm.session(...).chat(timeout=...)`, `timeout` is an inactivity timeout between emitted chat events, not a cap on total wall-clock response time. If the chat stalls for longer than `timeout`, Trillim restarts the current inference subprocess before surfacing the timeout so later requests stay protocol-synchronized. This is a temporary safety measure until cooperative mid-request cancellation exists in the inference engine.
 
 `runtime.llm.chat(...)` and `runtime.llm.stream_chat(...)` are one-turn helpers. Use `runtime.llm.session(...)` for multi-turn conversations or prompt validation.
 
@@ -87,7 +87,7 @@ async def main():
 asyncio.run(main())
 ```
 
-If `llm.chat(..., timeout=...)` expires, Trillim restarts the current inference subprocess before surfacing the timeout. That reset is intentional: the engine cannot yet cancel an in-flight request cleanly, so restarting avoids poisoning the next request.
+For `llm.chat(..., timeout=...)` and `chat.chat(timeout=...)`, `timeout` is an inactivity timeout between emitted chat events, not a cap on total wall-clock response time. If the chat stalls for longer than `timeout`, Trillim restarts the current inference subprocess before surfacing the timeout. That reset is intentional: the engine cannot yet cancel an in-flight request cleanly, so restarting avoids poisoning the next request.
 
 `llm.chat(...)` and `llm.stream_chat(...)` are one-turn helpers. For multi-turn conversations, prompt validation, and prompt-budget inspection, create an append-only `ChatSession` with `llm.session(...)`.
 

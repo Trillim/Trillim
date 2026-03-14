@@ -64,6 +64,30 @@ class _SlowScriptedEngine(_ScriptedEngine):
             yield token
 
 
+class _TokenDelayScriptedEngine(_ScriptedEngine):
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        token_delays: list[float],
+        tokenizer=None,
+        max_context_tokens: int = 4096,
+    ):
+        super().__init__(
+            responses,
+            tokenizer=tokenizer,
+            max_context_tokens=max_context_tokens,
+        )
+        self._token_delays = list(token_delays)
+
+    async def generate(self, **_):
+        response = self._responses.pop(0)
+        for index, ch in enumerate(response):
+            if index < len(self._token_delays):
+                await asyncio.sleep(self._token_delays[index])
+            yield ord(ch)
+
+
 class _SuccessfulSearch:
     def __init__(self, results: str):
         self._results = results
@@ -204,6 +228,79 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "not prepared"):
             session._finalize_assistant("oops", [])
+
+    async def test_session_chat_timeout_allows_long_responses_that_keep_progress(self):
+        engine = _TokenDelayScriptedEngine(
+            ["hello"],
+            token_delays=[0.02, 0.02, 0.02, 0.02, 0.02],
+        )
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = engine
+        llm.harness = DefaultHarness(engine)
+        session = llm.session([{"role": "user", "content": "Say hi"}])
+
+        start = asyncio.get_running_loop().time()
+        result = await session.chat(timeout=0.05)
+        elapsed = asyncio.get_running_loop().time() - start
+
+        self.assertEqual(result, "hello")
+        self.assertGreater(elapsed, 0.08)
+
+    async def test_session_chat_timeout_restarts_after_mid_stream_stall(self):
+        engine = _TokenDelayScriptedEngine(
+            ["hello"],
+            token_delays=[0.0, 0.08],
+        )
+        llm = LLM("models/fake")
+        llm.state = ServerState.RUNNING
+        llm.engine = engine
+        llm.harness = DefaultHarness(engine)
+        session = llm.session([{"role": "user", "content": "Say hi"}])
+        restart_calls: list[tuple] = []
+
+        async def fake_swap_engine(
+            model_dir: str,
+            adapter_dir=None,
+            harness_name=None,
+            search_provider=None,
+            num_threads=None,
+            lora_quant=None,
+            unembed_quant=None,
+        ):
+            restart_calls.append(
+                (
+                    model_dir,
+                    adapter_dir,
+                    harness_name,
+                    search_provider,
+                    num_threads,
+                    lora_quant,
+                    unembed_quant,
+                )
+            )
+            recovered = _ScriptedEngine(["recovered"])
+            llm.engine = recovered
+            llm.harness = DefaultHarness(recovered)
+            llm.state = ServerState.RUNNING
+            llm._session_generation += 1
+            return SimpleNamespace(status="success", model="fake", recompiled=False, message="")
+
+        llm._swap_engine = fake_swap_engine
+
+        with self.assertRaisesRegex(TimeoutError, "LLM chat timed out"):
+            await session.chat(timeout=0.02)
+
+        self.assertEqual(
+            restart_calls,
+            [("models/fake", None, "default", "ddgs", 0, None, None)],
+        )
+        with self.assertRaisesRegex(RuntimeError, "ChatSession is stale"):
+            _ = session.messages
+        self.assertEqual(
+            await llm.session([{"role": "user", "content": "Try again"}]).chat(),
+            "recovered",
+        )
 
 
 class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
