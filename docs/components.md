@@ -91,6 +91,8 @@ For `llm.chat(..., timeout=...)` and `chat.chat(timeout=...)`, `timeout` is an i
 
 `llm.chat(...)` and `llm.stream_chat(...)` are one-turn helpers. For multi-turn conversations, prompt validation, and prompt-budget inspection, create an append-only `ChatSession` with `llm.session(...)`.
 
+`ChatSession` is a public SDK type and can be imported with `from trillim import ChatSession`, but prefer creating sessions through `llm.session(...)` rather than calling the constructor directly. Underscored methods on `ChatSession` are internal implementation details.
+
 ```python
 from trillim import ContextOverflowError
 

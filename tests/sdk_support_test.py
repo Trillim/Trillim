@@ -8,6 +8,7 @@ import trillim
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
+from trillim.chat_session import ChatSession as ChatSessionModuleExport
 from trillim.errors import ContextOverflowError
 from trillim.harnesses import DefaultHarness, SearchHarness, get_harness
 from trillim.runtime import Runtime
@@ -66,12 +67,16 @@ class _ThirdTestComponent(_TestComponent):
 class SdkSurfaceTests(unittest.TestCase):
     def test_trillim_lazy_exports_cover_all_public_names(self):
         self.assertIs(trillim.__getattr__("LLM"), LLM)
+        self.assertIs(trillim.__getattr__("ChatSession"), ChatSessionModuleExport)
         self.assertIs(trillim.__getattr__("Server"), ServerExport)
         self.assertIs(trillim.__getattr__("Runtime"), Runtime)
         self.assertIs(trillim.__getattr__("TTS"), TTS)
         self.assertIs(trillim.__getattr__("SentenceChunker"), SentenceChunker)
         self.assertIs(trillim.__getattr__("Whisper"), Whisper)
         self.assertIs(trillim.__getattr__("ContextOverflowError"), ContextOverflowError)
+
+    def test_chat_session_public_module_matches_top_level_export(self):
+        self.assertIs(trillim.ChatSession, ChatSessionModuleExport)
 
     def test_trillim_lazy_exports_reject_unknown_names(self):
         with self.assertRaisesRegex(AttributeError, "has no attribute 'MissingThing'"):

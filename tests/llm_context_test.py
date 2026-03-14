@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 import trillim
-from trillim import ContextOverflowError
+from trillim import ChatSession, ContextOverflowError
 from trillim.harnesses._default import DefaultHarness
 from trillim.server import LLM
 from trillim.server._models import ServerState
@@ -108,6 +108,12 @@ def _make_llm(
 class ChatSessionMetricTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_overflow_error_is_exported(self):
         self.assertIs(trillim.ContextOverflowError, ContextOverflowError)
+
+    async def test_session_returns_public_chat_session_type(self):
+        llm, _ = _make_llm()
+        session = llm.session([{"role": "user", "content": "hello"}])
+
+        self.assertIs(type(session), ChatSession)
 
     async def test_session_exposes_prompt_metrics_without_duplicate_preparation(self):
         llm, tokenizer = _make_llm()
