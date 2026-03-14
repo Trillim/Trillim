@@ -147,8 +147,7 @@ def _run_chat_loop(loop, harness, sampling_params):
 
         if query.strip() == "/new":
             messages = []
-            harness.engine._cached_prompt_str = ""
-            harness.engine.cached_token_ids = []
+            harness.engine.reset_prompt_cache()
             print("Starting new conversation.")
             continue
 
@@ -161,8 +160,7 @@ def _run_chat_loop(loop, harness, sampling_params):
                 f"Context window full ({max_context} tokens). Starting new conversation."
             )
             messages = [messages[-1]]
-            harness.engine._cached_prompt_str = ""
-            harness.engine.cached_token_ids = []
+            harness.engine.reset_prompt_cache()
 
         loop.run_until_complete(_stream_response(harness, messages, sampling_params))
         print()

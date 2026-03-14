@@ -32,5 +32,6 @@ class DefaultHarness(Harness):
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
 
-        session._finalize_assistant(full_text, generated_token_ids)
+        cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
+        self.engine.finalize_prompt_cache(cache_snapshot)
         yield ChatFinalTextEvent(text=full_text)

@@ -32,6 +32,7 @@ from ._models import (
 )
 
 from trillim.errors import ContextOverflowError
+from trillim._prompt_cache import PromptSnapshot
 from trillim.engine import InferenceEngine
 from trillim.events import (
     ChatDoneEvent,
@@ -130,7 +131,7 @@ class ChatSession:
             )
 
     def _append_message(self, role: str, content: str) -> None:
-        engine, _ = self._require_active()
+        self._require_active()
         self._prepared_prompt_str = None
         self._prepared_token_ids = None
         self._messages.append({"role": role, "content": content})
@@ -140,7 +141,6 @@ class ChatSession:
             context=f"appending {role!r} message",
         )
         self._base_prompt_str = prompt_str
-        engine._cached_prompt_str = prompt_str
 
     def _prepare_reply(self) -> tuple[list[int], str]:
         self._require_turn_ready()
@@ -154,8 +154,8 @@ class ChatSession:
         self._prepared_prompt_str = prompt_str
         return list(self._prepared_token_ids), self._prepared_prompt_str
 
-    def _finalize_assistant(self, text: str, token_ids: list[int]) -> None:
-        engine, _ = self._require_active()
+    def _finalize_assistant(self, text: str, token_ids: list[int]) -> PromptSnapshot:
+        self._require_active()
         if self._prepared_prompt_str is None or self._prepared_token_ids is None:
             raise RuntimeError("ChatSession assistant turn was not prepared")
         self._messages.append({"role": "assistant", "content": text})
@@ -166,6 +166,10 @@ class ChatSession:
                 "ChatSession requires append-only prompt rendering; finalizing assistant output rewrote earlier prompt content"
             )
         tail = prompt_str[len(generated_prefix):]
+        cache_snapshot = PromptSnapshot.create(
+            list(self._prepared_token_ids) + list(token_ids),
+            generated_prefix,
+        )
         self._base_token_ids = (
             list(self._prepared_token_ids)
             + list(token_ids)
@@ -174,7 +178,7 @@ class ChatSession:
         self._base_prompt_str = prompt_str
         self._prepared_prompt_str = None
         self._prepared_token_ids = None
-        engine._cached_prompt_str = prompt_str
+        return cache_snapshot
 
     @property
     def messages(self) -> tuple[dict, ...]:
@@ -244,7 +248,7 @@ class ChatSession:
             prompt_tokens=prompt_tokens,
             completion_tokens=harness._last_completion_tokens,
             total_tokens=prompt_tokens + harness._last_completion_tokens,
-            cached_tokens=engine._last_cache_hit,
+            cached_tokens=engine.last_cache_hit,
         )
         yield ChatDoneEvent(text=full_text, usage=usage)
 
@@ -849,7 +853,7 @@ class LLM(Component):
                 full_text += decoder.decode(token_id)
                 completion_tokens += 1
 
-            cached_tokens = llm.engine._last_cache_hit
+            cached_tokens = llm.engine.last_cache_hit
 
             return CompletionResponse(
                 id=make_id(),

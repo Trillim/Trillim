@@ -57,14 +57,16 @@ class SearchHarness(Harness):
                 # No search tag — yield buffered text as final response
                 self._last_completion_tokens = len(generated_token_ids)
                 yield ChatTokenEvent(text=full_text)
-                session._finalize_assistant(full_text, generated_token_ids)
+                cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
+                self.engine.finalize_prompt_cache(cache_snapshot)
                 yield ChatFinalTextEvent(text=full_text)
                 return
 
             yield ChatSearchStartedEvent(query=query)
 
             # Keep cache aligned with model-generated state only.
-            session._finalize_assistant(full_text, generated_token_ids)
+            cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
+            self.engine.finalize_prompt_cache(cache_snapshot)
 
             try:
                 results = await self._search.search(query)
@@ -95,5 +97,6 @@ class SearchHarness(Harness):
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
 
-        session._finalize_assistant(full_text, generated_token_ids)
+        cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
+        self.engine.finalize_prompt_cache(cache_snapshot)
         yield ChatFinalTextEvent(text=full_text)

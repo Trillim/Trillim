@@ -5,6 +5,8 @@ import asyncio
 import os
 from collections.abc import AsyncGenerator
 
+from trillim._prompt_cache import PromptCacheManager, PromptSnapshot
+
 _ENGINE_TIMEOUT = 300  # seconds; maximum wait for a single engine I/O operation
 
 
@@ -34,9 +36,25 @@ class InferenceEngine:
         self.unembed_quant = unembed_quant
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
-        self.cached_token_ids: list[int] = []
-        self._last_cache_hit: int = 0
-        self._cached_prompt_str: str = ""
+        self._prompt_cache = PromptCacheManager()
+
+    @property
+    def cached_token_ids(self) -> list[int]:
+        return list(self._prompt_cache.token_ids)
+
+    @property
+    def cached_prompt_str(self) -> str | None:
+        return self._prompt_cache.prompt_str
+
+    @property
+    def last_cache_hit(self) -> int:
+        return self._prompt_cache.last_cache_hit
+
+    def reset_prompt_cache(self) -> None:
+        self._prompt_cache.clear()
+
+    def finalize_prompt_cache(self, snapshot: PromptSnapshot) -> None:
+        self._prompt_cache.finalize_prompt(snapshot)
 
     async def start(self):
         """Launch the C++ inference subprocess."""
@@ -81,9 +99,7 @@ class InferenceEngine:
 
     async def stop(self):
         """Shut down the subprocess gracefully."""
-        self.cached_token_ids = []
-        self._last_cache_hit = 0
-        self._cached_prompt_str = ""
+        self.reset_prompt_cache()
         if self.process and self.process.returncode is None:
             try:
                 self.process.stdin.write(b"0\n")
@@ -120,6 +136,7 @@ class InferenceEngine:
             else d["rep_penalty_lookback"]
         )
         mt = max_tokens if max_tokens is not None else 0
+        request = PromptSnapshot.create(token_ids, prompt_str)
 
         async with self.lock:
             proc = self.process
@@ -128,9 +145,7 @@ class InferenceEngine:
             completed = False
 
             async def _raise_engine_crash() -> None:
-                self.cached_token_ids = []
-                self._last_cache_hit = 0
-                self._cached_prompt_str = ""
+                self.reset_prompt_cache()
                 stderr = ""
                 try:
                     stderr_bytes = await proc.stderr.read()
@@ -143,54 +158,20 @@ class InferenceEngine:
                 raise RuntimeError(msg)
 
             try:
-                # String-level prefix matching (mirrors CLI chat approach):
-                # Compare rendered prompt strings to avoid re-tokenization mismatches.
-                if (
-                    prompt_str is not None
-                    and self._cached_prompt_str
-                    and prompt_str.startswith(self._cached_prompt_str)
-                ):
-                    suffix = prompt_str[len(self._cached_prompt_str) :]
-                    delta_tokens = self.tokenizer.encode(
-                        suffix, add_special_tokens=False
-                    )
-                    all_token_ids = self.cached_token_ids + delta_tokens
-                    reset_flag = 0
-                    match_len = len(self.cached_token_ids)
-                elif prompt_str is not None:
-                    # String mismatch — different conversation, full reset.
-                    # Do NOT fall through to token-level matching: shared
-                    # template-header tokens could trick it into reusing a
-                    # stale KV cache from the previous conversation.
-                    delta_tokens = token_ids
-                    reset_flag = 1
-                    match_len = 0
-                    all_token_ids = token_ids
-                else:
-                    # Token-level prefix matching (for /v1/completions with no template)
-                    cached = self.cached_token_ids
-                    match_len = 0
-                    limit = min(len(token_ids), len(cached))
-                    while match_len < limit and token_ids[match_len] == cached[match_len]:
-                        match_len += 1
-
-                    if match_len > 0 and match_len == len(cached):
-                        delta_tokens = token_ids[match_len:]
-                        reset_flag = 0
-                    else:
-                        delta_tokens = token_ids
-                        reset_flag = 1
-                        match_len = 0
-                    all_token_ids = token_ids
-
-                self._last_cache_hit = match_len
+                plan = self._prompt_cache.plan(
+                    request,
+                    encode_suffix=lambda suffix: self.tokenizer.encode(
+                        suffix,
+                        add_special_tokens=False,
+                    ),
+                )
 
                 # Build count-prefixed key=value request block
                 from trillim.utils import _build_request_block
 
                 req_block = _build_request_block(
-                    delta_tokens,
-                    reset_flag,
+                    list(plan.delta_tokens),
+                    plan.reset_flag,
                     temperature=temp,
                     top_k=tk,
                     top_p=tp,
@@ -244,9 +225,7 @@ class InferenceEngine:
                     )
                 except asyncio.TimeoutError:
                     proc.kill()
-                    self.cached_token_ids = []
-                    self._last_cache_hit = 0
-                    self._cached_prompt_str = ""
+                    self.reset_prompt_cache()
                     raise RuntimeError(
                         f"Inference engine unresponsive for {_ENGINE_TIMEOUT}s — "
                         "the model may be too large for available memory"
@@ -260,17 +239,17 @@ class InferenceEngine:
                             "Protocol error: expected int kv_position, "
                             f"got {kv_line.strip()!r}"
                         )
-                    self.cached_token_ids = (all_token_ids + generated_tokens)[
-                        :kv_position
-                    ]
+                    self._prompt_cache.commit_generation(
+                        plan,
+                        generated_token_ids=generated_tokens,
+                        kv_position=kv_position,
+                    )
                 else:
                     await _raise_engine_crash()
                 completed = True
             finally:
                 if not completed:
-                    self.cached_token_ids = []
-                    self._last_cache_hit = 0
-                    self._cached_prompt_str = ""
+                    self.reset_prompt_cache()
                     if proc.returncode is None:
                         try:
                             proc.kill()
