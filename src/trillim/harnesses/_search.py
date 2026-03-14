@@ -24,7 +24,12 @@ class SearchHarness(Harness):
 
     def __init__(self, engine: InferenceEngine, search_provider: str = "ddgs"):
         super().__init__(engine)
-        self._search = SearchClient(provider_name=search_provider)
+        self._search = SearchClient(
+            provider_name=search_provider,
+            count_tokens=lambda text: len(
+                self.tokenizer.encode(text, add_special_tokens=False)
+            ),
+        )
 
     async def _generate_buffered(self, session, **sampling: Any) -> tuple[str, list[int]]:
         """Generate a full response non-streaming."""

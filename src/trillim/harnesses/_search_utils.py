@@ -33,7 +33,7 @@ def extract_search_query(text: str) -> str | None:
 
 
 def _token_budget_to_char_budget(token_budget: int) -> int:
-    """Approximate conversion from tokens to chars for truncation."""
+    """Fallback conversion when no tokenizer-aware counter is available."""
     return max(1, token_budget) * _CHARS_PER_TOKEN
 
 
@@ -157,15 +157,73 @@ def _truncate_at_sentence(text: str, budget: int) -> str:
     return snippet
 
 
-def truncate_to_token_budget(text: str, query: str, token_budget: int = 1024) -> str:
-    """Select the most query-relevant paragraphs within an approximate token budget.
+def _truncate_to_exact_token_budget(
+    text: str,
+    token_budget: int,
+    count_tokens: Callable[[str], int],
+) -> str:
+    """Truncate text to the exact token budget, preferring sentence boundaries."""
+    if not text:
+        return ""
+
+    budget = max(1, token_budget)
+    if count_tokens(text) <= budget:
+        return text
+
+    sentence_ends = [idx + 1 for idx, ch in enumerate(text) if ch in ".!?"]
+    best_sentence = ""
+    left = 0
+    right = len(sentence_ends) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        candidate = text[:sentence_ends[mid]]
+        if count_tokens(candidate) <= budget:
+            best_sentence = candidate
+            left = mid + 1
+        else:
+            right = mid - 1
+    if best_sentence:
+        return best_sentence
+
+    # Sentence itself is very long
+    best_len = 0
+    left = 1
+    right = len(text)
+    while left <= right:
+        mid = (left + right) // 2
+        candidate = text[:mid]
+        if count_tokens(candidate) <= budget:
+            best_len = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+    return text[:best_len]
+
+
+def truncate_to_token_budget(
+    text: str,
+    query: str,
+    token_budget: int = 1024,
+    *,
+    count_tokens: Callable[[str], int] | None = None,
+) -> str:
+    """Select the most query-relevant paragraphs within a token budget.
 
     1. Split into paragraphs
     2. Score by keyword overlap with query
     3. Greedily select top-scoring paragraphs until budget
     4. Re-sort selected by original position (preserve reading order)
+
+    When ``count_tokens`` is provided, paragraph selection and truncation are
+    exact with respect to the active model tokenizer. Otherwise, the fallback
+    char heuristic is used.
     """
     char_budget = _token_budget_to_char_budget(token_budget)
+    exact_budget = max(1, token_budget)
+
+    def _count(text_value: str) -> int:
+        assert count_tokens is not None
+        return count_tokens(text_value)
 
     # Split into paragraphs
     paragraphs = []
@@ -180,6 +238,12 @@ def truncate_to_token_budget(text: str, query: str, token_budget: int = 1024) ->
 
     # Single paragraph — just truncate at sentence boundary
     if len(paragraphs) == 1:
+        if count_tokens is not None:
+            return _truncate_to_exact_token_budget(
+                paragraphs[0],
+                exact_budget,
+                _count,
+            )
         return _truncate_at_sentence(paragraphs[0], char_budget)
 
     # Build keyword set from query
@@ -197,15 +261,44 @@ def truncate_to_token_budget(text: str, query: str, token_budget: int = 1024) ->
 
     # Greedily select until budget
     selected = []
-    remaining = char_budget
-    for score, idx, para in scored:
-        if len(para) <= remaining:
-            selected.append((idx, para))
-            remaining -= len(para) + 2  # account for \n\n join
-        elif not selected:
-            # First paragraph exceeds budget — truncate at sentence boundary
-            selected.append((idx, _truncate_at_sentence(para, char_budget)))
-            break
+    if count_tokens is None:
+        remaining = char_budget
+        for score, idx, para in scored:
+            if len(para) <= remaining:
+                selected.append((idx, para))
+                remaining -= len(para) + 2  # account for \n\n join
+            elif not selected:
+                # First paragraph exceeds budget — truncate at sentence boundary
+                selected.append((idx, _truncate_at_sentence(para, char_budget)))
+                break
+    else:
+        token_count_cache: dict[str, int] = {}
+
+        def _cached_count(text_value: str) -> int:
+            cached = token_count_cache.get(text_value)
+            if cached is None:
+                cached = _count(text_value)
+                token_count_cache[text_value] = cached
+            return cached
+
+        for score, idx, para in scored:
+            candidate = selected + [(idx, para)]
+            candidate.sort()
+            candidate_text = "\n\n".join(candidate_para for _, candidate_para in candidate)
+            if _cached_count(candidate_text) <= exact_budget:
+                selected = candidate
+            elif not selected:
+                selected.append(
+                    (
+                        idx,
+                        _truncate_to_exact_token_budget(
+                            para,
+                            exact_budget,
+                            _cached_count,
+                        ),
+                    )
+                )
+                break
 
     # Re-sort by original position
     selected.sort()
@@ -250,11 +343,13 @@ class SearchProvider(ABC):
         *,
         token_budget: int,
         fetch_and_extract: Callable[[str], str | None],
+        count_tokens: Callable[[str], int] | None = None,
     ) -> str:
         """Provider-owned post-processing into model-ready text.
 
         Default behavior is tuned for web result providers (e.g., DDGS):
-        relevance sort, fetch full page text, then truncate to budget.
+        relevance sort, fetch full page text, then truncate to budget. When
+        ``count_tokens`` is available, the final prompt budget is exact.
         """
         if not results:
             raise SearchError("No search results found.")
@@ -286,14 +381,31 @@ class SearchProvider(ABC):
         per_result = max(1, token_budget // len(entries))
         parts: list[str] = []
         for i, (title, body) in enumerate(entries, 1):
-            truncated = truncate_to_token_budget(body, query, token_budget=per_result)
-            parts.append(f"[{i}] {title}\n{truncated}")
+            prefix = f"[{i}] {title}\n"
+            body_budget = per_result
+            if count_tokens is not None:
+                body_budget = max(1, per_result - count_tokens(prefix))
+            truncated = truncate_to_token_budget(
+                body,
+                query,
+                token_budget=body_budget,
+                count_tokens=count_tokens,
+            )
+            parts.append(f"{prefix}{truncated}")
 
         output = "\n\n".join(parts)
-        # Hard limit by approximate tokens.
-        char_budget = _token_budget_to_char_budget(token_budget)
-        if len(output) > char_budget:
-            output = _truncate_at_sentence(output, char_budget)
+        if count_tokens is not None:
+            if count_tokens(output) > max(1, token_budget):
+                output = _truncate_to_exact_token_budget(
+                    output,
+                    token_budget,
+                    count_tokens,
+                )
+        else:
+            # Hard limit by approximate tokens.
+            char_budget = _token_budget_to_char_budget(token_budget)
+            if len(output) > char_budget:
+                output = _truncate_at_sentence(output, char_budget)
         return output
 
 
@@ -427,9 +539,10 @@ class BraveSearchProvider(SearchProvider):
         *,
         token_budget: int,
         fetch_and_extract: Callable[[str], str | None],
+        count_tokens: Callable[[str], int] | None = None,
     ) -> str:
         """Brave LLM Context is already curated; pass grounding snippets through."""
-        del query, token_budget, fetch_and_extract
+        del query, fetch_and_extract # Intentionally unused coz Brave auto grounds results
         if not results:
             raise SearchError("No search results found.")
 
@@ -445,6 +558,12 @@ class BraveSearchProvider(SearchProvider):
         output = "\n\n".join(parts).strip()
         if not output:
             raise SearchError("No relevant search results found.")
+        if count_tokens is not None and count_tokens(output) > max(1, token_budget):
+            output = _truncate_to_exact_token_budget(
+                output,
+                token_budget,
+                count_tokens,
+            )
         return output
 
 
@@ -482,6 +601,7 @@ class SearchClient:
         max_results: int = 3,
         token_budget: int = 1024,
         api_key: str | None = None,
+        count_tokens: Callable[[str], int] | None = None,
     ):
         self.provider = get_search_provider(
             provider_name,
@@ -490,6 +610,7 @@ class SearchClient:
             api_key=api_key,
         )
         self.token_budget = token_budget
+        self.count_tokens = count_tokens
 
     async def search(self, query: str) -> str:
         """Run search pipeline in a thread (providers + urllib are sync)."""
@@ -502,6 +623,7 @@ class SearchClient:
             results,
             token_budget=self.token_budget,
             fetch_and_extract=self._fetch_and_extract,
+            count_tokens=self.count_tokens,
         )
 
     def _fetch_and_extract(self, url: str) -> str | None:
