@@ -184,6 +184,9 @@ class _ChatSession:
         self.calls.append(("session.add_user", content))
         self._messages.append({"role": "user", "content": content})
 
+    def fail(self) -> None:
+        raise ValueError("session boom")
+
     async def chat(self) -> str:
         self.calls.append(("session.chat", tuple(m["content"] for m in self._messages)))
         self._messages.append({"role": "assistant", "content": "session-reply"})
@@ -242,20 +245,27 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(runtime.started)
             self.assertEqual(runtime.components, (llm, whisper, tts))
             self.assertIn("llm", dir(runtime))
+            self.assertIsInstance(runtime.llm, runtime_module._RuntimeComponentProxy)
+            self.assertIsInstance(runtime.whisper, runtime_module._RuntimeComponentProxy)
+            self.assertIsInstance(runtime.tts, runtime_module._RuntimeComponentProxy)
             self.assertEqual(runtime.llm.chat(messages), "reply")
             self.assertEqual(list(runtime.llm.stream_chat(messages)), ["event-1", "event-2"])
             self.assertEqual(runtime.llm.max_context_tokens, 128)
             llm_session = runtime.llm.session(messages)
+            self.assertIsInstance(llm_session, runtime_module._RuntimeObjectProxy)
             self.assertEqual(llm_session.messages, ({"role": "user", "content": "hello"},))
             self.assertEqual(llm_session.prompt_tokens, 1)
             self.assertEqual(llm_session.max_context_tokens, 128)
             self.assertEqual(llm_session.remaining_context_tokens, 127)
             self.assertEqual(llm_session.validate(), 1)
             llm_session.add_user("again")
+            with self.assertRaisesRegex(ValueError, "session boom"):
+                llm_session.fail()
             self.assertEqual(list(llm_session.stream_chat()), ["session-event-1", "session-event-2"])
             self.assertEqual(llm_session.chat(), "session-reply")
             self.assertEqual(runtime.whisper.transcribe(b"audio"), "audio")
             session = runtime.tts.speak("hello")
+            self.assertIsInstance(session, runtime_module._RuntimeObjectProxy)
             self.assertEqual(session.state, "running")
             session.pause()
             self.assertEqual(session.state, "paused")
@@ -430,15 +440,15 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "'started' is not callable"):
             asyncio.run(runtime._invoke_attr_async(component, "started", (1,), {}))
 
-    def test_invoke_helpers_require_started(self):
+    def test_invoke_managed_helper_requires_started(self):
         component = LLM([])
         runtime = Runtime(component)
 
         with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
-            runtime._invoke_component_attr(component, "session", ([],), {})
+            runtime._invoke_managed_attr(component, "session", ([],), {})
 
         with self.assertRaisesRegex(RuntimeError, "Runtime not started"):
-            runtime._invoke_object_attr(object(), "__str__", (), {})
+            runtime._invoke_managed_attr(object(), "__str__", (), {})
 
     def test_syncify_result_awaits_coroutines(self):
         runtime = Runtime(LLM([]))
