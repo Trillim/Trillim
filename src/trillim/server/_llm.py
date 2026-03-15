@@ -210,22 +210,25 @@ class ChatSession:
         return list(self._prepared_token_ids), self._prepared_prompt_str
 
     def _finalize_assistant(self, text: str, token_ids: list[int]) -> PromptSnapshot:
-        self._require_active()
+        engine, _ = self._require_active()
         if self._prepared_prompt_str is None or self._prepared_token_ids is None:
             raise RuntimeError("ChatSession assistant turn was not prepared")
         self._messages.append({"role": "assistant", "content": text})
         prompt_str = self._render_prompt(add_generation_prompt=False)
         generated_prefix = self._prepared_prompt_str + text
-        cache_snapshot = PromptSnapshot.create(
-            list(self._prepared_token_ids) + list(token_ids),
-            generated_prefix,
-        )
-        self._base_token_ids = self._materialize_append_only_tokens(
+        visible_token_ids = list(self._prepared_token_ids) + list(token_ids)
+        final_token_ids = self._materialize_append_only_tokens(
             prompt_str,
             base_prompt_str=generated_prefix,
-            base_token_ids=list(self._prepared_token_ids) + list(token_ids),
+            base_token_ids=visible_token_ids,
             context="finalizing assistant output",
         )
+        cached_token_ids = tuple(getattr(engine, "cached_token_ids", final_token_ids))
+        if cached_token_ids == tuple(visible_token_ids):
+            cache_snapshot = PromptSnapshot.create(visible_token_ids, generated_prefix)
+        else:
+            cache_snapshot = PromptSnapshot.create(final_token_ids, prompt_str)
+        self._base_token_ids = final_token_ids
         self._base_prompt_str = prompt_str
         self._prepared_prompt_str = None
         self._prepared_token_ids = None
