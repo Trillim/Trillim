@@ -125,11 +125,10 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         engine: InferenceEngine,
         token_ids: list[int],
         *,
-        prompt_str: str | None = None,
         last_cache_hit: int = 0,
     ) -> None:
         engine._prompt_cache.restore(
-            PromptSnapshot.create(token_ids, prompt_str),
+            PromptSnapshot.create(token_ids),
             last_cache_hit=last_cache_hit,
         )
 
@@ -248,13 +247,12 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_resets_cache_without_process(self):
         engine = self._make_engine()
-        self._seed_cache(engine, [1, 2], prompt_str="cached", last_cache_hit=2)
+        self._seed_cache(engine, [1, 2], last_cache_hit=2)
 
         await engine.stop()
 
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertIsNone(engine.cached_prompt_str)
 
     async def test_stop_gracefully_terminates_running_process(self):
         engine = self._make_engine()
@@ -277,16 +275,6 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(proc.killed)
         self.assertEqual(proc.wait_calls, 1)
 
-    def test_finalize_prompt_cache_delegates_to_prompt_cache_manager(self):
-        engine = self._make_engine()
-        snapshot = PromptSnapshot.create([1, 2, 3], "abc")
-        self._seed_cache(engine, [1, 2, 3])
-
-        engine.finalize_prompt_cache(snapshot)
-
-        self.assertEqual(engine.cached_token_ids, [1, 2, 3])
-        self.assertEqual(engine.cached_prompt_str, "abc")
-
     async def test_generate_requires_running_process(self):
         engine = self._make_engine()
 
@@ -297,10 +285,10 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "Inference process is not running"):
             await self._collect(engine, token_ids=[1])
 
-    async def test_generate_reuses_string_prefix_cache(self):
+    async def test_generate_reuses_exact_cached_token_prefix(self):
         engine = self._make_engine()
         engine.process = _FakeProcess(stdout_lines=[b"65\n", b"0\n", b"4\n"])
-        self._seed_cache(engine, [1, 2], prompt_str="ab")
+        self._seed_cache(engine, [1, 2])
         request_calls: list[tuple[list[int], int, dict]] = []
 
         utils_module = _module(
@@ -314,7 +302,6 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
             tokens = await self._collect(
                 engine,
                 token_ids=[1, 2, 99, 100],
-                prompt_str="abcd",
             )
 
         self.assertEqual(tokens, [65])
@@ -335,10 +322,10 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.last_cache_hit, 2)
         self.assertEqual(engine.cached_token_ids, [1, 2, 99, 100])
 
-    async def test_generate_resets_on_prompt_string_mismatch(self):
+    async def test_generate_resets_when_request_is_shorter_than_cached_prefix(self):
         engine = self._make_engine()
         engine.process = _FakeProcess(stdout_lines=[b"0\n", b"1\n"])
-        self._seed_cache(engine, [5, 6], prompt_str="different")
+        self._seed_cache(engine, [5, 6])
         request_calls: list[tuple[list[int], int]] = []
 
         utils_module = _module(
@@ -351,8 +338,7 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"trillim.utils": utils_module}):
             tokens = await self._collect(
                 engine,
-                token_ids=[1, 2],
-                prompt_str="new prompt",
+                token_ids=[5],
                 temperature=0.2,
                 top_k=4,
                 top_p=0.5,
@@ -362,9 +348,9 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(tokens, [])
-        self.assertEqual(request_calls, [([1, 2], 1)])
+        self.assertEqual(request_calls, [([5], 1)])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertEqual(engine.cached_token_ids, [1])
+        self.assertEqual(engine.cached_token_ids, [5])
 
     async def test_generate_reuses_token_prefix_when_cached_prompt_is_unavailable(self):
         engine = self._make_engine()
@@ -420,7 +406,6 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertIsNone(engine.cached_prompt_str)
 
     async def test_generate_normalizes_sampling_validation_errors(self):
         engine = self._make_engine()
@@ -435,7 +420,7 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_raises_on_unexpected_stdout_eof(self):
         engine = self._make_engine()
         engine.process = _FakeProcess(stdout_lines=[b"65\n", b""], stderr_data=b"child exited")
-        self._seed_cache(engine, [1], prompt_str="cached", last_cache_hit=1)
+        self._seed_cache(engine, [1], last_cache_hit=1)
         utils_module = _module(
             "trillim.utils",
             _build_request_block=lambda *args, **kwargs: "request",
@@ -450,7 +435,6 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tokens, [65])
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertIsNone(engine.cached_prompt_str)
 
     async def test_generate_handles_stderr_read_failures_on_crash(self):
         engine = self._make_engine()
@@ -551,7 +535,7 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         engine = self._make_engine()
         proc = _FakeProcess(stdout_lines=[b"65\n"])
         engine.process = proc
-        self._seed_cache(engine, [1, 2], prompt_str="cached", last_cache_hit=2)
+        self._seed_cache(engine, [1, 2], last_cache_hit=2)
         utils_module = _module(
             "trillim.utils",
             _build_request_block=lambda *args, **kwargs: "request",
@@ -565,13 +549,12 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(proc.killed)
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertIsNone(engine.cached_prompt_str)
 
     async def test_generate_times_out_while_waiting_for_kv_position(self):
         engine = self._make_engine()
         proc = _FakeProcess(stdout_lines=[b"0\n", b"1\n"])
         engine.process = proc
-        self._seed_cache(engine, [1, 2], prompt_str="cached", last_cache_hit=2)
+        self._seed_cache(engine, [1, 2], last_cache_hit=2)
         utils_module = _module(
             "trillim.utils",
             _build_request_block=lambda *args, **kwargs: "request",
@@ -597,7 +580,6 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(proc.killed)
         self.assertEqual(engine.cached_token_ids, [])
         self.assertEqual(engine.last_cache_hit, 0)
-        self.assertIsNone(engine.cached_prompt_str)
 
     async def test_generate_raises_on_missing_kv_position_after_eos(self):
         engine = self._make_engine()

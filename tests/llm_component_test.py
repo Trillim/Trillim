@@ -68,7 +68,7 @@ class _ManagedEngine:
             eos_tokens=[0],
             max_position_embeddings=max_context_tokens,
         )
-        self._cached_prompt_str = ""
+        self._cached_token_ids: list[int] = []
         self._last_cache_hit = 0
         self.lock = _AsyncLockStub()
         self.start_error = start_error
@@ -78,18 +78,15 @@ class _ManagedEngine:
         self.init = {}
 
     @property
-    def cached_prompt_str(self) -> str:
-        return self._cached_prompt_str
+    def cached_token_ids(self) -> list[int]:
+        return list(self._cached_token_ids)
 
     @property
     def last_cache_hit(self) -> int:
         return self._last_cache_hit
 
-    def finalize_prompt_cache(self, snapshot) -> None:
-        self._cached_prompt_str = snapshot.prompt_str or ""
-
     def reset_prompt_cache(self) -> None:
-        self._cached_prompt_str = ""
+        self._cached_token_ids = []
         self._last_cache_hit = 0
 
     async def start(self):
@@ -104,6 +101,7 @@ class _ManagedEngine:
         self.generate_calls.append(kwargs)
         if self.responses:
             response = self.responses.pop(0)
+            self._cached_token_ids = list(kwargs["token_ids"]) + [ord(ch) for ch in response]
             for ch in response:
                 yield ord(ch)
 

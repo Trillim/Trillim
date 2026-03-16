@@ -23,7 +23,7 @@ class _FakeTokenizer:
         return "".join(chr(token_id) for token_id in token_ids)
 
 
-class _FinalizingRewriteTokenizer(_FakeTokenizer):
+class _TrimmingTemplateTokenizer(_FakeTokenizer):
     chat_template = "{{ messages }}"
 
     def apply_chat_template(
@@ -32,10 +32,8 @@ class _FinalizingRewriteTokenizer(_FakeTokenizer):
         tokenize: bool = False,
         add_generation_prompt: bool = False,
     ):
-        if not add_generation_prompt and messages and messages[-1]["role"] == "assistant":
-            return "rewritten-final-output"
         rendered = "".join(
-            f"<{message['role']}>{message['content']}</{message['role']}>"
+            f"<{message['role']}>{message['content'].strip()}</{message['role']}>"
             for message in messages
         )
         if add_generation_prompt:
@@ -48,30 +46,35 @@ class _ScriptedEngine:
         self._responses = list(responses)
         self.tokenizer = tokenizer or _FakeTokenizer()
         self.arch_config = SimpleNamespace(max_position_embeddings=max_context_tokens)
-        self._cached_prompt_str = ""
-        self._last_cache_hit = 3
-        self.finalized_prompt_snapshots = []
+        self._cached_token_ids: list[int] = []
+        self._last_cache_hit = 0
+        self.generate_calls: list[dict] = []
 
     @property
-    def cached_prompt_str(self) -> str:
-        return self._cached_prompt_str
+    def cached_token_ids(self) -> list[int]:
+        return list(self._cached_token_ids)
 
     @property
     def last_cache_hit(self) -> int:
         return self._last_cache_hit
 
-    def finalize_prompt_cache(self, snapshot) -> None:
-        self.finalized_prompt_snapshots.append(snapshot)
-        self._cached_prompt_str = snapshot.prompt_str or ""
-
     def reset_prompt_cache(self) -> None:
-        self._cached_prompt_str = ""
+        self._cached_token_ids = []
         self._last_cache_hit = 0
 
-    async def generate(self, **_):
+    async def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        request_tokens = list(kwargs["token_ids"])
+        cached_tokens = self._cached_token_ids
+        if cached_tokens and request_tokens[: len(cached_tokens)] == cached_tokens:
+            self._last_cache_hit = len(cached_tokens)
+        else:
+            self._last_cache_hit = 0
         response = self._responses.pop(0)
-        for ch in response:
-            yield ord(ch)
+        generated_tokens = [ord(ch) for ch in response]
+        self._cached_token_ids = request_tokens + generated_tokens
+        for token_id in generated_tokens:
+            yield token_id
 
 
 class _SlowScriptedEngine(_ScriptedEngine):
@@ -97,12 +100,21 @@ class _TokenDelayScriptedEngine(_ScriptedEngine):
         )
         self._token_delays = list(token_delays)
 
-    async def generate(self, **_):
+    async def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        request_tokens = list(kwargs["token_ids"])
+        cached_tokens = self._cached_token_ids
+        if cached_tokens and request_tokens[: len(cached_tokens)] == cached_tokens:
+            self._last_cache_hit = len(cached_tokens)
+        else:
+            self._last_cache_hit = 0
         response = self._responses.pop(0)
-        for index, ch in enumerate(response):
+        generated_tokens = [ord(ch) for ch in response]
+        self._cached_token_ids = request_tokens + generated_tokens
+        for index, token_id in enumerate(generated_tokens):
             if index < len(self._token_delays):
                 await asyncio.sleep(self._token_delays[index])
-            yield ord(ch)
+            yield token_id
 
 
 class _SuccessfulSearch:
@@ -159,7 +171,14 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "assistant", "content": "hi"},
             ),
         )
-        self.assertEqual(llm.engine.cached_prompt_str, "user: hello\nassistant: hi")
+        self.assertEqual(
+            llm.engine.generate_calls,
+            [{"token_ids": [ord(ch) for ch in "user: hello\nassistant: "]}],
+        )
+        self.assertEqual(
+            llm.engine.cached_token_ids,
+            [ord(ch) for ch in "user: hello\nassistant: hi"],
+        )
 
     async def test_default_harness_renders_empty_generation_prompt(self):
         llm = LLM("models/fake")
@@ -238,15 +257,25 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("".join(chunks), "answer")
 
-    async def test_session_rejects_non_append_only_finalization(self):
-        llm = LLM("models/fake")
+    async def test_search_harness_treats_template_normalization_as_safe_cache_miss(self):
+        llm = LLM("models/fake", harness_name="search")
         llm.state = ServerState.RUNNING
-        llm.engine = _ScriptedEngine(["broken"], tokenizer=_FinalizingRewriteTokenizer())
-        llm.harness = DefaultHarness(llm.engine)
-        session = llm.session([{"role": "user", "content": "hello"}])
+        llm.engine = _ScriptedEngine(
+            ["  <search>cats</search>\n", "answer"],
+            tokenizer=_TrimmingTemplateTokenizer(),
+        )
+        llm.harness = SearchHarness(llm.engine)
+        llm.harness._search = _SuccessfulSearch("curated cat result")
+        session = llm.session([{"role": "user", "content": "Find cats"}])
 
-        with self.assertRaisesRegex(RuntimeError, "append-only prompt rendering"):
-            await session.chat()
+        events = [event async for event in llm.harness.stream_events(session)]
+
+        self.assertEqual(events[-1].text, "answer")
+        self.assertEqual(llm.engine.last_cache_hit, 0)
+        self.assertEqual(
+            llm.engine.generate_calls[1]["token_ids"],
+            [ord(ch) for ch in "<user>Find cats</user><assistant><search>cats</search></assistant><search>curated cat result</search><assistant>"],
+        )
 
     async def test_finalize_assistant_requires_a_prepared_turn(self):
         llm = LLM("models/fake")
@@ -256,7 +285,7 @@ class HarnessEventTests(unittest.IsolatedAsyncioTestCase):
         session = llm.session([{"role": "user", "content": "hello"}])
 
         with self.assertRaisesRegex(RuntimeError, "not prepared"):
-            session._finalize_assistant("oops", [])
+            session._finalize_assistant("oops")
 
     async def test_session_chat_timeout_allows_long_responses_that_keep_progress(self):
         engine = _TokenDelayScriptedEngine(
@@ -356,7 +385,7 @@ class LLMChatApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done.usage.prompt_tokens, prompt_tokens)
         self.assertEqual(done.usage.completion_tokens, 2)
         self.assertEqual(done.usage.total_tokens, prompt_tokens + 2)
-        self.assertEqual(done.usage.cached_tokens, 3)
+        self.assertEqual(done.usage.cached_tokens, 0)
 
     async def test_chat_returns_final_text(self):
         llm = self._make_llm("hello")
