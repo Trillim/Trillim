@@ -132,6 +132,8 @@ Response:
 }
 ```
 
+`usage.cached_tokens` reports how many prompt tokens were reused from the backend cache. Chat requests are re-rendered and re-tokenized from the submitted message list on every call, then matched against the backend cache by exact token prefix.
+
 ### Streaming
 
 Set `"stream": true` to receive server-sent events:

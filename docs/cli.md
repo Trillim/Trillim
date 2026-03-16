@@ -96,6 +96,8 @@ trillim chat Trillim/BitNet-Search-TRNQ --harness search
 trillim chat Trillim/BitNet-Search-TRNQ --harness search --search-provider brave
 ```
 
+Each chat turn re-renders and re-tokenizes the full conversation, then reuses the backend KV cache when the new prompt shares an exact token prefix with the cached state.
+
 ## `trillim serve`
 
 Start an OpenAI-compatible API server.

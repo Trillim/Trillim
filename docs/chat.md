@@ -44,7 +44,7 @@ Paris is the largest city in France and serves as ...
 
 Trillim keeps the full conversation history by default. When the conversation approaches the context limit, it automatically resets to the most recent message and continues.
 
-Prompt caching is enabled for normal multi-turn usage, so follow-up turns are faster than the first turn.
+Prompt caching is enabled for normal multi-turn usage. Trillim re-renders and re-tokenizes the full prompt each turn, then reuses the backend KV cache whenever the new prompt shares an exact token prefix with the cached state, so follow-up turns are often faster than the first turn.
 
 ## Session Controls
 

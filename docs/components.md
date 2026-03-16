@@ -89,7 +89,7 @@ asyncio.run(main())
 
 For `llm.chat(..., timeout=...)` and `chat.chat(timeout=...)`, `timeout` is an inactivity timeout between emitted chat events, not a cap on total wall-clock response time. If the chat stalls for longer than `timeout`, Trillim restarts the current inference subprocess before surfacing the timeout. That reset is intentional: the engine cannot yet cancel an in-flight request cleanly, so restarting avoids poisoning the next request.
 
-`llm.chat(...)` and `llm.stream_chat(...)` are one-turn helpers. For multi-turn conversations, prompt validation, and prompt-budget inspection, create an append-only `ChatSession` with `llm.session(...)`.
+`llm.chat(...)` and `llm.stream_chat(...)` are one-turn helpers. For multi-turn conversations, prompt validation, and prompt-budget inspection, create a `ChatSession` with `llm.session(...)`.
 
 `ChatSession` is a public SDK type and can be imported with `from trillim import ChatSession`, but prefer creating sessions through `llm.session(...)` rather than calling the constructor directly. Underscored methods on `ChatSession` are internal implementation details.
 
@@ -111,9 +111,9 @@ except ContextOverflowError as exc:
     print(exc)
 ```
 
-`ChatSession` is append-only. Add new turns with `chat.add_user(...)` or `chat.add_system(...)`. Do not edit or remove earlier messages; create a new session when you want to restart from a different history.
+`ChatSession` is append-only at the message level. Add new turns with `chat.add_user(...)` or `chat.add_system(...)`. Do not edit or remove earlier messages; create a new session when you want to restart from a different history.
 
-`ChatSession` also requires append-only prompt rendering from the active chat template. If finalizing a turn or appending a later message would rewrite earlier rendered prompt text, Trillim raises an error instead of mutating prior prompt state. Incremental tokenization stays on the fast path only when a small overlap check near the append boundary agrees with suffix-only encoding. Tokenizers that merge across longer boundaries still work, but they fall back to full prompt re-encoding more often and will be slower in multi-turn sessions.
+Each turn renders the full prompt from the current message list and tokenizes it once. Backend cache reuse is decided from exact token-prefix matching, so chat templates are free to normalize message content without crashing the session. If the rendered prompt diverges from the backend cache, Trillim safely resets and continues.
 
 Use `llm.stream_chat(...)` when you want structured progress events for a single turn, or `chat.stream_chat(...)` when you want structured events from a multi-turn session:
 
