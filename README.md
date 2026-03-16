@@ -31,7 +31,7 @@ trillim pull Trillim/BitNet-TRNQ
 trillim chat Trillim/BitNet-TRNQ
 ```
 
-`trillim chat` keeps multi-turn history, re-renders and re-tokenizes the full prompt each turn, and reuses the KV cache whenever the new prompt shares an exact token prefix with the backend cache. Use `/new` to reset the conversation or `q` to quit.
+`trillim chat` keeps multi-turn history, preserves exact token continuity for prior turns, and reuses the KV cache whenever the next turn can safely append to that exact prompt state. Use `/new` to reset the conversation or `q` to quit.
 
 ### Search-Augmented Chat
 

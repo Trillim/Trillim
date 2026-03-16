@@ -96,7 +96,7 @@ trillim chat Trillim/BitNet-Search-TRNQ --harness search
 trillim chat Trillim/BitNet-Search-TRNQ --harness search --search-provider brave
 ```
 
-Each chat turn re-renders and re-tokenizes the full conversation, then reuses the backend KV cache when the new prompt shares an exact token prefix with the cached state.
+Each chat turn keeps the exact tokenized state of prior turns and appends the next turn incrementally when that boundary is safe, so the backend KV cache can be reused reliably across normal multi-turn chats.
 
 ## `trillim serve`
 

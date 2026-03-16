@@ -113,7 +113,7 @@ except ContextOverflowError as exc:
 
 `ChatSession` is append-only at the message level. Add new turns with `chat.add_user(...)` or `chat.add_system(...)`. Do not edit or remove earlier messages; create a new session when you want to restart from a different history.
 
-Each turn renders the full prompt from the current message list and tokenizes it once. Backend cache reuse is decided from exact token-prefix matching, so chat templates are free to normalize message content without crashing the session. If the rendered prompt diverges from the backend cache, Trillim safely resets and continues.
+`ChatSession` keeps the exact committed prompt tokens from prior turns. New turns are appended incrementally when the rendered prompt boundary can be proven safe; otherwise Trillim falls back to a cache miss and full re-encode for that turn. This keeps cache continuity stable for normal chat/search sessions without requiring prompt strings to be the source of truth.
 
 Use `llm.stream_chat(...)` when you want structured progress events for a single turn, or `chat.stream_chat(...)` when you want structured events from a multi-turn session:
 
