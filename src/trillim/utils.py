@@ -11,9 +11,6 @@ import tempfile
 
 from transformers import AutoTokenizer
 
-from trillim._sampling import EngineSamplingParams
-
-
 def _load_from_path(model_path: str, trust_remote_code: bool = False):
     """
     Load tokenizer from a single path, handling custom tokenizer classes.
@@ -237,6 +234,7 @@ def _build_request_block(
     when explicitly provided after validation. ``max_tokens=0`` means
     unbounded generation and is omitted from the request block.
     """
+    from trillim._sampling import EngineSamplingParams
     validated = EngineSamplingParams.model_validate(
         {
             "temperature": temperature,
