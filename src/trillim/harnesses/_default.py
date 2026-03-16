@@ -19,19 +19,16 @@ class DefaultHarness(Harness):
     ) -> AsyncIterator[ChatEvent]:
         """Stream tokens directly from the engine."""
         self._last_completion_tokens = 0
-        token_ids, prompt_str = session._prepare_reply()
+        token_ids = session._prepare_reply()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
-        generated_token_ids: list[int] = []
         async for token_id in self.engine.generate(
-            token_ids=token_ids, prompt_str=prompt_str, **sampling,
+            token_ids=token_ids, **sampling,
         ):
             self._last_completion_tokens += 1
-            generated_token_ids.append(token_id)
             chunk = decoder.decode(token_id)
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
 
-        cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
-        self.engine.finalize_prompt_cache(cache_snapshot)
+        session._finalize_assistant(full_text)
         yield ChatFinalTextEvent(text=full_text)

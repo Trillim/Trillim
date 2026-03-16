@@ -46,18 +46,11 @@ class InferenceEngine:
         return list(self._prompt_cache.token_ids)
 
     @property
-    def cached_prompt_str(self) -> str | None:
-        return self._prompt_cache.prompt_str
-
-    @property
     def last_cache_hit(self) -> int:
         return self._prompt_cache.last_cache_hit
 
     def reset_prompt_cache(self) -> None:
         self._prompt_cache.clear()
-
-    def finalize_prompt_cache(self, snapshot: PromptSnapshot) -> None:
-        self._prompt_cache.finalize_prompt(snapshot)
 
     async def start(self):
         """Launch the C++ inference subprocess."""
@@ -115,7 +108,6 @@ class InferenceEngine:
     async def generate(
         self,
         token_ids: list[int],
-        prompt_str: str | None = None,
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
@@ -139,7 +131,7 @@ class InferenceEngine:
             else d["rep_penalty_lookback"]
         )
         mt = max_tokens if max_tokens is not None else 0
-        request = PromptSnapshot.create(token_ids, prompt_str)
+        request = PromptSnapshot.create(token_ids)
 
         async with self.lock:
             proc = self.process
@@ -161,13 +153,7 @@ class InferenceEngine:
                 raise RuntimeError(msg)
 
             try:
-                plan = self._prompt_cache.plan(
-                    request,
-                    encode_suffix=lambda suffix: self.tokenizer.encode(
-                        suffix,
-                        add_special_tokens=False,
-                    ),
-                )
+                plan = self._prompt_cache.plan(request)
 
                 # Build count-prefixed key=value request block
                 from trillim.utils import _build_request_block

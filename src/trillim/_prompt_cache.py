@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -12,15 +12,10 @@ class PromptSnapshot:
     """Exact prompt state that may be used for backend cache planning."""
 
     token_ids: tuple[int, ...]
-    prompt_str: str | None = None
 
     @classmethod
-    def create(
-        cls,
-        token_ids: Sequence[int],
-        prompt_str: str | None = None,
-    ) -> PromptSnapshot:
-        return cls(tuple(token_ids), prompt_str)
+    def create(cls, token_ids: Sequence[int]) -> PromptSnapshot:
+        return cls(tuple(token_ids))
 
 
 @dataclass(frozen=True)
@@ -34,7 +29,7 @@ class CachePlan:
 
 
 class PromptCacheManager:
-    """Own the prompt prefix that the inference subprocess cache represents."""
+    """Own the token prefix that the inference subprocess cache represents."""
 
     def __init__(self) -> None:
         self.clear()
@@ -44,16 +39,11 @@ class PromptCacheManager:
         return self._token_ids
 
     @property
-    def prompt_str(self) -> str | None:
-        return self._prompt_str
-
-    @property
     def last_cache_hit(self) -> int:
         return self._last_cache_hit
 
     def clear(self) -> None:
         self._token_ids: tuple[int, ...] = ()
-        self._prompt_str: str | None = None
         self._last_cache_hit = 0
 
     def restore(
@@ -66,45 +56,9 @@ class PromptCacheManager:
             self.clear()
             return
         self._token_ids = snapshot.token_ids
-        self._prompt_str = snapshot.prompt_str
         self._last_cache_hit = last_cache_hit
 
-    def plan(
-        self,
-        request: PromptSnapshot,
-        *,
-        encode_suffix: Callable[[str], Sequence[int]],
-    ) -> CachePlan:
-        if request.prompt_str is not None:
-            return self._plan_string_request(request, encode_suffix=encode_suffix)
-        return self._plan_token_request(request)
-
-    def _plan_string_request(
-        self,
-        request: PromptSnapshot,
-        *,
-        encode_suffix: Callable[[str], Sequence[int]],
-    ) -> CachePlan:
-        # Chat-style requests only reuse cache when the backend can prove the
-        # exact cached prompt prefix. Falling back to token-prefix matching here
-        # risks reusing shared template headers from a different conversation.
-        if self._prompt_str is None or not request.prompt_str.startswith(self._prompt_str):
-            return CachePlan(
-                request=request,
-                delta_tokens=request.token_ids,
-                reset_flag=1,
-                cache_hit=0,
-            )
-
-        suffix = request.prompt_str[len(self._prompt_str):]
-        return CachePlan(
-            request=request,
-            delta_tokens=tuple(encode_suffix(suffix)),
-            reset_flag=0,
-            cache_hit=len(self._token_ids),
-        )
-
-    def _plan_token_request(self, request: PromptSnapshot) -> CachePlan:
+    def plan(self, request: PromptSnapshot) -> CachePlan:
         match_len = 0
         limit = min(len(request.token_ids), len(self._token_ids))
         while match_len < limit and request.token_ids[match_len] == self._token_ids[match_len]:
@@ -135,14 +89,3 @@ class PromptCacheManager:
         combined = plan.request.token_ids + tuple(generated_token_ids)
         self._token_ids = combined[:kv_position]
         self._last_cache_hit = plan.cache_hit
-        if plan.request.prompt_str is not None and kv_position == len(plan.request.token_ids):
-            self._prompt_str = plan.request.prompt_str
-        else:
-            self._prompt_str = None
-
-    def finalize_prompt(self, snapshot: PromptSnapshot) -> bool:
-        if snapshot.token_ids != self._token_ids:
-            self._prompt_str = None
-            return False
-        self._prompt_str = snapshot.prompt_str
-        return True

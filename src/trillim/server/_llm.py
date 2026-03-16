@@ -32,7 +32,6 @@ from ._models import (
 )
 
 from trillim.errors import ContextOverflowError
-from trillim._prompt_cache import PromptSnapshot
 from trillim.engine import InferenceEngine
 from trillim.events import (
     ChatDoneEvent,
@@ -48,16 +47,11 @@ from trillim.harnesses import Harness, get_harness
 # LLM component
 # ---------------------------------------------------------------------------
 
-_APPEND_TOKEN_VALIDATION_TAIL_CHARS = (8, 16, 32)
-
-
 class ChatSession:
-    """Append-only multi-turn chat state for a single active model.
+    """Multi-turn chat state for a single active model.
 
-    Prompt rendering must stay append-only. Incremental suffix tokenization is
-    only a fast path: ChatSession validates a small overlap near the append
-    boundary and falls back to full prompt re-encoding when a tokenizer needs
-    more left-context than that window can prove.
+    Messages are canonical. Each turn renders and tokenizes the full next
+    prompt, while backend cache reuse is decided from exact token prefixes.
     """
 
     _runtime_proxy = True
@@ -70,9 +64,6 @@ class ChatSession:
         self._llm = llm
         self._llm_generation = llm._session_generation
         self._messages: list[dict] = []
-        self._base_prompt_str = ""
-        self._base_token_ids: list[int] = []
-        self._prepared_prompt_str: str | None = None
         self._prepared_token_ids: list[int] | None = None
         for message in messages or []:
             self._append_message(message["role"], message["content"])
@@ -102,75 +93,11 @@ class ChatSession:
             return "assistant: "
         return prompt
 
-    def _encode_full_prompt(self, prompt_str: str) -> list[int]:
+    def _encode_prompt(self, prompt_str: str) -> list[int]:
         engine, _ = self._require_active()
         tokenizer = engine.tokenizer
         has_template = hasattr(tokenizer, "chat_template") and tokenizer.chat_template
         return tokenizer.encode(prompt_str, add_special_tokens=not has_template)
-
-    def _encode_suffix(self, suffix: str) -> list[int]:
-        if not suffix:
-            return []
-        engine, _ = self._require_active()
-        return engine.tokenizer.encode(suffix, add_special_tokens=False)
-
-    def _suffix_passes_overlap_validation(
-        self,
-        base_prompt_str: str,
-        suffix: str,
-        suffix_token_ids: list[int],
-    ) -> bool:
-        if not base_prompt_str or not suffix:
-            return True
-        engine, _ = self._require_active()
-        tokenizer = engine.tokenizer
-        checked_tail_lengths: set[int] = set()
-        for tail_chars in _APPEND_TOKEN_VALIDATION_TAIL_CHARS:
-            tail_len = min(len(base_prompt_str), tail_chars)
-            if tail_len in checked_tail_lengths:
-                continue
-            checked_tail_lengths.add(tail_len)
-            tail_text = base_prompt_str[-tail_len:]
-            tail_token_ids = tokenizer.encode(tail_text, add_special_tokens=False)
-            combined_token_ids = tokenizer.encode(
-                tail_text + suffix,
-                add_special_tokens=False,
-            )
-            if combined_token_ids != tail_token_ids + suffix_token_ids:
-                return False
-        return True
-
-    def _materialize_append_only_tokens(
-        self,
-        prompt_str: str,
-        *,
-        base_prompt_str: str,
-        base_token_ids: list[int],
-        context: str,
-    ) -> list[int]:
-        """Return exact prompt tokens for an append-only prompt update.
-
-        Suffix-only encoding is the fast path. Tokenizers that merge across a
-        longer boundary than the local validation window lose that fast path and
-        pay a full prompt re-encode here instead.
-        """
-        if not base_prompt_str and not base_token_ids:
-            return self._encode_full_prompt(prompt_str)
-        if not prompt_str.startswith(base_prompt_str):
-            raise RuntimeError(
-                f"ChatSession requires append-only prompt rendering; {context} rewrote earlier prompt content"
-            )
-        suffix = prompt_str[len(base_prompt_str):]
-        if not suffix:
-            return list(base_token_ids)
-        suffix_token_ids = self._encode_suffix(suffix)
-        if self._suffix_passes_overlap_validation(
-            base_prompt_str,
-            suffix,
-            suffix_token_ids,
-        ):
-            return list(base_token_ids) + suffix_token_ids
-        return self._encode_full_prompt(prompt_str)
 
     def _require_turn_ready(self) -> None:
         self._require_active()
@@ -183,56 +110,23 @@ class ChatSession:
 
     def _append_message(self, role: str, content: str) -> None:
         self._require_active()
-        self._prepared_prompt_str = None
         self._prepared_token_ids = None
         self._messages.append({"role": role, "content": content})
-        prompt_str = self._render_prompt(add_generation_prompt=False)
-        self._base_token_ids = self._materialize_append_only_tokens(
-            prompt_str,
-            base_prompt_str=self._base_prompt_str,
-            base_token_ids=self._base_token_ids,
-            context=f"appending {role!r} message",
-        )
-        self._base_prompt_str = prompt_str
 
-    def _prepare_reply(self) -> tuple[list[int], str]:
+    def _prepare_reply(self) -> list[int]:
         self._require_turn_ready()
-        if self._prepared_token_ids is not None and self._prepared_prompt_str is not None:
-            return list(self._prepared_token_ids), self._prepared_prompt_str
+        if self._prepared_token_ids is not None:
+            return list(self._prepared_token_ids)
         prompt_str = self._render_prompt(add_generation_prompt=True)
-        self._prepared_token_ids = self._materialize_append_only_tokens(
-            prompt_str,
-            base_prompt_str=self._base_prompt_str,
-            base_token_ids=self._base_token_ids,
-            context="preparing the next assistant turn",
-        )
-        self._prepared_prompt_str = prompt_str
-        return list(self._prepared_token_ids), self._prepared_prompt_str
+        self._prepared_token_ids = self._encode_prompt(prompt_str)
+        return list(self._prepared_token_ids)
 
-    def _finalize_assistant(self, text: str, token_ids: list[int]) -> PromptSnapshot:
-        engine, _ = self._require_active()
-        if self._prepared_prompt_str is None or self._prepared_token_ids is None:
+    def _finalize_assistant(self, text: str) -> None:
+        self._require_active()
+        if self._prepared_token_ids is None:
             raise RuntimeError("ChatSession assistant turn was not prepared")
         self._messages.append({"role": "assistant", "content": text})
-        prompt_str = self._render_prompt(add_generation_prompt=False)
-        generated_prefix = self._prepared_prompt_str + text
-        visible_token_ids = list(self._prepared_token_ids) + list(token_ids)
-        final_token_ids = self._materialize_append_only_tokens(
-            prompt_str,
-            base_prompt_str=generated_prefix,
-            base_token_ids=visible_token_ids,
-            context="finalizing assistant output",
-        )
-        cached_token_ids = tuple(getattr(engine, "cached_token_ids", final_token_ids))
-        if cached_token_ids == tuple(visible_token_ids):
-            cache_snapshot = PromptSnapshot.create(visible_token_ids, generated_prefix)
-        else:
-            cache_snapshot = PromptSnapshot.create(final_token_ids, prompt_str)
-        self._base_token_ids = final_token_ids
-        self._base_prompt_str = prompt_str
-        self._prepared_prompt_str = None
         self._prepared_token_ids = None
-        return cache_snapshot
 
     @property
     def messages(self) -> tuple[dict, ...]:
@@ -249,8 +143,7 @@ class ChatSession:
 
     @property
     def prompt_tokens(self) -> int:
-        token_ids, _ = self._prepare_reply()
-        return len(token_ids)
+        return len(self._prepare_reply())
 
     @property
     def remaining_context_tokens(self) -> int:

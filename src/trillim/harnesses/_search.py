@@ -33,12 +33,12 @@ class SearchHarness(Harness):
 
     async def _generate_buffered(self, session, **sampling: Any) -> tuple[str, list[int]]:
         """Generate a full response non-streaming."""
-        token_ids, prompt_str = session._prepare_reply()
+        token_ids = session._prepare_reply()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
         generated_token_ids: list[int] = []
         async for token_id in self.engine.generate(
-            token_ids=token_ids, prompt_str=prompt_str, **sampling,
+            token_ids=token_ids, **sampling,
         ):
             generated_token_ids.append(token_id)
             full_text += decoder.decode(token_id)
@@ -62,16 +62,14 @@ class SearchHarness(Harness):
                 # No search tag — yield buffered text as final response
                 self._last_completion_tokens = len(generated_token_ids)
                 yield ChatTokenEvent(text=full_text)
-                cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
-                self.engine.finalize_prompt_cache(cache_snapshot)
+                session._finalize_assistant(full_text)
                 yield ChatFinalTextEvent(text=full_text)
                 return
 
             yield ChatSearchStartedEvent(query=query)
 
             # Keep cache aligned with model-generated state only.
-            cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
-            self.engine.finalize_prompt_cache(cache_snapshot)
+            session._finalize_assistant(full_text)
 
             try:
                 results = await self._search.search(query)
@@ -89,19 +87,16 @@ class SearchHarness(Harness):
                 yield ChatSearchResultEvent(query=query, content=results)
 
         # Final iteration: stream token-by-token
-        token_ids, prompt_str = session._prepare_reply()
+        token_ids = session._prepare_reply()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
-        generated_token_ids: list[int] = []
         async for token_id in self.engine.generate(
-            token_ids=token_ids, prompt_str=prompt_str, **sampling,
+            token_ids=token_ids, **sampling,
         ):
             self._last_completion_tokens += 1
-            generated_token_ids.append(token_id)
             chunk = decoder.decode(token_id)
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
 
-        cache_snapshot = session._finalize_assistant(full_text, generated_token_ids)
-        self.engine.finalize_prompt_cache(cache_snapshot)
+        session._finalize_assistant(full_text)
         yield ChatFinalTextEvent(text=full_text)
