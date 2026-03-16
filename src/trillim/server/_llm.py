@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -47,11 +47,14 @@ from trillim.harnesses import Harness, get_harness
 # LLM component
 # ---------------------------------------------------------------------------
 
+_APPEND_TOKEN_HEAL_WINDOW = 32
+
 class ChatSession:
     """Multi-turn chat state for a single active model.
 
-    Messages are canonical. Each turn renders and tokenizes the full next
-    prompt, while backend cache reuse is decided from exact token prefixes.
+    Messages are canonical. Committed prompt tokens stay in exact backend form,
+    and new turns append from that token tape whenever the tokenizer boundary
+    can be healed safely.
     """
 
     _runtime_proxy = True
@@ -64,8 +67,26 @@ class ChatSession:
         self._llm = llm
         self._llm_generation = llm._session_generation
         self._messages: list[dict] = []
+        self._committed_prompt_str = ""
+        self._committed_token_ids: list[int] = []
+        self._prepared_prompt_str: str | None = None
         self._prepared_token_ids: list[int] | None = None
-        for message in messages or []:
+        restore_chat_state = getattr(
+            llm,
+            "_restore_chat_state",
+            lambda restored_messages: (0, "", ()),
+        )
+        restored_len, restored_prompt_str, restored_token_ids = restore_chat_state(
+            messages or []
+        )
+        if restored_len > 0:
+            self._messages.extend(
+                {"role": message["role"], "content": message["content"]}
+                for message in (messages or [])[:restored_len]
+            )
+            self._committed_prompt_str = restored_prompt_str
+            self._committed_token_ids = list(restored_token_ids)
+        for message in (messages or [])[restored_len:]:
             self._append_message(message["role"], message["content"])
 
     def _require_active(self) -> tuple[InferenceEngine, Harness]:
@@ -99,6 +120,93 @@ class ChatSession:
         has_template = hasattr(tokenizer, "chat_template") and tokenizer.chat_template
         return tokenizer.encode(prompt_str, add_special_tokens=not has_template)
 
+    def _encode_suffix(self, suffix: str) -> list[int]:
+        if not suffix:
+            return []
+        engine, _ = self._require_active()
+        return engine.tokenizer.encode(suffix, add_special_tokens=False)
+
+    def _decode_prompt_tokens(self, token_ids: Sequence[int]) -> str | None:
+        engine, _ = self._require_active()
+        decode = getattr(engine.tokenizer, "decode", None)
+        if decode is None:
+            return None
+        try:
+            text = decode(token_ids, skip_special_tokens=False)
+        except TypeError:
+            try:
+                text = decode(token_ids)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return text if isinstance(text, str) else None
+
+    def _shared_prefix_len(
+        self,
+        left: Sequence[int],
+        right: Sequence[int],
+    ) -> int:
+        match_len = 0
+        limit = min(len(left), len(right))
+        while match_len < limit and left[match_len] == right[match_len]:
+            match_len += 1
+        return match_len
+
+    def _materialize_append_only_tokens(
+        self,
+        prompt_str: str,
+        *,
+        base_prompt_str: str,
+        base_token_ids: Sequence[int],
+    ) -> list[int]:
+        if not base_prompt_str and not base_token_ids:
+            return self._encode_prompt(prompt_str)
+        if not prompt_str.startswith(base_prompt_str):
+            return self._encode_prompt(prompt_str)
+        decoded_base_prompt = self._decode_prompt_tokens(base_token_ids)
+        if decoded_base_prompt != base_prompt_str:
+            return self._encode_prompt(prompt_str)
+        suffix = prompt_str[len(base_prompt_str):]
+        if not suffix:
+            return list(base_token_ids)
+        best_candidate: list[int] | None = None
+        best_preserved_prefix = -1
+        max_healing_window = min(len(base_token_ids), _APPEND_TOKEN_HEAL_WINDOW)
+
+        for healing_window in range(1, max_healing_window + 1):
+            healing_prefix = list(base_token_ids[:-healing_window])
+            healing_token_ids = list(base_token_ids[-healing_window:])
+            healing_text = self._decode_prompt_tokens(healing_token_ids)
+            if healing_text is None:
+                continue
+            healed_token_ids = self._encode_suffix(healing_text + suffix)
+            preserved_prefix = len(healing_prefix) + self._shared_prefix_len(
+                healing_token_ids,
+                healed_token_ids,
+            )
+            if preserved_prefix <= best_preserved_prefix:
+                continue
+            best_candidate = healing_prefix + healed_token_ids
+            best_preserved_prefix = preserved_prefix
+            if preserved_prefix == len(base_token_ids):
+                return best_candidate
+
+        if best_candidate is not None:
+            return best_candidate
+        return self._encode_prompt(prompt_str)
+
+    def _remember_committed_state(
+        self,
+        prompt_str: str,
+        token_ids: Sequence[int],
+    ) -> None:
+        self._committed_prompt_str = prompt_str
+        self._committed_token_ids = list(token_ids)
+        remember_chat_state = getattr(self._llm, "_remember_chat_state", None)
+        if remember_chat_state is not None:
+            remember_chat_state(self._messages, prompt_str, token_ids)
+
     def _require_turn_ready(self) -> None:
         self._require_active()
         if not self._messages:
@@ -110,22 +218,50 @@ class ChatSession:
 
     def _append_message(self, role: str, content: str) -> None:
         self._require_active()
+        self._prepared_prompt_str = None
         self._prepared_token_ids = None
         self._messages.append({"role": role, "content": content})
+        prompt_str = self._render_prompt(add_generation_prompt=False)
+        token_ids = self._materialize_append_only_tokens(
+            prompt_str,
+            base_prompt_str=self._committed_prompt_str,
+            base_token_ids=self._committed_token_ids,
+        )
+        self._remember_committed_state(prompt_str, token_ids)
 
     def _prepare_reply(self) -> list[int]:
         self._require_turn_ready()
-        if self._prepared_token_ids is not None:
+        if self._prepared_token_ids is not None and self._prepared_prompt_str is not None:
             return list(self._prepared_token_ids)
         prompt_str = self._render_prompt(add_generation_prompt=True)
-        self._prepared_token_ids = self._encode_prompt(prompt_str)
+        self._prepared_token_ids = self._materialize_append_only_tokens(
+            prompt_str,
+            base_prompt_str=self._committed_prompt_str,
+            base_token_ids=self._committed_token_ids,
+        )
+        self._prepared_prompt_str = prompt_str
         return list(self._prepared_token_ids)
 
     def _finalize_assistant(self, text: str) -> None:
-        self._require_active()
-        if self._prepared_token_ids is None:
+        engine, _ = self._require_active()
+        if self._prepared_token_ids is None or self._prepared_prompt_str is None:
             raise RuntimeError("ChatSession assistant turn was not prepared")
         self._messages.append({"role": "assistant", "content": text})
+        prompt_str = self._render_prompt(add_generation_prompt=False)
+        cached_token_ids = list(engine.cached_token_ids)
+        decoded_cached_prompt = self._decode_prompt_tokens(cached_token_ids)
+        committed_prompt_str = prompt_str
+        if (
+            cached_token_ids
+            and decoded_cached_prompt is not None
+            and prompt_str.startswith(decoded_cached_prompt)
+        ):
+            committed_prompt_str = decoded_cached_prompt
+            committed_token_ids = cached_token_ids
+        else:
+            committed_token_ids = self._encode_prompt(prompt_str)
+        self._remember_committed_state(committed_prompt_str, committed_token_ids)
+        self._prepared_prompt_str = None
         self._prepared_token_ids = None
 
     @property
@@ -295,6 +431,10 @@ class LLM(Component):
         self.state: ServerState = ServerState.NO_MODEL
         self._swap_lock: asyncio.Lock | None = None
         self._session_generation = 0
+        self._chat_state_cache: dict[
+            tuple[tuple[str, str], ...],
+            tuple[str, tuple[int, ...]],
+        ] = {}
 
     def _require_started(self) -> tuple[InferenceEngine, Harness]:
         if (
@@ -319,6 +459,33 @@ class LLM(Component):
 
     def _clone_messages(self, messages: list[dict]) -> list[dict]:
         return [{"role": m["role"], "content": m["content"]} for m in messages]
+
+    def _chat_state_key(self, messages: Sequence[dict]) -> tuple[tuple[str, str], ...]:
+        return tuple((message["role"], message["content"]) for message in messages)
+
+    def _restore_chat_state(
+        self,
+        messages: Sequence[dict],
+    ) -> tuple[int, str, tuple[int, ...]]:
+        for prefix_len in range(len(messages), -1, -1):
+            state = self._chat_state_cache.get(
+                self._chat_state_key(messages[:prefix_len])
+            )
+            if state is not None:
+                prompt_str, token_ids = state
+                return prefix_len, prompt_str, token_ids
+        return 0, "", ()
+
+    def _remember_chat_state(
+        self,
+        messages: Sequence[dict],
+        prompt_str: str,
+        token_ids: Sequence[int],
+    ) -> None:
+        self._chat_state_cache[self._chat_state_key(messages)] = (
+            prompt_str,
+            tuple(token_ids),
+        )
 
     def session(self, messages: list[dict] | None = None) -> ChatSession:
         self._require_started()
@@ -462,6 +629,7 @@ class LLM(Component):
         self.harness = self._create_harness(
             self.engine, self._harness_name, self._search_provider
         )
+        self._chat_state_cache.clear()
         self.state = ServerState.RUNNING
         self._session_generation += 1
 
@@ -471,6 +639,7 @@ class LLM(Component):
             await self.engine.stop()
         self.harness = None
         self.engine = None
+        self._chat_state_cache.clear()
         self._session_generation += 1
 
     # -- hot-swap ------------------------------------------------------------
@@ -623,6 +792,7 @@ class LLM(Component):
         self._lora_quant = lora_quant
         self._unembed_quant = unembed_quant
         self.model_name = new_name
+        self._chat_state_cache.clear()
         self.state = ServerState.RUNNING
         self._session_generation += 1
 
