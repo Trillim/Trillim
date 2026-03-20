@@ -175,6 +175,28 @@ def _safetensors_dtype_code(dtype_str):
     return entry
 
 
+def _validate_supported_model_tensors(model_dir: str, config: ModelConfig) -> None:
+    """Reject known-unsupported tensor groups before reading shard payloads."""
+    try:
+        tensor_names = get_all_tensor_names(model_dir)
+    except FileNotFoundError:
+        return
+
+    if config.arch_type.name == "QWEN35":
+        unsupported_groups = []
+        if any(name.startswith("model.visual.") for name in tensor_names):
+            unsupported_groups.append("model.visual.*")
+        if any(name.startswith("mtp.") for name in tensor_names):
+            unsupported_groups.append("mtp.*")
+
+        if unsupported_groups:
+            groups = ", ".join(unsupported_groups)
+            raise ValueError(
+                "Qwen3.5 multimodal checkpoints are not supported for quantization yet. "
+                f"Found unsupported tensor groups: {groups}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Manifest writer
 # ---------------------------------------------------------------------------
@@ -191,6 +213,9 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
     manifest_dir overrides where the temp manifest is written (defaults to
     model_dir).  Use this to avoid writing into a read-only model directory.
     """
+    if not skip_model:
+        _validate_supported_model_tensors(model_dir, config)
+
     # Try to load base model safetensors; allow adapter-only mode
     if skip_model:
         shard_files, weight_map = [], {}

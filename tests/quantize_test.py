@@ -436,6 +436,57 @@ class QuantizeTests(unittest.TestCase):
         self.assertEqual(q_norm_entry["action"], quantize.ACTION_BF16_RAW)
         self.assertTrue(all(entry["action"] == quantize.ACTION_BF16_RAW for entry in manifest["tensors"][:2]))
 
+    def test_write_manifest_rejects_qwen35_multimodal_tensor_groups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "qwen-multimodal"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "model_type": "qwen3_5",
+                        "text_config": {
+                            "hidden_size": 2560,
+                            "intermediate_size": 9216,
+                            "num_hidden_layers": 32,
+                            "num_attention_heads": 16,
+                            "num_key_value_heads": 4,
+                            "head_dim": 256,
+                            "vocab_size": 248320,
+                            "max_position_embeddings": 262144,
+                            "rms_norm_eps": 1e-6,
+                            "rope_parameters": {"rope_theta": 10000000.0},
+                            "tie_word_embeddings": True,
+                            "attention_bias": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "model.language_model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                            "model.visual.merger.linear_fc1.weight": "model-00001-of-00002.safetensors",
+                            "mtp.fc.weight": "model-00002-of-00002.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=str(model_dir),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Qwen3\.5 multimodal checkpoints are not supported.*model\.visual\.\*, mtp\.\*",
+            ):
+                quantize.write_manifest(str(model_dir), config)
+
     def test_write_manifest_handles_inconsistent_shard_maps_in_mocked_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             shard = Path(temp_dir) / "shard.safetensors"
