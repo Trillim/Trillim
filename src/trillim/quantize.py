@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -126,6 +127,59 @@ def get_processing_order(tensors_meta, arch_info):
     return sorted(tensors_meta, key=sort_key)
 
 
+def get_visual_processing_order(tensors_meta):
+    """Sort Qwen visual tensors into a stable block-major order."""
+    component_order = [
+        "patch_embed.proj.weight",
+        "patch_embed.proj.bias",
+        "pos_embed.weight",
+        "norm1.weight",
+        "norm1.bias",
+        "attn.qkv.weight",
+        "attn.qkv.bias",
+        "attn.proj.weight",
+        "attn.proj.bias",
+        "norm2.weight",
+        "norm2.bias",
+        "mlp.linear_fc1.weight",
+        "mlp.linear_fc1.bias",
+        "mlp.linear_fc2.weight",
+        "mlp.linear_fc2.bias",
+        "merger.norm.weight",
+        "merger.norm.bias",
+        "merger.linear_fc1.weight",
+        "merger.linear_fc1.bias",
+        "merger.linear_fc2.weight",
+        "merger.linear_fc2.bias",
+    ]
+
+    def get_intra_priority(key):
+        for idx, suffix in enumerate(component_order):
+            if key.endswith(suffix):
+                return idx
+        return len(component_order)
+
+    def sort_key(item):
+        key = item["key"]
+
+        if key.startswith("model.visual.patch_embed."):
+            return (0, -1, get_intra_priority(key), key.endswith(".bias"), key)
+        if key == "model.visual.pos_embed.weight":
+            return (1, -1, get_intra_priority(key), 0, key)
+
+        block_match = re.search(r"\.blocks\.(\d+)\.", key)
+        if block_match:
+            block_idx = int(block_match.group(1))
+            return (2, block_idx, get_intra_priority(key), key.endswith(".bias"), key)
+
+        if key.startswith("model.visual.merger."):
+            return (3, -1, get_intra_priority(key), key.endswith(".bias"), key)
+
+        return (4, -1, get_intra_priority(key), key.endswith(".bias"), key)
+
+    return sorted(tensors_meta, key=sort_key)
+
+
 # ---------------------------------------------------------------------------
 # Manifest constants
 # ---------------------------------------------------------------------------
@@ -135,6 +189,11 @@ ACTION_BF16_RAW         = 0
 ACTION_TERNARY_QUANTIZE = 1
 # ACTION_EMBEDDING_I8     = 2 (removed in Quantization v2 update)
 ACTION_REPACK_TERNARY   = 3
+
+# Tensor section codes (match C++ TensorSectionType enum)
+SECTION_TEXT_CORE = 1
+SECTION_VISUAL = 2
+SECTION_MTP = 3
 
 # Dtype codes (match C++ DType enum)
 DTYPE_F32  = 0
@@ -175,12 +234,37 @@ def _safetensors_dtype_code(dtype_str):
     return entry
 
 
+def _validate_supported_model_tensors(
+    model_dir: str,
+    config: ModelConfig,
+    language_model_only: bool = False,
+) -> None:
+    """Reject known-unsupported tensor groups before reading shard payloads."""
+    try:
+        tensor_names = get_all_tensor_names(model_dir)
+    except FileNotFoundError:
+        return
+
+    if config.arch_type.name == "QWEN35":
+        unsupported_groups = []
+        if any(name.startswith("mtp.") for name in tensor_names):
+            if not language_model_only:
+                unsupported_groups.append("mtp.*")
+
+        if unsupported_groups:
+            groups = ", ".join(unsupported_groups)
+            raise ValueError(
+                "Qwen3.5 checkpoints with MTP tensors require --language-model-only for text-only quantization. "
+                f"Found unsupported tensor groups: {groups}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Manifest writer
 # ---------------------------------------------------------------------------
 
 def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=False,
-                    manifest_dir=None):
+                    manifest_dir=None, language_model_only=False):
     """Write a binary manifest for the C++ quantizer.
 
     Returns the path to the written manifest file.
@@ -191,6 +275,13 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
     manifest_dir overrides where the temp manifest is written (defaults to
     model_dir).  Use this to avoid writing into a read-only model directory.
     """
+    if not skip_model:
+        _validate_supported_model_tensors(
+            model_dir,
+            config,
+            language_model_only=language_model_only,
+        )
+
     # Try to load base model safetensors; allow adapter-only mode
     if skip_model:
         shard_files, weight_map = [], {}
@@ -226,6 +317,7 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
 
     # Build tensor entries (skip if no base model safetensors)
     tensor_entries = []
+    sections = []
     if has_model_tensors:
         # Get all tensor metadata
         if is_sharded:
@@ -251,7 +343,59 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
             filtered_meta = [t for t in filtered_meta if "lm_head" not in t["key"]]
         filtered_meta = [t for t in filtered_meta if not t["key"].endswith("_scale")]
 
-        tensors_meta = get_processing_order(filtered_meta, config.arch_info)
+        text_meta = []
+        visual_meta = []
+        other_meta = []
+        for item in filtered_meta:
+            key = item["key"]
+            if language_model_only and (
+                key.startswith("model.visual.") or key.startswith("mtp.")
+            ):
+                continue
+            if key.startswith("model.visual."):
+                visual_meta.append(item)
+            elif key.startswith("mtp."):
+                other_meta.append(item)
+            else:
+                text_meta.append(item)
+
+        tensors_meta = []
+        sections = []
+
+        if text_meta:
+            ordered_text_meta = get_processing_order(text_meta, config.arch_info)
+            section_start = len(tensors_meta)
+            tensors_meta.extend(ordered_text_meta)
+            sections.append(
+                {
+                    "type": SECTION_TEXT_CORE,
+                    "first_tensor_idx": section_start,
+                    "num_tensors": len(ordered_text_meta),
+                }
+            )
+
+        if visual_meta:
+            ordered_visual_meta = get_visual_processing_order(visual_meta)
+            section_start = len(tensors_meta)
+            tensors_meta.extend(ordered_visual_meta)
+            sections.append(
+                {
+                    "type": SECTION_VISUAL,
+                    "first_tensor_idx": section_start,
+                    "num_tensors": len(ordered_visual_meta),
+                }
+            )
+
+        if other_meta:
+            section_start = len(tensors_meta)
+            tensors_meta.extend(sorted(other_meta, key=lambda item: item["key"]))
+            sections.append(
+                {
+                    "type": SECTION_MTP,
+                    "first_tensor_idx": section_start,
+                    "num_tensors": len(other_meta),
+                }
+            )
 
         for item in tensors_meta:
             key = item["key"]
@@ -259,12 +403,13 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
             file_path = item["file"]
 
             row = shape[0] if len(shape) >= 1 else 1
-            col = shape[1] if len(shape) >= 2 else 1
+            col = math.prod(shape[1:]) if len(shape) >= 2 else 1
 
             is_1d = col == 1
             is_embedding = (config.arch_info.embedding_pattern in key and "lm_head" not in key)
+            is_visual_pos_embed = key.endswith("pos_embed.weight")
             is_lm_head = "lm_head" in key
-            should_quantize = not (is_1d or is_embedding or is_lm_head)
+            should_quantize = not (is_1d or is_embedding or is_visual_pos_embed or is_lm_head)
 
             # Only promote axes that correspond to model dimensions that expand
             # from *_orig to aligned runtime dims. Arbitrary axes stay raw in
@@ -288,7 +433,7 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
 
             if needs_padding:
                 padded_row = orig_shape[0] if len(orig_shape) >= 1 else 1
-                padded_col = orig_shape[1] if len(orig_shape) >= 2 else 1
+                padded_col = math.prod(orig_shape[1:]) if len(orig_shape) >= 2 else 1
 
             # Look up absolute offset and dtype
             header = shard_headers[file_path]
@@ -389,6 +534,13 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
             f.write(struct.pack("<H", e["scale_shard_idx"]))
             f.write(struct.pack("<Q", e["scale_offset"]))
             f.write(struct.pack("<Q", e["scale_size"]))
+
+        # Tensor sections
+        f.write(struct.pack("<I", len(sections)))
+        for section in sections:
+            f.write(struct.pack("<B", section["type"]))
+            f.write(struct.pack("<I", section["first_tensor_idx"]))
+            f.write(struct.pack("<I", section["num_tensors"]))
 
         # LoRA entries
         if lora_entries is not None:
@@ -534,7 +686,7 @@ def _find_quantize_binary():
 
 
 def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter_dir=None,
-                       adapter_output_dir=None):
+                       adapter_output_dir=None, language_model_only=False):
     """Invoke the C++ quantizer to produce qmodel.tensors, rope.cache, and/or qmodel.lora."""
     if model_output_dir and os.path.realpath(model_output_dir) == os.path.realpath(model_dir):
         raise ValueError("model_output_dir and model_dir resolve to the same path.")
@@ -543,6 +695,7 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
     manifest_path = write_manifest(
         model_dir, config, adapter_dir=adapter_dir,
         manifest_dir=model_output_dir,
+        language_model_only=language_model_only,
     )
     print(f"  Manifest: {manifest_path}")
 
@@ -561,18 +714,12 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
     if config.tie_word_embeddings:
         cmd.append("--tie-embeddings")
 
-    # RoPE args
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path, encoding="utf-8") as f:
-        raw_config = json.load(f)
-    rope_theta = raw_config.get("rope_theta", 500000.0)
-    max_pos = raw_config.get("max_position_embeddings", 4096)
-
     cmd += [
         "--rope-output", os.path.join(model_output_dir, "rope.cache"),
-        "--rope-theta", str(rope_theta),
-        "--max-pos", str(max_pos),
+        "--rope-theta", str(config.rope_theta),
+        "--max-pos", str(config.max_position_embeddings),
         "--head-dim", str(config.head_dim),
+        "--rope-dim", str(int(round(config.head_dim * config.partial_rotary_factor))),
     ]
 
     # LoRA args
@@ -607,14 +754,15 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
 
 
 def _run_cpp_lora_only(binary_path, model_dir, config, adapter_dir,
-                       adapter_output_dir):
+                       adapter_output_dir, language_model_only=False):
     """Invoke the C++ quantizer for LoRA-only extraction (no model tensors)."""
     if os.path.realpath(adapter_output_dir) == os.path.realpath(adapter_dir):
         raise ValueError("adapter_output_dir and adapter_dir resolve to the same path.")
 
     print("  Writing LoRA manifest...")
     manifest_path = write_manifest(model_dir, config, adapter_dir=adapter_dir, skip_model=True,
-                                   manifest_dir=adapter_output_dir)
+                                   manifest_dir=adapter_output_dir,
+                                   language_model_only=language_model_only)
     print(f"  Manifest: {manifest_path}")
 
     adapter_config_path = os.path.join(adapter_dir, "adapter_config.json")
@@ -914,6 +1062,11 @@ def main():
         "--adapter",
         help="Extract LoRA adapter from PEFT directory → <adapter_dir>-TRNQ/",
     )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="For multimodal checkpoints, quantize only model.language_model.* tensors for text inference",
+    )
     args = parser.parse_args()
 
     if not args.model and not args.adapter:
@@ -968,6 +1121,7 @@ def main():
             binary_path, model_dir, config, model_output_dir,
             adapter_dir=args.adapter if args.adapter else None,
             adapter_output_dir=adapter_output_dir,
+            language_model_only=args.language_model_only,
         )
 
         qmodel_path = os.path.join(model_output_dir, "qmodel.tensors")
@@ -992,6 +1146,7 @@ def main():
         _run_cpp_lora_only(
             binary_path, model_dir, config, args.adapter,
             adapter_output_dir=adapter_output_dir,
+            language_model_only=args.language_model_only,
         )
 
         lora_path = os.path.join(adapter_output_dir, "qmodel.lora")

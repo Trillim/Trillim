@@ -2,7 +2,7 @@
 """
 Architecture registry and model configuration.
 
-Defines supported architectures (BitNet, Llama, Qwen2, Mistral) and provides
+Defines supported architectures (BitNet, Llama, Qwen3.5) and provides
 ModelConfig for extracting model dimensions from config.json.
 """
 
@@ -15,11 +15,12 @@ from typing import Optional
 
 
 class ArchType(IntEnum):
-    """Architecture enumeration - matches C++ ArchType enum."""
+    """Python architecture enumeration."""
 
     UNKNOWN = 0
     BITNET = 1
     LLAMA = 2
+    QWEN35 = 3
 
 
 class ActivationType(IntEnum):
@@ -81,6 +82,36 @@ ARCH_REGISTRY: dict[str, ArchInfo] = {
             "mlp.down_proj",
         ],
     ),
+    "qwen3_5forconditionalgeneration": ArchInfo(
+        arch_type=ArchType.QWEN35,
+        activation=ActivationType.SILU,
+        has_attn_sub_norm=False,
+        has_ffn_sub_norm=False,
+        component_order=[
+            "input_layernorm",
+            "linear_attn.A_log",
+            "linear_attn.conv1d.weight",
+            "linear_attn.dt_bias",
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+            "linear_attn.in_proj_qkv.weight",
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.norm.weight",
+            "linear_attn.out_proj.weight",
+            "self_attn.k_norm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.q_proj",
+            "self_attn.o_proj",
+            "post_attention_layernorm",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ],
+        embedding_pattern="language_model.embed_tokens",
+        final_norm_pattern="model.language_model.norm.weight",
+    ),
 }
 
 _VARIANT_ALIASES = {
@@ -118,7 +149,21 @@ _STOP_TOKEN_NAMES = (
 _DEFAULT_EOS_TOKENS = {
     ArchType.BITNET: 128009,
     ArchType.LLAMA: 128009,
+    ArchType.QWEN35: 248044,
 }
+
+
+def _extract_model_text_config(config: dict) -> dict:
+    """Return the text config for text-only or multimodal checkpoints."""
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and text_config:
+        normalized = dict(text_config)
+        normalized["architectures"] = config.get(
+            "architectures",
+            text_config.get("architectures", []),
+        )
+        return normalized
+    return config
 
 
 def _get_all_tensor_names(model_dir):
@@ -265,6 +310,32 @@ def _resolve_activation(arch_info: ArchInfo, config: dict) -> ArchInfo:
     return replace(arch_info, activation=detected_activation)
 
 
+def _resolve_rope_theta(config: dict) -> float:
+    rope_theta = config.get("rope_theta")
+    if rope_theta is not None:
+        return rope_theta
+
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        nested_theta = rope_parameters.get("rope_theta")
+        if nested_theta is not None:
+            return nested_theta
+
+    return 10000.0
+
+
+def _resolve_partial_rotary_factor(config: dict) -> float:
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        factor = rope_parameters.get("partial_rotary_factor")
+        if factor is not None:
+            return float(factor)
+    factor = config.get("partial_rotary_factor")
+    if factor is not None:
+        return float(factor)
+    return 1.0
+
+
 def _resolve_qkv_bias(
     arch_info: ArchInfo,
     config: dict,
@@ -283,9 +354,32 @@ def _resolve_qkv_bias(
 
 def _resolve_tied_embeddings(config: dict, tensor_names: Optional[list[str]]) -> bool:
     tie_word_embeddings = config.get("tie_word_embeddings", False)
-    if tensor_names and any("lm_head.weight" in name for name in tensor_names):
+    if tensor_names and any(name.endswith("lm_head.weight") for name in tensor_names):
         return False
     return tie_word_embeddings
+
+
+def _extract_qwen35_fields(config: dict, arch_type: ArchType) -> dict[str, object]:
+    if arch_type != ArchType.QWEN35:
+        return {
+            "layer_types": [],
+            "attn_output_gate": False,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "linear_key_head_dim": 0,
+            "linear_value_head_dim": 0,
+            "linear_conv_kernel_dim": 0,
+        }
+
+    return {
+        "layer_types": list(config.get("layer_types", [])),
+        "attn_output_gate": bool(config.get("attn_output_gate", False)),
+        "linear_num_key_heads": int(config.get("linear_num_key_heads", 0)),
+        "linear_num_value_heads": int(config.get("linear_num_value_heads", 0)),
+        "linear_key_head_dim": int(config.get("linear_key_head_dim", 0)),
+        "linear_value_head_dim": int(config.get("linear_value_head_dim", 0)),
+        "linear_conv_kernel_dim": int(config.get("linear_conv_kernel_dim", 0)),
+    }
 
 
 def _collect_added_token_ids(
@@ -369,11 +463,19 @@ class ModelConfig:
     max_position_embeddings: int
     norm_eps: float
     rope_theta: float
+    partial_rotary_factor: float
     eos_tokens: list[int]
     has_qkv_bias: bool = False
     tie_word_embeddings: bool = True
     hidden_dim_orig: int = 0
     intermediate_dim_orig: int = 0
+    layer_types: list[str] | None = None
+    attn_output_gate: bool = False
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 0
 
     @classmethod
     def from_config_json(
@@ -381,17 +483,20 @@ class ModelConfig:
         adapter_dir: Optional[str] = None,
     ) -> "ModelConfig":
         """Parse config.json and extract model configuration."""
-        config = _load_json_file(config_path)
+        raw_config = _load_json_file(config_path)
+        config = _extract_model_text_config(raw_config)
         arch_info = _resolve_arch_info(config)
         tensor_names = _load_tensor_names_if_available(model_dir)
         arch_info = _resolve_bitnet_arch_info(arch_info, tensor_names)
         dims = _extract_dimensions(config)
         norm_eps = config.get("rms_norm_eps", config.get("layer_norm_epsilon", 1e-6))
-        rope_theta = config.get("rope_theta", 10000.0)
+        rope_theta = _resolve_rope_theta(config)
+        partial_rotary_factor = _resolve_partial_rotary_factor(config)
         arch_info = _resolve_activation(arch_info, config)
         arch_info, has_qkv_bias = _resolve_qkv_bias(arch_info, config, tensor_names)
         tie_word_embeddings = _resolve_tied_embeddings(config, tensor_names)
         eos_tokens = _collect_eos_tokens(config, arch_info.arch_type, model_dir, adapter_dir)
+        qwen35_fields = _extract_qwen35_fields(config, arch_info.arch_type)
 
         return cls(
             arch_type=arch_info.arch_type,
@@ -406,9 +511,17 @@ class ModelConfig:
             max_position_embeddings=dims["max_position_embeddings"],
             norm_eps=norm_eps,
             rope_theta=rope_theta,
+            partial_rotary_factor=partial_rotary_factor,
             eos_tokens=eos_tokens,
             has_qkv_bias=has_qkv_bias,
             tie_word_embeddings=tie_word_embeddings,
             hidden_dim_orig=dims["hidden_dim_orig"],
             intermediate_dim_orig=dims["intermediate_dim_orig"],
+            layer_types=qwen35_fields["layer_types"],
+            attn_output_gate=qwen35_fields["attn_output_gate"],
+            linear_num_key_heads=qwen35_fields["linear_num_key_heads"],
+            linear_num_value_heads=qwen35_fields["linear_num_value_heads"],
+            linear_key_head_dim=qwen35_fields["linear_key_head_dim"],
+            linear_value_head_dim=qwen35_fields["linear_value_head_dim"],
+            linear_conv_kernel_dim=qwen35_fields["linear_conv_kernel_dim"],
         )

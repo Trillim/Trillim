@@ -156,6 +156,7 @@ class ModelArchTests(unittest.TestCase):
                     "num_key_value_heads": 4,
                     "rms_norm_eps": 1e-5,
                     "rope_theta": 500000.0,
+                    "partial_rotary_factor": 0.5,
                     "max_position_embeddings": 8192,
                 },
             )
@@ -169,6 +170,7 @@ class ModelArchTests(unittest.TestCase):
         self.assertEqual(config.max_position_embeddings, 8192)
         self.assertEqual(config.norm_eps, 1e-5)
         self.assertEqual(config.rope_theta, 500000.0)
+        self.assertEqual(config.partial_rotary_factor, 0.5)
 
     def test_from_config_json_keeps_arch_default_activation_when_override_matches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -196,6 +198,77 @@ class ModelArchTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Unknown activation function 'gelu'"):
                 ModelConfig.from_config_json(str(config_path))
+
+    def test_from_config_json_supports_qwen35_text_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            config_path = self._write_config(
+                model_dir,
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "hidden_size": 2560,
+                        "intermediate_size": 9216,
+                        "num_hidden_layers": 32,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 4,
+                        "head_dim": 256,
+                        "layer_types": ["linear_attention", "full_attention"],
+                        "attn_output_gate": True,
+                        "linear_num_key_heads": 16,
+                        "linear_num_value_heads": 32,
+                        "linear_key_head_dim": 128,
+                        "linear_value_head_dim": 128,
+                        "linear_conv_kernel_dim": 4,
+                        "vocab_size": 248320,
+                        "max_position_embeddings": 262144,
+                        "rms_norm_eps": 1e-6,
+                        "rope_parameters": {
+                            "rope_theta": 10000000.0,
+                            "partial_rotary_factor": 0.25,
+                        },
+                        "hidden_act": "silu",
+                        "eos_token_id": 248044,
+                        "tie_word_embeddings": True,
+                        "attention_bias": False,
+                    },
+                },
+            )
+            self._write_tensor_index(
+                model_dir,
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.language_model.norm.weight",
+            )
+
+            config = ModelConfig.from_config_json(str(config_path), model_dir=str(model_dir))
+
+        self.assertEqual(config.arch_type, ArchType.QWEN35)
+        self.assertEqual(config.arch_info.activation, ActivationType.SILU)
+        self.assertEqual(config.arch_info.embedding_pattern, "language_model.embed_tokens")
+        self.assertEqual(config.arch_info.final_norm_pattern, "model.language_model.norm.weight")
+        self.assertEqual(config.hidden_dim, 2560)
+        self.assertEqual(config.intermediate_dim, 9216)
+        self.assertEqual(config.num_layers, 32)
+        self.assertEqual(config.num_heads, 16)
+        self.assertEqual(config.num_kv_heads, 4)
+        self.assertEqual(config.vocab_size, 248320)
+        self.assertEqual(config.head_dim, 256)
+        self.assertEqual(config.max_position_embeddings, 262144)
+        self.assertEqual(config.norm_eps, 1e-6)
+        self.assertEqual(config.rope_theta, 10000000.0)
+        self.assertEqual(config.partial_rotary_factor, 0.25)
+        self.assertTrue(config.tie_word_embeddings)
+        self.assertFalse(config.has_qkv_bias)
+        self.assertEqual(config.eos_tokens, [248044])
+        self.assertEqual(config.layer_types, ["linear_attention", "full_attention"])
+        self.assertTrue(config.attn_output_gate)
+        self.assertEqual(config.linear_num_key_heads, 16)
+        self.assertEqual(config.linear_num_value_heads, 32)
+        self.assertEqual(config.linear_key_head_dim, 128)
+        self.assertEqual(config.linear_value_head_dim, 128)
+        self.assertEqual(config.linear_conv_kernel_dim, 4)
 
     def test_from_config_json_collects_and_dedupes_eos_tokens_from_model_and_adapter(self):
         with tempfile.TemporaryDirectory() as temp_dir:

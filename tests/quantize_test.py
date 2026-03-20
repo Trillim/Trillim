@@ -17,7 +17,7 @@ from unittest.mock import patch
 import numpy as np
 from safetensors.numpy import save_file
 
-from trillim.model_arch import ARCH_REGISTRY, ArchType, LORA_TARGETS
+from trillim.model_arch import ARCH_REGISTRY, ArchType, LORA_TARGETS, ModelConfig
 import trillim.quantize as quantize
 
 
@@ -50,9 +50,20 @@ def _read_manifest(path: str) -> dict:
                 }
             )
 
+        section_count = struct.unpack("<I", handle.read(4))[0]
+        sections = []
+        for _ in range(section_count):
+            sections.append(
+                {
+                    "type": struct.unpack("<B", handle.read(1))[0],
+                    "first_tensor_idx": struct.unpack("<I", handle.read(4))[0],
+                    "num_tensors": struct.unpack("<I", handle.read(4))[0],
+                }
+            )
+
         remainder = handle.read()
         if not remainder:
-            return {"shards": shards, "tensors": tensors, "lora": None}
+            return {"shards": shards, "tensors": tensors, "sections": sections, "lora": None}
 
     offset = 0
 
@@ -95,6 +106,7 @@ def _read_manifest(path: str) -> dict:
     return {
         "shards": shards,
         "tensors": tensors,
+        "sections": sections,
         "lora": {
             "num_layers": num_layers,
             "targets_per_layer": targets_per_layer,
@@ -118,6 +130,9 @@ class QuantizeTests(unittest.TestCase):
             "num_kv_heads": 4,
             "head_dim": 32,
             "norm_eps": 1e-5,
+            "rope_theta": 500000.0,
+            "partial_rotary_factor": 1.0,
+            "max_position_embeddings": 4096,
             "tie_word_embeddings": False,
         }
         values.update(overrides)
@@ -184,6 +199,122 @@ class QuantizeTests(unittest.TestCase):
         else:
             save_file(tensors, str(model_dir / "model.safetensors"))
 
+        return str(model_dir)
+
+    def _write_qwen_model(self, root: str) -> str:
+        model_dir = Path(root) / "qwen-model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "_name_or_path": "Org/Qwen3.5-4B",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "rope_theta": 123.0,
+                    "max_position_embeddings": 456,
+                    "text_config": {
+                        "hidden_size": 2560,
+                        "intermediate_size": 9216,
+                        "num_hidden_layers": 1,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 4,
+                        "head_dim": 160,
+                        "layer_types": ["full_attention"],
+                        "attn_output_gate": True,
+                        "linear_num_key_heads": 16,
+                        "linear_num_value_heads": 32,
+                        "linear_key_head_dim": 128,
+                        "linear_value_head_dim": 128,
+                        "linear_conv_kernel_dim": 4,
+                        "vocab_size": 248320,
+                        "max_position_embeddings": 262144,
+                        "rms_norm_eps": 1e-6,
+                        "rope_parameters": {
+                            "rope_theta": 10000000.0,
+                            "partial_rotary_factor": 0.25,
+                        },
+                        "hidden_act": "silu",
+                        "eos_token_id": 248044,
+                        "tie_word_embeddings": True,
+                        "attention_bias": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        save_file(
+            {
+                "model.language_model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
+                "model.language_model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
+                "model.language_model.norm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.q_norm.weight": np.zeros((256,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.k_norm.weight": np.zeros((256,), dtype=np.float16),
+            },
+            str(model_dir / "model.safetensors"),
+        )
+        return str(model_dir)
+
+    def _write_qwen_multimodal_model(self, root: str) -> str:
+        model_dir = Path(root) / "qwen-multimodal"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "hidden_size": 2560,
+                        "intermediate_size": 9216,
+                        "num_hidden_layers": 1,
+                        "num_attention_heads": 16,
+                        "num_key_value_heads": 4,
+                        "head_dim": 256,
+                        "vocab_size": 248320,
+                        "max_position_embeddings": 262144,
+                        "rms_norm_eps": 1e-6,
+                        "rope_parameters": {"rope_theta": 10000000.0},
+                        "tie_word_embeddings": True,
+                        "attention_bias": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        save_file(
+            {
+                "model.language_model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
+                "model.language_model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
+                "model.language_model.norm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.visual.patch_embed.proj.weight": np.zeros((1024, 3, 2, 2), dtype=np.float16),
+                "model.visual.patch_embed.proj.bias": np.zeros((1024,), dtype=np.float16),
+                "model.visual.pos_embed.weight": np.zeros((16, 1024), dtype=np.float16),
+                "model.visual.blocks.0.norm1.weight": np.zeros((1024,), dtype=np.float16),
+                "model.visual.blocks.0.attn.qkv.weight": np.zeros((3072, 1024), dtype=np.float16),
+                "model.visual.blocks.0.attn.proj.weight": np.zeros((1024, 1024), dtype=np.float16),
+                "model.visual.blocks.0.norm2.weight": np.zeros((1024,), dtype=np.float16),
+                "model.visual.blocks.0.mlp.linear_fc1.weight": np.zeros((4096, 1024), dtype=np.float16),
+                "model.visual.blocks.0.mlp.linear_fc2.weight": np.zeros((1024, 4096), dtype=np.float16),
+                "model.visual.merger.linear_fc1.weight": np.zeros((4096, 1024), dtype=np.float16),
+                "model.visual.merger.linear_fc2.weight": np.zeros((2560, 4096), dtype=np.float16),
+            },
+            str(model_dir / "model.safetensors"),
+        )
         return str(model_dir)
 
     def _write_adapter(
@@ -285,6 +416,44 @@ class QuantizeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
             quantize._safetensors_dtype_code("BAD")
 
+    def test_processing_order_explicitly_covers_qwen35_text_components(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = self._write_qwen_model(temp_dir)
+            qwen_config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=model_dir,
+            )
+
+        ordered = quantize.get_processing_order(
+            [
+                {"key": "model.language_model.layers.0.mlp.down_proj.weight"},
+                {"key": "model.language_model.layers.0.linear_attn.out_proj.weight"},
+                {"key": "model.language_model.layers.0.self_attn.q_proj.weight"},
+                {"key": "model.language_model.layers.0.post_attention_layernorm.weight"},
+                {"key": "model.language_model.layers.0.input_layernorm.weight"},
+                {"key": "model.language_model.layers.0.self_attn.q_norm.weight"},
+                {"key": "model.language_model.layers.0.linear_attn.norm.weight"},
+                {"key": "model.language_model.norm.weight"},
+                {"key": "model.language_model.embed_tokens.weight"},
+            ],
+            qwen_config.arch_info,
+        )
+
+        self.assertEqual(
+            [item["key"] for item in ordered],
+            [
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.norm.weight",
+                "model.language_model.layers.0.input_layernorm.weight",
+                "model.language_model.layers.0.linear_attn.norm.weight",
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                "model.language_model.layers.0.self_attn.q_norm.weight",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.language_model.layers.0.post_attention_layernorm.weight",
+                "model.language_model.layers.0.mlp.down_proj.weight",
+            ],
+        )
+
     def test_header_parsing_and_manifest_generation_cover_actions_padding_and_scales(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = self._write_model(temp_dir)
@@ -297,6 +466,10 @@ class QuantizeTests(unittest.TestCase):
 
             self.assertEqual(len(manifest["shards"]), 1)
             self.assertEqual(len(manifest["tensors"]), 8)
+            self.assertEqual(
+                manifest["sections"],
+                [{"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": 8}],
+            )
 
             embedding_entry = manifest["tensors"][0]
             self.assertEqual(embedding_entry["action"], quantize.ACTION_BF16_RAW)
@@ -323,6 +496,10 @@ class QuantizeTests(unittest.TestCase):
             sharded_model = self._write_model(temp_dir, sharded=True)
             manifest = _read_manifest(quantize.write_manifest(sharded_model, self._config()))
             self.assertEqual(len(manifest["shards"]), 2)
+            self.assertEqual(
+                manifest["sections"],
+                [{"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": len(manifest["tensors"])}],
+            )
 
             empty_model = Path(temp_dir) / "empty-model"
             empty_model.mkdir()
@@ -340,6 +517,201 @@ class QuantizeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(FileNotFoundError, "No model.safetensors"):
                 quantize.write_manifest(str(empty_model), self._config())
+
+    def test_write_manifest_supports_qwen35_model_config_and_tensor_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = self._write_qwen_model(temp_dir)
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=model_dir,
+            )
+
+            manifest = _read_manifest(quantize.write_manifest(model_dir, config))
+
+        self.assertEqual(config.arch_type, ArchType.QWEN35)
+        self.assertEqual(config.rope_theta, 10000000.0)
+        self.assertEqual(config.partial_rotary_factor, 0.25)
+        self.assertEqual(config.max_position_embeddings, 262144)
+        self.assertTrue(config.tie_word_embeddings)
+        self.assertEqual(config.arch_info.final_norm_pattern, "model.language_model.norm.weight")
+        self.assertEqual(config.layer_types, ["full_attention"])
+        self.assertTrue(config.attn_output_gate)
+        self.assertEqual(config.linear_num_key_heads, 16)
+        self.assertEqual(config.linear_num_value_heads, 32)
+        self.assertEqual(config.linear_key_head_dim, 128)
+        self.assertEqual(config.linear_value_head_dim, 128)
+        self.assertEqual(config.linear_conv_kernel_dim, 4)
+        self.assertEqual(len(manifest["tensors"]), 12)
+        self.assertEqual(
+            manifest["sections"],
+            [{"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": 12}],
+        )
+
+        embedding_entry = manifest["tensors"][0]
+        norm_entry = manifest["tensors"][1]
+        q_proj_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 2560 and entry["col"] == 2560 and entry["action"] == quantize.ACTION_TERNARY_QUANTIZE
+        )
+        k_proj_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 640 and entry["col"] == 2560
+        )
+        q_norm_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 256 and entry["col"] == 1
+        )
+
+        self.assertEqual(embedding_entry["action"], quantize.ACTION_BF16_RAW)
+        self.assertEqual(norm_entry["action"], quantize.ACTION_BF16_RAW)
+        self.assertEqual(q_proj_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
+        self.assertEqual((q_proj_entry["row"], q_proj_entry["col"]), (2560, 2560))
+        self.assertEqual((k_proj_entry["row"], k_proj_entry["col"]), (640, 2560))
+        self.assertEqual(q_norm_entry["action"], quantize.ACTION_BF16_RAW)
+        self.assertTrue(all(entry["action"] == quantize.ACTION_BF16_RAW for entry in manifest["tensors"][:2]))
+
+    def test_write_manifest_rejects_qwen35_multimodal_tensor_groups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "qwen-multimodal"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "model_type": "qwen3_5",
+                        "text_config": {
+                            "hidden_size": 2560,
+                            "intermediate_size": 9216,
+                            "num_hidden_layers": 32,
+                            "num_attention_heads": 16,
+                            "num_key_value_heads": 4,
+                            "head_dim": 256,
+                            "vocab_size": 248320,
+                            "max_position_embeddings": 262144,
+                            "rms_norm_eps": 1e-6,
+                            "rope_parameters": {"rope_theta": 10000000.0},
+                            "tie_word_embeddings": True,
+                            "attention_bias": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "model.language_model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                            "mtp.fc.weight": "model-00002-of-00002.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=str(model_dir),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Qwen3\.5 checkpoints with MTP tensors require --language-model-only.*mtp\.\*",
+            ):
+                quantize.write_manifest(str(model_dir), config)
+
+    def test_write_manifest_supports_qwen35_text_and_visual_sections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = self._write_qwen_multimodal_model(temp_dir)
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=model_dir,
+            )
+
+            manifest = _read_manifest(quantize.write_manifest(model_dir, config))
+
+        self.assertEqual(
+            manifest["sections"],
+            [
+                {"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": 10},
+                {"type": quantize.SECTION_VISUAL, "first_tensor_idx": 10, "num_tensors": 11},
+            ],
+        )
+        visual_pos_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 16 and entry["col"] == 1024
+        )
+        visual_qkv_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 3072 and entry["col"] == 1024
+        )
+        patch_proj_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 1024 and entry["col"] == 12
+        )
+        self.assertEqual(visual_pos_entry["action"], quantize.ACTION_BF16_RAW)
+        self.assertEqual(visual_qkv_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
+        self.assertEqual(patch_proj_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
+
+    def test_write_manifest_language_model_only_filters_visual_and_mtp_sections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "qwen-multimodal"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "model_type": "qwen3_5",
+                        "text_config": {
+                            "hidden_size": 2560,
+                            "intermediate_size": 9216,
+                            "num_hidden_layers": 1,
+                            "num_attention_heads": 16,
+                            "num_key_value_heads": 4,
+                            "head_dim": 256,
+                            "vocab_size": 248320,
+                            "max_position_embeddings": 262144,
+                            "rms_norm_eps": 1e-6,
+                            "rope_parameters": {"rope_theta": 10000000.0},
+                            "tie_word_embeddings": True,
+                            "attention_bias": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+            save_file(
+                {
+                    "model.language_model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
+                    "model.language_model.norm.weight": np.zeros((2560,), dtype=np.float16),
+                    "model.visual.patch_embed.proj.weight": np.zeros((1024, 3, 2, 2), dtype=np.float16),
+                    "mtp.fc.weight": np.zeros((2560, 2560), dtype=np.float16),
+                },
+                str(model_dir / "model.safetensors"),
+            )
+
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=str(model_dir),
+            )
+            manifest = _read_manifest(
+                quantize.write_manifest(str(model_dir), config, language_model_only=True)
+            )
+
+        self.assertEqual(
+            manifest["sections"],
+            [{"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": 10}],
+        )
+        self.assertEqual(len(manifest["tensors"]), 10)
 
     def test_write_manifest_handles_inconsistent_shard_maps_in_mocked_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -458,6 +830,13 @@ class QuantizeTests(unittest.TestCase):
             self.assertFalse((Path(model_output_dir) / ".quantize_manifest.bin").exists())
             self.assertFalse((Path(model_output_dir) / "qmodel.tensors.tmp").exists())
 
+            rope_theta_index = seen_cmds[0].index("--rope-theta")
+            max_pos_index = seen_cmds[0].index("--max-pos")
+            rope_dim_index = seen_cmds[0].index("--rope-dim")
+            self.assertEqual(seen_cmds[0][rope_theta_index + 1], str(config.rope_theta))
+            self.assertEqual(seen_cmds[0][max_pos_index + 1], str(config.max_position_embeddings))
+            self.assertEqual(seen_cmds[0][rope_dim_index + 1], str(config.head_dim))
+
             with self.assertRaisesRegex(ValueError, "model_output_dir and model_dir resolve to the same path"):
                 quantize._run_cpp_quantizer("/fake/bin", model_dir, config, model_dir)
 
@@ -486,6 +865,62 @@ class QuantizeTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "C\\+\\+ quantizer exited with code 7"):
                     quantize._run_cpp_quantizer("/fake/bin", model_dir, config, model_output_dir)
+
+    def test_run_cpp_quantizer_uses_normalized_rope_fields_instead_of_raw_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "rope_theta": 123.0,
+                        "max_position_embeddings": 456,
+                        "text_config": {
+                            "rope_theta": 10000000.0,
+                            "max_position_embeddings": 262144,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model_output_dir = str(Path(temp_dir) / "model-out")
+            Path(model_output_dir).mkdir()
+            config = self._config(
+                arch_type=ArchType.QWEN35,
+                arch_info=ARCH_REGISTRY["qwen3_5forconditionalgeneration"],
+                rope_theta=10000000.0,
+                partial_rotary_factor=0.25,
+                max_position_embeddings=262144,
+            )
+            seen_cmds: list[list[str]] = []
+
+            def fake_manifest(*args, **kwargs):
+                manifest_path = Path(model_output_dir) / ".quantize_manifest.bin"
+                manifest_path.write_bytes(b"manifest")
+                return str(manifest_path)
+
+            def fake_run(cmd, capture_output=False):
+                seen_cmds.append(cmd)
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch("trillim.quantize.write_manifest", side_effect=fake_manifest),
+                patch("trillim.quantize.subprocess.run", side_effect=fake_run),
+            ):
+                quantize._run_cpp_quantizer(
+                    "/fake/bin",
+                    str(model_dir),
+                    config,
+                    model_output_dir,
+                )
+
+            rope_theta_index = seen_cmds[0].index("--rope-theta")
+            max_pos_index = seen_cmds[0].index("--max-pos")
+            rope_dim_index = seen_cmds[0].index("--rope-dim")
+            self.assertEqual(seen_cmds[0][rope_theta_index + 1], "10000000.0")
+            self.assertEqual(seen_cmds[0][max_pos_index + 1], "262144")
+            self.assertEqual(seen_cmds[0][rope_dim_index + 1], "8")
 
     def test_run_cpp_lora_only_and_file_copy_helpers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -685,6 +1120,7 @@ class QuantizeTests(unittest.TestCase):
             write_model_cfg_mock.assert_called_once_with("/tmp/model-out", config, str(model_dir))
             copy_adapter_mock.assert_called_once_with(str(adapter_dir), "/tmp/adapter-out")
             write_adapter_cfg_mock.assert_called_once_with("/tmp/adapter-out", config, str(adapter_dir), str(model_dir))
+            self.assertFalse(run_quantizer_mock.call_args.kwargs["language_model_only"])
 
             with (
                 patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--model"]),
@@ -701,6 +1137,20 @@ class QuantizeTests(unittest.TestCase):
             self.assertIn("Usage: trillim chat /tmp/model-only", [call.args[0] for call in print_mock.call_args_list])
 
             with (
+                patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--model", "--language-model-only"]),
+                patch("trillim.quantize._find_quantize_binary", return_value="/fake/bin"),
+                patch("trillim.quantize.ModelConfig.from_config_json", return_value=config),
+                patch("trillim.quantize._make_model_output_dir", return_value="/tmp/model-only"),
+                patch("trillim.quantize._run_cpp_quantizer") as run_quantizer_mock,
+                patch("trillim.quantize._copy_model_files"),
+                patch("trillim.quantize._write_trillim_model_config"),
+                patch("builtins.print"),
+            ):
+                quantize.main()
+
+            self.assertTrue(run_quantizer_mock.call_args.kwargs["language_model_only"])
+
+            with (
                 patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--adapter", str(adapter_dir)]),
                 patch("trillim.quantize._find_quantize_binary", return_value="/fake/bin"),
                 patch("trillim.quantize.ModelConfig.from_config_json", return_value=config),
@@ -714,6 +1164,7 @@ class QuantizeTests(unittest.TestCase):
                     quantize.main()
 
             run_lora_only_mock.assert_called_once()
+            self.assertFalse(run_lora_only_mock.call_args.kwargs["language_model_only"])
 
             with patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--adapter", str(temp_dir) + "/missing"]):
                 with (
@@ -727,7 +1178,6 @@ class QuantizeTests(unittest.TestCase):
         with patch.object(__import__("sys"), "argv", ["trillim quantize", "model"]):
             with self.assertRaisesRegex(ValueError, "specify --model and/or --adapter"):
                 runpy.run_path(quantize.__file__, run_name="__main__")
-
 
 if __name__ == "__main__":
     unittest.main()
