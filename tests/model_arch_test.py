@@ -199,8 +199,9 @@ class ModelArchTests(unittest.TestCase):
 
     def test_from_config_json_supports_qwen35_text_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
             config_path = self._write_config(
-                Path(temp_dir),
+                model_dir,
                 {
                     "architectures": ["Qwen3_5ForConditionalGeneration"],
                     "model_type": "qwen3_5",
@@ -214,7 +215,9 @@ class ModelArchTests(unittest.TestCase):
                         "vocab_size": 248320,
                         "max_position_embeddings": 262144,
                         "rms_norm_eps": 1e-6,
-                        "rope_theta": 10000000.0,
+                        "rope_parameters": {
+                            "rope_theta": 10000000.0,
+                        },
                         "hidden_act": "silu",
                         "eos_token_id": 248044,
                         "tie_word_embeddings": True,
@@ -222,11 +225,19 @@ class ModelArchTests(unittest.TestCase):
                     },
                 },
             )
+            self._write_tensor_index(
+                model_dir,
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.language_model.norm.weight",
+            )
 
-            config = ModelConfig.from_config_json(str(config_path))
+            config = ModelConfig.from_config_json(str(config_path), model_dir=str(model_dir))
 
         self.assertEqual(config.arch_type, ArchType.QWEN35)
         self.assertEqual(config.arch_info.activation, ActivationType.SILU)
+        self.assertEqual(config.arch_info.embedding_pattern, "language_model.embed_tokens")
+        self.assertEqual(config.arch_info.final_norm_pattern, "model.language_model.norm.weight")
         self.assertEqual(config.hidden_dim, 2560)
         self.assertEqual(config.intermediate_dim, 9216)
         self.assertEqual(config.num_layers, 32)

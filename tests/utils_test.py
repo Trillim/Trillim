@@ -374,6 +374,9 @@ class UtilsTests(unittest.TestCase):
                             "num_attention_heads": 16,
                             "num_key_value_heads": 4,
                             "vocab_size": 248320,
+                            "rope_parameters": {
+                                "rope_theta": 10000000.0,
+                            },
                         },
                     }
                 ),
@@ -394,6 +397,9 @@ class UtilsTests(unittest.TestCase):
                             "num_attention_heads": 16,
                             "num_key_value_heads": 4,
                             "vocab_size": 248320,
+                            "rope_parameters": {
+                                "rope_theta": 10000000.0,
+                            },
                         },
                     }
                 ),

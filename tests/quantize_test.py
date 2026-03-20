@@ -209,7 +209,9 @@ class QuantizeTests(unittest.TestCase):
                         "vocab_size": 248320,
                         "max_position_embeddings": 262144,
                         "rms_norm_eps": 1e-6,
-                        "rope_theta": 10000000.0,
+                        "rope_parameters": {
+                            "rope_theta": 10000000.0,
+                        },
                         "hidden_act": "silu",
                         "eos_token_id": 248044,
                         "tie_word_embeddings": True,
@@ -222,17 +224,18 @@ class QuantizeTests(unittest.TestCase):
         (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
         save_file(
             {
-                "model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
-                "model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
-                "model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
-                "model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
-                "model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
-                "model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
-                "model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
-                "model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
-                "model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
-                "model.norm.weight": np.zeros((2560,), dtype=np.float16),
-                "model.layers.0.self_attn.rotary_emb.inv_freq": np.zeros((80,), dtype=np.float32),
+                "model.language_model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
+                "model.language_model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                "model.language_model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
+                "model.language_model.norm.weight": np.zeros((2560,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.q_norm.weight": np.zeros((256,), dtype=np.float16),
+                "model.language_model.layers.0.self_attn.k_norm.weight": np.zeros((256,), dtype=np.float16),
             },
             str(model_dir / "model.safetensors"),
         )
@@ -407,7 +410,8 @@ class QuantizeTests(unittest.TestCase):
         self.assertEqual(config.rope_theta, 10000000.0)
         self.assertEqual(config.max_position_embeddings, 262144)
         self.assertTrue(config.tie_word_embeddings)
-        self.assertEqual(len(manifest["tensors"]), 10)
+        self.assertEqual(config.arch_info.final_norm_pattern, "model.language_model.norm.weight")
+        self.assertEqual(len(manifest["tensors"]), 12)
 
         embedding_entry = manifest["tensors"][0]
         norm_entry = manifest["tensors"][1]
@@ -419,12 +423,18 @@ class QuantizeTests(unittest.TestCase):
             entry for entry in manifest["tensors"]
             if entry["row"] == 640 and entry["col"] == 2560
         )
+        q_norm_entry = next(
+            entry for entry in manifest["tensors"]
+            if entry["row"] == 256 and entry["col"] == 1
+        )
 
         self.assertEqual(embedding_entry["action"], quantize.ACTION_BF16_RAW)
         self.assertEqual(norm_entry["action"], quantize.ACTION_BF16_RAW)
         self.assertEqual(q_proj_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
         self.assertEqual((q_proj_entry["row"], q_proj_entry["col"]), (2560, 2560))
         self.assertEqual((k_proj_entry["row"], k_proj_entry["col"]), (640, 2560))
+        self.assertEqual(q_norm_entry["action"], quantize.ACTION_BF16_RAW)
+        self.assertTrue(all(entry["action"] == quantize.ACTION_BF16_RAW for entry in manifest["tensors"][:2]))
 
     def test_write_manifest_handles_inconsistent_shard_maps_in_mocked_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

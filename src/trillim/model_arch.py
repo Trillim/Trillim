@@ -98,6 +98,8 @@ ARCH_REGISTRY: dict[str, ArchInfo] = {
             "mlp.up_proj",
             "mlp.down_proj",
         ],
+        embedding_pattern="language_model.embed_tokens",
+        final_norm_pattern="model.language_model.norm.weight",
     ),
 }
 
@@ -297,6 +299,20 @@ def _resolve_activation(arch_info: ArchInfo, config: dict) -> ArchInfo:
     return replace(arch_info, activation=detected_activation)
 
 
+def _resolve_rope_theta(config: dict) -> float:
+    rope_theta = config.get("rope_theta")
+    if rope_theta is not None:
+        return rope_theta
+
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        nested_theta = rope_parameters.get("rope_theta")
+        if nested_theta is not None:
+            return nested_theta
+
+    return 10000.0
+
+
 def _resolve_qkv_bias(
     arch_info: ArchInfo,
     config: dict,
@@ -315,7 +331,7 @@ def _resolve_qkv_bias(
 
 def _resolve_tied_embeddings(config: dict, tensor_names: Optional[list[str]]) -> bool:
     tie_word_embeddings = config.get("tie_word_embeddings", False)
-    if tensor_names and any("lm_head.weight" in name for name in tensor_names):
+    if tensor_names and any(name.endswith("lm_head.weight") for name in tensor_names):
         return False
     return tie_word_embeddings
 
@@ -420,7 +436,7 @@ class ModelConfig:
         arch_info = _resolve_bitnet_arch_info(arch_info, tensor_names)
         dims = _extract_dimensions(config)
         norm_eps = config.get("rms_norm_eps", config.get("layer_norm_epsilon", 1e-6))
-        rope_theta = config.get("rope_theta", 10000.0)
+        rope_theta = _resolve_rope_theta(config)
         arch_info = _resolve_activation(arch_info, config)
         arch_info, has_qkv_bias = _resolve_qkv_bias(arch_info, config, tensor_names)
         tie_word_embeddings = _resolve_tied_embeddings(config, tensor_names)
