@@ -561,7 +561,7 @@ class QuantizeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 ValueError,
-                r"Qwen3\.5 MTP tensors are not supported.*mtp\.\*",
+                r"Qwen3\.5 checkpoints with MTP tensors require --language-model-only.*mtp\.\*",
             ):
                 quantize.write_manifest(str(model_dir), config)
 
@@ -597,6 +597,66 @@ class QuantizeTests(unittest.TestCase):
         self.assertEqual(visual_pos_entry["action"], quantize.ACTION_BF16_RAW)
         self.assertEqual(visual_qkv_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
         self.assertEqual(patch_proj_entry["action"], quantize.ACTION_TERNARY_QUANTIZE)
+
+    def test_write_manifest_language_model_only_filters_visual_and_mtp_sections(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "qwen-multimodal"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "model_type": "qwen3_5",
+                        "text_config": {
+                            "hidden_size": 2560,
+                            "intermediate_size": 9216,
+                            "num_hidden_layers": 1,
+                            "num_attention_heads": 16,
+                            "num_key_value_heads": 4,
+                            "head_dim": 256,
+                            "vocab_size": 248320,
+                            "max_position_embeddings": 262144,
+                            "rms_norm_eps": 1e-6,
+                            "rope_parameters": {"rope_theta": 10000000.0},
+                            "tie_word_embeddings": True,
+                            "attention_bias": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+            save_file(
+                {
+                    "model.language_model.embed_tokens.weight": np.zeros((16, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.input_layernorm.weight": np.zeros((2560,), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.q_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.k_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.v_proj.weight": np.zeros((640, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.self_attn.o_proj.weight": np.zeros((2560, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.gate_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.up_proj.weight": np.zeros((9216, 2560), dtype=np.float16),
+                    "model.language_model.layers.0.mlp.down_proj.weight": np.zeros((2560, 9216), dtype=np.float16),
+                    "model.language_model.norm.weight": np.zeros((2560,), dtype=np.float16),
+                    "model.visual.patch_embed.proj.weight": np.zeros((1024, 3, 2, 2), dtype=np.float16),
+                    "mtp.fc.weight": np.zeros((2560, 2560), dtype=np.float16),
+                },
+                str(model_dir / "model.safetensors"),
+            )
+
+            config = ModelConfig.from_config_json(
+                os.path.join(model_dir, "config.json"),
+                model_dir=str(model_dir),
+            )
+            manifest = _read_manifest(
+                quantize.write_manifest(str(model_dir), config, language_model_only=True)
+            )
+
+        self.assertEqual(
+            manifest["sections"],
+            [{"type": quantize.SECTION_TEXT_CORE, "first_tensor_idx": 0, "num_tensors": 10}],
+        )
+        self.assertEqual(len(manifest["tensors"]), 10)
 
     def test_write_manifest_handles_inconsistent_shard_maps_in_mocked_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1000,6 +1060,7 @@ class QuantizeTests(unittest.TestCase):
             write_model_cfg_mock.assert_called_once_with("/tmp/model-out", config, str(model_dir))
             copy_adapter_mock.assert_called_once_with(str(adapter_dir), "/tmp/adapter-out")
             write_adapter_cfg_mock.assert_called_once_with("/tmp/adapter-out", config, str(adapter_dir), str(model_dir))
+            self.assertFalse(run_quantizer_mock.call_args.kwargs["language_model_only"])
 
             with (
                 patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--model"]),
@@ -1016,6 +1077,20 @@ class QuantizeTests(unittest.TestCase):
             self.assertIn("Usage: trillim chat /tmp/model-only", [call.args[0] for call in print_mock.call_args_list])
 
             with (
+                patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--model", "--language-model-only"]),
+                patch("trillim.quantize._find_quantize_binary", return_value="/fake/bin"),
+                patch("trillim.quantize.ModelConfig.from_config_json", return_value=config),
+                patch("trillim.quantize._make_model_output_dir", return_value="/tmp/model-only"),
+                patch("trillim.quantize._run_cpp_quantizer") as run_quantizer_mock,
+                patch("trillim.quantize._copy_model_files"),
+                patch("trillim.quantize._write_trillim_model_config"),
+                patch("builtins.print"),
+            ):
+                quantize.main()
+
+            self.assertTrue(run_quantizer_mock.call_args.kwargs["language_model_only"])
+
+            with (
                 patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--adapter", str(adapter_dir)]),
                 patch("trillim.quantize._find_quantize_binary", return_value="/fake/bin"),
                 patch("trillim.quantize.ModelConfig.from_config_json", return_value=config),
@@ -1029,6 +1104,7 @@ class QuantizeTests(unittest.TestCase):
                     quantize.main()
 
             run_lora_only_mock.assert_called_once()
+            self.assertFalse(run_lora_only_mock.call_args.kwargs["language_model_only"])
 
             with patch.object(__import__("sys"), "argv", ["trillim quantize", str(model_dir), "--adapter", str(temp_dir) + "/missing"]):
                 with (

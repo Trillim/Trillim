@@ -234,7 +234,11 @@ def _safetensors_dtype_code(dtype_str):
     return entry
 
 
-def _validate_supported_model_tensors(model_dir: str, config: ModelConfig) -> None:
+def _validate_supported_model_tensors(
+    model_dir: str,
+    config: ModelConfig,
+    language_model_only: bool = False,
+) -> None:
     """Reject known-unsupported tensor groups before reading shard payloads."""
     try:
         tensor_names = get_all_tensor_names(model_dir)
@@ -244,12 +248,13 @@ def _validate_supported_model_tensors(model_dir: str, config: ModelConfig) -> No
     if config.arch_type.name == "QWEN35":
         unsupported_groups = []
         if any(name.startswith("mtp.") for name in tensor_names):
-            unsupported_groups.append("mtp.*")
+            if not language_model_only:
+                unsupported_groups.append("mtp.*")
 
         if unsupported_groups:
             groups = ", ".join(unsupported_groups)
             raise ValueError(
-                "Qwen3.5 MTP tensors are not supported for quantization yet. "
+                "Qwen3.5 checkpoints with MTP tensors require --language-model-only for text-only quantization. "
                 f"Found unsupported tensor groups: {groups}"
             )
 
@@ -259,7 +264,7 @@ def _validate_supported_model_tensors(model_dir: str, config: ModelConfig) -> No
 # ---------------------------------------------------------------------------
 
 def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=False,
-                    manifest_dir=None):
+                    manifest_dir=None, language_model_only=False):
     """Write a binary manifest for the C++ quantizer.
 
     Returns the path to the written manifest file.
@@ -271,7 +276,11 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
     model_dir).  Use this to avoid writing into a read-only model directory.
     """
     if not skip_model:
-        _validate_supported_model_tensors(model_dir, config)
+        _validate_supported_model_tensors(
+            model_dir,
+            config,
+            language_model_only=language_model_only,
+        )
 
     # Try to load base model safetensors; allow adapter-only mode
     if skip_model:
@@ -339,6 +348,10 @@ def write_manifest(model_dir, config: ModelConfig, adapter_dir=None, skip_model=
         other_meta = []
         for item in filtered_meta:
             key = item["key"]
+            if language_model_only and (
+                key.startswith("model.visual.") or key.startswith("mtp.")
+            ):
+                continue
             if key.startswith("model.visual."):
                 visual_meta.append(item)
             elif key.startswith("mtp."):
@@ -673,7 +686,7 @@ def _find_quantize_binary():
 
 
 def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter_dir=None,
-                       adapter_output_dir=None):
+                       adapter_output_dir=None, language_model_only=False):
     """Invoke the C++ quantizer to produce qmodel.tensors, rope.cache, and/or qmodel.lora."""
     if model_output_dir and os.path.realpath(model_output_dir) == os.path.realpath(model_dir):
         raise ValueError("model_output_dir and model_dir resolve to the same path.")
@@ -682,6 +695,7 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
     manifest_path = write_manifest(
         model_dir, config, adapter_dir=adapter_dir,
         manifest_dir=model_output_dir,
+        language_model_only=language_model_only,
     )
     print(f"  Manifest: {manifest_path}")
 
@@ -739,14 +753,15 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
 
 
 def _run_cpp_lora_only(binary_path, model_dir, config, adapter_dir,
-                       adapter_output_dir):
+                       adapter_output_dir, language_model_only=False):
     """Invoke the C++ quantizer for LoRA-only extraction (no model tensors)."""
     if os.path.realpath(adapter_output_dir) == os.path.realpath(adapter_dir):
         raise ValueError("adapter_output_dir and adapter_dir resolve to the same path.")
 
     print("  Writing LoRA manifest...")
     manifest_path = write_manifest(model_dir, config, adapter_dir=adapter_dir, skip_model=True,
-                                   manifest_dir=adapter_output_dir)
+                                   manifest_dir=adapter_output_dir,
+                                   language_model_only=language_model_only)
     print(f"  Manifest: {manifest_path}")
 
     adapter_config_path = os.path.join(adapter_dir, "adapter_config.json")
@@ -1046,6 +1061,11 @@ def main():
         "--adapter",
         help="Extract LoRA adapter from PEFT directory → <adapter_dir>-TRNQ/",
     )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="For multimodal checkpoints, quantize only model.language_model.* tensors for text inference",
+    )
     args = parser.parse_args()
 
     if not args.model and not args.adapter:
@@ -1100,6 +1120,7 @@ def main():
             binary_path, model_dir, config, model_output_dir,
             adapter_dir=args.adapter if args.adapter else None,
             adapter_output_dir=adapter_output_dir,
+            language_model_only=args.language_model_only,
         )
 
         qmodel_path = os.path.join(model_output_dir, "qmodel.tensors")
@@ -1124,6 +1145,7 @@ def main():
         _run_cpp_lora_only(
             binary_path, model_dir, config, args.adapter,
             adapter_output_dir=adapter_output_dir,
+            language_model_only=args.language_model_only,
         )
 
         lora_path = os.path.join(adapter_output_dir, "qmodel.lora")
