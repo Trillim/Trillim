@@ -118,6 +118,8 @@ class QuantizeTests(unittest.TestCase):
             "num_kv_heads": 4,
             "head_dim": 32,
             "norm_eps": 1e-5,
+            "rope_theta": 500000.0,
+            "max_position_embeddings": 4096,
             "tie_word_embeddings": False,
         }
         values.update(overrides)
@@ -458,6 +460,11 @@ class QuantizeTests(unittest.TestCase):
             self.assertFalse((Path(model_output_dir) / ".quantize_manifest.bin").exists())
             self.assertFalse((Path(model_output_dir) / "qmodel.tensors.tmp").exists())
 
+            rope_theta_index = seen_cmds[0].index("--rope-theta")
+            max_pos_index = seen_cmds[0].index("--max-pos")
+            self.assertEqual(seen_cmds[0][rope_theta_index + 1], str(config.rope_theta))
+            self.assertEqual(seen_cmds[0][max_pos_index + 1], str(config.max_position_embeddings))
+
             with self.assertRaisesRegex(ValueError, "model_output_dir and model_dir resolve to the same path"):
                 quantize._run_cpp_quantizer("/fake/bin", model_dir, config, model_dir)
 
@@ -486,6 +493,59 @@ class QuantizeTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "C\\+\\+ quantizer exited with code 7"):
                     quantize._run_cpp_quantizer("/fake/bin", model_dir, config, model_output_dir)
+
+    def test_run_cpp_quantizer_uses_normalized_rope_fields_instead_of_raw_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["Qwen3_5ForConditionalGeneration"],
+                        "rope_theta": 123.0,
+                        "max_position_embeddings": 456,
+                        "text_config": {
+                            "rope_theta": 10000000.0,
+                            "max_position_embeddings": 262144,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model_output_dir = str(Path(temp_dir) / "model-out")
+            Path(model_output_dir).mkdir()
+            config = self._config(
+                arch_type=ArchType.QWEN35,
+                arch_info=ARCH_REGISTRY["qwen3_5forconditionalgeneration"],
+                rope_theta=10000000.0,
+                max_position_embeddings=262144,
+            )
+            seen_cmds: list[list[str]] = []
+
+            def fake_manifest(*args, **kwargs):
+                manifest_path = Path(model_output_dir) / ".quantize_manifest.bin"
+                manifest_path.write_bytes(b"manifest")
+                return str(manifest_path)
+
+            def fake_run(cmd, capture_output=False):
+                seen_cmds.append(cmd)
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch("trillim.quantize.write_manifest", side_effect=fake_manifest),
+                patch("trillim.quantize.subprocess.run", side_effect=fake_run),
+            ):
+                quantize._run_cpp_quantizer(
+                    "/fake/bin",
+                    str(model_dir),
+                    config,
+                    model_output_dir,
+                )
+
+            rope_theta_index = seen_cmds[0].index("--rope-theta")
+            max_pos_index = seen_cmds[0].index("--max-pos")
+            self.assertEqual(seen_cmds[0][rope_theta_index + 1], "10000000.0")
+            self.assertEqual(seen_cmds[0][max_pos_index + 1], "262144")
 
     def test_run_cpp_lora_only_and_file_copy_helpers(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -561,17 +561,10 @@ def _run_cpp_quantizer(binary_path, model_dir, config, model_output_dir, adapter
     if config.tie_word_embeddings:
         cmd.append("--tie-embeddings")
 
-    # RoPE args
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path, encoding="utf-8") as f:
-        raw_config = json.load(f)
-    rope_theta = raw_config.get("rope_theta", 500000.0)
-    max_pos = raw_config.get("max_position_embeddings", 4096)
-
     cmd += [
         "--rope-output", os.path.join(model_output_dir, "rope.cache"),
-        "--rope-theta", str(rope_theta),
-        "--max-pos", str(max_pos),
+        "--rope-theta", str(config.rope_theta),
+        "--max-pos", str(config.max_position_embeddings),
         "--head-dim", str(config.head_dim),
     ]
 
