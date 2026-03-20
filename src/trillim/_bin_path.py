@@ -9,7 +9,7 @@ from pathlib import Path
 _BIN_DIR = os.path.join(os.path.dirname(__file__), "_bin")
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 _SOURCE_BINARIES = {
-    "inference": ("TRILLIM_INFERENCE_BIN", Path(__file__).resolve().parents[3] / "darknet" / "executables" / "trillim-inference"),
+    "trillim-inference": ("TRILLIM_INFERENCE_BIN", Path(__file__).resolve().parents[3] / "darknet" / "executables" / "trillim-inference"),
     "trillim-quantize": ("TRILLIM_QUANTIZE_BIN", Path(__file__).resolve().parents[3] / "darkquant" / "executables" / "trillim-quantize"),
 }
 
@@ -51,7 +51,7 @@ def _resolve(name: str) -> str:
 
 
 def inference_bin() -> str:
-    return _resolve("inference")
+    return _resolve("trillim-inference")
 
 
 def quantize_bin() -> str:

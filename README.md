@@ -199,4 +199,4 @@ Thread count defaults to `num_cores - 2`. Override it with `--threads N`.
 
 ## License
 
-The Trillim Python SDK source code is MIT-licensed. The C++ inference engine binaries (`inference`, `trillim-quantize`) bundled in the pip package are **proprietary**. You may use them as part of Trillim, but may not reverse-engineer or redistribute them separately. See [LICENSE](LICENSE) for the full terms.
+The Trillim Python SDK source code is MIT-licensed. The C++ inference engine binaries (`trillim-inference`, `trillim-quantize`) bundled in the pip package are **proprietary**. You may use them as part of Trillim, but may not reverse-engineer or redistribute them separately. See [LICENSE](LICENSE) for the full terms.
