@@ -2,12 +2,12 @@
 """Build platform-specific wheels for all 6 supported platforms.
 
 WARNING: This script is NOT for general use. It requires access to the private
-DarkNet repository with pre-compiled binaries for all target platforms. Only
-Trillim developers building distribution wheels should run this.
+DarkNet and DarkQuant repositories with pre-compiled binaries for all target
+platforms. Only Trillim developers building distribution wheels should run this.
 
 For each platform:
 1. Cleans src/trillim/_bin/
-2. Copies the correct binaries from DarkNet's executables/<platform>/
+2. Copies the correct binaries from the sibling DarkNet and DarkQuant repos
 3. Builds a wheel with `uv build --wheel`
 4. Retags the wheel with the correct platform tag
 5. Moves the tagged wheel to dist/
@@ -27,39 +27,43 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DARKNET = ROOT.parent / "DarkNet"
+DARKQUANT = ROOT.parent / "DarkQuant"
 BIN_DIR = ROOT / "src" / "trillim" / "_bin"
 DIST_DIR = ROOT / "dist"
 
-BINARIES = ["inference", "trillim-quantize"]
+BINARY_SOURCES = {
+    "trillim-inference": {
+        "repo": DARKNET,
+        "source_name": "trillim-inference",
+    },
+    "trillim-quantize": {
+        "repo": DARKQUANT,
+        "source_name": "trillim-quantize",
+    },
+}
 
 PLATFORMS: dict[str, dict] = {
     "linux-x86_64": {
-        "src": DARKNET / "executables",
         "tag": "manylinux_2_27_x86_64.manylinux2014_x86_64",
         "exe_suffix": "",
     },
     "linux-arm64": {
-        "src": DARKNET / "executables" / "linux-arm64",
         "tag": "manylinux_2_27_aarch64.manylinux2014_aarch64",
         "exe_suffix": "",
     },
     "macos-x86_64": {
-        "src": DARKNET / "executables" / "macos-x86_64",
         "tag": "macosx_11_0_x86_64",
         "exe_suffix": "",
     },
     "macos-arm64": {
-        "src": DARKNET / "executables" / "macos-arm64",
         "tag": "macosx_11_0_arm64",
         "exe_suffix": "",
     },
     "win-x86_64": {
-        "src": DARKNET / "executables" / "win-x86_64",
         "tag": "win_amd64",
         "exe_suffix": ".exe",
     },
     "win-arm64": {
-        "src": DARKNET / "executables" / "win-arm64",
         "tag": "win_arm64",
         "exe_suffix": ".exe",
     },
@@ -74,11 +78,14 @@ def clean_bin_dir() -> None:
 
 def copy_binaries(platform: str) -> None:
     info = PLATFORMS[platform]
-    src_dir: Path = info["src"]
     suffix: str = info["exe_suffix"]
 
-    for name in BINARIES:
-        src = src_dir / (name + suffix)
+    for name, binary_info in BINARY_SOURCES.items():
+        repo: Path = binary_info["repo"]
+        src_name: str = binary_info["source_name"]
+        src_dir = repo / "executables" / platform
+
+        src = src_dir / (src_name + suffix)
         dst = BIN_DIR / (name + suffix)
         if not src.exists():
             print(f"  ERROR: {src} not found", file=sys.stderr)
@@ -91,7 +98,7 @@ def copy_binaries(platform: str) -> None:
     if gitkeep.exists():
         gitkeep.unlink()
 
-    print(f"  Copied binaries from {src_dir}")
+    print(f"  Copied binaries for {platform}")
 
 
 def build_wheel() -> Path:
