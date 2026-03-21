@@ -29,4 +29,6 @@ class HarnessBaseTests(unittest.IsolatedAsyncioTestCase):
         chunks = [chunk async for chunk in harness.stream_text(object())]
 
         self.assertEqual(chunks, ["a"])
+        self.assertEqual(harness.prompt_tokens, 0)
         self.assertEqual(harness.completion_tokens, 0)
+        self.assertEqual(harness.cached_tokens, 0)

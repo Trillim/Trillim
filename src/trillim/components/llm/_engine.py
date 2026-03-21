@@ -107,6 +107,8 @@ class InferenceEngine:
         self.process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._prompt_cache = _PromptCache()
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
 
     @property
     def cached_token_ids(self) -> list[int]:
@@ -122,6 +124,16 @@ class InferenceEngine:
     def last_cache_hit(self) -> int:
         """Return the prompt-cache hit length for the last request."""
         return self._prompt_cache.last_cache_hit
+
+    @property
+    def last_prompt_tokens(self) -> int:
+        """Return the authoritative prompt-token count for the last request."""
+        return self._last_prompt_tokens
+
+    @property
+    def last_completion_tokens(self) -> int:
+        """Return the authoritative completion-token count for the last request."""
+        return self._last_completion_tokens
 
     async def start(self) -> None:
         """Start the inference worker and send its init block."""
@@ -143,6 +155,7 @@ class InferenceEngine:
     async def stop(self) -> None:
         """Stop the worker and clear cached prompt state."""
         self._prompt_cache.clear()
+        self._clear_usage()
         process = self.process
         self.process = None
         if process is None or process.returncode is not None:
@@ -198,21 +211,28 @@ class InferenceEngine:
                 kv_line = await self._readline("kv_position")
                 kv_position = _parse_protocol_int(kv_line, "kv_position")
                 self._prompt_cache.commit(plan, generated, kv_position)
+                prompt_tokens = min(len(plan.request.token_ids), kv_position)
+                self._last_prompt_tokens = prompt_tokens
+                self._last_completion_tokens = max(0, kv_position - prompt_tokens)
                 completed = True
             except asyncio.CancelledError:
+                self._clear_usage()
                 self._prompt_cache.clear()
                 await self._kill_process()
                 raise
             except EngineError:
+                self._clear_usage()
                 self._prompt_cache.clear()
                 await self._kill_process()
                 raise
             except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                self._clear_usage()
                 self._prompt_cache.clear()
                 await self._kill_process()
                 raise EngineCrashedError("Inference engine crashed") from exc
             finally:
                 if not completed:
+                    self._clear_usage()
                     self._prompt_cache.clear()
                     if process.returncode is not None:
                         self.process = None
@@ -270,6 +290,10 @@ class InferenceEngine:
             pass
         await process.wait()
         self.process = None
+
+    def _clear_usage(self) -> None:
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
 
 
 async def _read_stderr(process: asyncio.subprocess.Process) -> str:

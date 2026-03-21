@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -21,7 +22,22 @@ from trillim.components.llm._swap import _wait_for_idle_or_cancel, restart_model
 from trillim.components.llm._tokenizer import load_tokenizer
 from trillim.components.llm._validation import validate_messages
 from trillim.harnesses.default import DefaultHarness
+from trillim.harnesses.search.harness import SearchHarness
+from trillim.harnesses.search.provider import (
+    DEFAULT_SEARCH_TOKEN_BUDGET,
+    normalize_provider_name,
+    resolve_search_token_budget,
+    validate_harness_name,
+)
 from trillim.errors import AdmissionRejectedError
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeOptions:
+    harness_name: str
+    search_provider: str
+    search_token_budget: int
+    requested_search_token_budget: int
 
 
 class LLM(Component):
@@ -33,6 +49,9 @@ class LLM(Component):
         *,
         num_threads: int = 0,
         trust_remote_code: bool = False,
+        harness_name: str = "default",
+        search_provider: str = "ddgs",
+        search_token_budget: int = DEFAULT_SEARCH_TOKEN_BUDGET,
         _model_validator=validate_model_dir,
         _tokenizer_loader=load_tokenizer,
         _engine_factory=InferenceEngine,
@@ -42,9 +61,14 @@ class LLM(Component):
             raise ValueError("model_dir is required")
         if num_threads < 0 or num_threads > MAX_THREADS:
             raise ValueError(f"num_threads must be between 0 and {MAX_THREADS}")
+        if search_token_budget < 1:
+            raise ValueError("search_token_budget must be at least 1")
         self._configured_model_dir = str(model_dir)
         self._num_threads = num_threads
         self._trust_remote_code = trust_remote_code
+        self._configured_harness_name = validate_harness_name(harness_name)
+        self._configured_search_provider = normalize_provider_name(search_provider)
+        self._configured_search_token_budget = search_token_budget
         self._model_validator = _model_validator
         self._tokenizer_loader = _tokenizer_loader
         self._engine_factory = _engine_factory
@@ -53,6 +77,7 @@ class LLM(Component):
         self._defaults = None
         self._engine = None
         self._harness = None
+        self._runtime_search_token_budget: int | None = None
         self._state = LLMState.UNAVAILABLE
         self._admission = GenerationAdmission()
         self._swap_lock = asyncio.Lock()
@@ -85,15 +110,26 @@ class LLM(Component):
         if self._engine is not None and self._state == LLMState.RUNNING:
             return
         try:
-            validated, tokenizer, defaults, engine = self._build_runtime(
-                self._configured_model_dir
+            validated, tokenizer, defaults, engine, runtime_options = self._build_runtime(
+                self._configured_model_dir,
+                harness_name=self._configured_harness_name,
+                search_provider=self._configured_search_provider,
+                search_token_budget=self._configured_search_token_budget,
             )
             await engine.start()
         except Exception:
             self._clear_runtime()
             self._state = LLMState.SERVER_ERROR
             raise
-        self._bind_runtime(validated, tokenizer, defaults, engine)
+        self._bind_runtime(
+            validated,
+            tokenizer,
+            defaults,
+            engine,
+            harness_name=runtime_options.harness_name,
+            search_provider=runtime_options.search_provider,
+            search_token_budget=runtime_options.search_token_budget,
+        )
         self._state = LLMState.RUNNING
         await self._admission.finish_swapping()
 
@@ -190,9 +226,22 @@ class LLM(Component):
         )
         return text
 
-    async def swap_model(self, model_dir: str | Path) -> ModelInfo:
+    async def swap_model(
+        self,
+        model_dir: str | Path,
+        *,
+        harness_name: str | None = None,
+        search_provider: str | None = None,
+        search_token_budget: int | None = None,
+    ) -> ModelInfo:
         """Hot-swap to another model without restarting the server."""
-        await swap_model(self, str(model_dir))
+        await swap_model(
+            self,
+            str(model_dir),
+            harness_name=harness_name,
+            search_provider=search_provider,
+            search_token_budget=search_token_budget,
+        )
         return self.model_info()
 
     def _set_hot_swap_routes_enabled(self, enabled: bool) -> None:
@@ -227,7 +276,14 @@ class LLM(Component):
                 raise RuntimeError("Chat stream ended without a done event")
             return text, usage
 
-    def _build_runtime(self, model_dir: str | Path):
+    def _build_runtime(
+        self,
+        model_dir: str | Path,
+        *,
+        harness_name: str | None = None,
+        search_provider: str | None = None,
+        search_token_budget: int | None = None,
+    ):
         validated = self._model_validator(model_dir)
         tokenizer = self._tokenizer_loader(
             validated.path,
@@ -241,14 +297,66 @@ class LLM(Component):
             num_threads=self._num_threads,
             progress_timeout=TOKEN_PROGRESS_TIMEOUT_SECONDS,
         )
-        return validated, tokenizer, defaults, engine
+        runtime_options = _RuntimeOptions(
+            harness_name=validate_harness_name(
+                self._configured_harness_name if harness_name is None else harness_name
+            ),
+            search_provider=normalize_provider_name(
+                self._configured_search_provider
+                if search_provider is None
+                else search_provider
+            ),
+            search_token_budget=resolve_search_token_budget(
+                self._configured_search_token_budget
+                if search_token_budget is None
+                else search_token_budget,
+                max_context_tokens=validated.max_position_embeddings,
+            ),
+            requested_search_token_budget=(
+                self._configured_search_token_budget
+                if search_token_budget is None
+                else search_token_budget
+            ),
+        )
+        return validated, tokenizer, defaults, engine, runtime_options
 
-    def _bind_runtime(self, validated, tokenizer, defaults, engine) -> None:
+    def _bind_runtime(
+        self,
+        validated,
+        tokenizer,
+        defaults,
+        engine,
+        *,
+        harness_name: str,
+        search_provider: str,
+        search_token_budget: int,
+    ) -> None:
         self._runtime_model = validated
         self._tokenizer = tokenizer
         self._defaults = defaults
         self._engine = engine
-        self._harness = DefaultHarness(engine)
+        self._runtime_search_token_budget = search_token_budget
+        if harness_name == "default":
+            self._harness = DefaultHarness(engine)
+            return
+        self._harness = SearchHarness(
+            engine,
+            search_provider=search_provider,
+            search_token_budget=search_token_budget,
+        )
+
+    def _update_configured_runtime(
+        self,
+        *,
+        model_dir: str,
+        harness_name: str,
+        search_provider: str,
+        search_token_budget: int,
+    ) -> None:
+        self._configured_model_dir = model_dir
+        self._configured_harness_name = harness_name
+        self._configured_search_provider = search_provider
+        self._configured_search_token_budget = search_token_budget
 
     def _clear_runtime(self) -> None:
         self._runtime_model = None
@@ -256,6 +364,7 @@ class LLM(Component):
         self._defaults = None
         self._engine = None
         self._harness = None
+        self._runtime_search_token_budget = None
 
     def _require_runtime(self):
         if self._runtime_model is None or self._engine is None or self._harness is None:

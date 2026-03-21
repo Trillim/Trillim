@@ -95,7 +95,12 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
             payload = await _read_json_body(request, REQUEST_BODY_LIMIT_BYTES)
             try:
                 swap_request = validate_swap_request(payload)
-                info = await llm.swap_model(swap_request.model_dir)
+                info = await llm.swap_model(
+                    swap_request.model_dir,
+                    harness_name=swap_request.harness_name,
+                    search_provider=swap_request.search_provider,
+                    search_token_budget=swap_request.search_token_budget,
+                )
             except Exception as exc:
                 raise _as_http_error(exc) from exc
             return {

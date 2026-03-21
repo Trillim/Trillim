@@ -6,7 +6,9 @@ from pathlib import Path
 import unittest
 
 from trillim.components.llm._config import LLMState
+from trillim.components.llm._swap import restart_model
 from trillim.components.llm.public import LLM
+from trillim.harnesses.search.harness import SearchHarness
 from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
 
 
@@ -80,3 +82,51 @@ class SwapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(llm.state, LLMState.SERVER_ERROR)
         self.assertIsNone(llm.model_name)
+
+    async def test_swap_model_updates_harness_provider_and_budget(self):
+        models = [
+            make_runtime_model(Path("/tmp/model-one"), name="model-one"),
+            make_runtime_model(Path("/tmp/model-two"), name="model-two"),
+        ]
+        model_iter = iter(models)
+        llm = LLM(
+            "models/one",
+            _model_validator=lambda _: next(model_iter),
+            _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+            _engine_factory=FakeEngineFactory(responses=["one"]),
+        )
+        await llm.start()
+
+        await llm.swap_model(
+            "models/two",
+            harness_name="search",
+            search_provider="BRAVE_SEARCH",
+            search_token_budget=2048,
+        )
+
+        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertEqual(llm._configured_harness_name, "search")
+        self.assertEqual(llm._configured_search_provider, "brave")
+        self.assertEqual(llm._configured_search_token_budget, 2048)
+        self.assertEqual(llm._runtime_search_token_budget, 1024)
+        await llm.stop()
+
+    async def test_restart_model_preserves_search_runtime_options(self):
+        llm = LLM(
+            "models/one",
+            harness_name="search",
+            search_provider="BRAVE_SEARCH",
+            search_token_budget=2048,
+            _model_validator=lambda _: make_runtime_model(Path("/tmp/model-one"), name="model-one"),
+            _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+            _engine_factory=FakeEngineFactory(responses=["one"]),
+        )
+        await llm.start()
+
+        await restart_model(llm)
+
+        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertEqual(llm._configured_harness_name, "search")
+        self.assertEqual(llm._configured_search_provider, "brave")
+        self.assertEqual(llm._runtime_search_token_budget, 1024)
+        await llm.stop()

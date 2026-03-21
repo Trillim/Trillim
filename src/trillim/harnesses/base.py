@@ -19,7 +19,14 @@ class Harness(abc.ABC):
     def __init__(self, engine: InferenceEngine) -> None:
         """Bind the harness to an engine."""
         self._engine = engine
+        self._prompt_tokens = 0
         self._completion_tokens = 0
+        self._cached_tokens = 0
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Return the prompt-token count for the last completed turn."""
+        return self._prompt_tokens
 
     @property
     def completion_tokens(self) -> int:
@@ -27,9 +34,26 @@ class Harness(abc.ABC):
         return self._completion_tokens
 
     @property
+    def cached_tokens(self) -> int:
+        """Return the cached-token count reported for the last completed turn."""
+        return self._cached_tokens
+
+    @property
     def tokenizer(self):
         """Return the engine tokenizer."""
         return self._engine.tokenizer
+
+    def _reset_usage(self) -> None:
+        """Reset per-turn usage accounting."""
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._cached_tokens = 0
+
+    def _apply_engine_usage(self) -> None:
+        """Copy authoritative usage values from the engine."""
+        self._prompt_tokens = self._engine.last_prompt_tokens
+        self._completion_tokens = self._engine.last_completion_tokens
+        self._cached_tokens = self._engine.last_cache_hit
 
     async def stream_text(
         self,

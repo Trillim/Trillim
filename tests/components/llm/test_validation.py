@@ -48,7 +48,29 @@ class ValidationTests(unittest.TestCase):
 
     def test_validate_sampling_options_and_swap_request(self):
         sampling = validate_sampling_options(max_tokens=32, top_k=10)
-        swap = validate_swap_request({"model_dir": "/tmp/model"})
+        swap = validate_swap_request(
+            {
+                "model_dir": "/tmp/model",
+                "harness_name": "search",
+                "search_provider": "BRAVE_SEARCH",
+                "search_token_budget": 32,
+            }
+        )
 
         self.assertEqual(sampling.max_tokens, 32)
         self.assertEqual(swap.model_dir, "/tmp/model")
+        self.assertEqual(swap.harness_name, "search")
+        self.assertEqual(swap.search_provider, "BRAVE_SEARCH")
+        self.assertEqual(swap.search_token_budget, 32)
+
+    def test_validate_messages_accepts_search_role(self):
+        validated = validate_messages(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "search", "content": "facts"},
+            ],
+            require_user_turn=False,
+            allow_empty=False,
+        )
+
+        self.assertEqual(validated[-1].role, "search")

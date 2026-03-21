@@ -74,6 +74,8 @@ class FakeEngine:
         self.process = object()
         self._cached_token_ids: list[int] = []
         self._last_cache_hit = 0
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
 
     @property
     def cached_token_ids(self) -> list[int]:
@@ -87,6 +89,14 @@ class FakeEngine:
     def last_cache_hit(self) -> int:
         return self._last_cache_hit
 
+    @property
+    def last_prompt_tokens(self) -> int:
+        return self._last_prompt_tokens
+
+    @property
+    def last_completion_tokens(self) -> int:
+        return self._last_completion_tokens
+
     async def start(self) -> None:
         self.start_calls += 1
         if self.lifecycle_log is not None:
@@ -99,6 +109,8 @@ class FakeEngine:
         if self.lifecycle_log is not None:
             self.lifecycle_log.append(f"stop:{self.model.name}")
         self.process = None
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
 
     async def generate(self, token_ids, **sampling):
         self.generate_calls.append({"token_ids": list(token_ids), **sampling})
@@ -125,6 +137,8 @@ class FakeEngine:
         if kv_position > len(combined):
             combined = combined + ([0] * (kv_position - len(combined)))
         self._cached_token_ids = combined[:kv_position]
+        self._last_prompt_tokens = min(len(request_tokens), kv_position)
+        self._last_completion_tokens = max(0, kv_position - self._last_prompt_tokens)
 
 
 class FakeEngineFactory:

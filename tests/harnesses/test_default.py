@@ -37,5 +37,24 @@ class DefaultHarnessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([event.type for event in events], ["token", "token", "final_text"])
         self.assertEqual(events[-1].text, "ok")
+        self.assertEqual(harness.prompt_tokens, 3)
         self.assertEqual(harness.completion_tokens, 2)
+        self.assertEqual(harness.cached_tokens, 0)
         self.assertEqual(session.final_text, "ok")
+
+    async def test_default_harness_uses_engine_reported_usage(self):
+        engine = FakeEngine(
+            make_runtime_model(Path("/tmp/model")),
+            FakeTokenizer(),
+            SamplingDefaults(),
+            responses=["ok"],
+            kv_positions=[4],
+        )
+        harness = DefaultHarness(engine)
+        session = _SessionStub([1, 2, 3])
+
+        events = [event async for event in harness.stream_events(session, max_tokens=8)]
+
+        self.assertEqual(events[-1].text, "ok")
+        self.assertEqual(harness.prompt_tokens, 3)
+        self.assertEqual(harness.completion_tokens, 1)

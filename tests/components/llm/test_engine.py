@@ -106,7 +106,20 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tokens, [65])
         self.assertEqual(engine.last_cache_hit, 2)
+        self.assertEqual(engine.last_prompt_tokens, 3)
+        self.assertEqual(engine.last_completion_tokens, 1)
         self.assertEqual(engine.cached_token_ids, [1, 2, 99, 65])
+
+    async def test_generate_usage_follows_authoritative_kv_position(self):
+        engine = self._make_engine()
+        engine.process = _FakeProcess(lines=[b"65\n", b"66\n", b"0\n", b"4\n"])
+
+        tokens = [token async for token in engine.generate([1, 2, 3], max_tokens=8)]
+
+        self.assertEqual(tokens, [65, 66])
+        self.assertEqual(engine.last_prompt_tokens, 3)
+        self.assertEqual(engine.last_completion_tokens, 1)
+        self.assertEqual(engine.cached_token_count, 4)
 
     async def test_generate_raises_protocol_errors_for_invalid_ints(self):
         engine = self._make_engine()

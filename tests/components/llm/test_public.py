@@ -7,6 +7,7 @@ import unittest
 
 from trillim.components.llm._config import LLMState
 from trillim.components.llm.public import LLM
+from trillim.harnesses.search.harness import SearchHarness
 from trillim.errors import AdmissionRejectedError
 from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
 
@@ -59,4 +60,25 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "not running"):
             llm.open_session([{"role": "user", "content": "hello"}])
 
+        await llm.stop()
+
+    async def test_search_harness_binds_and_clamps_runtime_budget(self):
+        llm = LLM(
+            "models/fake",
+            harness_name="search",
+            search_provider="BRAVE_SEARCH",
+            search_token_budget=2048,
+            _model_validator=lambda _: make_runtime_model(
+                Path("/tmp/fake-model"),
+                name="fake",
+            ),
+            _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+            _engine_factory=FakeEngineFactory(responses=["ok"]),
+        )
+
+        await llm.start()
+
+        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertEqual(llm._configured_search_provider, "brave")
+        self.assertEqual(llm._runtime_search_token_budget, 1024)
         await llm.stop()

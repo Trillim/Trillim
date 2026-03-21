@@ -23,6 +23,29 @@ from tests.components.llm.support import (
 )
 
 
+class _StrictTemplateTokenizer(FakeTokenizer):
+    chat_template = "strict"
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ):
+        del tokenize
+        for message in messages:
+            if message["role"] not in {"system", "user", "assistant"}:
+                raise AssertionError(f"unexpected role {message['role']}")
+        rendered = "".join(
+            f"<{message['role']}>{message['content']}</{message['role']}>"
+            for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return rendered
+
+
 class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
     def _make_llm(self, *, responses=None, kv_positions=None, failure=None):
         return LLM(
@@ -135,4 +158,24 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
             await session.chat(max_tokens=8)
 
         self.assertEqual(llm.state.value, "running")
+        await llm.stop()
+
+    async def test_session_renders_search_messages_for_chat_templates(self):
+        llm = LLM(
+            "models/fake",
+            _model_validator=lambda _: make_runtime_model(Path("/tmp/fake-model")),
+            _tokenizer_loader=lambda *_args, **_kwargs: _StrictTemplateTokenizer(),
+            _engine_factory=FakeEngineFactory(responses=["ok"]),
+        )
+        await llm.start()
+        session = llm.open_session(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "search", "content": "facts"},
+            ]
+        )
+
+        prompt = session._render_prompt(add_generation_prompt=True)
+
+        self.assertIn("<system>Search results:\nfacts</system>", prompt)
         await llm.stop()

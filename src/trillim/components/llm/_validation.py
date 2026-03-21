@@ -39,7 +39,7 @@ class ChatMessageInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "search"]
     content: str
 
     @field_validator("content")
@@ -77,6 +77,9 @@ class SwapModelRequestInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_dir: str = Field(min_length=1, max_length=MAX_MODEL_PATH_CHARS)
+    harness_name: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
+    search_provider: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
+    search_token_budget: int | None = Field(default=None, ge=1)
 
 
 def validate_chat_request(

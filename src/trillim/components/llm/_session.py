@@ -19,6 +19,7 @@ from trillim.components.llm._events import (
 )
 from trillim.components.llm._limits import SESSION_TOKEN_LIMIT
 from trillim.components.llm._validation import validate_messages, validate_sampling_options
+from trillim.harnesses.search.provider import SearchAuthenticationError
 from trillim.errors import (
     ContextOverflowError,
     ProgressTimeoutError,
@@ -140,14 +141,6 @@ class ChatSession:
             max_tokens=max_tokens,
         )
         self._ensure_turn_startable()
-        prompt_tokens = len(self._prepare_generation())
-        if prompt_tokens >= self._llm.max_context_tokens:
-            raise ContextOverflowError(prompt_tokens, self._llm.max_context_tokens)
-        if prompt_tokens > SESSION_TOKEN_LIMIT:
-            self._state = "exhausted"
-            raise SessionExhaustedError(
-                f"Chat session exceeds the {SESSION_TOKEN_LIMIT} token lifetime limit"
-            )
         await self._begin_consumer()
         try:
             async with await self._llm._admission.acquire():
@@ -169,15 +162,30 @@ class ChatSession:
                 yield ChatDoneEvent(
                     text=full_text,
                     usage=ChatUsage(
-                        prompt_tokens=prompt_tokens,
+                        prompt_tokens=self._llm._harness.prompt_tokens,
                         completion_tokens=self._llm._harness.completion_tokens,
-                        total_tokens=prompt_tokens + self._llm._harness.completion_tokens,
-                        cached_tokens=self._llm._engine.last_cache_hit,
+                        total_tokens=(
+                            self._llm._harness.prompt_tokens
+                            + self._llm._harness.completion_tokens
+                        ),
+                        cached_tokens=self._llm._harness.cached_tokens,
                     ),
                 )
         except asyncio.CancelledError:
             if self._state not in {"closed", "owner_stopped"}:
                 self._state = "closed"
+            raise
+        except SearchAuthenticationError as exc:
+            if self._state not in {"closed", "owner_stopped"} and not self._stale:
+                self._state = "open"
+            raise RuntimeError(str(exc)) from exc
+        except ContextOverflowError:
+            if self._state not in {"closed", "owner_stopped"} and not self._stale:
+                self._state = "open"
+            raise
+        except SessionExhaustedError:
+            if self._state not in {"closed", "owner_stopped"} and not self._stale:
+                self._state = "exhausted"
             raise
         except EngineProgressTimeoutError as exc:
             if self._state not in {"closed", "owner_stopped"} and not self._stale:
@@ -243,38 +251,80 @@ class ChatSession:
         self._active_task = asyncio.current_task()
         self._terminated.clear()
 
-    def _prepare_generation(self) -> list[int]:
-        prompt = self._render_prompt(add_generation_prompt=True)
+    def _prepare_generation(
+        self,
+        messages: list[dict[str, str]] | tuple[dict[str, str], ...] | None = None,
+    ) -> list[int]:
+        prompt = self._render_prompt(messages=messages, add_generation_prompt=True)
         token_ids = self._llm._tokenizer.encode(
             prompt,
             add_special_tokens=not bool(
                 getattr(self._llm._tokenizer, "chat_template", None)
             ),
         )
-        return list(token_ids)
+        prepared = list(token_ids)
+        prompt_tokens = len(prepared)
+        if prompt_tokens >= self._llm.max_context_tokens:
+            raise ContextOverflowError(prompt_tokens, self._llm.max_context_tokens)
+        if prompt_tokens > SESSION_TOKEN_LIMIT:
+            if messages is None or messages is self._messages:
+                self._state = "exhausted"
+            raise SessionExhaustedError(
+                f"Chat session exceeds the {SESSION_TOKEN_LIMIT} token lifetime limit"
+            )
+        return prepared
 
     def _commit_assistant_turn(self, text: str) -> None:
         self._messages.append({"role": "assistant", "content": text})
         self._cached_token_count = self._llm._engine.cached_token_count
 
-    def _render_prompt(self, *, add_generation_prompt: bool) -> str:
+    def _commit_messages(self, messages: list[dict[str, str]]) -> None:
+        self._messages = [message.copy() for message in messages]
+        self._cached_token_count = self._llm._engine.cached_token_count
+
+    def _render_prompt(
+        self,
+        *,
+        messages: list[dict[str, str]] | tuple[dict[str, str], ...] | None = None,
+        add_generation_prompt: bool,
+    ) -> str:
+        prompt_messages = self._renderable_messages(
+            self._messages if messages is None else messages
+        )
         tokenizer = self._llm._tokenizer
         chat_template = getattr(tokenizer, "chat_template", None)
         if chat_template:
             return tokenizer.apply_chat_template(
-                self._messages,
+                prompt_messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
         prompt = "\n".join(
             f"{message['role']}: {message['content']}"
-            for message in self._messages
+            for message in prompt_messages
         )
         if not add_generation_prompt:
             return prompt
         if prompt:
             return f"{prompt}\nassistant: "
         return "assistant: "
+
+    def _renderable_messages(
+        self,
+        messages: list[dict[str, str]] | tuple[dict[str, str], ...],
+    ) -> list[dict[str, str]]:
+        rendered: list[dict[str, str]] = []
+        for message in messages:
+            if message["role"] == "search":
+                rendered.append(
+                    {
+                        "role": "system",
+                        "content": f"Search results:\n{message['content']}",
+                    }
+                )
+                continue
+            rendered.append(message.copy())
+        return rendered
 
     def _mark_stale(self) -> None:
         self._stale = True

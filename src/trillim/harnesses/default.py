@@ -19,16 +19,16 @@ class DefaultHarness(Harness):
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Stream token and final-text events for one generation."""
-        self._completion_tokens = 0
+        self._reset_usage()
         token_ids = session._prepare_generation()
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
         async for token_id in self._engine.generate(token_ids=token_ids, **sampling):
-            self._completion_tokens += 1
             chunk = decoder.decode(token_id)
             if not chunk:
                 continue
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
         session._commit_assistant_turn(full_text)
+        self._apply_engine_usage()
         yield ChatFinalTextEvent(text=full_text)
