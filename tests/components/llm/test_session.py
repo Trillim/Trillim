@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 import unittest
 
-from trillim.components.llm import ChatDoneEvent
+from trillim.components.llm import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm.public import LLM
 from trillim.errors import (
     ProgressTimeoutError,
@@ -136,6 +136,32 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cleaned.is_set())
         with self.assertRaises(asyncio.CancelledError):
             await task
+        await llm.stop()
+
+    async def test_session_close_from_active_consumer_waits_for_cleanup(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+        cleaned = asyncio.Event()
+
+        async def blocking_stream_events(*_args, **_kwargs):
+            try:
+                yield ChatTokenEvent(text="hello")
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        llm._harness.stream_events = blocking_stream_events
+
+        seen = []
+        async for event in session.stream_chat(max_tokens=8):
+            seen.append(event)
+            await session.close()
+            self.assertTrue(cleaned.is_set())
+
+        self.assertEqual(seen, [ChatTokenEvent(text="hello")])
+        self.assertEqual(session.state, "closed")
+        self.assertTrue(session._terminated.is_set())
         await llm.stop()
 
     async def test_session_exhausts_after_kv_position_limit(self):

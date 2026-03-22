@@ -156,6 +156,7 @@ class _ChatSession(ChatSession):
         self._stale = False
         self._consumer_active = False
         self._active_task: asyncio.Task | None = None
+        self._active_event_stream = None
         self._terminated = asyncio.Event()
         self._terminated.set()
     @property
@@ -190,6 +191,13 @@ class _ChatSession(ChatSession):
         task = self._active_task
         if task is not None and not task.done():
             if task is asyncio.current_task():
+                event_stream = self._active_event_stream
+                if event_stream is not None:
+                    await event_stream.aclose()
+                self._active_event_stream = None
+                self._consumer_active = False
+                self._active_task = None
+                self._terminated.set()
                 return
             task.cancel()
         await self._wait_for_termination()
@@ -254,15 +262,19 @@ class _ChatSession(ChatSession):
         try:
             async with await self._llm._admission.acquire():
                 full_text = ""
-                async for event in self._llm._harness.stream_events(
+                event_stream = self._llm._harness.stream_events(
                     self,
                     **sampling.to_kwargs(),
-                ):
+                )
+                self._active_event_stream = event_stream
+                async for event in event_stream:
                     if isinstance(event, ChatTokenEvent):
                         full_text += event.text
                     elif isinstance(event, ChatFinalTextEvent):
                         full_text = event.text
                     yield event
+                if self._state in {"closed", "owner_stopped"}:
+                    return
                 self._cached_token_count = self._llm._engine.cached_token_count
                 if self._cached_token_count >= SESSION_TOKEN_LIMIT:
                     self._state = "exhausted"
@@ -311,6 +323,7 @@ class _ChatSession(ChatSession):
                 self._state = "failed"
             raise
         finally:
+            self._active_event_stream = None
             self._consumer_active = False
             self._active_task = None
             self._terminated.set()
