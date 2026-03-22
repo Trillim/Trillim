@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import tempfile
 import os
 import stat
@@ -78,6 +79,38 @@ class STTValidationTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def test_open_validated_source_file_rejects_symlink_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"abc")
+            symlink = root / "audio-link.wav"
+            symlink.symlink_to(audio)
+
+            with self.assertRaisesRegex(InvalidRequestError, "must not use symlinks"):
+                open_validated_source_file(symlink)
+
+    def test_open_validated_source_file_rejects_symlink_open_races(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio = Path(temp_dir) / "audio.wav"
+            audio.write_bytes(b"abc")
+
+            with patch(
+                "trillim.components.stt._validation.os.open",
+                side_effect=OSError(errno.ELOOP, "symlink"),
+            ):
+                with self.assertRaisesRegex(InvalidRequestError, "must not use symlinks"):
+                    open_validated_source_file(audio)
+
+    def test_open_validated_source_file_wraps_symlink_permission_errors(self):
+        audio = Path("/tmp/audio.wav")
+        with patch(
+            "trillim.components.stt._validation.Path.is_symlink",
+            side_effect=PermissionError("denied"),
+        ):
+            with self.assertRaisesRegex(InvalidRequestError, "could not be opened"):
+                open_validated_source_file(audio)
+
     def test_open_validated_source_file_uses_binary_flag_when_available(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             audio = Path(temp_dir) / "audio.wav"
@@ -94,13 +127,18 @@ class STTValidationTests(unittest.TestCase):
                 "O_BINARY",
                 0x8000,
                 create=True,
+            ), patch.object(
+                __import__("trillim.components.stt._validation", fromlist=["os"]).os,
+                "O_NOFOLLOW",
+                0x4000,
+                create=True,
             ), patch(
                 "trillim.components.stt._validation.os.open",
                 side_effect=tracked_open,
             ):
                 fd = open_validated_source_file(audio)
             try:
-                self.assertEqual(captured_flags, [os.O_RDONLY | 0x8000])
+                self.assertEqual(captured_flags, [os.O_RDONLY | 0x8000 | 0x4000])
             finally:
                 os.close(fd)
 

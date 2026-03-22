@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
@@ -67,6 +68,8 @@ def validate_source_file(path: str | Path) -> Path:
 def open_validated_source_file(path: Path) -> int:
     """Open a caller-owned source file and validate the opened descriptor."""
     try:
+        if path.is_symlink():
+            raise InvalidRequestError(f"audio file must not use symlinks: {path}")
         path_stat = os.stat(path)
     except FileNotFoundError as exc:
         raise InvalidRequestError(f"audio file does not exist: {path}") from exc
@@ -74,12 +77,18 @@ def open_validated_source_file(path: Path) -> int:
         raise InvalidRequestError(f"audio file could not be opened: {path}") from exc
     if not stat.S_ISREG(path_stat.st_mode):
         raise InvalidRequestError(f"audio file is not a regular file: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         fd = os.open(path, flags)
     except FileNotFoundError as exc:
         raise InvalidRequestError(f"audio file does not exist: {path}") from exc
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise InvalidRequestError(f"audio file must not use symlinks: {path}") from exc
         raise InvalidRequestError(f"audio file could not be opened: {path}") from exc
     try:
         stat_result = os.fstat(fd)

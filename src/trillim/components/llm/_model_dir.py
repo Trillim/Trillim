@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,14 +74,14 @@ _ACTIVATION_MAP = {
 
 def validate_model_dir(model_dir: str | Path) -> ModelRuntimeConfig:
     """Validate a model directory and extract runtime metadata."""
-    path = Path(model_dir).expanduser()
-    try:
-        path = path.resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise ModelValidationError(f"Model directory does not exist: {model_dir}") from exc
+    path = Path(os.path.abspath(Path(model_dir).expanduser()))
+    _raise_if_symlink(path, "Model directory must not use symlinks")
+    if not path.exists():
+        raise ModelValidationError(f"Model directory does not exist: {model_dir}")
     if not path.is_dir():
         raise ModelValidationError(f"Model directory is not a directory: {path}")
     config_path = path / "config.json"
+    _raise_if_symlink(config_path, "Model bundle must not use symlinks")
     if not config_path.is_file():
         raise ModelValidationError(f"config.json not found in {path}")
     _require_runtime_artifacts(path)
@@ -144,7 +145,9 @@ def _resolve_arch_info(config: dict) -> _ArchitectureInfo:
 
 def _require_runtime_artifacts(model_dir: Path) -> None:
     for filename in ("qmodel.tensors", "rope.cache"):
-        if not (model_dir / filename).is_file():
+        artifact_path = model_dir / filename
+        _raise_if_symlink(artifact_path, "Model bundle must not use symlinks")
+        if not artifact_path.is_file():
             raise ModelValidationError(f"{filename} not found in {model_dir}")
 
 
@@ -260,12 +263,18 @@ def _collect_eos_tokens(
 
 
 def _load_optional_json(path: Path) -> dict | None:
+    _raise_if_symlink(path, "Model bundle must not use symlinks")
     if not path.is_file():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _raise_if_symlink(path: Path, message: str) -> None:
+    if path.is_symlink():
+        raise ModelValidationError(f"{message}: {path}")
 
 
 def _collect_added_tokens(tokenizer_payload: dict | None) -> list[int]:
