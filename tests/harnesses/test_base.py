@@ -7,11 +7,11 @@ import unittest
 
 from trillim.components.llm._config import SamplingDefaults
 from trillim.components.llm._events import ChatFinalTextEvent, ChatTokenEvent
-from trillim.harnesses.base import Harness
+from trillim.harnesses._base import _Harness
 from tests.components.llm.support import FakeEngine, FakeTokenizer, make_runtime_model
 
 
-class _ProbeHarness(Harness):
+class _ProbeHarness(_Harness):
     async def stream_events(self, session, **sampling):
         yield ChatTokenEvent(text="a")
         yield ChatFinalTextEvent(text="ab")

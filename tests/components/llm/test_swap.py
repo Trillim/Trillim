@@ -8,7 +8,7 @@ import unittest
 from trillim.components.llm._config import LLMState
 from trillim.components.llm._swap import restart_model
 from trillim.components.llm.public import LLM
-from trillim.harnesses.search.harness import SearchHarness
+from trillim.harnesses.search._harness import _SearchHarness
 from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
 
 
@@ -104,7 +104,7 @@ class SwapTests(unittest.IsolatedAsyncioTestCase):
             search_token_budget=2048,
         )
 
-        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertIsInstance(llm._harness, _SearchHarness)
         self.assertEqual(llm._configured_harness_name, "search")
         self.assertEqual(llm._configured_search_provider, "brave")
         self.assertEqual(llm._configured_search_token_budget, 2048)
@@ -125,7 +125,7 @@ class SwapTests(unittest.IsolatedAsyncioTestCase):
 
         await restart_model(llm)
 
-        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertIsInstance(llm._harness, _SearchHarness)
         self.assertEqual(llm._configured_harness_name, "search")
         self.assertEqual(llm._configured_search_provider, "brave")
         self.assertEqual(llm._runtime_search_token_budget, 1024)

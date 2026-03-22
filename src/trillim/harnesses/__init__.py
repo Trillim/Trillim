@@ -1,6 +1,3 @@
-"""LLM harness exports."""
+"""Private LLM harness package."""
 
-from trillim.harnesses.base import Harness
-from trillim.harnesses.default import DefaultHarness
-
-__all__ = ["DefaultHarness", "Harness"]
+__all__: list[str] = []

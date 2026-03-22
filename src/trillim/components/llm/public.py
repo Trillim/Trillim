@@ -17,12 +17,12 @@ from trillim.components.llm._engine import InferenceEngine
 from trillim.components.llm._limits import MAX_THREADS, TOKEN_PROGRESS_TIMEOUT_SECONDS
 from trillim.components.llm._model_dir import validate_model_dir
 from trillim.components.llm._router import build_router
-from trillim.components.llm._session import ChatSession
+from trillim.components.llm._session import ChatSession, _ChatSession, _create_chat_session
 from trillim.components.llm._swap import _wait_for_idle_or_cancel, restart_model, swap_model
 from trillim.components.llm._tokenizer import load_tokenizer
 from trillim.components.llm._validation import validate_messages
-from trillim.harnesses.default import DefaultHarness
-from trillim.harnesses.search.harness import SearchHarness
+from trillim.harnesses._default import _DefaultHarness
+from trillim.harnesses.search._harness import _SearchHarness
 from trillim.harnesses.search.provider import (
     DEFAULT_SEARCH_TOKEN_BUDGET,
     normalize_provider_name,
@@ -81,7 +81,7 @@ class LLM(Component):
         self._state = LLMState.UNAVAILABLE
         self._admission = GenerationAdmission()
         self._swap_lock = asyncio.Lock()
-        self._sessions: weakref.WeakSet[ChatSession] = weakref.WeakSet()
+        self._sessions: weakref.WeakSet[_ChatSession] = weakref.WeakSet()
         self._hot_swap_routes_enabled = False
 
     @property
@@ -180,7 +180,7 @@ class LLM(Component):
             require_user_turn=False,
             allow_empty=True,
         )
-        session = ChatSession(self, validated)
+        session = _create_chat_session(self, validated)
         self._sessions.add(session)
         return session
 
@@ -337,9 +337,9 @@ class LLM(Component):
         self._engine = engine
         self._runtime_search_token_budget = search_token_budget
         if harness_name == "default":
-            self._harness = DefaultHarness(engine)
+            self._harness = _DefaultHarness(engine)
             return
-        self._harness = SearchHarness(
+        self._harness = _SearchHarness(
             engine,
             search_provider=search_provider,
             search_token_budget=search_token_budget,

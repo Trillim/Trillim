@@ -1,4 +1,4 @@
-"""Search harness for models that emit ``<search>...</search>`` tags."""
+"""Private search harness for models that emit ``<search>...</search>`` tags."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ from typing import Any
 
 from trillim.components.llm._events import ChatEvent, ChatFinalTextEvent, ChatTokenEvent
 from trillim.components.llm._incremental_decode import IncrementalDecoder
-from trillim.harnesses.base import Harness
+from trillim.components.llm._session import _ChatSession
+from trillim.harnesses._base import _Harness
 from trillim.harnesses.search.client import SearchClient
 from trillim.harnesses.search.metrics import SearchMetrics
 from trillim.harnesses.search.provider import (
@@ -19,7 +20,7 @@ from trillim.harnesses.search.provider import (
 )
 
 
-class SearchHarness(Harness):
+class _SearchHarness(_Harness):
     """Run a bounded search loop before streaming the final answer."""
 
     def __init__(
@@ -39,7 +40,7 @@ class SearchHarness(Harness):
 
     async def stream_events(
         self,
-        session,
+        session: _ChatSession,
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Run buffered search iterations, then stream the final answer."""

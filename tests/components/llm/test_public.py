@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import typing
 import unittest
 
+import trillim.components.llm as llm_exports
+import trillim.components.llm.public as llm_public_exports
+from trillim.components.llm import ChatSession
 from trillim.components.llm._config import LLMState
+from trillim.components.llm._session import _ChatSession
 from trillim.components.llm.public import LLM
-from trillim.harnesses.search.harness import SearchHarness
+from trillim.harnesses.search._harness import _SearchHarness
 from trillim.errors import AdmissionRejectedError
 from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
 
@@ -38,11 +43,67 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         await llm.stop()
         self.assertEqual(llm.model_info().state.value, "unavailable")
 
+    def test_chat_session_is_runtime_public(self):
+        self.assertTrue(hasattr(llm_exports, "ChatSession"))
+        self.assertTrue(hasattr(llm_public_exports, "ChatSession"))
+
+    def test_chat_session_direct_construction_is_rejected(self):
+        with self.assertRaisesRegex(TypeError, "use LLM.open_session"):
+            ChatSession()
+        with self.assertRaisesRegex(TypeError, "use LLM.open_session"):
+            _ChatSession()
+
+    def test_chat_session_public_subclassing_is_rejected(self):
+        namespace = {"ChatSession": ChatSession}
+        with self.assertRaisesRegex(TypeError, "cannot be subclassed publicly"):
+            exec(
+                "class UserChatSession(ChatSession, _allow_subclass=True):\n"
+                "    @property\n"
+                "    def state(self):\n"
+                "        return 'open'\n"
+                "    @property\n"
+                "    def messages(self):\n"
+                "        return ()\n"
+                "    @property\n"
+                "    def cached_token_count(self):\n"
+                "        return 0\n"
+                "    async def __aenter__(self):\n"
+                "        return self\n"
+                "    async def __aexit__(self, exc_type, exc, tb):\n"
+                "        return None\n"
+                "    async def close(self):\n"
+                "        return None\n"
+                "    def add_user(self, content):\n"
+                "        return None\n"
+                "    def add_system(self, content):\n"
+                "        return None\n"
+                "    async def chat(self, **kwargs):\n"
+                "        return ''\n"
+                "    async def stream_chat(self, **kwargs):\n"
+                "        if False:\n"
+                "            yield None\n",
+                namespace,
+            )
+
+    def test_open_session_return_type_hints_resolve_at_runtime(self):
+        self.assertIs(typing.get_type_hints(LLM.open_session)["return"], ChatSession)
+
     async def test_open_session_requires_started_runtime(self):
         llm = self._make_llm()
 
         with self.assertRaisesRegex(RuntimeError, "LLM not started"):
             llm.open_session()
+
+    async def test_open_session_returns_owner_created_chat_session(self):
+        llm = self._make_llm()
+        await llm.start()
+
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        self.assertIsInstance(session, ChatSession)
+        self.assertIsInstance(session, _ChatSession)
+        await session.close()
+        await llm.stop()
 
     async def test_open_session_rejects_when_llm_is_not_running(self):
         llm = self._make_llm()
@@ -78,7 +139,7 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
 
         await llm.start()
 
-        self.assertIsInstance(llm._harness, SearchHarness)
+        self.assertIsInstance(llm._harness, _SearchHarness)
         self.assertEqual(llm._configured_search_provider, "brave")
         self.assertEqual(llm._runtime_search_token_budget, 1024)
         await llm.stop()

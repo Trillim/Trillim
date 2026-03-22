@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 
 from trillim.components.llm._config import SamplingDefaults
-from trillim.harnesses.default import DefaultHarness
+from trillim.harnesses._default import _DefaultHarness
 from tests.components.llm.support import FakeEngine, FakeTokenizer, make_runtime_model
 
 
@@ -30,7 +30,7 @@ class DefaultHarnessTests(unittest.IsolatedAsyncioTestCase):
             SamplingDefaults(),
             responses=["ok"],
         )
-        harness = DefaultHarness(engine)
+        harness = _DefaultHarness(engine)
         session = _SessionStub([1, 2, 3])
 
         events = [event async for event in harness.stream_events(session, max_tokens=8)]
@@ -50,7 +50,7 @@ class DefaultHarnessTests(unittest.IsolatedAsyncioTestCase):
             responses=["ok"],
             kv_positions=[4],
         )
-        harness = DefaultHarness(engine)
+        harness = _DefaultHarness(engine)
         session = _SessionStub([1, 2, 3])
 
         events = [event async for event in harness.stream_events(session, max_tokens=8)]

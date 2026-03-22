@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import abc
 import asyncio
 from collections.abc import AsyncIterator
 
@@ -30,12 +31,121 @@ from trillim.errors import (
 )
 
 
-class ChatSession:
-    """Owner-managed multi-turn chat state for one active LLM model."""
+_CHAT_SESSION_OWNER_TOKEN = object()
+_CHAT_SESSION_CONSTRUCTION_ERROR = (
+    "ChatSession cannot be constructed directly; use LLM.open_session()"
+)
+_ALLOW_CHAT_SESSION_SUBCLASS = False
+
+
+def _create_chat_session(llm, messages) -> _ChatSession:
+    return _ChatSession(llm, messages, _owner_token=_CHAT_SESSION_OWNER_TOKEN)
+
+
+class ChatSession(abc.ABC):
+    """Public chat-session handle returned by the LLM component."""
 
     _runtime_proxy = True
 
-    def __init__(self, llm, messages) -> None:
+    def __init_subclass__(cls, **kwargs) -> None:
+        del kwargs
+        super().__init_subclass__()
+        if not _ALLOW_CHAT_SESSION_SUBCLASS:
+            raise TypeError("ChatSession cannot be subclassed publicly")
+
+    def __new__(cls, *args, **kwargs):
+        del args, kwargs
+        if cls is ChatSession:
+            raise TypeError(_CHAT_SESSION_CONSTRUCTION_ERROR)
+        return super().__new__(cls)
+
+    @property
+    @abc.abstractmethod
+    def state(self) -> str:
+        """Return the current session state."""
+        ...  # pragma: no cover
+
+    @property
+    @abc.abstractmethod
+    def messages(self) -> tuple[dict[str, str], ...]:
+        """Return a copy of the canonical session messages."""
+        ...  # pragma: no cover
+
+    @property
+    @abc.abstractmethod
+    def cached_token_count(self) -> int:
+        """Return the last committed cached token count."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    async def __aenter__(self) -> ChatSession:
+        """Enter the session as an async context manager."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        """Close the session when leaving an async context manager."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    async def close(self) -> None:
+        """Close the session and cancel any active turn."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    def add_user(self, content: str) -> None:
+        """Append a user message to the session."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    def add_system(self, content: str) -> None:
+        """Append a system message to the session."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    async def chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Collect the next assistant turn as a single string."""
+        ...  # pragma: no cover
+
+    @abc.abstractmethod
+    async def stream_chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[ChatEvent]:
+        """Stream structured events for the next assistant turn."""
+        ...  # pragma: no cover
+
+
+_ALLOW_CHAT_SESSION_SUBCLASS = True
+
+
+class _ChatSession(ChatSession):
+    """Private concrete chat-session implementation owned by one LLM runtime."""
+
+    def __new__(cls, llm=None, messages=None, *, _owner_token=None):
+        del llm, messages
+        if _owner_token is not _CHAT_SESSION_OWNER_TOKEN:
+            raise TypeError(_CHAT_SESSION_CONSTRUCTION_ERROR)
+        return super().__new__(cls)
+
+    def __init__(self, llm=None, messages=None, *, _owner_token=None) -> None:
+        if _owner_token is not _CHAT_SESSION_OWNER_TOKEN:
+            raise TypeError(_CHAT_SESSION_CONSTRUCTION_ERROR)
+        if llm is None or messages is None:
+            raise TypeError(_CHAT_SESSION_CONSTRUCTION_ERROR)
         self._llm = llm
         self._messages = [
             {"role": message.role, "content": message.content}
@@ -48,7 +158,6 @@ class ChatSession:
         self._active_task: asyncio.Task | None = None
         self._terminated = asyncio.Event()
         self._terminated.set()
-
     @property
     def state(self) -> str:
         """Return the current session state."""
@@ -348,3 +457,6 @@ class ChatSession:
                 task.cancel()
         except Exception:
             pass
+
+
+_ALLOW_CHAT_SESSION_SUBCLASS = False

@@ -1,5 +1,3 @@
-"""Local search harness internals."""
+"""Private search harness package."""
 
-from trillim.harnesses.search.harness import SearchHarness
-
-__all__ = ["SearchHarness"]
+__all__: list[str] = []

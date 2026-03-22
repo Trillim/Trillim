@@ -1,4 +1,4 @@
-"""Base harness protocol for LLM orchestration."""
+"""Private base harness abstraction for LLM orchestration."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ from trillim.components.llm._events import ChatEvent, ChatTokenEvent
 
 if TYPE_CHECKING:
     from trillim.components.llm._engine import InferenceEngine
-    from trillim.components.llm._session import ChatSession
+    from trillim.components.llm._session import _ChatSession
 
 
-class Harness(abc.ABC):
-    """Abstract base class for LLM orchestration harnesses."""
+class _Harness(abc.ABC):
+    """Internal base class for concrete LLM harness implementations."""
 
     def __init__(self, engine: InferenceEngine) -> None:
         """Bind the harness to an engine."""
@@ -57,7 +57,7 @@ class Harness(abc.ABC):
 
     async def stream_text(
         self,
-        session: ChatSession,
+        session: _ChatSession,
         **sampling: Any,
     ) -> AsyncIterator[str]:
         """Yield only text fragments from structured harness events."""
@@ -68,7 +68,7 @@ class Harness(abc.ABC):
     @abc.abstractmethod
     async def stream_events(
         self,
-        session: ChatSession,
+        session: _ChatSession,
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Yield structured chat events for a single assistant turn."""

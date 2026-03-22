@@ -1,4 +1,4 @@
-"""Default harness for direct single-pass LLM generation."""
+"""Private default harness for direct single-pass LLM generation."""
 
 from __future__ import annotations
 
@@ -7,15 +7,16 @@ from typing import Any
 
 from trillim.components.llm._events import ChatEvent, ChatFinalTextEvent, ChatTokenEvent
 from trillim.components.llm._incremental_decode import IncrementalDecoder
-from trillim.harnesses.base import Harness
+from trillim.components.llm._session import _ChatSession
+from trillim.harnesses._base import _Harness
 
 
-class DefaultHarness(Harness):
+class _DefaultHarness(_Harness):
     """Run one direct generation with no tool orchestration."""
 
     async def stream_events(
         self,
-        session,
+        session: _ChatSession,
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Stream token and final-text events for one generation."""
