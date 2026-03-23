@@ -96,14 +96,13 @@ class InferenceEngine:
         *,
         num_threads: int = 0,
         progress_timeout: float,
-        binary_path: str | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
         self.num_threads = num_threads
         self.progress_timeout = progress_timeout
-        self.binary_path = binary_path or _default_binary_path()
+        self.binary_path = _bundled_binary_path()
         self.process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._prompt_cache = _PromptCache()
@@ -306,9 +305,11 @@ async def _read_stderr(process: asyncio.subprocess.Process) -> str:
         return ""
 
 
-def _default_binary_path() -> str:
+def _bundled_binary_path() -> str:
     bundled = Path(__file__).resolve().parents[2] / "_bin" / "trillim-inference"
-    return str(bundled if bundled.exists() else "trillim-inference")
+    if not bundled.is_file():
+        raise FileNotFoundError(f"Missing bundled LLM inference binary: {bundled}")
+    return str(bundled)
 
 
 def _build_init_block(model: ModelRuntimeConfig, num_threads: int) -> str:

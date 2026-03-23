@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import trillim.components.llm._engine as engine_module
 from trillim.components.llm._config import SamplingDefaults
 from trillim.components.llm._engine import (
     EngineCrashedError,
@@ -65,14 +67,24 @@ class _FakeProcess:
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    def _expected_binary_path(self) -> str:
+        return str(Path(engine_module.__file__).resolve().parents[2] / "_bin" / "trillim-inference")
+
     def _make_engine(self) -> InferenceEngine:
         return InferenceEngine(
             make_runtime_model(Path("/tmp/model")),
             FakeTokenizer(),
             SamplingDefaults(),
             progress_timeout=5.0,
-            binary_path="/fake/inference",
         )
+
+    def test_inference_engine_does_not_expose_binary_path_override(self):
+        self.assertNotIn("binary_path", inspect.signature(InferenceEngine).parameters)
+
+    def test_inference_engine_raises_when_bundled_binary_is_missing(self):
+        with patch.object(engine_module.Path, "is_file", return_value=False):
+            with self.assertRaisesRegex(FileNotFoundError, "Missing bundled LLM inference binary"):
+                self._make_engine()
 
     async def test_start_launches_process_and_writes_init_block(self):
         engine = self._make_engine()
@@ -85,6 +97,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             await engine.start()
 
         mock_exec.assert_awaited_once()
+        self.assertEqual(mock_exec.await_args.args[0], self._expected_binary_path())
         self.assertTrue(process.stdin.writes[0].startswith(b"17\n"))
 
     async def test_stop_writes_exit_block(self):
