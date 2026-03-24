@@ -63,6 +63,8 @@ class FakeEngine:
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
+        self.init_config = kwargs.get("init_config")
+        self.kwargs = dict(kwargs)
         self.responses = list(responses or [])
         self.kv_positions = list(kv_positions or [])
         self.failure = failure

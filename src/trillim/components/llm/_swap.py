@@ -11,7 +11,7 @@ from trillim.components.llm._limits import (
 
 async def swap_model(
     llm,
-    model_dir: str,
+    init_config,
     *,
     harness_name: str | None = None,
     search_provider: str | None = None,
@@ -19,8 +19,8 @@ async def swap_model(
 ) -> None:
     """Swap the active model after draining or cancelling in-flight work."""
     async with llm._swap_lock:
-        validated, tokenizer, defaults, engine, runtime_options = llm._build_runtime(
-            model_dir,
+        built_runtime = llm._build_runtime(
+            init_config,
             harness_name=harness_name,
             search_provider=search_provider,
             search_token_budget=search_token_budget,
@@ -31,26 +31,19 @@ async def swap_model(
             if old_engine is not None:
                 await old_engine.stop()
             llm._clear_runtime()
-            await engine.start()
-            llm._bind_runtime(
-                validated,
-                tokenizer,
-                defaults,
-                engine,
-                harness_name=runtime_options.harness_name,
-                search_provider=runtime_options.search_provider,
-                search_token_budget=runtime_options.search_token_budget,
-            )
+            await built_runtime.engine.start()
+            llm._bind_runtime(built_runtime)
             llm._update_configured_runtime(
-                model_dir=str(model_dir),
-                harness_name=runtime_options.harness_name,
-                search_provider=runtime_options.search_provider,
-                search_token_budget=runtime_options.requested_search_token_budget,
+                init_config=built_runtime.init_config,
+                harness_name=built_runtime.runtime_options.harness_name,
+                search_provider=built_runtime.runtime_options.search_provider,
+                search_token_budget=built_runtime.runtime_options.requested_search_token_budget,
             )
             llm._state = LLMState.RUNNING
             await llm._admission.finish_swapping()
         except Exception:
-            await _best_effort_stop(engine)
+            built_runtime.runtime_files.cleanup()
+            await _best_effort_stop(built_runtime.engine)
             await _best_effort_stop(old_engine)
             llm._set_server_error()
             raise
@@ -64,8 +57,8 @@ async def restart_model(llm) -> None:
             return
         old_engine = llm._engine
         try:
-            validated, tokenizer, defaults, engine, runtime_options = llm._build_runtime(
-                llm._runtime_model.path,
+            built_runtime = llm._build_runtime(
+                llm._configured_init_config,
                 harness_name=llm._configured_harness_name,
                 search_provider=llm._configured_search_provider,
                 search_token_budget=llm._configured_search_token_budget,
@@ -74,20 +67,14 @@ async def restart_model(llm) -> None:
             if old_engine is not None:
                 await old_engine.stop()
             llm._clear_runtime()
-            await engine.start()
-            llm._bind_runtime(
-                validated,
-                tokenizer,
-                defaults,
-                engine,
-                harness_name=runtime_options.harness_name,
-                search_provider=runtime_options.search_provider,
-                search_token_budget=runtime_options.search_token_budget,
-            )
+            await built_runtime.engine.start()
+            llm._bind_runtime(built_runtime)
             llm._state = LLMState.RUNNING
             await llm._admission.finish_swapping()
         except Exception:
-            await _best_effort_stop(engine if "engine" in locals() else None)
+            if "built_runtime" in locals():
+                built_runtime.runtime_files.cleanup()
+            await _best_effort_stop(built_runtime.engine if "built_runtime" in locals() else None)
             await _best_effort_stop(old_engine)
             llm._set_server_error()
             raise

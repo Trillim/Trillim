@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
 
 from trillim.components.llm import ChatUsage
 from trillim.server import Server
-from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
+from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model, model_dir
 from trillim.components.llm.public import LLM
 
 
@@ -34,6 +35,32 @@ class LLMRouterTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["state"], "running")
         self.assertEqual(body["data"][0]["id"], "fake")
+
+    def test_models_route_reports_adapter_runtime_config(self):
+        with model_dir() as root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            adapter.mkdir()
+            (adapter / "qmodel.lora").write_bytes(b"adapter")
+            llm = LLM(
+                str(root),
+                num_threads=4,
+                lora_dir=str(adapter),
+                lora_quant="q4_0",
+                unembed_quant="q8_0",
+                _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+                _engine_factory=FakeEngineFactory(responses=["ok"]),
+            )
+            server = Server(llm)
+
+            with TestClient(server.app) as client:
+                response = client.get("/v1/models")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["data"][0]["adapter_path"], str(adapter))
+        self.assertEqual(body["data"][0]["init_config"]["num_threads"], 4)
+        self.assertEqual(body["data"][0]["init_config"]["lora_quant"], "q4_0")
+        self.assertEqual(body["data"][0]["init_config"]["unembed_quant"], "q8_0")
 
     def test_chat_completions_returns_final_text(self):
         with TestClient(self._make_server(responses=["hello"]).app) as client:
@@ -131,6 +158,66 @@ class LLMRouterTests(unittest.TestCase):
         self.assertEqual(llm._configured_harness_name, "search")
         self.assertEqual(llm._configured_search_provider, "brave")
         self.assertEqual(llm._configured_search_token_budget, 2048)
+
+    def test_swap_route_accepts_init_runtime_options(self):
+        with model_dir() as root, model_dir() as next_root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            adapter.mkdir()
+            (adapter / "qmodel.lora").write_bytes(b"adapter")
+            factory = FakeEngineFactory(responses=["ok"])
+            llm = LLM(
+                str(root),
+                _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+                _engine_factory=factory,
+            )
+            server = Server(llm, allow_hot_swap=True)
+
+            with TestClient(server.app) as client:
+                response = client.post(
+                    "/v1/models/swap",
+                    json={
+                        "model_dir": str(next_root),
+                        "num_threads": 7,
+                        "lora_dir": str(adapter),
+                        "lora_quant": "q4_0",
+                        "unembed_quant": "q8_0",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["path"], str(next_root))
+        self.assertEqual(response.json()["adapter_path"], str(adapter))
+        self.assertEqual(response.json()["init_config"]["num_threads"], 7)
+        self.assertEqual(factory.instances[-1].init_config.num_threads, 7)
+        self.assertEqual(factory.instances[-1].init_config.lora_dir, adapter)
+
+    def test_swap_route_resets_init_runtime_options_to_defaults_when_omitted(self):
+        with model_dir() as root, model_dir() as next_root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            adapter.mkdir()
+            (adapter / "qmodel.lora").write_bytes(b"adapter")
+            factory = FakeEngineFactory(responses=["ok"])
+            llm = LLM(
+                str(root),
+                num_threads=4,
+                lora_dir=str(adapter),
+                lora_quant="q4_0",
+                unembed_quant="q8_0",
+                _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+                _engine_factory=factory,
+            )
+            server = Server(llm, allow_hot_swap=True)
+
+            with TestClient(server.app) as client:
+                response = client.post("/v1/models/swap", json={"model_dir": str(next_root)})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["adapter_path"])
+        self.assertEqual(response.json()["init_config"]["num_threads"], 0)
+        self.assertIsNone(response.json()["init_config"]["lora_quant"])
+        self.assertIsNone(response.json()["init_config"]["unembed_quant"])
+        self.assertEqual(factory.instances[-1].init_config.num_threads, 0)
+        self.assertIsNone(factory.instances[-1].init_config.lora_dir)
 
     def test_swap_route_rejects_unknown_harness_with_400(self):
         with TestClient(self._make_server(allow_hot_swap=True).app) as client:

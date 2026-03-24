@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import typing
 import unittest
 
@@ -14,7 +15,7 @@ from trillim.components.llm._session import _ChatSession
 from trillim.components.llm.public import LLM
 from trillim.errors import AdmissionRejectedError, ComponentLifecycleError
 from trillim.harnesses.search._harness import _SearchHarness
-from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model
+from tests.components.llm.support import FakeEngineFactory, FakeTokenizer, make_runtime_model, model_dir
 
 
 class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
@@ -155,3 +156,70 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm._configured_search_provider, "brave")
         self.assertEqual(llm._runtime_search_token_budget, 1024)
         await llm.stop()
+
+    async def test_model_info_reports_adapter_runtime_config(self):
+        with model_dir() as root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            adapter.mkdir()
+            (adapter / "qmodel.lora").write_bytes(b"adapter")
+            tokenizer_paths: list[Path] = []
+            factory = FakeEngineFactory(responses=["ok"])
+
+            def load_fake_tokenizer(path, **_kwargs):
+                tokenizer_paths.append(Path(path))
+                return FakeTokenizer()
+
+            llm = LLM(
+                str(root),
+                num_threads=6,
+                lora_dir=f"{adapter}\nignored=1",
+                lora_quant="q4_0\nignored=1",
+                unembed_quant="q8_0\nignored=1",
+                _tokenizer_loader=load_fake_tokenizer,
+                _engine_factory=factory,
+            )
+
+            await llm.start()
+
+            info = llm.model_info()
+
+            self.assertEqual(info.path, str(root))
+            self.assertEqual(info.adapter_path, str(adapter))
+            self.assertIsNotNone(info.init_config)
+            self.assertEqual(info.init_config.num_threads, 6)
+            self.assertEqual(info.init_config.lora_quant, "q4_0")
+            self.assertEqual(info.init_config.unembed_quant, "q8_0")
+            self.assertNotEqual(tokenizer_paths[0], root)
+            self.assertEqual(factory.instances[0].init_config.lora_dir, adapter)
+            await llm.stop()
+
+    async def test_swap_model_resets_init_runtime_options_to_defaults_when_omitted(self):
+        with model_dir() as root, model_dir() as next_root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            adapter.mkdir()
+            (adapter / "qmodel.lora").write_bytes(b"adapter")
+            factory = FakeEngineFactory(responses=["ok"])
+            llm = LLM(
+                str(root),
+                num_threads=6,
+                lora_dir=str(adapter),
+                lora_quant="q4_0",
+                unembed_quant="q8_0",
+                _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+                _engine_factory=factory,
+            )
+
+            await llm.start()
+            info = await llm.swap_model(str(next_root))
+
+            self.assertEqual(info.path, str(next_root))
+            self.assertIsNone(info.adapter_path)
+            self.assertIsNotNone(info.init_config)
+            self.assertEqual(info.init_config.num_threads, 0)
+            self.assertIsNone(info.init_config.lora_quant)
+            self.assertIsNone(info.init_config.unembed_quant)
+            self.assertEqual(factory.instances[-1].init_config.num_threads, 0)
+            self.assertIsNone(factory.instances[-1].init_config.lora_dir)
+            self.assertIsNone(factory.instances[-1].init_config.lora_quant)
+            self.assertIsNone(factory.instances[-1].init_config.unembed_quant)
+            await llm.stop()

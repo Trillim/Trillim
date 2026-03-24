@@ -8,15 +8,19 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from trillim.components.llm._limits import (
-    MAX_MESSAGES,
     MAX_MESSAGE_CHARS,
+    MAX_MESSAGES,
     MAX_MODEL_NAME_CHARS,
     MAX_MODEL_PATH_CHARS,
     MAX_OUTPUT_TOKENS,
+    MAX_THREADS,
     TOTAL_MESSAGE_TEXT_LIMIT_BYTES,
 )
-from trillim.harnesses.search.provider import normalize_provider_name, validate_harness_name
 from trillim.errors import InvalidRequestError
+from trillim.harnesses.search.provider import (
+    normalize_provider_name,
+    validate_harness_name,
+)
 
 
 class SamplingOptions(BaseModel):
@@ -65,7 +69,9 @@ class ChatRequestInput(SamplingOptions):
 
     @field_validator("messages")
     @classmethod
-    def _validate_messages(cls, value: tuple[ChatMessageInput, ...]) -> tuple[ChatMessageInput, ...]:
+    def _validate_messages(
+        cls, value: tuple[ChatMessageInput, ...]
+    ) -> tuple[ChatMessageInput, ...]:
         if not value:
             raise ValueError("messages must not be empty")
         if len(value) > MAX_MESSAGES:
@@ -79,9 +85,26 @@ class SwapModelRequestInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_dir: str = Field(min_length=1, max_length=MAX_MODEL_PATH_CHARS)
+    num_threads: int | None = Field(default=None, ge=0, le=MAX_THREADS)
+    lora_dir: str | None = Field(
+        default=None, min_length=1, max_length=MAX_MODEL_PATH_CHARS
+    )
+    lora_quant: str | None = Field(
+        default="bf16", min_length=1, max_length=MAX_MODEL_NAME_CHARS
+    )
+    unembed_quant: str | None = Field(
+        default="int8", min_length=1, max_length=MAX_MODEL_NAME_CHARS
+    )
     harness_name: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
     search_provider: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
     search_token_budget: int | None = Field(default=None, ge=1)
+
+    @field_validator("lora_dir", "lora_quant", "unembed_quant")
+    @classmethod
+    def _validate_non_blank_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("value must not be blank")
+        return value
 
 
 def validate_chat_request(

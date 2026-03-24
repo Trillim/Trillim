@@ -62,6 +62,17 @@ class ModelRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class InitConfig:
+    """Configured init-time options for one LLM runtime."""
+
+    model_dir: Path
+    num_threads: int = 0
+    lora_dir: Path | None = None
+    lora_quant: str | None = None
+    unembed_quant: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SamplingDefaults:
     """Default sampling values loaded from model metadata."""
 
@@ -74,6 +85,15 @@ class SamplingDefaults:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeInitInfo:
+    """Public snapshot of active init-time worker options."""
+
+    num_threads: int = 0
+    lora_quant: str | None = None
+    unembed_quant: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ModelInfo:
     """Public snapshot of the active LLM runtime state."""
 
@@ -82,6 +102,8 @@ class ModelInfo:
     path: str | None
     max_context_tokens: int | None
     trust_remote_code: bool
+    adapter_path: str | None = None
+    init_config: RuntimeInitInfo | None = None
 
 
 def load_sampling_defaults(model_dir: Path) -> SamplingDefaults:

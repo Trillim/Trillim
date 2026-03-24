@@ -51,6 +51,10 @@ class ValidationTests(unittest.TestCase):
         swap = validate_swap_request(
             {
                 "model_dir": "/tmp/model",
+                "num_threads": 4,
+                "lora_dir": "/tmp/adapter",
+                "lora_quant": "q4_0",
+                "unembed_quant": "q8_0",
                 "harness_name": "search",
                 "search_provider": "BRAVE_SEARCH",
                 "search_token_budget": 32,
@@ -59,6 +63,10 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(sampling.max_tokens, 32)
         self.assertEqual(swap.model_dir, "/tmp/model")
+        self.assertEqual(swap.num_threads, 4)
+        self.assertEqual(swap.lora_dir, "/tmp/adapter")
+        self.assertEqual(swap.lora_quant, "q4_0")
+        self.assertEqual(swap.unembed_quant, "q8_0")
         self.assertEqual(swap.harness_name, "search")
         self.assertEqual(swap.search_provider, "BRAVE_SEARCH")
         self.assertEqual(swap.search_token_budget, 32)
@@ -85,6 +93,15 @@ class ValidationTests(unittest.TestCase):
                 {
                     "model_dir": "/tmp/model",
                     "search_provider": "bogus",
+                }
+            )
+
+    def test_validate_swap_request_rejects_blank_init_strings(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must not be blank"):
+            validate_swap_request(
+                {
+                    "model_dir": "/tmp/model",
+                    "lora_quant": "   ",
                 }
             )
 

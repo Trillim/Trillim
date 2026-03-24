@@ -98,6 +98,10 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
                 swap_request = validate_swap_request(payload)
                 info = await llm.swap_model(
                     swap_request.model_dir,
+                    num_threads=swap_request.num_threads,
+                    lora_dir=swap_request.lora_dir,
+                    lora_quant=swap_request.lora_quant,
+                    unembed_quant=swap_request.unembed_quant,
                     harness_name=swap_request.harness_name,
                     search_provider=swap_request.search_provider,
                     search_token_budget=swap_request.search_token_budget,
@@ -109,6 +113,10 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
                 "model": info.name,
                 "state": info.state,
                 "path": info.path,
+                "max_context_tokens": info.max_context_tokens,
+                "trust_remote_code": info.trust_remote_code,
+                "adapter_path": info.adapter_path,
+                "init_config": _init_config_payload(info),
             }
 
     return router
@@ -187,6 +195,18 @@ def _model_payload(info: ModelInfo) -> dict[str, object]:
         "path": info.path,
         "max_context_tokens": info.max_context_tokens,
         "trust_remote_code": info.trust_remote_code,
+        "adapter_path": info.adapter_path,
+        "init_config": _init_config_payload(info),
+    }
+
+
+def _init_config_payload(info: ModelInfo) -> dict[str, object] | None:
+    if info.init_config is None:
+        return None
+    return {
+        "num_threads": info.init_config.num_threads,
+        "lora_quant": info.init_config.lora_quant,
+        "unembed_quant": info.init_config.unembed_quant,
     }
 
 

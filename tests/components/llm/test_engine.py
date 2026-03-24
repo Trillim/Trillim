@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import trillim.components.llm._engine as engine_module
-from trillim.components.llm._config import SamplingDefaults
+from trillim.components.llm._config import InitConfig, SamplingDefaults
 from trillim.components.llm._engine import (
     EngineCrashedError,
     EngineProgressTimeoutError,
@@ -99,6 +99,65 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         mock_exec.assert_awaited_once()
         self.assertEqual(mock_exec.await_args.args[0], self._expected_binary_path())
         self.assertTrue(process.stdin.writes[0].startswith(b"17\n"))
+
+    async def test_start_writes_adapter_init_fields_when_configured(self):
+        engine = InferenceEngine(
+            make_runtime_model(Path("/tmp/model")),
+            FakeTokenizer(),
+            SamplingDefaults(),
+            init_config=InitConfig(
+                model_dir=Path("/tmp/model"),
+                num_threads=4,
+                lora_dir=Path("/tmp/adapter"),
+                lora_quant="q4_0",
+                unembed_quant="q8_0",
+            ),
+            progress_timeout=5.0,
+        )
+        process = _FakeProcess()
+
+        with patch(
+            "trillim.components.llm._engine.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            await engine.start()
+
+        block = process.stdin.writes[0].decode("utf-8")
+        self.assertIn("num_threads=4\n", block)
+        self.assertIn("lora_dir=/tmp/adapter\n", block)
+        self.assertIn("lora_quant=q4_0\n", block)
+        self.assertIn("unembed_quant=q8_0\n", block)
+
+    async def test_start_uses_only_the_first_line_of_string_init_fields(self):
+        engine = InferenceEngine(
+            make_runtime_model(Path("/tmp/model")),
+            FakeTokenizer(),
+            SamplingDefaults(),
+            init_config=InitConfig(
+                model_dir=Path("/tmp/model"),
+                num_threads=4,
+                lora_dir=Path("/tmp/adapter\nnum_threads=999"),
+                lora_quant="q4_0\nrope_theta=1",
+                unembed_quant="q8_0\nactivation=0",
+            ),
+            progress_timeout=5.0,
+        )
+        process = _FakeProcess()
+
+        with patch(
+            "trillim.components.llm._engine.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            await engine.start()
+
+        block = process.stdin.writes[0].decode("utf-8")
+        self.assertIn("num_threads=4\n", block)
+        self.assertIn("lora_dir=/tmp/adapter\n", block)
+        self.assertIn("lora_quant=q4_0\n", block)
+        self.assertIn("unembed_quant=q8_0\n", block)
+        self.assertNotIn("num_threads=999\n", block)
+        self.assertNotIn("rope_theta=1\n", block)
+        self.assertNotIn("activation=0\n", block)
 
     async def test_stop_writes_exit_block(self):
         engine = self._make_engine()

@@ -12,6 +12,7 @@ from trillim.components.llm._config import (
     ArchitectureType,
     LLMState,
     ModelInfo,
+    RuntimeInitInfo,
     SamplingDefaults,
     load_sampling_defaults,
 )
@@ -19,9 +20,23 @@ from trillim.components.llm._config import (
 
 class LLMConfigTests(unittest.TestCase):
     def test_enums_and_model_info_are_stable(self):
-        info = ModelInfo(LLMState.RUNNING, "model", "/tmp/model", 123, False)
+        info = ModelInfo(
+            LLMState.RUNNING,
+            "model",
+            "/tmp/model",
+            123,
+            False,
+            adapter_path="/tmp/adapter",
+            init_config=RuntimeInitInfo(
+                num_threads=4,
+                lora_quant="q4_0",
+                unembed_quant="q8_0",
+            ),
+        )
 
         self.assertEqual(info.state, LLMState.RUNNING)
+        self.assertEqual(info.adapter_path, "/tmp/adapter")
+        self.assertEqual(info.init_config.num_threads, 4)
         self.assertEqual(LLMState.SERVER_ERROR.value, "server_error")
         self.assertEqual(ArchitectureType.LLAMA, 2)
         self.assertEqual(ActivationType.SILU, 1)

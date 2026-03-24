@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from trillim.components.llm._config import ModelRuntimeConfig, SamplingDefaults
+from trillim.components.llm._config import InitConfig, ModelRuntimeConfig, SamplingDefaults
 
 
 class EngineError(RuntimeError):
@@ -94,13 +94,17 @@ class InferenceEngine:
         tokenizer,
         defaults: SamplingDefaults,
         *,
-        num_threads: int = 0,
+        init_config: InitConfig | None = None,
         progress_timeout: float,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
-        self.num_threads = num_threads
+        self.init_config = (
+            InitConfig(model_dir=model.path)
+            if init_config is None
+            else init_config
+        )
         self.progress_timeout = progress_timeout
         self.binary_path = _bundled_binary_path()
         self.process: asyncio.subprocess.Process | None = None
@@ -146,7 +150,7 @@ class InferenceEngine:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await self._write_block(_build_init_block(self.model, self.num_threads))
+            await self._write_block(_build_init_block(self.model, self.init_config))
         except Exception:
             await self._kill_process()
             raise
@@ -318,7 +322,7 @@ def _bundled_binary_path() -> str:
     return str(bundled)
 
 
-def _build_init_block(model: ModelRuntimeConfig, num_threads: int) -> str:
+def _build_init_block(model: ModelRuntimeConfig, init_config: InitConfig) -> str:
     pairs = [
         f"arch_type={int(model.arch_type)}",
         f"activation={int(model.activation)}",
@@ -338,9 +342,22 @@ def _build_init_block(model: ModelRuntimeConfig, num_threads: int) -> str:
         f"has_ffn_sub_norm={1 if model.has_ffn_sub_norm else 0}",
         f"eos_tokens={','.join(str(token_id) for token_id in model.eos_tokens)}",
     ]
-    if num_threads:
-        pairs.append(f"num_threads={num_threads}")
+    if init_config.num_threads:
+        pairs.append(f"num_threads={init_config.num_threads}")
+    if init_config.lora_dir is not None:
+        pairs.append(f"lora_dir={_first_protocol_line(str(init_config.lora_dir))}")
+    if init_config.lora_quant is not None:
+        pairs.append(f"lora_quant={_first_protocol_line(init_config.lora_quant)}")
+    if init_config.unembed_quant is not None:
+        pairs.append(f"unembed_quant={_first_protocol_line(init_config.unembed_quant)}")
     return f"{len(pairs)}\n" + "".join(f"{pair}\n" for pair in pairs)
+
+
+def _first_protocol_line(value: str) -> str:
+    lines = value.strip().splitlines()
+    if not lines:
+        return value
+    return lines[0]
 
 
 def _build_request_block(
