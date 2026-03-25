@@ -82,10 +82,10 @@ soundfile
 
 --------------------------------------------------------------------------------
 
-python-multipart
+coverage
   License:   Apache License 2.0
-  Copyright: Copyright 2012, Andrew Dunham
-  URL:       https://github.com/Kludex/python-multipart
+  Copyright: Copyright (c) Ned Batchelder and contributors
+  URL:       https://github.com/coveragepy/coveragepy
 
 --------------------------------------------------------------------------------
 

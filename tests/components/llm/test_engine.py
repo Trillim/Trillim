@@ -177,10 +177,27 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         tokens = [token async for token in engine.generate([1, 2, 99], max_tokens=8)]
 
         self.assertEqual(tokens, [65])
+        request_block = engine.process.stdin.writes[0].decode("utf-8")
+        self.assertIn("reset=0\n", request_block)
+        self.assertIn("tokens=99\n", request_block)
         self.assertEqual(engine.last_cache_hit, 2)
         self.assertEqual(engine.last_prompt_tokens, 3)
         self.assertEqual(engine.last_completion_tokens, 1)
         self.assertEqual(engine.cached_token_ids, [1, 2, 99, 65])
+
+    async def test_generate_resets_cache_when_prompt_prefix_diverges(self):
+        engine = self._make_engine()
+        engine.process = _FakeProcess(lines=[b"65\n", b"0\n", b"3\n"])
+        engine._prompt_cache._token_ids = (1, 2, 3)
+
+        tokens = [token async for token in engine.generate([1, 9], max_tokens=8)]
+
+        self.assertEqual(tokens, [65])
+        request_block = engine.process.stdin.writes[0].decode("utf-8")
+        self.assertIn("reset=1\n", request_block)
+        self.assertIn("tokens=1,9\n", request_block)
+        self.assertEqual(engine.last_cache_hit, 0)
+        self.assertEqual(engine.cached_token_ids, [1, 9, 65])
 
     async def test_generate_usage_follows_authoritative_kv_position(self):
         engine = self._make_engine()

@@ -15,6 +15,7 @@ from trillim.harnesses.search.provider import (
     FALLBACK_SEARCH_FAILURE_MESSAGE,
     SearchAuthenticationError,
     SearchError,
+    SearchResult,
 )
 from tests.components.llm.support import (
     FakeEngineFactory,
@@ -181,4 +182,31 @@ class SearchHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done.usage.prompt_tokens, prompt_tokens)
         self.assertEqual(done.usage.completion_tokens, 1)
         self.assertEqual(done.usage.total_tokens, prompt_tokens + 1)
+        await llm.stop()
+
+    async def test_search_harness_uses_real_search_client_pipeline(self):
+        llm = self._make_llm(responses=["<search>cats</search>", "answer"])
+        await llm.start()
+
+        with patch(
+            "trillim.harnesses.search.client.DDGSSearchProvider.search",
+            return_value=[
+                SearchResult(
+                    title="Cats",
+                    url="https://example.com/cats",
+                    snippet="snippet",
+                )
+            ],
+        ) as provider_search, patch(
+            "trillim.harnesses.search.client.build_search_context",
+            return_value="curated cat results",
+        ) as build_context:
+            async with llm.open_session([{"role": "user", "content": "Find cats"}]) as session:
+                result = await session.chat(max_tokens=8)
+
+        self.assertEqual(result, "answer")
+        provider_search.assert_called_once_with("cats", max_results=5)
+        build_context.assert_called_once()
+        self.assertEqual(session.messages[2]["role"], "search")
+        self.assertEqual(session.messages[2]["content"], "curated cat results")
         await llm.stop()

@@ -432,26 +432,122 @@ class CLITests(unittest.TestCase):
             cli._stream_assistant_turn(runtime, session, session.messages)
         self.assertIn("done", output.getvalue())
 
+    def test_make_chat_key_bindings_uses_visual_editor_and_updates_buffer(self):
+        bindings = cli._make_chat_key_bindings()
+        buffer = SimpleNamespace(text="draft", cursor_position=0)
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+        observed: dict[str, object] = {}
+
+        def edit_file(argv: list[str]) -> int:
+            observed["editor"] = argv[0]
+            temp_path = Path(argv[1])
+            observed["path"] = temp_path
+            self.assertEqual(temp_path.read_text(encoding="utf-8"), "draft")
+            temp_path.write_text("edited text", encoding="utf-8")
+            return 0
+
+        with patch.dict(
+            "trillim.cli.os.environ",
+            {"VISUAL": "nano", "EDITOR": "vim"},
+            clear=True,
+        ), patch("trillim.cli.subprocess.call", side_effect=edit_file):
+            bindings.bindings[0].handler(event)
+
+        self.assertEqual(observed["editor"], "nano")
+        self.assertEqual(buffer.text, "edited text")
+        self.assertEqual(buffer.cursor_position, len("edited text"))
+        self.assertIsInstance(observed["path"], Path)
+        self.assertFalse(observed["path"].exists())
+
+    def test_make_chat_key_bindings_uses_editor_when_visual_missing(self):
+        bindings = cli._make_chat_key_bindings()
+        buffer = SimpleNamespace(text="", cursor_position=0)
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+        called_with: list[str] = []
+
+        def open_editor(argv: list[str]) -> int:
+            called_with.append(argv[0])
+            return 0
+
+        with patch.dict(
+            "trillim.cli.os.environ",
+            {"EDITOR": "vim"},
+            clear=True,
+        ), patch("trillim.cli.subprocess.call", side_effect=open_editor):
+            bindings.bindings[0].handler(event)
+
+        self.assertEqual(called_with, ["vim"])
+
+    def test_make_chat_key_bindings_defaults_to_vi(self):
+        bindings = cli._make_chat_key_bindings()
+        buffer = SimpleNamespace(text="", cursor_position=0)
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+        called_with: list[str] = []
+
+        def open_editor(argv: list[str]) -> int:
+            called_with.append(argv[0])
+            return 0
+
+        with patch.dict(
+            "trillim.cli.os.environ",
+            {},
+            clear=True,
+        ), patch("trillim.cli.subprocess.call", side_effect=open_editor):
+            bindings.bindings[0].handler(event)
+
+        self.assertEqual(called_with, ["vi"])
+
     def test_run_chat_supports_reset_prompt_and_quit(self):
         fake_runtime = _FakeRuntime(object())
         with patch("trillim.cli.Runtime", return_value=fake_runtime), patch(
             "trillim.cli.LLM",
             return_value=object(),
         ), patch(
+            "trillim.cli._make_chat_key_bindings",
+            return_value="bindings",
+        ), patch(
             "trillim.cli._stream_assistant_turn",
             side_effect=lambda runtime, session, snapshot: session,
         ) as stream_turn, patch(
-            "builtins.input",
+            "trillim.cli.better_input",
             side_effect=["/new", "hello", "q"],
-        ):
+        ) as prompt_input:
             output = io.StringIO()
             with redirect_stdout(output):
                 result = cli._run_chat("Trillim/model", "Local/adapter")
         self.assertEqual(result, 0)
         self.assertEqual(fake_runtime.llm.opened_messages, [(), ()])
         self.assertEqual(stream_turn.call_count, 1)
+        self.assertEqual(
+            prompt_input.call_args_list,
+            [
+                unittest.mock.call("user: ", key_bindings="bindings"),
+                unittest.mock.call("user: ", key_bindings="bindings"),
+                unittest.mock.call("user: ", key_bindings="bindings"),
+            ],
+        )
         self.assertIn("Adapter: Local/adapter", output.getvalue())
         self.assertIn("Conversation reset.", output.getvalue())
+
+    def test_run_chat_ignores_blank_prompt(self):
+        fake_runtime = _FakeRuntime(object())
+        with patch("trillim.cli.Runtime", return_value=fake_runtime), patch(
+            "trillim.cli.LLM",
+            return_value=object(),
+        ), patch(
+            "trillim.cli._make_chat_key_bindings",
+            return_value=object(),
+        ), patch(
+            "trillim.cli._stream_assistant_turn",
+        ) as stream_turn, patch(
+            "trillim.cli.better_input",
+            side_effect=["   ", "q"],
+        ):
+            result = cli._run_chat("Trillim/model", None)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(fake_runtime.llm.opened_messages, [()])
+        stream_turn.assert_not_called()
 
     def test_run_chat_handles_keyboard_interrupt_and_eof_at_prompt(self):
         fake_runtime = _FakeRuntime(object())
@@ -459,14 +555,20 @@ class CLITests(unittest.TestCase):
             "trillim.cli.LLM",
             return_value=object(),
         ), patch(
-            "builtins.input",
+            "trillim.cli._make_chat_key_bindings",
+            return_value=object(),
+        ), patch(
+            "trillim.cli.better_input",
             side_effect=[KeyboardInterrupt(), EOFError()],
         ):
             output = io.StringIO()
             with redirect_stdout(output):
                 result = cli._run_chat("Trillim/model", None)
         self.assertEqual(result, 0)
-        self.assertIn("Commands: /new to reset, q to quit", output.getvalue())
+        self.assertIn(
+            "Commands: /new to reset, q to quit, Ctrl+G for editor",
+            output.getvalue(),
+        )
 
     def test_run_serve_builds_server_without_voice_by_default(self):
         server = SimpleNamespace(run=lambda **kwargs: kwargs)

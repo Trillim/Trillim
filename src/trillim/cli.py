@@ -5,11 +5,17 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import platform
 import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from prompt_toolkit import prompt as better_input
+from prompt_toolkit.key_binding import KeyBindings
 
 from trillim import LLM, STT, TTS, Runtime, Server, _model_store
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
@@ -317,6 +323,33 @@ def _stream_assistant_turn(runtime: Runtime, session, messages_snapshot) -> obje
             pass
 
 
+def _make_chat_key_bindings() -> KeyBindings:
+    kb = KeyBindings()
+
+    @kb.add("c-g")
+    def _open_editor(event) -> None:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR", "vi")
+        buffer = event.app.current_buffer
+        with tempfile.NamedTemporaryFile(
+            suffix=".txt",
+            mode="w+",
+            encoding="utf-8",
+            delete=False,
+        ) as handle:
+            handle.write(buffer.text)
+            temp_path = handle.name
+        try:
+            subprocess.call([editor, temp_path])
+            with open(temp_path, encoding="utf-8") as handle:
+                text = handle.read()
+            buffer.text = text
+            buffer.cursor_position = len(text)
+        finally:
+            os.unlink(temp_path)
+
+    return kb
+
+
 def _run_chat(model_id: str, adapter_id: str | None) -> int:
     runtime = Runtime(
         LLM(
@@ -326,14 +359,15 @@ def _run_chat(model_id: str, adapter_id: str | None) -> int:
     )
     with runtime:
         session = runtime.llm.open_session()
+        key_bindings = _make_chat_key_bindings()
         print(f"Model: {model_id}")
         if adapter_id is not None:
             print(f"Adapter: {adapter_id}")
-        print("Commands: /new to reset, q to quit")
+        print("Commands: /new to reset, q to quit, Ctrl+G for editor")
         try:
             while True:
                 try:
-                    prompt = input("user: ")
+                    prompt = better_input("user: ", key_bindings=key_bindings)
                 except EOFError:
                     print()
                     break

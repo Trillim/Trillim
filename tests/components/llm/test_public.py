@@ -283,3 +283,25 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(factory.instances[-1].init_config.lora_quant)
         self.assertIsNone(factory.instances[-1].init_config.unembed_quant)
         await llm.stop()
+
+    async def test_public_llm_chats_with_real_adapter_overlay(self):
+        root = _model_store.store_path_for_id("Trillim/root")
+        adapter = _model_store.store_path_for_id("Local/adapter")
+        write_model_bundle(root)
+        write_adapter_bundle(adapter, model_root=root)
+
+        llm = LLM(
+            "Trillim/root",
+            lora_dir="Local/adapter",
+            _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+            _engine_factory=FakeEngineFactory(responses=["hello"]),
+        )
+
+        await llm.start()
+        result = await llm.chat([{"role": "user", "content": "Say hi"}])
+        info = llm.model_info()
+
+        self.assertEqual(result, "hello")
+        self.assertEqual(info.adapter_path, str(adapter))
+        self.assertEqual(llm._engine.init_config.lora_dir, adapter)
+        await llm.stop()
