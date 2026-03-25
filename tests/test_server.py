@@ -1,6 +1,7 @@
 """Tests for server/app composition."""
 
 import unittest
+from types import SimpleNamespace
 
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
@@ -49,6 +50,15 @@ class _HotSwapAwareComponent(_RouteComponent):
         self.enabled = enabled
 
 
+class _ModelInfoComponent(_RouteComponent):
+    def __init__(self, calls: list[str], name: str, *, state: str) -> None:
+        super().__init__(calls, name)
+        self._state = state
+
+    def model_info(self):
+        return SimpleNamespace(state=self._state)
+
+
 class ServerTests(unittest.TestCase):
     def test_server_requires_components(self):
         with self.assertRaisesRegex(ValueError, "at least one component"):
@@ -75,6 +85,27 @@ class ServerTests(unittest.TestCase):
             calls,
             ["one.start", "two.start", "two.stop", "one.stop"],
         )
+
+    def test_server_healthz_returns_503_for_unready_component_states(self):
+        for state in ("server_error", "draining", "swapping", "unavailable"):
+            with self.subTest(state=state):
+                calls: list[str] = []
+                server = Server(_ModelInfoComponent(calls, "llm", state=state))
+                with TestClient(server.app) as client:
+                    response = client.get("/healthz")
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    response.json(),
+                    {"status": "degraded", "components": {"llm": {"state": state}}},
+                )
+
+    def test_server_healthz_keeps_running_model_info_components_ready(self):
+        calls: list[str] = []
+        server = Server(_ModelInfoComponent(calls, "llm", state="running"))
+        with TestClient(server.app) as client:
+            response = client.get("/healthz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
 
     def test_server_stops_started_components_when_startup_fails(self):
         calls: list[str] = []

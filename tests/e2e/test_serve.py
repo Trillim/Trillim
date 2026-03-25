@@ -283,6 +283,43 @@ class ServeE2ETests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(body), {"status": "ok"})
 
+    def test_serve_rejects_concurrent_streaming_generation_before_sse(self):
+        with _ServeProcess() as server, ThreadPoolExecutor(max_workers=1) as executor:
+            slow_future = executor.submit(
+                server.json_request,
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "slow request"}]},
+            )
+
+            rejected = None
+            deadline = time.monotonic() + 2.0
+            stream_body = json.dumps(
+                {
+                    "messages": [{"role": "user", "content": "stream please"}],
+                    "stream": True,
+                }
+            ).encode("utf-8")
+            while time.monotonic() < deadline:
+                if slow_future.done():
+                    break
+                status, body, _headers = server.request(
+                    "/v1/chat/completions",
+                    method="POST",
+                    body=stream_body,
+                    headers={"content-type": "application/json"},
+                )
+                if status == 429:
+                    rejected = json.loads(body)
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(rejected)
+            self.assertIn("busy", rejected["detail"])
+
+            slow_status, slow_body, _headers = slow_future.result(timeout=5.0)
+            self.assertEqual(slow_status, 200)
+            self.assertEqual(slow_body["choices"][0]["message"]["content"], "hello")
+
 
 class VoiceServeE2ETests(unittest.TestCase):
     def test_serve_voice_handles_transcription_voice_store_and_speech(self):

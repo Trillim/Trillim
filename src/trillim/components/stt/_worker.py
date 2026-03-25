@@ -10,6 +10,8 @@ from pathlib import Path
 
 from trillim.components.stt._config import DEFAULT_WORKER_CONFIG
 from trillim.components.stt._limits import (
+    MAX_WORKER_ERROR_BYTES,
+    MAX_WORKER_OUTPUT_BYTES,
     TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS,
     WORKER_KILL_AFTER_SECONDS,
 )
@@ -18,6 +20,10 @@ from trillim.errors import ProgressTimeoutError
 
 class WorkerFailureError(RuntimeError):
     """Raised when the STT subprocess fails closed."""
+
+
+class _WorkerStreamTooLargeError(RuntimeError):
+    """Raised when one worker pipe exceeds its configured bound."""
 
 
 async def transcribe_owned_audio_file(
@@ -32,8 +38,9 @@ async def transcribe_owned_audio_file(
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, _stderr = await asyncio.wait_for(
-            process.communicate(),
+        stdout, _stderr = await _collect_worker_output(
+            process,
+            stdout_limit=MAX_WORKER_OUTPUT_BYTES,
             timeout=TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError as exc:
@@ -41,6 +48,9 @@ async def transcribe_owned_audio_file(
         raise ProgressTimeoutError(
             f"STT transcription timed out after {TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS} seconds"
         ) from exc
+    except _WorkerStreamTooLargeError as exc:
+        await _stop_process(process)
+        raise WorkerFailureError(str(exc)) from exc
     except asyncio.CancelledError:
         await _stop_process(process)
         raise
@@ -71,6 +81,62 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+
+
+async def _collect_worker_output(
+    process: asyncio.subprocess.Process,
+    *,
+    stdout_limit: int,
+    timeout: float,
+) -> tuple[bytes, bytes]:
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_task = asyncio.create_task(
+        _read_bounded_stream(
+            process.stdout,
+            limit=stdout_limit,
+            overflow_message="STT worker produced oversized stdout output",
+        )
+    )
+    stderr_task = asyncio.create_task(
+        _read_bounded_stream(
+            process.stderr,
+            limit=MAX_WORKER_ERROR_BYTES,
+            overflow_message="STT worker produced oversized stderr output",
+        )
+    )
+    wait_task = asyncio.create_task(process.wait())
+    gather = asyncio.gather(wait_task, stdout_task, stderr_task)
+    try:
+        _, stdout, stderr = await asyncio.wait_for(gather, timeout=timeout)
+    finally:
+        await _finish_worker_tasks(wait_task, stdout_task, stderr_task)
+    return stdout, stderr
+
+
+async def _finish_worker_tasks(*tasks: asyncio.Task) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _read_bounded_stream(
+    stream: asyncio.StreamReader,
+    *,
+    limit: int,
+    overflow_message: str,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise _WorkerStreamTooLargeError(overflow_message)
+        chunks.append(chunk)
 
 
 def _parse_worker_output(stdout: bytes) -> str:

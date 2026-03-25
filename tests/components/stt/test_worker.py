@@ -86,6 +86,29 @@ class STTWorkerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ProgressTimeoutError, "timed out"):
                 await transcribe_owned_audio_file(self.audio_path, language=None)
 
+    async def test_transcribe_owned_audio_file_rejects_oversized_stdout(self):
+        with patch.object(
+            _worker,
+            "_worker_command",
+            return_value=python_command("import sys; sys.stdout.write('x' * 9)"),
+        ), patch.object(_worker, "MAX_WORKER_OUTPUT_BYTES", 8):
+            with self.assertRaisesRegex(WorkerFailureError, "oversized stdout"):
+                await transcribe_owned_audio_file(self.audio_path, language=None)
+
+    async def test_transcribe_owned_audio_file_rejects_oversized_stderr(self):
+        with patch.object(
+            _worker,
+            "_worker_command",
+            return_value=python_command(
+                "import sys",
+                "sys.stderr.write('x' * 17)",
+                "sys.stderr.flush()",
+                "raise SystemExit(1)",
+            ),
+        ), patch.object(_worker, "MAX_WORKER_ERROR_BYTES", 16):
+            with self.assertRaisesRegex(WorkerFailureError, "oversized stderr"):
+                await transcribe_owned_audio_file(self.audio_path, language=None)
+
     def test_main_returns_one_on_local_transcription_failure(self):
         with patch(
             "trillim.components.stt._worker._transcribe_locally",

@@ -19,7 +19,11 @@ from trillim.components.llm._events import (
     ChatUsage,
 )
 from trillim.components.llm._limits import SESSION_TOKEN_LIMIT
-from trillim.components.llm._validation import validate_messages, validate_sampling_options
+from trillim.components.llm._validation import (
+    SamplingOptions,
+    validate_messages,
+    validate_sampling_options,
+)
 from trillim.harnesses.search.provider import SearchAuthenticationError
 from trillim.errors import (
     ContextOverflowError,
@@ -255,6 +259,35 @@ class _ChatSession(ChatSession):
         max_tokens: int | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """Stream structured events for the next assistant turn."""
+        sampling = self._prepare_stream_chat(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            rep_penalty_lookback=rep_penalty_lookback,
+            max_tokens=max_tokens,
+        )
+        try:
+            async with await self._llm._admission.acquire():
+                async for event in self._stream_chat_prepared(sampling):
+                    yield event
+        except EngineProgressTimeoutError as exc:
+            await self._llm._recover_from_engine_failure()
+            raise ProgressTimeoutError(str(exc)) from exc
+        except (EngineCrashedError, EngineError) as exc:
+            await self._llm._recover_from_engine_failure()
+            raise RuntimeError(str(exc)) from exc
+
+    def _prepare_stream_chat(
+        self,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        rep_penalty_lookback: int | None = None,
+        max_tokens: int | None = None,
+    ) -> SamplingOptions:
         sampling = validate_sampling_options(
             temperature=temperature,
             top_k=top_k,
@@ -264,40 +297,45 @@ class _ChatSession(ChatSession):
             max_tokens=max_tokens,
         )
         self._ensure_turn_startable()
+        return sampling
+
+    async def _stream_chat_prepared(
+        self,
+        sampling: SamplingOptions,
+    ) -> AsyncIterator[ChatEvent]:
         await self._begin_consumer()
         try:
-            async with await self._llm._admission.acquire():
-                full_text = ""
-                event_stream = self._llm._harness.stream_events(
-                    self,
-                    **sampling.to_kwargs(),
-                )
-                self._active_event_stream = event_stream
-                async for event in event_stream:
-                    if isinstance(event, ChatTokenEvent):
-                        full_text += event.text
-                    elif isinstance(event, ChatFinalTextEvent):
-                        full_text = event.text
-                    yield event
-                if self._state in {"closed", "owner_stopped"}:
-                    return
-                self._cached_token_count = self._llm._engine.cached_token_count
-                if self._cached_token_count >= SESSION_TOKEN_LIMIT:
-                    self._state = "exhausted"
-                elif self._state not in {"closed", "owner_stopped"} and not self._stale:
-                    self._state = "open"
-                yield ChatDoneEvent(
-                    text=full_text,
-                    usage=ChatUsage(
-                        prompt_tokens=self._llm._harness.prompt_tokens,
-                        completion_tokens=self._llm._harness.completion_tokens,
-                        total_tokens=(
-                            self._llm._harness.prompt_tokens
-                            + self._llm._harness.completion_tokens
-                        ),
-                        cached_tokens=self._llm._harness.cached_tokens,
+            full_text = ""
+            event_stream = self._llm._harness.stream_events(
+                self,
+                **sampling.to_kwargs(),
+            )
+            self._active_event_stream = event_stream
+            async for event in event_stream:
+                if isinstance(event, ChatTokenEvent):
+                    full_text += event.text
+                elif isinstance(event, ChatFinalTextEvent):
+                    full_text = event.text
+                yield event
+            if self._state in {"closed", "owner_stopped"}:
+                return
+            self._cached_token_count = self._llm._engine.cached_token_count
+            if self._cached_token_count >= SESSION_TOKEN_LIMIT:
+                self._state = "exhausted"
+            elif self._state not in {"closed", "owner_stopped"} and not self._stale:
+                self._state = "open"
+            yield ChatDoneEvent(
+                text=full_text,
+                usage=ChatUsage(
+                    prompt_tokens=self._llm._harness.prompt_tokens,
+                    completion_tokens=self._llm._harness.completion_tokens,
+                    total_tokens=(
+                        self._llm._harness.prompt_tokens
+                        + self._llm._harness.completion_tokens
                     ),
-                )
+                    cached_tokens=self._llm._harness.cached_tokens,
+                ),
+            )
         except asyncio.CancelledError:
             if self._state not in {"closed", "owner_stopped"}:
                 self._state = "closed"
@@ -314,16 +352,14 @@ class _ChatSession(ChatSession):
             if self._state not in {"closed", "owner_stopped"} and not self._stale:
                 self._state = "exhausted"
             raise
-        except EngineProgressTimeoutError as exc:
+        except EngineProgressTimeoutError:
             if self._state not in {"closed", "owner_stopped"} and not self._stale:
                 self._state = "failed"
-            await self._llm._recover_from_engine_failure()
-            raise ProgressTimeoutError(str(exc)) from exc
-        except (EngineCrashedError, EngineError) as exc:
+            raise
+        except (EngineCrashedError, EngineError):
             if self._state not in {"closed", "owner_stopped"} and not self._stale:
                 self._state = "failed"
-            await self._llm._recover_from_engine_failure()
-            raise RuntimeError(str(exc)) from exc
+            raise
         except Exception:
             if self._state not in {"closed", "owner_stopped"} and not self._stale:
                 self._state = "failed"

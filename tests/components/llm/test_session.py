@@ -11,6 +11,7 @@ from trillim import _model_store
 from trillim.components.llm import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm.public import LLM
 from trillim.errors import (
+    InvalidRequestError,
     ProgressTimeoutError,
     SessionBusyError,
     SessionClosedError,
@@ -18,6 +19,7 @@ from trillim.errors import (
     SessionStaleError,
 )
 from tests.components.llm.support import (
+    crashed,
     FakeEngineFactory,
     FakeTokenizer,
     make_runtime_model,
@@ -194,6 +196,44 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
             await session.chat(max_tokens=8)
 
         self.assertEqual(llm.state.value, "running")
+        await llm.stop()
+
+    async def test_session_recovers_from_engine_crash_and_raises_public_error(self):
+        llm = self._make_llm(failure=crashed())
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        with self.assertRaisesRegex(RuntimeError, "Inference engine crashed: boom"):
+            await session.chat(max_tokens=8)
+
+        self.assertEqual(llm.state.value, "running")
+        await llm.stop()
+
+    async def test_session_validation_error_is_not_masked_by_busy_admission(self):
+        llm = self._make_llm(responses=["ok"])
+        await llm.start()
+        active_session = llm.open_session([{"role": "user", "content": "hello"}])
+        invalid_session = llm.open_session([{"role": "user", "content": "hello"}])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_stream_events(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            yield ChatTokenEvent(text="ok")
+
+        llm._harness.stream_events = blocking_stream_events
+
+        async def consume():
+            async for _event in active_session.stream_chat(max_tokens=8):
+                pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        with self.assertRaisesRegex(InvalidRequestError, "greater than or equal to 1"):
+            await invalid_session.chat(max_tokens=0)
+        release.set()
+        await task
         await llm.stop()
 
     async def test_session_renders_search_messages_for_chat_templates(self):

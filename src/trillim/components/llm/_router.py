@@ -7,9 +7,15 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response
+from starlette.types import Receive, Scope, Send
 
 from trillim.components.llm._config import ModelInfo
+from trillim.components.llm._engine import (
+    EngineCrashedError,
+    EngineError,
+    EngineProgressTimeoutError,
+)
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._limits import REQUEST_BODY_LIMIT_BYTES
 from trillim.components.llm._validation import validate_chat_request, validate_swap_request
@@ -23,6 +29,83 @@ from trillim.errors import (
     SessionExhaustedError,
     SessionStaleError,
 )
+
+
+class _ChatStreamResponse(Response):
+    media_type = "text/event-stream"
+
+    def __init__(self, llm, request_model) -> None:
+        self._llm = llm
+        self._request_model = request_model
+        self.status_code = 200
+        self.background = None
+        self.body = None
+        self.init_headers()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        session = None
+        admission_lease = None
+        try:
+            try:
+                session = self._llm.open_session(_request_messages(self._request_model))
+                sampling = session._prepare_stream_chat(**_sampling_kwargs(self._request_model))
+                admission_lease = await self._llm._admission.acquire()
+            except Exception as exc:
+                try:
+                    await _http_exception_response(_as_http_error(exc))(scope, receive, send)
+                except OSError:
+                    pass
+                return
+
+            response_id = _response_id()
+            created = int(time.time())
+            try:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": self.status_code,
+                        "headers": self.raw_headers,
+                    }
+                )
+                async with session:
+                    async for chunk in _stream_chat_response(
+                        self._llm,
+                        session,
+                        sampling=sampling,
+                        response_id=response_id,
+                        created=created,
+                    ):
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk.encode("utf-8"),
+                                "more_body": True,
+                            }
+                        )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                )
+            except EngineProgressTimeoutError as exc:
+                await admission_lease.release()
+                admission_lease = None
+                await self._llm._recover_from_engine_failure()
+                raise ProgressTimeoutError(str(exc)) from exc
+            except (EngineCrashedError, EngineError) as exc:
+                await admission_lease.release()
+                admission_lease = None
+                await self._llm._recover_from_engine_failure()
+                raise RuntimeError(str(exc)) from exc
+            except OSError:
+                return
+        finally:
+            if admission_lease is not None:
+                await admission_lease.release()
+            if session is not None:
+                await session.close()
 
 
 def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
@@ -48,21 +131,10 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
                 active_model_name=info.name,
             )
             if chat_request.stream:
-                return StreamingResponse(
-                    _stream_chat_response(llm, chat_request),
-                    media_type="text/event-stream",
-                )
+                return _ChatStreamResponse(llm, chat_request)
             text, usage = await llm._collect_chat(
-                [
-                    {"role": message.role, "content": message.content}
-                    for message in chat_request.messages
-                ],
-                temperature=chat_request.temperature,
-                top_k=chat_request.top_k,
-                top_p=chat_request.top_p,
-                repetition_penalty=chat_request.repetition_penalty,
-                rep_penalty_lookback=chat_request.rep_penalty_lookback,
-                max_tokens=chat_request.max_tokens,
+                _request_messages(chat_request),
+                **_sampling_kwargs(chat_request),
             )
         except Exception as exc:
             raise _as_http_error(exc) from exc
@@ -122,9 +194,7 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
     return router
 
 
-async def _stream_chat_response(llm, request_model):
-    response_id = _response_id()
-    created = int(time.time())
+async def _stream_chat_response(llm, session, *, sampling, response_id: str, created: int):
     yield _sse(
         {
             "id": response_id,
@@ -140,51 +210,38 @@ async def _stream_chat_response(llm, request_model):
             ],
         }
     )
-    async with llm.open_session(
-        [
-            {"role": message.role, "content": message.content}
-            for message in request_model.messages
-        ]
-    ) as session:
-        async for event in session.stream_chat(
-            temperature=request_model.temperature,
-            top_k=request_model.top_k,
-            top_p=request_model.top_p,
-            repetition_penalty=request_model.repetition_penalty,
-            rep_penalty_lookback=request_model.rep_penalty_lookback,
-            max_tokens=request_model.max_tokens,
-        ):
-            if isinstance(event, ChatTokenEvent):
-                if not event.text:
-                    continue
-                yield _sse(
-                    {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": llm.model_info().name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": event.text},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                )
-            elif isinstance(event, ChatDoneEvent):
-                yield _sse(
-                    {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": llm.model_info().name,
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "stop"}
-                        ],
-                    }
-                )
-                break
+    async for event in session._stream_chat_prepared(sampling):
+        if isinstance(event, ChatTokenEvent):
+            if not event.text:
+                continue
+            yield _sse(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": llm.model_info().name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": event.text},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        elif isinstance(event, ChatDoneEvent):
+            yield _sse(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": llm.model_info().name,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    ],
+                }
+            )
+            break
     yield "data: [DONE]\n\n"
 
 
@@ -243,6 +300,32 @@ def _as_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ProgressTimeoutError):
         return HTTPException(status_code=504, detail=str(exc))
     return HTTPException(status_code=503, detail=str(exc))
+
+
+def _http_exception_response(exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
+def _request_messages(request_model) -> list[dict[str, str]]:
+    return [
+        {"role": message.role, "content": message.content}
+        for message in request_model.messages
+    ]
+
+
+def _sampling_kwargs(request_model) -> dict[str, float | int | None]:
+    return {
+        "temperature": request_model.temperature,
+        "top_k": request_model.top_k,
+        "top_p": request_model.top_p,
+        "repetition_penalty": request_model.repetition_penalty,
+        "rep_penalty_lookback": request_model.rep_penalty_lookback,
+        "max_tokens": request_model.max_tokens,
+    }
 
 
 def _response_id() -> str:

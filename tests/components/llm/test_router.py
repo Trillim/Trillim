@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 from fastapi.testclient import TestClient
 
 from trillim import _model_store
-from trillim.components.llm import ChatUsage
+from trillim.components.llm import ChatDoneEvent, ChatTokenEvent, ChatUsage
+from trillim.components.llm import _router as llm_router
+from trillim.components.llm._engine import EngineCrashedError, EngineProgressTimeoutError
 from trillim.components.llm.public import LLM
+from trillim.errors import AdmissionRejectedError, ProgressTimeoutError
 from trillim.server import Server
 from tests.components.llm.support import (
     FakeEngineFactory,
@@ -45,6 +50,17 @@ class LLMRouterTests(unittest.TestCase):
             _engine_factory=FakeEngineFactory(responses=responses or ["ok"]),
         )
         return Server(llm, allow_hot_swap=allow_hot_swap)
+
+    def _stream_request_model(self):
+        return SimpleNamespace(
+            messages=[SimpleNamespace(role="user", content="Say hi")],
+            temperature=None,
+            top_k=None,
+            top_p=None,
+            repetition_penalty=None,
+            rep_penalty_lookback=None,
+            max_tokens=None,
+        )
 
     def test_models_route_reports_truthful_model(self):
         with TestClient(self._make_server().app) as client:
@@ -141,6 +157,245 @@ class LLMRouterTests(unittest.TestCase):
         self.assertIn('"delta": {"role": "assistant"}', body)
         self.assertIn('"content": "h"', body)
         self.assertIn("data: [DONE]", body)
+
+    def test_stream_chat_response_skips_empty_token_events(self):
+        class _LLM:
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+        class _Session:
+            async def _stream_chat_prepared(self, _sampling):
+                yield ChatTokenEvent(text="")
+                yield ChatTokenEvent(text="ok")
+                yield ChatDoneEvent(text="ok", usage=ChatUsage(1, 1, 2, 0))
+
+        async def collect() -> list[str]:
+            return [
+                chunk
+                async for chunk in llm_router._stream_chat_response(
+                    _LLM(),
+                    _Session(),
+                    sampling="sampling",
+                    response_id="chatcmpl-test",
+                    created=123,
+                )
+            ]
+
+        chunks = asyncio.run(collect())
+        body = "".join(chunks)
+
+        self.assertIn('"delta": {"role": "assistant"}', body)
+        self.assertIn('"content": "ok"', body)
+        self.assertEqual(body.count('"content": "ok"'), 1)
+        self.assertIn("data: [DONE]", body)
+
+    def test_chat_completions_stream_rejects_busy_before_committing_sse(self):
+        server = self._make_server(responses=["hi"])
+        llm = server.components[0]
+
+        async def reject_admission():
+            raise AdmissionRejectedError("LLM is busy")
+
+        llm._admission.acquire = reject_admission
+
+        with TestClient(server.app, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Say hi"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["detail"], "LLM is busy")
+
+    def test_chat_stream_response_releases_admission_on_start_disconnect(self):
+        server = self._make_server(responses=["hi"])
+        llm = server.components[0]
+
+        async def run():
+            await llm.start()
+            response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            async def send(_message):
+                raise OSError("disconnect")
+
+            await response({"type": "http"}, receive, send)
+            self.assertEqual(llm._admission.active_count, 0)
+            await llm.stop()
+
+        asyncio.run(run())
+
+    def test_chat_stream_response_swallows_disconnect_while_sending_error_response(self):
+        class _LLM:
+            def open_session(self, _messages):
+                raise AdmissionRejectedError("LLM is busy")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            raise OSError("disconnect")
+
+        async def run() -> None:
+            response = llm_router._ChatStreamResponse(_LLM(), self._stream_request_model())
+            await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+
+    def test_chat_stream_response_recovers_from_progress_timeout(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        class _FailingSession:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def _stream_chat_prepared(self, _sampling):
+                if False:  # pragma: no cover
+                    yield None
+                raise EngineProgressTimeoutError("boom")
+
+        class _LLM:
+            def __init__(self) -> None:
+                self.recoveries = 0
+                self._lease = _Lease()
+                self._session = _FailingSession()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                self.recoveries += 1
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        request_model = self._stream_request_model()
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        async def run() -> None:
+            response = llm_router._ChatStreamResponse(llm, request_model)
+            with self.assertRaisesRegex(ProgressTimeoutError, "boom"):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages[0]["type"], "http.response.start")
+        self.assertIn(b'"delta": {"role": "assistant"}', messages[1]["body"])
+        self.assertEqual(llm._lease.release_count, 1)
+        self.assertTrue(llm._session.closed)
+        self.assertEqual(llm.recoveries, 1)
+
+    def test_chat_stream_response_recovers_from_engine_crash(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        class _FailingSession:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def _stream_chat_prepared(self, _sampling):
+                if False:  # pragma: no cover
+                    yield None
+                raise EngineCrashedError("boom")
+
+        class _LLM:
+            def __init__(self) -> None:
+                self.recoveries = 0
+                self._lease = _Lease()
+                self._session = _FailingSession()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                self.recoveries += 1
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        request_model = self._stream_request_model()
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        async def run() -> None:
+            response = llm_router._ChatStreamResponse(llm, request_model)
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages[0]["type"], "http.response.start")
+        self.assertIn(b'"delta": {"role": "assistant"}', messages[1]["body"])
+        self.assertEqual(llm._lease.release_count, 1)
+        self.assertTrue(llm._session.closed)
+        self.assertEqual(llm.recoveries, 1)
 
     def test_swap_route_is_only_registered_when_enabled(self):
         with TestClient(self._make_server(allow_hot_swap=False).app) as client:
