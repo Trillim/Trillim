@@ -1,0 +1,218 @@
+# Advanced SDK and Server Notes
+
+This page collects the deeper operational details behind Trillim's SDK and server surfaces. It is for users who want to make the most of the runtime.
+
+## Runtime Model
+
+`Runtime` is the supported synchronous facade over async-native components.
+
+What that means in practice:
+
+- `LLM`, `STT`, and `TTS` are async components internally
+- `Runtime` owns a background event loop and exposes blocking sync calls
+- component methods, async iterators, and session handles are all bridged through that runtime loop
+
+This is why sync control operations still behave cooperatively rather than magically interrupting work mid-step.
+
+## Truthful Runtime Metadata
+
+Trillim tries hard to keep runtime state truthful rather than convenient.
+
+For `LLM`:
+
+- `model_info()` is the authoritative runtime snapshot
+- `model_info()` reports the active model name, path, adapter path, trust setting, and active init-time worker options
+- `LLM.max_context_tokens` is only defined while a model is active
+- adapter identity is exposed separately through `adapter_path`; it is not folded into `model_info().name`
+
+If you are building dashboards, admin routes, or tooling, prefer `model_info()` over cached assumptions.
+
+## Session Handles
+
+`ChatSession` and `TTSSession` are live handles, not plain value objects.
+
+Important rules:
+
+- sessions are created by their owning service and are never caller-constructed
+- the public session types are abstract handles; concrete implementations stay private
+- sessions are single-consumer
+- explicit close and cancel behavior is part of the contract
+- `Runtime` is the supported sync context-manager surface for returned session handles
+
+### `ChatSession` States
+
+- `open`
+- `streaming`
+- `closed`
+- `exhausted`
+- `stale`
+- `failed`
+- `owner_stopped`
+
+Important implications:
+
+- a session becomes `stale` when an LLM swap actually begins handoff after preflight succeeds
+- a session becomes `exhausted` when its lifetime token quota is consumed
+- `close()` waits for active-turn cleanup before returning
+
+### `TTSSession` States
+
+- `running`
+- `paused`
+- `completed`
+- `cancelled`
+- `failed`
+- `owner_stopped`
+
+Important implications:
+
+- `pause()` applies at safe boundaries, not retroactively
+- `set_speed()` affects the next synthesis chunk and later chunks only
+- `collect()` and async iteration are mutually exclusive
+- `close()` and `cancel()` wait for cleanup before returning
+
+## Safe-Boundary Control Semantics
+
+Trillim uses cooperative control semantics rather than pretending work can be interrupted anywhere.
+
+Safe boundaries:
+
+- `LLM`: emitted token or stream chunk boundaries
+- `STT`: no caller-visible incremental control surface; work starts only after the full bounded upload is accepted
+- `TTS`: text-segment and emitted-audio boundaries
+
+This matters for cancellation, pause, resume, and speed changes.
+
+## Search Harness Contract
+
+The search harness is not just “LLM plus search results.” It has its own behavior model.
+
+Rules:
+
+- it looks for model-emitted `<search>...</search>` sentinels
+- search-detection turns are buffered until the harness knows whether a search sentinel was emitted
+- if search is used, only the final answer turn is streamed incrementally to the caller
+- if no search sentinel is emitted, the buffered answer is emitted only after that turn completes
+- search history may appear in session state as role `search`
+- before prompt rendering, `search` history entries are normalized into `system` messages prefixed with `Search results:`
+
+Operational limits:
+
+- total model turns per request: `3`
+- max search fetch rounds per request: `2`
+- supported providers: `ddgs`, `brave`
+- results per search: `5`
+- runtime search token budget is clamped to `max_context_tokens // 4`
+
+`brave` requires `SEARCH_API_KEY` in the environment.
+
+## Hot Swap Semantics
+
+Hot swap is designed to preserve correctness first.
+
+Important rules:
+
+- swap can change the base model, adapter, and search/runtime options together
+- replacement-model preflight and setup may happen while the current model is still serving
+- once swap handoff begins, existing chat sessions become stale
+- omitted or `null` init-time swap fields reset to Trillim defaults rather than inheriting the previous runtime's values
+- recovery swaps may be issued from `server_error`
+
+If you expose `/v1/models/swap`, design your callers around session invalidation and truthful post-swap introspection.
+
+## Adapter Overlay Rules
+
+LoRA adapter support is one of the places where the RFC details matter most.
+
+Important rules:
+
+- the base `model_dir` remains the source of required runtime artifacts such as weights and rope cache
+- adapter compatibility is validated through required `base_model_config_hash` metadata
+- adapter tokenizer and config metadata take precedence when an adapter is configured; base-model metadata is the fallback for missing values
+- runtime overlays are manifest-driven and materialize only the files Trillim actually needs
+- `qmodel.tensors`, `rope.cache`, and `qmodel.lora` are hardlinked into the overlay
+- if a hardlink cannot be created, startup or swap fails instead of copying those artifacts
+- `model_dir`, `lora_dir`, and the process temp directory must share a filesystem for LoRA overlays to work
+
+The practical takeaway is simple: keep the base model, adapter, and temp area on the same filesystem and treat adapter compatibility metadata as required, not advisory.
+
+## `trust_remote_code` Boundaries
+
+`trust_remote_code` is intentionally fail-closed.
+
+Rules:
+
+- Trillim will not load bundles that require remote code unless you opt in
+- when enabled with adapters, adapter files may override tokenizer or config Python modules in the runtime overlay
+- only top-level local `auto_map` entry points and their bounded sibling-module relative import closure are supported
+- package-scoped `auto_map` modules and package or parent relative imports are not supported
+
+The built-in CLI defaults to `trust_remote_code=False`.
+
+## Limits and Capacity
+
+The runtime avoids unbounded queues and unbounded retries by design.
+
+### LLM
+
+- request body cap: `2 MiB`
+- messages per request: `256`
+- pre-tokenization text cap per request: `1 MiB`
+- lifetime quota per chat session: `256k` tokens
+- max generated output per request: `8192` tokens
+- active generations: `1`
+- queue length: `0`
+
+### STT
+
+- upload cap: `64 MiB`
+- active jobs: `1`
+- queue length: `0`
+- transcription worker timeout: `180s`
+
+### TTS
+
+- input text cap: `1_000_000` chars
+- raw HTTP speech body cap: `6 MiB`
+- active jobs: `1`
+- queue length: `0`
+- hard text-segment cap: `512` chars
+- pending segment queue: `8`
+- emitted audio chunk queue: `8`
+
+### Custom Voices
+
+- max stored voices: `64`
+- max upload size per voice: `10 MiB`
+- total stored custom voice bytes: `100 MiB`
+- voice-state build timeout: `30s`
+
+## Progress Timeout Model
+
+Timeouts are progress-based by default.
+
+Rules:
+
+- `LLM`: the next token or output chunk must arrive within `5s`
+- `STT`: once transcription begins, the worker must complete within `180s`
+- `TTS`: the next emitted audio chunk must arrive within `15s`
+- custom voice registration must complete voice-state build within `30s`
+- non-progress heartbeats do not count
+- if progress stops, the worker is killed and the request fails
+
+This is why a timeout in Trillim often implies worker recovery, not just a raised error.
+
+## Choosing the Right Surface
+
+Use the main docs first:
+
+- [Python SDK](components.md) for normal integration work
+- [API Server](server.md) for routes and client-facing behavior
+
+Use this page when you need to reason about:
+
+- exact session invalidation and cleanup behavior
+- hot-swap edge cases
+- search orchestration behavior
+- LoRA overlay constraints
+- timeout, quota, and admission behavior
