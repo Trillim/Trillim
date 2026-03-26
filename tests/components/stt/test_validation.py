@@ -179,6 +179,12 @@ class STTValidationTests(unittest.TestCase):
                 content_length=None,
                 language=None,
             )
+        with self.assertRaisesRegex(InvalidRequestError, "content-type"):
+            validate_http_request(
+                content_type="audio/",
+                content_length=None,
+                language=None,
+            )
         with self.assertRaisesRegex(InvalidRequestError, "invalid content-length"):
             validate_http_request(
                 content_type="audio/wav",

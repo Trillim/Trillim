@@ -335,6 +335,12 @@ def _stream_assistant_turn(runtime: Runtime, session, messages_snapshot) -> obje
         finally:
             session.close()
         return runtime.llm.open_session(messages_snapshot)
+    except Exception:
+        try:
+            session.close()
+        except Exception:
+            pass
+        raise
     finally:
         try:
             stream.close()

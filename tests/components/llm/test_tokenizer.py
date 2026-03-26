@@ -31,3 +31,15 @@ class TokenizerLoaderTests(unittest.TestCase):
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=object()):
             with self.assertRaisesRegex(ModelValidationError, "encode/decode"):
                 load_tokenizer(Path("/tmp/model"), trust_remote_code=False)
+
+    def test_load_tokenizer_rejects_non_callable_encode_decode_attributes(self):
+        class _BadTokenizer:
+            encode = 1
+            decode = 2
+
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=_BadTokenizer(),
+        ):
+            with self.assertRaisesRegex(ModelValidationError, "encode/decode"):
+                load_tokenizer(Path("/tmp/model"), trust_remote_code=False)

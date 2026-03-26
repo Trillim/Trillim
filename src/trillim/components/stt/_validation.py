@@ -60,7 +60,10 @@ def validate_audio_bytes(audio_bytes: bytes) -> bytes:
 
 def validate_source_file(path: str | Path) -> Path:
     """Perform cheap preliminary validation on a caller-owned source path."""
-    if not str(path):
+    if isinstance(path, str):
+        if not path:
+            raise InvalidRequestError("path is required")
+    elif getattr(path, "_raw_paths", None) == [""]:
         raise InvalidRequestError("path is required")
     return Path(path).expanduser()
 
@@ -155,7 +158,9 @@ def _normalize_content_type(content_type: str | None) -> str:
             "content-type must be audio/* or application/octet-stream"
         )
     value = content_type.split(";", 1)[0].strip().lower()
-    if value == "application/octet-stream" or value.startswith("audio/"):
+    if value == "application/octet-stream":
+        return value
+    if value.startswith("audio/") and value != "audio/":
         return value
     raise InvalidRequestError(
         "content-type must be audio/* or application/octet-stream"

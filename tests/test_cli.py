@@ -455,6 +455,17 @@ class CLITests(unittest.TestCase):
             cli._stream_assistant_turn(runtime, session, session.messages)
         self.assertIn("done", output.getvalue())
 
+    def test_stream_assistant_turn_closes_session_on_unexpected_stream_errors(self):
+        session = _FakeSession(stream=_FakeStream(next_exception=RuntimeError("boom")))
+        runtime = SimpleNamespace(
+            llm=SimpleNamespace(open_session=lambda messages: _FakeSession(messages=messages))
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            cli._stream_assistant_turn(runtime, session, session.messages)
+
+        self.assertEqual(session.close_calls, 1)
+
     def test_make_chat_key_bindings_uses_visual_editor_and_updates_buffer(self):
         bindings = cli._make_chat_key_bindings()
         buffer = SimpleNamespace(text="draft", cursor_position=0)

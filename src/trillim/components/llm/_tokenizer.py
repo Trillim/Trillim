@@ -22,7 +22,9 @@ def load_tokenizer(model_dir: Path, *, trust_remote_code: bool):
         raise ModelValidationError(
             f"Could not load tokenizer from {model_dir}"
         ) from exc
-    if not hasattr(tokenizer, "encode") or not hasattr(tokenizer, "decode"):
+    if not callable(getattr(tokenizer, "encode", None)) or not callable(
+        getattr(tokenizer, "decode", None)
+    ):
         raise ModelValidationError(
             f"Tokenizer loaded from {model_dir} is missing encode/decode methods"
         )

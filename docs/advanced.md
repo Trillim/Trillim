@@ -122,8 +122,6 @@ If you expose `/v1/models/swap`, design your callers around session invalidation
 
 ## Adapter Overlay Rules
 
-LoRA adapter support is one of the places where the RFC details matter most.
-
 Important rules:
 
 - the base `model_dir` remains the source of required runtime artifacts such as weights and rope cache

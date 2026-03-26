@@ -69,6 +69,12 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await tts.register_voice("custom-str", str(second_source)), "custom-str")
         await tts.stop()
 
+    async def test_register_voice_rejects_empty_path_objects(self):
+        tts = await self._start_tts()
+        with self.assertRaisesRegex(InvalidRequestError, "path is required"):
+            await tts.register_voice("custom", Path(""))
+        await tts.stop()
+
     async def test_register_voice_rejects_duplicate_names(self):
         tts = await self._start_tts()
         source = Path(self._temp_dir.name) / "voice.wav"

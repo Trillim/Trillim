@@ -84,6 +84,11 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "hello")
         self.assertFalse(seen_path["path"].exists())
 
+    async def test_transcribe_file_rejects_empty_path_objects(self):
+        stt = await self._start_stt()
+        with self.assertRaisesRegex(InvalidRequestError, "path is required"):
+            await stt.transcribe_file(Path(""))
+
     async def test_transcribe_file_rejects_changed_source_and_cleans_up(self):
         stt = await self._start_stt()
         source = Path(self._temp_dir.name) / "source.wav"
