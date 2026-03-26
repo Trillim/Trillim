@@ -67,6 +67,31 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         await llm.stop()
         self.assertEqual(llm.model_info().state.value, "unavailable")
 
+    async def test_cancel_active_sessions_attempts_all_sessions_even_if_one_close_fails(self):
+        class _Session:
+            def __init__(self, exc: Exception | None = None) -> None:
+                self.exc = exc
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                if self.exc is not None:
+                    raise self.exc
+
+        first = _Session(RuntimeError("first boom"))
+        second = _Session()
+        llm = type("_LLM", (), {"_sessions": [first, second]})()
+
+        with self.assertRaisesRegex(RuntimeError, "first boom"):
+            await LLM._cancel_active_sessions(llm)
+
+        self.assertEqual(first.close_calls, 1)
+        self.assertEqual(
+            second.close_calls,
+            1,
+            "swap/session cancellation should still reach later sessions after one close fails",
+        )
+
     def test_chat_session_is_runtime_public(self):
         self.assertTrue(hasattr(llm_exports, "ChatSession"))
         self.assertTrue(hasattr(llm_public_exports, "ChatSession"))

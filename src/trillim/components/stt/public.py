@@ -102,6 +102,7 @@ class STT(Component):
         async with await self._admission.acquire():
             async with self._track_active_task():
                 owned_audio = None
+                primary_error: BaseException | None = None
                 try:
                     owned_audio = await normalize_audio()
                     validate_owned_audio_input(owned_audio)
@@ -109,9 +110,16 @@ class STT(Component):
                         owned_audio.path,
                         language=language,
                     )
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
                 finally:
                     if owned_audio is not None:
-                        unlink_if_exists(owned_audio.path)
+                        try:
+                            unlink_if_exists(owned_audio.path)
+                        except Exception:
+                            if primary_error is None:
+                                raise
 
     def _require_started(self) -> None:
         if not self._started:

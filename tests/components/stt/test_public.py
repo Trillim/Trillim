@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from trillim.components.stt._config import OwnedAudioInput
 from trillim.components.stt._config import SourceFileSnapshot
 from trillim.components.stt.public import STT
 from trillim.errors import AdmissionRejectedError, InvalidRequestError, ProgressTimeoutError
@@ -195,6 +196,42 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(ProgressTimeoutError, "timed out"):
                 await stt.transcribe_bytes(b"abc")
+
+    async def test_cleanup_failure_does_not_mask_transcription_error(self):
+        stt = await self._start_stt()
+        owned = OwnedAudioInput(path=Path(self._temp_dir.name) / "owned.audio", size_bytes=3)
+        owned.path.write_bytes(b"abc")
+
+        async def normalize_audio():
+            return owned
+
+        with patch(
+            "trillim.components.stt.public.transcribe_owned_audio_file",
+            side_effect=RuntimeError("worker boom"),
+        ), patch(
+            "trillim.components.stt.public.unlink_if_exists",
+            side_effect=RuntimeError("cleanup boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "worker boom"):
+                await stt._run_transcription(normalize_audio, language=None)
+
+    async def test_cleanup_failure_after_successful_transcription_surfaces(self):
+        stt = await self._start_stt()
+        owned = OwnedAudioInput(path=Path(self._temp_dir.name) / "owned.audio", size_bytes=3)
+        owned.path.write_bytes(b"abc")
+
+        async def normalize_audio():
+            return owned
+
+        with patch(
+            "trillim.components.stt.public.transcribe_owned_audio_file",
+            return_value="hello",
+        ), patch(
+            "trillim.components.stt.public.unlink_if_exists",
+            side_effect=RuntimeError("cleanup boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup boom"):
+                await stt._run_transcription(normalize_audio, language=None)
 
     async def test_transcribe_requires_started_component(self):
         stt = STT()

@@ -79,7 +79,10 @@ class _ChatStreamResponse(Response):
                     disconnect_recovery_needed = True
                 try:
                     if session is not None:
-                        await session.close()
+                        try:
+                            await session.close()
+                        except Exception:
+                            pass
                 finally:
                     task_group.cancel_scope.cancel()
 
@@ -227,7 +230,10 @@ class _ChatStreamResponse(Response):
             if admission_lease is not None:
                 await admission_lease.release()
             if session is not None:
-                await session.close()
+                try:
+                    await session.close()
+                except Exception:
+                    pass
 
 
 def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:

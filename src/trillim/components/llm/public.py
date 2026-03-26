@@ -572,8 +572,15 @@ class LLM(Component):
         await _wait_for_idle_or_cancel(self)
 
     async def _cancel_active_sessions(self) -> None:
+        first_error: Exception | None = None
         for session in list(self._sessions):
-            await session.close()
+            try:
+                await session.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     async def _recover_from_engine_failure(self) -> None:
         await restart_model(self)

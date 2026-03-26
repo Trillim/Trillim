@@ -587,6 +587,39 @@ class CLITests(unittest.TestCase):
         self.assertIn("Adapter: Local/adapter", output.getvalue())
         self.assertIn("Conversation reset.", output.getvalue())
 
+    def test_run_chat_reset_reopens_session_even_if_old_session_close_fails(self):
+        first = _FakeSession()
+        second = _FakeSession()
+
+        def failing_close() -> None:
+            first.close_calls += 1
+            raise RuntimeError("close boom")
+
+        first.close = failing_close
+        fake_runtime = _FakeRuntime(object())
+        fake_runtime.llm.open_session = unittest.mock.Mock(side_effect=[first, second])
+
+        with patch("trillim.cli._require_remote_code_opt_in"), patch(
+            "trillim.cli.Runtime",
+            return_value=fake_runtime,
+        ), patch(
+            "trillim.cli.LLM",
+            return_value=object(),
+        ), patch(
+            "trillim.cli._make_chat_key_bindings",
+            return_value="bindings",
+        ), patch(
+            "trillim.cli.better_input",
+            side_effect=["/new", "q"],
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cli._run_chat("Trillim/model", None)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(fake_runtime.llm.open_session.call_count, 2)
+        self.assertIn("Conversation reset.", output.getvalue())
+
     def test_run_chat_ignores_blank_prompt(self):
         fake_runtime = _FakeRuntime(object())
         with patch("trillim.cli._require_remote_code_opt_in"), patch(

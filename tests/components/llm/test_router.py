@@ -361,6 +361,83 @@ class LLMRouterTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_chat_stream_response_swallows_session_close_failures_during_disconnect_recovery(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        started = asyncio.Event()
+
+        class _Session:
+            def __init__(self) -> None:
+                self._active_task = None
+
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                self._active_task = asyncio.current_task()
+                started.set()
+                await asyncio.Future()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                raise RuntimeError("close boom")
+
+            async def _consume_started_stream(self, _first_event, _full_text):
+                if False:  # pragma: no cover
+                    yield None
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+                self.recoveries = 0
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                self.recoveries += 1
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        messages = []
+
+        async def receive():
+            await started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        async def run() -> None:
+            response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+            await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages, [])
+        self.assertEqual(llm._lease.release_count, 1)
+        self.assertEqual(llm.recoveries, 1)
+
     def test_chat_stream_response_skips_headers_after_disconnect_before_commit(self):
         class _Lease:
             def __init__(self) -> None:

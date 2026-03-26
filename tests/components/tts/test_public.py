@@ -106,6 +106,25 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             await tts.register_voice("custom", str(source))
         await tts.stop()
 
+    async def test_register_voice_does_not_report_failure_after_publish_when_upload_cleanup_fails(self):
+        tts = await self._start_tts()
+        original_unlink = Path.unlink
+
+        def fail_owned_upload_cleanup(path: Path, *args, **kwargs):
+            if path.parent == self.spool_dir and path.name.startswith("tts-") and path.suffix == ".audio":
+                raise PermissionError("cleanup boom")
+            return original_unlink(path, *args, **kwargs)
+
+        try:
+            with patch(
+                "pathlib.Path.unlink",
+                autospec=True,
+                side_effect=fail_owned_upload_cleanup,
+            ):
+                self.assertEqual(await tts.register_voice("custom", b"voice"), "custom")
+        finally:
+            await tts.stop()
+
     async def test_speak_collect_and_synthesize_wav(self):
         tts = await self._start_tts()
         session = await tts.speak("hello world")
@@ -203,6 +222,92 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
                     speed=1.0,
                 )
         self.assertFalse(cleanup_path.exists())
+        await tts.stop()
+
+    async def test_failed_reserved_start_does_not_mask_admission_error_with_worker_close_failure(self):
+        tts = await self._start_tts()
+        reservation = await tts._reserve_session_slot()
+        await tts._release_reserved_slot(reservation)
+        cleanup_path = self.spool_dir / "voice.state"
+        cleanup_path.parent.mkdir(parents=True, exist_ok=True)
+        cleanup_path.write_bytes(b"voice")
+        resolved_voice = SimpleNamespace(
+            kind="custom",
+            reference="voice-ref",
+            cleanup_path=cleanup_path,
+        )
+
+        async def resolve_for_session(_voice: str, *, spool_dir: Path):
+            self.assertEqual(spool_dir, self.spool_dir)
+            return resolved_voice
+
+        class _FailingWorker:
+            async def close(self) -> None:
+                raise RuntimeError("close boom")
+
+        tts._session_worker_factory = lambda **_kwargs: _FailingWorker()
+        with patch.object(
+            tts._voice_store,
+            "resolve_for_session",
+            side_effect=resolve_for_session,
+        ):
+            with self.assertRaisesRegex(
+                AdmissionRejectedError,
+                "reservation is no longer active",
+            ):
+                await tts._start_reserved_session(
+                    reservation,
+                    "hello world",
+                    voice="custom",
+                    speed=1.0,
+                )
+        self.assertFalse(cleanup_path.exists())
+        await tts.stop()
+
+    async def test_failed_reserved_start_does_not_mask_admission_error_with_voice_cleanup_failure(self):
+        tts = await self._start_tts()
+        reservation = await tts._reserve_session_slot()
+        await tts._release_reserved_slot(reservation)
+        cleanup_path = self.spool_dir / "voice.state"
+        cleanup_path.parent.mkdir(parents=True, exist_ok=True)
+        cleanup_path.write_bytes(b"voice")
+        resolved_voice = SimpleNamespace(
+            kind="custom",
+            reference="voice-ref",
+            cleanup_path=cleanup_path,
+        )
+
+        async def resolve_for_session(_voice: str, *, spool_dir: Path):
+            self.assertEqual(spool_dir, self.spool_dir)
+            return resolved_voice
+
+        original_unlink = Path.unlink
+
+        def fail_voice_cleanup(path: Path, *args, **kwargs):
+            if path == cleanup_path:
+                raise PermissionError("cleanup boom")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(
+            tts._voice_store,
+            "resolve_for_session",
+            side_effect=resolve_for_session,
+        ), patch(
+            "pathlib.Path.unlink",
+            autospec=True,
+            side_effect=fail_voice_cleanup,
+        ):
+            with self.assertRaisesRegex(
+                AdmissionRejectedError,
+                "reservation is no longer active",
+            ):
+                await tts._start_reserved_session(
+                    reservation,
+                    "hello world",
+                    voice="custom",
+                    speed=1.0,
+                )
+        self.assertTrue(cleanup_path.exists())
         await tts.stop()
 
     async def test_stop_clears_reserved_slot(self):

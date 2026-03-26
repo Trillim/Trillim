@@ -427,7 +427,10 @@ def _run_chat(
                 if stripped == "q":
                     break
                 if stripped == "/new":
-                    session.close()
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
                     session = runtime.llm.open_session()
                     print("Conversation reset.")
                     continue

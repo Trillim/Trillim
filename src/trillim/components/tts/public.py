@@ -165,7 +165,10 @@ class TTS(Component):
                 build_voice_state=self._build_voice_state,
             )
         finally:
-            owned_upload.path.unlink(missing_ok=True)
+            try:
+                owned_upload.path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     async def delete_voice(self, name: str) -> str:
         """Delete one managed custom voice."""
@@ -329,8 +332,14 @@ class TTS(Component):
         finally:
             if not started:
                 if resolved_voice.cleanup_path is not None:
-                    resolved_voice.cleanup_path.unlink(missing_ok=True)
-                await session_worker.close()
+                    try:
+                        resolved_voice.cleanup_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                try:
+                    await session_worker.close()
+                except Exception:
+                    pass
 
     async def _register_voice_http_request(self, request) -> str:
         """Handle the raw-body HTTP voice-upload request."""
