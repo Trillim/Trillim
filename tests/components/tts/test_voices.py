@@ -140,6 +140,10 @@ class TTSVoiceStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(copied.path.read_bytes(), b"hello")
         copied.path.unlink(missing_ok=True)
 
+    async def test_copy_source_audio_rejects_empty_string_paths_before_touching_cwd(self):
+        with self.assertRaisesRegex(InvalidRequestError, "path is required"):
+            await copy_source_audio("", spool_dir=self.spool_dir)
+
     async def test_tampered_manifest_disables_custom_voice_functionality(self):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "manifest.json").write_text(

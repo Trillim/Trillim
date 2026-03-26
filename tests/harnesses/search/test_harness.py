@@ -210,3 +210,31 @@ class SearchHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.messages[2]["role"], "search")
         self.assertEqual(session.messages[2]["content"], "curated cat results")
         await llm.stop()
+
+    async def test_search_harness_emits_only_final_event_for_empty_buffered_text(self):
+        llm = self._make_llm(responses=[""])
+        await llm.start()
+
+        async with llm.open_session([{"role": "user", "content": "Say nothing"}]) as session:
+            events = [event async for event in session.stream_chat(max_tokens=8)]
+
+        self.assertEqual([event.type for event in events], ["final_text", "done"])
+        self.assertEqual(events[-1].text, "")
+        await llm.stop()
+
+    async def test_search_harness_streams_final_generation_after_max_iterations(self):
+        llm = self._make_llm(
+            responses=["<search>cats</search>", "<search>dogs</search>", "done"],
+        )
+        await llm.start()
+        llm._harness._search = _SuccessfulSearch("curated search results")
+
+        async with llm.open_session([{"role": "user", "content": "Search twice"}]) as session:
+            events = [event async for event in session.stream_chat(max_tokens=8)]
+
+        self.assertEqual(session.messages[1]["content"], "<search>cats</search>")
+        self.assertEqual(session.messages[2]["role"], "search")
+        self.assertEqual(session.messages[3]["content"], "<search>dogs</search>")
+        self.assertEqual(session.messages[-1]["content"], "done")
+        self.assertEqual(events[-1].text, "done")
+        await llm.stop()

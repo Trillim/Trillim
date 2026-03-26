@@ -12,9 +12,12 @@ from unittest.mock import patch
 
 from trillim.harnesses.search.fetch import (
     _fetch_and_extract,
+    _open_request,
     _SafeRedirectHandler,
+    _truncate_at_sentence,
     build_search_context,
     is_safe_url,
+    resolves_to_safe_addresses,
     truncate_to_token_budget,
 )
 from trillim.harnesses.search.provider import SearchError, SearchResult
@@ -38,7 +41,9 @@ class SearchFetchTests(unittest.TestCase):
     def test_is_safe_url_rejects_local_targets(self):
         self.assertFalse(is_safe_url("file:///tmp/x"))
         self.assertFalse(is_safe_url("http://localhost/test"))
+        self.assertFalse(is_safe_url("https://sub.localhost/test"))
         self.assertFalse(is_safe_url("https://127.0.0.1/test"))
+        self.assertFalse(is_safe_url("https:///missing-host"))
         self.assertTrue(is_safe_url("https://example.com/test"))
 
     def test_build_search_context_limits_results_and_uses_fetch_bodies(self):
@@ -66,6 +71,8 @@ class SearchFetchTests(unittest.TestCase):
         self.assertIn("body from https://example.com/0", content)
 
     def test_build_search_context_raises_when_no_fetchable_results_exist(self):
+        with self.assertRaisesRegex(SearchError, "search returned no results"):
+            build_search_context("cats", [], token_budget=40)
         with self.assertRaisesRegex(SearchError, "no relevant fetchable results"):
             build_search_context(
                 "cats",
@@ -74,11 +81,124 @@ class SearchFetchTests(unittest.TestCase):
                 fetcher=lambda *_args, **_kwargs: None,
             )
 
+    def test_build_search_context_falls_back_to_snippets_and_skips_empty_truncations(self):
+        result = SearchResult(title="", url="https://example.com", snippet="snippet body")
+
+        content = build_search_context(
+            "cats",
+            [result],
+            token_budget=20,
+            fetcher=lambda *_args, **_kwargs: None,
+        )
+        self.assertIn("[1] https://example.com", content)
+        self.assertIn("snippet body", content)
+
+        with patch(
+            "trillim.harnesses.search.fetch.truncate_to_token_budget",
+            return_value="",
+        ):
+            with self.assertRaisesRegex(SearchError, "no relevant fetchable results"):
+                build_search_context(
+                    "cats",
+                    [SearchResult(title="Title", url="https://example.com", snippet="snippet")],
+                    token_budget=8,
+                    fetcher=lambda *_args, **_kwargs: "body",
+                )
+
+        content = build_search_context(
+            "cats",
+            [
+                SearchResult(title="Skip", url="https://example.com/skip", snippet=""),
+                SearchResult(title="Keep", url="https://example.com/keep", snippet="kept snippet"),
+            ],
+            token_budget=12,
+            fetcher=lambda url, **_kwargs: None if url.endswith("/skip") else "",
+        )
+        self.assertIn("[1] Keep", content)
+
+    def test_build_search_context_skips_individual_fetch_failures_when_other_results_work(self):
+        results = [
+            SearchResult(title="Broken", url="https://example.com/bad", snippet=""),
+            SearchResult(title="Working", url="https://example.com/good", snippet="good snippet"),
+        ]
+
+        def fetcher(url: str, *, timeout: float, max_bytes: int) -> str:
+            del timeout, max_bytes
+            if url.endswith("/bad"):
+                raise SearchError("upstream timeout")
+            return "good body"
+
+        content = build_search_context(
+            "cats",
+            results,
+            token_budget=20,
+            fetcher=fetcher,
+        )
+
+        self.assertIn("[1] Working", content)
+        self.assertIn("good body", content)
+        self.assertNotIn("Broken", content)
+
     def test_truncate_to_token_budget_uses_rough_character_budget(self):
         text = "cats " * 100
         truncated = truncate_to_token_budget(text, "cats", token_budget=8)
 
         self.assertLessEqual(len(truncated), 32)
+
+    def test_resolves_to_safe_addresses_and_truncation_helpers_cover_edge_cases(self):
+        self.assertFalse(resolves_to_safe_addresses("https:///missing-host"))
+        with patch(
+            "trillim.harnesses.search.fetch.socket.getaddrinfo",
+            side_effect=OSError("boom"),
+        ):
+            self.assertFalse(resolves_to_safe_addresses("https://example.com"))
+        with patch(
+            "trillim.harnesses.search.fetch.socket.getaddrinfo",
+            return_value=[],
+        ):
+            self.assertFalse(resolves_to_safe_addresses("https://example.com"))
+        with patch(
+            "trillim.harnesses.search.fetch.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("bad-ip", 443))],
+        ):
+            self.assertFalse(resolves_to_safe_addresses("https://example.com"))
+        with patch(
+            "trillim.harnesses.search.fetch.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+        ):
+            self.assertTrue(resolves_to_safe_addresses("https://example.com"))
+        with patch(
+            "trillim.harnesses.search.fetch.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 4443))],
+        ):
+            self.assertTrue(resolves_to_safe_addresses("https://example.com:4443"))
+
+        self.assertEqual(truncate_to_token_budget(" \n\n ", "cats", token_budget=4), "")
+        self.assertEqual(
+            truncate_to_token_budget("Only cats matter.", "cats", token_budget=8),
+            "Only cats matter.",
+        )
+        selected = truncate_to_token_budget(
+            "dogs only\n\ncats are great\n\ncats and dogs together",
+            "cats dogs",
+            token_budget=8,
+        )
+        self.assertIn("cats and dogs together", selected)
+        self.assertEqual(
+            truncate_to_token_budget(
+                "short pick\n\n" + ("z" * 120),
+                "short",
+                token_budget=4,
+            ),
+            "short pick",
+        )
+        self.assertEqual(
+            truncate_to_token_budget("x" * 200, "cats", token_budget=2),
+            "x" * 8,
+        )
+
+        self.assertEqual(_truncate_at_sentence("Hello. Goodbye.", 7), "Hello.")
+        self.assertEqual(_truncate_at_sentence("abcdef", 3), "abc")
 
     def test_fetch_and_extract_reads_html_and_uses_trafilatura(self):
         fake_module = types.SimpleNamespace(
@@ -175,3 +295,33 @@ class SearchFetchTests(unittest.TestCase):
                     {"Location": "https://redirected.example"},
                     "https://redirected.example",
                 )
+
+    def test_safe_redirect_handler_and_open_request_allow_safe_paths(self):
+        handler = _SafeRedirectHandler()
+        request = urllib.request.Request("https://example.com/start")
+
+        with patch(
+            "trillim.harnesses.search.fetch.resolves_to_safe_addresses",
+            return_value=True,
+        ), patch(
+            "urllib.request.HTTPRedirectHandler.redirect_request",
+            return_value="redirected",
+        ) as redirect_request:
+            result = handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {"Location": "/next"},
+                "/next",
+            )
+
+        self.assertEqual(result, "redirected")
+        redirect_request.assert_called_once()
+
+        opener = types.SimpleNamespace(open=lambda request, timeout: (request.full_url, timeout))
+        with patch("urllib.request.build_opener", return_value=opener) as build_opener:
+            opened = _open_request(urllib.request.Request("https://example.com"), timeout=1.5)
+
+        self.assertEqual(opened, ("https://example.com", 1.5))
+        self.assertTrue(build_opener.called)

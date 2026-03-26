@@ -2,11 +2,13 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 from trillim.components import Component
+from trillim.errors import ComponentLifecycleError
 from trillim.server import Server
 
 
@@ -41,6 +43,12 @@ class _BrokenStartComponent(_RouteComponent):
         raise RuntimeError("broken start")
 
 
+class _BrokenStopComponent(_RouteComponent):
+    async def stop(self) -> None:
+        self.calls.append(f"{self.component_name}.stop")
+        raise RuntimeError("broken stop")
+
+
 class _HotSwapAwareComponent(_RouteComponent):
     def __init__(self, calls: list[str], name: str) -> None:
         super().__init__(calls, name)
@@ -57,6 +65,15 @@ class _ModelInfoComponent(_RouteComponent):
 
     def model_info(self):
         return SimpleNamespace(state=self._state)
+
+
+class _EnumStateComponent(_RouteComponent):
+    def __init__(self, calls: list[str], name: str, *, state: str) -> None:
+        super().__init__(calls, name)
+        self._state = state
+
+    def model_info(self):
+        return SimpleNamespace(state=SimpleNamespace(value=self._state))
 
 
 class ServerTests(unittest.TestCase):
@@ -125,3 +142,47 @@ class ServerTests(unittest.TestCase):
 
         self.assertTrue(llm_component.enabled)
         self.assertFalse(other_component.enabled)
+
+    def test_server_healthz_uses_state_value_objects(self):
+        calls: list[str] = []
+        server = Server(_EnumStateComponent(calls, "llm", state="swapping"))
+
+        with TestClient(server.app) as client:
+            response = client.get("/healthz")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {"status": "degraded", "components": {"llm": {"state": "swapping"}}},
+        )
+
+    def test_server_exposes_components_and_run_delegates_to_uvicorn(self):
+        calls: list[str] = []
+        component = _RouteComponent(calls, "one")
+        server = Server(component)
+
+        self.assertEqual(server.components, (component,))
+        with patch("trillim.server.uvicorn.run") as run:
+            server.run(host="0.0.0.0", port=9000, log_level="debug")
+
+        run.assert_called_once_with(server.app, host="0.0.0.0", port=9000, log_level="debug")
+
+    def test_server_raises_component_lifecycle_error_when_shutdown_fails(self):
+        calls: list[str] = []
+        server = Server(_RouteComponent(calls, "ok"), _BrokenStopComponent(calls, "bad"))
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "Component shutdown failed"):
+            with TestClient(server.app):
+                pass
+
+        self.assertEqual(calls, ["ok.start", "bad.start", "bad.stop", "ok.stop"])
+
+    def test_server_startup_cleanup_swallows_shutdown_errors(self):
+        calls: list[str] = []
+        server = Server(_BrokenStopComponent(calls, "ok"), _BrokenStartComponent(calls, "bad"))
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "Component startup failed"):
+            with TestClient(server.app):
+                pass
+
+        self.assertEqual(calls, ["ok.start", "bad.start", "ok.stop"])

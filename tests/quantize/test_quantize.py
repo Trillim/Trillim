@@ -5,10 +5,13 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import struct
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +20,7 @@ from trillim._bundle_metadata import (
     compute_base_model_config_hash,
 )
 from trillim.quantize import quantize
+from trillim.quantize import _config as quantize_config
 from trillim.quantize import _entrypoint as entrypoint
 from trillim.quantize import _manifest as manifest
 from trillim.quantize import _output as output
@@ -285,6 +289,58 @@ def _write_adapter(
         },
     )
     return adapter_dir
+
+
+def _write_config_only_model(
+    root: Path,
+    *,
+    name: str = "config-only",
+    payload: dict[str, object] | None = None,
+) -> Path:
+    model_dir = root / name
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            payload
+            or {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 130,
+                "intermediate_size": 129,
+                "num_attention_heads": 5,
+                "num_hidden_layers": 2,
+                "vocab_size": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return model_dir
+
+
+def _write_remote_code_model(
+    root: Path,
+    *,
+    name: str,
+    config_payload: dict[str, object] | None,
+    tokenizer_payload: dict[str, object] | None = None,
+    files: dict[str, str],
+) -> Path:
+    model_dir = root / name
+    model_dir.mkdir()
+    if config_payload is not None:
+        (model_dir / "config.json").write_text(
+            json.dumps(config_payload),
+            encoding="utf-8",
+        )
+    if tokenizer_payload is not None:
+        (model_dir / "tokenizer_config.json").write_text(
+            json.dumps(tokenizer_payload),
+            encoding="utf-8",
+        )
+    for relative_path, content in files.items():
+        path = model_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return model_dir
 
 
 def _dtype_size(dtype: str) -> int:
@@ -814,6 +870,1214 @@ class QuantizeTests(unittest.TestCase):
             managed_model.mkdir(parents=True)
             with self.assertRaisesRegex(ValueError, "must not be inside"):
                 quantize(managed_model)
+
+
+class QuantizeInternalTests(unittest.TestCase):
+    def test_quantize_config_helpers_cover_defaults_aliases_and_parsing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_config_only_model(root)
+
+            config = entrypoint.load_model_config(model_dir)
+
+            self.assertEqual(config.hidden_dim, 256)
+            self.assertEqual(config.intermediate_dim, 256)
+            self.assertEqual(config.hidden_dim_orig, 130)
+            self.assertEqual(config.intermediate_dim_orig, 129)
+            self.assertEqual(config.num_kv_heads, 5)
+            self.assertEqual(config.head_dim, 26)
+            self.assertEqual(config.max_position_embeddings, 4096)
+            self.assertEqual(config.rope_theta, 10000.0)
+            self.assertEqual(config.partial_rotary_factor, 1.0)
+            self.assertFalse(config.tie_word_embeddings)
+            self.assertEqual(config.source_model, "")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported architecture"):
+                quantize_config._resolve_arch_info({"architectures": ["UnknownForCausalLM"]})
+
+            self.assertEqual(quantize_config._align_to_128(129), 256)
+            self.assertEqual(quantize_config._resolve_activation({}), "silu")
+            self.assertEqual(
+                quantize_config._resolve_activation({"hidden_act": "ReLU2"}),
+                "relu_squared",
+            )
+            self.assertEqual(
+                quantize_config._resolve_rope_theta({"rope_parameters": {"rope_theta": 777.0}}),
+                777.0,
+            )
+            self.assertEqual(
+                quantize_config._resolve_partial_rotary_factor(
+                    {"rope_parameters": {"partial_rotary_factor": 0.25}}
+                ),
+                0.25,
+            )
+            self.assertEqual(
+                quantize_config._resolve_partial_rotary_factor({"partial_rotary_factor": 0.5}),
+                0.5,
+            )
+            self.assertFalse(quantize_config._resolve_tied_embeddings({}, None))
+            self.assertEqual(
+                quantize_config.layer_index_for_key(
+                    "model.layers.12.mlp.gate_proj.weight",
+                    config.arch_info,
+                ),
+                12,
+            )
+            self.assertIsNone(
+                quantize_config.layer_index_for_key(
+                    "model.embed_tokens.weight",
+                    config.arch_info,
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unsupported activation function"):
+                quantize_config._resolve_activation({"hidden_act": "gelu_fast"})
+            for invalid_value in (True, "nope", 0):
+                with self.subTest(invalid_value=invalid_value):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        quantize_config._require_positive_int(invalid_value, "bad")
+
+    def test_quantize_config_load_tensor_names_and_legacy_bitnet_variants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            index_dir = root / "index-model"
+            index_dir.mkdir()
+            (index_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "one.safetensors", "b": "two.safetensors"}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                quantize_config._load_tensor_names_if_available(index_dir),
+                ["a", "b"],
+            )
+
+            single_dir = root / "single-model"
+            single_dir.mkdir()
+            header = {
+                "__metadata__": {"format": "pt"},
+                "model.embed_tokens.weight": {
+                    "dtype": "F16",
+                    "shape": [2, 2],
+                    "data_offsets": [0, 8],
+                },
+                "lm_head.weight": {
+                    "dtype": "F16",
+                    "shape": [2, 2],
+                    "data_offsets": [8, 16],
+                },
+            }
+            encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+            (single_dir / "model.safetensors").write_bytes(
+                struct.pack("<Q", len(encoded)) + encoded + (b"\0" * 16)
+            )
+            self.assertEqual(
+                quantize_config._load_tensor_names_if_available(single_dir),
+                ["model.embed_tokens.weight", "lm_head.weight"],
+            )
+
+            invalid_index_dir = root / "invalid-index"
+            invalid_index_dir.mkdir()
+            (invalid_index_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": []}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(quantize_config._load_tensor_names_if_available(invalid_index_dir))
+            self.assertIsNone(quantize_config._load_tensor_names_if_available(root / "missing"))
+
+            bitnet_payload = {
+                "architectures": ["BitnetForCausalLM"],
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 4,
+                "vocab_size": 64,
+            }
+            bitnet_dir = _write_config_only_model(root, name="bitnet", payload=bitnet_payload)
+            _write_safetensors(
+                bitnet_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("F16", (4, 128)),
+                    "model.layers.0.self_attn.inner_attn_ln.weight": ("F16", (128,)),
+                    "model.layers.0.mlp.ffn_layernorm.weight": ("F16", (128,)),
+                    "model.norm.weight": ("F16", (128,)),
+                    "lm_head.weight": ("F16", (4, 128)),
+                },
+            )
+
+            config = entrypoint.load_model_config(bitnet_dir)
+
+            self.assertEqual(config.arch_name, "bitnet")
+            self.assertEqual(config.arch_info.component_order[1], "self_attn.inner_attn_ln")
+            self.assertEqual(config.arch_info.component_order[-2], "mlp.ffn_layernorm")
+
+            clean_bitnet_root = root / "bitnet-clean-root"
+            clean_bitnet_root.mkdir()
+            clean_bitnet_dir = _write_config_only_model(
+                clean_bitnet_root,
+                payload=bitnet_payload,
+            )
+            _write_safetensors(
+                clean_bitnet_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("F16", (4, 128)),
+                    "model.layers.0.self_attn.attn_sub_norm.weight": ("F16", (128,)),
+                    "model.layers.0.mlp.ffn_sub_norm.weight": ("F16", (128,)),
+                    "model.norm.weight": ("F16", (128,)),
+                    "lm_head.weight": ("F16", (4, 128)),
+                },
+            )
+            clean_bitnet_config = entrypoint.load_model_config(clean_bitnet_dir)
+            self.assertEqual(clean_bitnet_config.arch_info.component_order[1], "self_attn.attn_sub_norm")
+            self.assertEqual(clean_bitnet_config.arch_info.component_order[-2], "mlp.ffn_sub_norm")
+
+            old_attn_root = root / "bitnet-old-attn-root"
+            old_attn_root.mkdir()
+            old_attn_dir = _write_config_only_model(old_attn_root, payload=bitnet_payload)
+            _write_safetensors(
+                old_attn_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("F16", (4, 128)),
+                    "model.layers.0.self_attn.inner_attn_ln.weight": ("F16", (128,)),
+                    "model.layers.0.mlp.ffn_sub_norm.weight": ("F16", (128,)),
+                    "model.norm.weight": ("F16", (128,)),
+                    "lm_head.weight": ("F16", (4, 128)),
+                },
+            )
+            old_attn_config = entrypoint.load_model_config(old_attn_dir)
+            self.assertEqual(old_attn_config.arch_info.component_order[1], "self_attn.inner_attn_ln")
+            self.assertEqual(old_attn_config.arch_info.component_order[-2], "mlp.ffn_sub_norm")
+
+            old_ffn_root = root / "bitnet-old-ffn-root"
+            old_ffn_root.mkdir()
+            old_ffn_dir = _write_config_only_model(old_ffn_root, payload=bitnet_payload)
+            _write_safetensors(
+                old_ffn_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("F16", (4, 128)),
+                    "model.layers.0.self_attn.attn_sub_norm.weight": ("F16", (128,)),
+                    "model.layers.0.mlp.ffn_layernorm.weight": ("F16", (128,)),
+                    "model.norm.weight": ("F16", (128,)),
+                    "lm_head.weight": ("F16", (4, 128)),
+                },
+            )
+            old_ffn_config = entrypoint.load_model_config(old_ffn_dir)
+            self.assertEqual(old_ffn_config.arch_info.component_order[1], "self_attn.attn_sub_norm")
+            self.assertEqual(old_ffn_config.arch_info.component_order[-2], "mlp.ffn_layernorm")
+
+            with self.assertRaisesRegex(FileNotFoundError, "config.json"):
+                entrypoint.load_model_config(root / "missing-config")
+
+    def test_manifest_discovery_and_tensor_sorting_helpers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_llama_model(root, sharded=True)
+            config = entrypoint.load_model_config(model_dir)
+
+            shard_files, weight_map = manifest.get_sharded_files(model_dir)
+            self.assertEqual(len(shard_files), 2)
+            self.assertIn("model.layers.0.self_attn.q_proj.weight", weight_map)
+            self.assertEqual(
+                manifest.get_all_tensor_names(model_dir),
+                list(weight_map.keys()),
+            )
+            self.assertFalse(manifest.determine_language_model_only(model_dir, config))
+
+            meta = manifest.get_tensor_metadata(shard_files[0])
+            self.assertTrue(all("start" in item for item in meta))
+            header, data_start = manifest._get_header_and_offsets(shard_files[0])
+            self.assertIn("model.embed_tokens.weight", header)
+            self.assertGreater(data_start, 8)
+            self.assertEqual(manifest._safetensors_dtype_code("F16"), (manifest.DTYPE_F16, 2))
+            with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
+                manifest._safetensors_dtype_code("X9")
+
+            metadata_path = root / "metadata-only.safetensors"
+            metadata_header = {
+                "__metadata__": {"format": "pt"},
+                "visible.weight": {"dtype": "F16", "shape": [2, 2], "data_offsets": [0, 8]},
+            }
+            metadata_bytes = json.dumps(metadata_header, separators=(",", ":")).encode("utf-8")
+            metadata_path.write_bytes(
+                struct.pack("<Q", len(metadata_bytes)) + metadata_bytes + (b"\0" * 8)
+            )
+            self.assertEqual(
+                manifest.get_tensor_metadata(metadata_path),
+                [{"key": "visible.weight", "start": 0, "shape": [2, 2]}],
+            )
+
+            filtered = manifest._ordered_text_tensors(
+                [
+                    {"key": "model.layers.0.mlp.down_proj.bias", "shape": [250], "file": shard_files[1]},
+                    {"key": "model.embed_tokens.weight", "shape": [4, 250], "file": shard_files[0]},
+                    {"key": "lm_head.weight", "shape": [4, 250], "file": shard_files[1]},
+                    {"key": "model.norm.weight", "shape": [250], "file": shard_files[1]},
+                    {"key": "model.layers.0.self_attn.q_proj.weight", "shape": [250, 250], "file": shard_files[0]},
+                    {"key": "model.layers.0.self_attn.rotary_emb.inv_freq", "shape": [8], "file": shard_files[1]},
+                    {"key": "model.layers.0.self_attn.k_proj.weight_scale", "shape": [250], "file": shard_files[0]},
+                    {"key": "model.visual.patch_embed.proj.weight", "shape": [1], "file": shard_files[1]},
+                ],
+                config,
+                language_model_only=True,
+            )
+            self.assertEqual(
+                [str(item["key"]) for item in filtered],
+                [
+                    "model.embed_tokens.weight",
+                    "lm_head.weight",
+                    "model.norm.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.layers.0.mlp.down_proj.bias",
+                ],
+            )
+            self.assertTrue(
+                manifest._is_supported_text_tensor(
+                    "model.layers.0.self_attn.q_proj.weight",
+                    config,
+                )
+            )
+            self.assertTrue(
+                manifest._is_supported_text_tensor("lm_head.bias", config)
+            )
+            self.assertFalse(
+                manifest._is_supported_text_tensor("model.layers.0.unknown.weight", config)
+            )
+            self.assertTrue(
+                manifest._matches_component_key(
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "self_attn.q_proj",
+                )
+            )
+            self.assertTrue(
+                manifest._matches_component_key(
+                    "model.layers.0.input_layernorm.weight",
+                    "input_layernorm",
+                )
+            )
+            self.assertTrue(
+                manifest._matches_component_key(
+                    "model.layers.0.linear_attn.A_log",
+                    "linear_attn.A_log",
+                )
+            )
+            self.assertFalse(
+                manifest._matches_component_key(
+                    "model.layers.0.self_attn.A_log.weight",
+                    "linear_attn.A_log",
+                )
+            )
+            self.assertFalse(manifest._is_supported_text_tensor("model.unknown.weight", config))
+            self.assertEqual(
+                manifest._processing_sort_key("model.embed_tokens.weight", config),
+                (0, -1, -1, 0),
+            )
+            self.assertEqual(
+                manifest._processing_sort_key("model.unknown.weight", config),
+                (3, -1, -1, 0),
+            )
+            self.assertEqual(
+                manifest._processing_sort_key("model.layers.0.unknown.weight", config),
+                (2, 0, len(config.arch_info.component_order), 0),
+            )
+            self.assertTrue(
+                manifest._should_skip_tensor(
+                    "model.layers.0.self_attn.k_proj.weight_scale",
+                    tie_word_embeddings=False,
+                )
+            )
+            self.assertTrue(
+                manifest._should_skip_tensor(
+                    "lm_head.weight",
+                    tie_word_embeddings=True,
+                )
+            )
+            self.assertTrue(manifest._is_language_model_only_skip("model.visual.patch_embed.proj.weight"))
+            self.assertTrue(manifest._is_language_model_only_skip("mtp.fc.weight"))
+
+            invalid_index_dir = root / "invalid-index"
+            invalid_index_dir.mkdir()
+            (invalid_index_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": []}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Invalid sharded safetensors index"):
+                manifest.get_sharded_files(invalid_index_dir)
+
+            with self.assertRaisesRegex(FileNotFoundError, "No model.safetensors"):
+                manifest.get_sharded_files(root / "missing-model")
+
+            with patch("trillim.quantize._manifest.Path.is_file", return_value=True):
+                self.assertTrue(manifest.resolve_quantize_binary().name.startswith("trillim-quantize"))
+            with patch("trillim.quantize._manifest.Path.is_file", return_value=False):
+                with self.assertRaisesRegex(FileNotFoundError, "Bundled quantizer binary not found"):
+                    manifest.resolve_quantize_binary()
+
+    def test_manifest_validation_adapter_helpers_and_quantizer_commands(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_llama_model(root)
+            config = entrypoint.load_model_config(model_dir)
+
+            visual_root = root / "visual-root"
+            visual_root.mkdir()
+            visual_model_dir = _write_llama_model(visual_root)
+            visual_tensor_path = visual_model_dir / "model.safetensors"
+            _write_safetensors(
+                visual_tensor_path,
+                {
+                    "model.embed_tokens.weight": ("F16", (4, 250)),
+                    "model.visual.patch_embed.proj.weight": ("F16", (1,)),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "layer unsupported at this time"):
+                manifest._validate_supported_model_tensors(
+                    visual_model_dir,
+                    entrypoint.load_model_config(visual_model_dir),
+                    language_model_only=False,
+                )
+
+            qwen_dir = _write_qwen_multimodal_model(root)
+            qwen_config = entrypoint.load_model_config(qwen_dir)
+            with self.assertRaisesRegex(ValueError, "text-only quantization"):
+                manifest._validate_supported_model_tensors(
+                    qwen_dir,
+                    qwen_config,
+                    language_model_only=False,
+                )
+            manifest._validate_supported_model_tensors(
+                qwen_dir,
+                qwen_config,
+                language_model_only=True,
+            )
+
+            missing_weights_model = _write_config_only_model(root, name="missing-weights")
+            with patch("trillim.quantize._manifest._validate_supported_model_tensors"):
+                with self.assertRaises(FileNotFoundError):
+                    manifest.build_manifest(
+                        missing_weights_model,
+                        entrypoint.load_model_config(missing_weights_model),
+                        output_dir=missing_weights_model,
+                    )
+
+            adapter_only_model = _write_config_only_model(
+                root,
+                name="adapter-only-model",
+                payload={
+                    "architectures": ["LlamaForCausalLM"],
+                    "hidden_size": 250,
+                    "intermediate_size": 300,
+                    "num_attention_heads": 5,
+                    "num_hidden_layers": 1,
+                    "num_key_value_heads": 5,
+                    "vocab_size": 64,
+                },
+            )
+            adapter_only_root = root / "adapter-only-root"
+            adapter_only_root.mkdir()
+            adapter_dir = _write_adapter(adapter_only_root)
+            with patch("trillim.quantize._manifest._validate_supported_model_tensors"):
+                adapter_manifest = manifest.build_manifest(
+                    adapter_only_model,
+                    entrypoint.load_model_config(adapter_only_model),
+                    output_dir=adapter_dir,
+                    adapter_dir=adapter_dir,
+                    language_model_only=False,
+                )
+            adapter_payload = _read_manifest(adapter_manifest)
+            self.assertEqual(adapter_payload["tensors"], [])
+            self.assertEqual(adapter_payload["sections"], [])
+            self.assertIsNotNone(adapter_payload["lora"])
+
+            with patch("trillim.quantize._manifest._validate_supported_model_tensors"), patch(
+                "trillim.quantize._manifest._ordered_text_tensors",
+                return_value=[],
+            ):
+                empty_manifest_path = manifest.build_manifest(
+                    model_dir,
+                    config,
+                    output_dir=root,
+                    language_model_only=False,
+                )
+            self.assertEqual(_read_manifest(empty_manifest_path)["sections"], [])
+
+            adapter_rslora_root = root / "adapter-rslora-root"
+            adapter_rslora_root.mkdir()
+            adapter_with_rslora = _write_adapter(
+                adapter_rslora_root,
+                target_modules=["q_proj"],
+                tensors={
+                    "model.layers.0.self_attn.q_proj.lora_A.weight": ("F32", (4, 250)),
+                    "model.layers.0.self_attn.q_proj.lora_B.weight": ("F32", (250, 4)),
+                },
+            )
+            adapter_config_path = adapter_with_rslora / "adapter_config.json"
+            adapter_payload_json = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+            adapter_payload_json["use_rslora"] = True
+            adapter_payload_json["lora_alpha"] = 10
+            adapter_config_path.write_text(json.dumps(adapter_payload_json), encoding="utf-8")
+            entries, scale = manifest._build_lora_entries(
+                adapter_with_rslora,
+                config,
+                [],
+                {},
+                {},
+                {},
+            )
+            self.assertAlmostEqual(scale, 5.0)
+            self.assertIsNotNone(entries[0][manifest.LORA_TARGETS.index("self_attn.q_proj")])
+            adapter_header, adapter_data_start = manifest._get_header_and_offsets(
+                adapter_with_rslora / "adapter_model.safetensors"
+            )
+            entries, scale = manifest._build_lora_entries(
+                adapter_with_rslora,
+                config,
+                [adapter_with_rslora / "adapter_model.safetensors"],
+                {adapter_with_rslora / "adapter_model.safetensors": 0},
+                {adapter_with_rslora / "adapter_model.safetensors": adapter_header},
+                {adapter_with_rslora / "adapter_model.safetensors": adapter_data_start},
+            )
+            self.assertAlmostEqual(scale, 5.0)
+            self.assertEqual(entries[0][manifest.LORA_TARGETS.index("self_attn.q_proj")]["a_shard_idx"], 0)
+
+            header = {
+                "model.layers.0.self_attn.q_proj.lora_A.weight": {},
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": {},
+            }
+            self.assertEqual(
+                manifest._find_lora_key(header, 0, "self_attn.q_proj", "A"),
+                "model.layers.0.self_attn.q_proj.lora_A.weight",
+            )
+            self.assertEqual(
+                manifest._find_lora_key(header, 0, "self_attn.q_proj", "B"),
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+            )
+            self.assertEqual(
+                manifest._parse_adapter_tensor_key(
+                    "model.layers.12.self_attn.q_proj.lora_A.weight"
+                ),
+                (12, "self_attn.q_proj", "A"),
+            )
+            self.assertIsNone(
+                manifest._parse_adapter_tensor_key(
+                    "model.layers.not-a-layer.self_attn.q_proj.lora_A.weight"
+                )
+            )
+            self.assertIsNone(manifest._parse_adapter_tensor_key("garbage"))
+            self.assertEqual(
+                manifest._expected_lora_dims(config, "mlp.down_proj"),
+                (300, 250),
+            )
+            for invalid_value in (True, "bad", 0):
+                with self.subTest(invalid_value=invalid_value):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        manifest._require_positive_int(invalid_value, "rank")
+
+            bad_target_dir = root / "bad-target"
+            bad_target_dir.mkdir()
+            (bad_target_dir / "adapter_config.json").write_text(
+                json.dumps({"r": 4, "target_modules": "q_proj"}),
+                encoding="utf-8",
+            )
+            _write_safetensors(
+                bad_target_dir / "adapter_model.safetensors",
+                {
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": (
+                        "F32",
+                        (4, 250),
+                    ),
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": (
+                        "F32",
+                        (250, 4),
+                    ),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "target_modules must be a list"):
+                manifest._read_adapter_metadata(bad_target_dir, config)
+
+            missing_weights_adapter_dir = root / "missing-weights-adapter"
+            missing_weights_adapter_dir.mkdir()
+            (missing_weights_adapter_dir / "adapter_config.json").write_text(
+                json.dumps({"r": 4, "target_modules": ["q_proj"]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(FileNotFoundError, "adapter_model.safetensors"):
+                manifest._read_adapter_metadata(missing_weights_adapter_dir, config)
+
+            too_many_layers_dir = root / "too-many-layers"
+            too_many_layers_dir.mkdir()
+            (too_many_layers_dir / "adapter_config.json").write_text(
+                json.dumps({"r": 4, "target_modules": ["q_proj"]}),
+                encoding="utf-8",
+            )
+            _write_safetensors(
+                too_many_layers_dir / "adapter_model.safetensors",
+                {
+                    "base_model.model.model.layers.9.self_attn.q_proj.lora_A.weight": (
+                        "F32",
+                        (4, 250),
+                    ),
+                    "base_model.model.model.layers.9.self_attn.q_proj.lora_B.weight": (
+                        "F32",
+                        (250, 4),
+                    ),
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "only has 1 layers"):
+                manifest._read_adapter_metadata(too_many_layers_dir, config)
+
+            unsupported_key_dir = root / "unsupported-key-adapter"
+            unsupported_key_dir.mkdir()
+            (unsupported_key_dir / "adapter_config.json").write_text(
+                json.dumps({"r": 4, "target_modules": ["q_proj"]}),
+                encoding="utf-8",
+            )
+            bad_header = {
+                "__metadata__": {"format": "pt"},
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": {
+                    "dtype": "F32",
+                    "shape": [4, 250],
+                    "data_offsets": [0, 4000],
+                },
+                "weird": {
+                    "dtype": "F32",
+                    "shape": [250, 4],
+                    "data_offsets": [4000, 8000],
+                },
+            }
+            bad_header_bytes = json.dumps(bad_header, separators=(",", ":")).encode("utf-8")
+            (unsupported_key_dir / "adapter_model.safetensors").write_bytes(
+                struct.pack("<Q", len(bad_header_bytes)) + bad_header_bytes + (b"\0" * 8000)
+            )
+            with self.assertRaisesRegex(ValueError, "layer unsupported at this time: weird"):
+                manifest._read_adapter_metadata(unsupported_key_dir, config)
+
+            with patch(
+                "trillim.quantize._manifest._parse_adapter_tensor_key",
+                return_value=(0, "unsupported.target", "A"),
+            ):
+                with self.assertRaisesRegex(ValueError, "layer unsupported at this time"):
+                    manifest._read_adapter_metadata(unsupported_key_dir, config)
+
+            with self.assertRaisesRegex(FileNotFoundError, "adapter_config.json"):
+                manifest._read_adapter_config_file(root / "missing-adapter")
+
+            weird_scale_file = root / "weird-scale.safetensors"
+            weird_scale_header = {"__metadata__": {"format": "pt"}}
+            weird_scale_bytes = json.dumps(weird_scale_header, separators=(",", ":")).encode("utf-8")
+            weird_scale_file.write_bytes(
+                struct.pack("<Q", len(weird_scale_bytes)) + weird_scale_bytes
+            )
+
+            class _WeightMap(dict):
+                def __bool__(self):
+                    return True
+
+                def values(self):
+                    return [model_dir / "model.safetensors"]
+
+                def get(self, key, default=None):
+                    if key.endswith("_scale"):
+                        return weird_scale_file
+                    return super().get(key, default)
+
+            real_get_header_and_offsets = manifest._get_header_and_offsets
+
+            def fake_get_header_and_offsets(shard_path: Path):
+                if shard_path == weird_scale_file:
+                    return {}, 8
+                return real_get_header_and_offsets(shard_path)
+
+            with patch("trillim.quantize._manifest.get_sharded_files", return_value=([model_dir / "model.safetensors"], _WeightMap())), patch(
+                "trillim.quantize._manifest._validate_supported_model_tensors",
+            ), patch(
+                "trillim.quantize._manifest._get_header_and_offsets",
+                side_effect=fake_get_header_and_offsets,
+            ):
+                weird_manifest_path = manifest.build_manifest(model_dir, config, output_dir=root)
+            weird_tensor = next(
+                tensor
+                for tensor in _read_manifest(weird_manifest_path)["tensors"]
+                if tensor["action"] == manifest.ACTION_REPACK_TERNARY
+            )
+            self.assertEqual(weird_tensor["has_scale"], 0)
+
+            extra_shard = root / "extra-shard.safetensors"
+            extra_shard.write_bytes(struct.pack("<Q", 2) + b"{}")
+
+            class _ExpandedWeightMap(dict):
+                def __bool__(self):
+                    return True
+
+                def values(self):
+                    return [model_dir / "model.safetensors", extra_shard]
+
+            with patch(
+                "trillim.quantize._manifest.get_sharded_files",
+                return_value=([model_dir / "model.safetensors"], _ExpandedWeightMap()),
+            ), patch(
+                "trillim.quantize._manifest._validate_supported_model_tensors",
+            ):
+                expanded_manifest = manifest.build_manifest(model_dir, config, output_dir=root)
+            self.assertIn(str(extra_shard), _read_manifest(expanded_manifest)["shards"])
+
+            command_output_dir = root / "quantizer-output"
+            command_output_dir.mkdir()
+            manifest_path = command_output_dir / ".quantize_manifest.bin"
+            manifest_path.write_bytes(b"manifest")
+            temp_path = command_output_dir / "qmodel.tensors.tmp"
+            temp_path.write_bytes(b"temp")
+            tied_config = replace(entrypoint.load_model_config(model_dir), tie_word_embeddings=True)
+
+            recorded_commands: list[list[str]] = []
+
+            def fake_run(command, check):
+                del check
+                recorded_commands.append(list(command))
+                return types.SimpleNamespace(returncode=0)
+
+            with patch("trillim.quantize._manifest.build_manifest", return_value=manifest_path), patch(
+                "trillim.quantize._manifest.subprocess.run",
+                side_effect=fake_run,
+            ):
+                manifest.run_model_quantizer(
+                    Path("/tmp/binary"),
+                    model_dir,
+                    tied_config,
+                    output_dir=command_output_dir,
+                    language_model_only=False,
+                )
+            self.assertIn("--tie-embeddings", recorded_commands[0])
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(temp_path.exists())
+
+            manifest_path.write_bytes(b"manifest")
+            temp_path.write_bytes(b"temp")
+            with patch("trillim.quantize._manifest.build_manifest", return_value=manifest_path), patch(
+                "trillim.quantize._manifest.subprocess.run",
+                return_value=types.SimpleNamespace(returncode=7),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exited with code 7"):
+                    manifest.run_model_quantizer(
+                        Path("/tmp/binary"),
+                        model_dir,
+                        config,
+                        output_dir=command_output_dir,
+                        language_model_only=False,
+                    )
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(temp_path.exists())
+
+            adapter_output_dir = root / "adapter-quantizer-output"
+            adapter_output_dir.mkdir()
+            manifest_path = adapter_output_dir / ".quantize_manifest.bin"
+            manifest_path.write_bytes(b"manifest")
+            unused = adapter_output_dir / ".unused-qmodel.tensors"
+            unused.write_bytes(b"temp")
+            unused_tmp = adapter_output_dir / ".unused-qmodel.tensors.tmp"
+            unused_tmp.write_bytes(b"temp")
+            command_adapter_root = root / "command-adapter"
+            command_adapter_root.mkdir()
+            with patch("trillim.quantize._manifest.build_manifest", return_value=manifest_path), patch(
+                "trillim.quantize._manifest._read_adapter_config_file",
+                return_value={"r": 8},
+            ), patch(
+                "trillim.quantize._manifest.subprocess.run",
+                side_effect=fake_run,
+            ):
+                manifest.run_adapter_quantizer(
+                    Path("/tmp/binary"),
+                    model_dir,
+                    config,
+                    adapter_dir=_write_adapter(command_adapter_root),
+                    output_dir=adapter_output_dir,
+                    language_model_only=False,
+                )
+            self.assertIn("--lora-rank", recorded_commands[-1])
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(unused.exists())
+            self.assertFalse(unused_tmp.exists())
+
+            manifest_path.write_bytes(b"manifest")
+            unused.write_bytes(b"temp")
+            unused_tmp.write_bytes(b"temp")
+            with patch("trillim.quantize._manifest.build_manifest", return_value=manifest_path), patch(
+                "trillim.quantize._manifest._read_adapter_config_file",
+                return_value={"r": 8},
+            ), patch(
+                "trillim.quantize._manifest.subprocess.run",
+                return_value=types.SimpleNamespace(returncode=9),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exited with code 9"):
+                    manifest.run_adapter_quantizer(
+                        Path("/tmp/binary"),
+                        model_dir,
+                        tied_config,
+                        adapter_dir=adapter_with_rslora,
+                        output_dir=adapter_output_dir,
+                        language_model_only=False,
+                    )
+            self.assertFalse(manifest_path.exists())
+            self.assertFalse(unused.exists())
+            self.assertFalse(unused_tmp.exists())
+
+            extra_path = root / "extra.txt"
+            extra_path.write_text("temp", encoding="utf-8")
+            manifest._cleanup_paths(extra_path, root / "missing.txt")
+            self.assertFalse(extra_path.exists())
+
+    def test_output_staging_recovery_remote_code_and_entrypoint_helpers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patched_model_store() as store_root:
+                source_dir = store_root / "source"
+                source_dir.mkdir()
+                preferred = output.prepare_output_target(source_dir)
+                preferred.parent.mkdir(parents=True, exist_ok=True)
+                preferred.mkdir()
+                (preferred.parent / f"{preferred.name}-2").mkdir()
+                (preferred.parent / f"{preferred.name}-3").mkdir()
+                with patch("trillim.quantize._output.sys_stdin_isatty", return_value=True), patch(
+                    "trillim.quantize._output.sys_stdout_isatty",
+                    return_value=True,
+                ), patch("builtins.input", side_effect=["n"]):
+                    deduped = output.prepare_output_target(source_dir)
+                self.assertEqual(deduped.name, "source-TRNQ-4")
+
+                staging = preferred.parent / f"{preferred.name}-new"
+                staging.mkdir()
+                with self.assertRaisesRegex(RuntimeError, "Staging directory is still present"):
+                    output.build_staging_dir(preferred)
+                shutil_ready = preferred.parent / "publish-target"
+                staging = preferred.parent / "publish-target-new"
+                with self.assertRaisesRegex(RuntimeError, "Staging directory not found"):
+                    output.publish_staging_dir(shutil_ready)
+                staging.mkdir()
+                with self.assertRaisesRegex(RuntimeError, "Staging directory is incomplete"):
+                    output.publish_staging_dir(shutil_ready)
+                output.mark_staging_complete(staging)
+                output.publish_staging_dir(shutil_ready)
+                self.assertTrue(shutil_ready.is_dir())
+
+                existing_target = preferred.parent / "existing-target"
+                existing_target.mkdir()
+                (existing_target / "old.txt").write_text("old", encoding="utf-8")
+                staging = preferred.parent / "existing-target-new"
+                staging.mkdir()
+                (staging / "new.txt").write_text("new", encoding="utf-8")
+                output.mark_staging_complete(staging)
+                output.publish_staging_dir(existing_target)
+                self.assertTrue((existing_target / "new.txt").is_file())
+                self.assertFalse((preferred.parent / "existing-target-old").exists())
+
+                for name in ("bad-staging-new", "bad-backup-old", "bad-target"):
+                    bad_path = preferred.parent / name
+                    bad_path.write_text("not-a-dir", encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "not a directory"):
+                        output.recover_publish_state(
+                            preferred.parent / name.removesuffix("-new").removesuffix("-old")
+                        )
+                    bad_path.unlink()
+
+                recovery_target = preferred.parent / "recover-me"
+                recovery_target.mkdir()
+                recovery_staging = preferred.parent / "recover-me-new"
+                recovery_backup = preferred.parent / "recover-me-old"
+                recovery_staging.mkdir()
+                recovery_backup.mkdir()
+                output.recover_publish_state(recovery_target)
+                self.assertFalse(recovery_staging.exists())
+                self.assertFalse(recovery_backup.exists())
+
+                promoted_target = preferred.parent / "promote-me"
+                promoted_staging = preferred.parent / "promote-me-new"
+                promoted_backup = preferred.parent / "promote-me-old"
+                promoted_staging.mkdir()
+                output.mark_staging_complete(promoted_staging)
+                promoted_backup.mkdir()
+                output.recover_publish_state(promoted_target)
+                self.assertTrue(promoted_target.exists())
+                self.assertFalse(promoted_backup.exists())
+
+                restored_target = preferred.parent / "restore-me"
+                restored_staging = preferred.parent / "restore-me-new"
+                restored_backup = preferred.parent / "restore-me-old"
+                restored_staging.mkdir()
+                restored_backup.mkdir()
+                (restored_backup / "old.txt").write_text("old", encoding="utf-8")
+                output.recover_publish_state(restored_target)
+                self.assertTrue((restored_target / "old.txt").is_file())
+                self.assertFalse(restored_staging.exists())
+
+                direct_restore_target = preferred.parent / "direct-restore"
+                direct_restore_backup = preferred.parent / "direct-restore-old"
+                direct_restore_backup.mkdir()
+                (direct_restore_backup / "old.txt").write_text("old", encoding="utf-8")
+                output.recover_publish_state(direct_restore_target)
+                self.assertTrue((direct_restore_target / "old.txt").is_file())
+
+                cleanup_target = preferred.parent / "cleanup-me"
+                cleanup_staging = preferred.parent / "cleanup-me-new"
+                cleanup_staging.mkdir()
+                output.recover_publish_state(cleanup_target)
+                self.assertFalse(cleanup_staging.exists())
+
+                promote_target = preferred.parent / "promote-direct"
+                promote_staging = preferred.parent / "promote-direct-new"
+                promote_staging.mkdir()
+                output.mark_staging_complete(promote_staging)
+                output.recover_publish_state(promote_target)
+                self.assertTrue(promote_target.is_dir())
+
+                broken_target = preferred.parent / "broken-publish"
+                broken_staging = preferred.parent / "broken-publish-new"
+                broken_staging.mkdir()
+                output.mark_staging_complete(broken_staging)
+                with patch(
+                    "trillim.quantize._output.os.replace",
+                    side_effect=OSError("boom"),
+                ):
+                    with self.assertRaises(OSError):
+                        output.publish_staging_dir(broken_target)
+
+                output_json = preferred.parent / "payload.json"
+                output._write_json(output_json, {"x": 1})
+                self.assertTrue(output_json.read_text(encoding="utf-8").endswith("\n"))
+
+                nested_source = preferred.parent / "nested" / "source.txt"
+                nested_source.parent.mkdir(parents=True, exist_ok=True)
+                nested_source.write_text("copy", encoding="utf-8")
+                nested_destination = preferred.parent / "deep" / "copy.txt"
+                output._copy_file(nested_source, nested_destination)
+                self.assertEqual(nested_destination.read_text(encoding="utf-8"), "copy")
+
+                self.assertTrue(output._should_skip_adapter_path(Path("__pycache__/x.pyc")))
+                self.assertTrue(output._should_skip_adapter_path(Path("weights.tmp")))
+                self.assertTrue(output._should_skip_adapter_path(Path("adapter_model.safetensors")))
+                self.assertTrue(output._should_skip_adapter_path(Path("adapter_model.safetensors.index.json")))
+                self.assertTrue(output._should_skip_adapter_path(Path("adapter_model.bin")))
+                self.assertFalse(output._should_skip_adapter_path(Path("nested/keep.txt")))
+
+            adapter_dir = root / "adapter-copy"
+            adapter_dir.mkdir()
+            (adapter_dir / "__pycache__").mkdir()
+            (adapter_dir / "__pycache__" / "cached.pyc").write_bytes(b"x")
+            (adapter_dir / "weights.tmp").write_text("skip", encoding="utf-8")
+            (adapter_dir / "adapter_model.bin").write_text("skip", encoding="utf-8")
+            (adapter_dir / "adapter_model.safetensors").write_text("skip", encoding="utf-8")
+            (adapter_dir / "adapter_model.safetensors.index.json").write_text("skip", encoding="utf-8")
+            (adapter_dir / "nested").mkdir()
+            (adapter_dir / "nested" / "keep.txt").write_text("keep", encoding="utf-8")
+            adapter_output = root / "adapter-out"
+            output.copy_adapter_support_files(adapter_dir, adapter_output)
+            self.assertTrue((adapter_output / "nested" / "keep.txt").is_file())
+            self.assertFalse((adapter_output / "adapter_model.bin").exists())
+
+            empty_model_dir = _write_config_only_model(root, name="empty-model")
+            empty_output = root / "empty-output"
+            empty_output.mkdir()
+            output.write_adapter_metadata(
+                empty_output,
+                config=entrypoint.load_model_config(empty_model_dir),
+                adapter_dir=root / "missing-adapter-config",
+                model_dir=empty_model_dir,
+            )
+            adapter_metadata = json.loads(
+                (empty_output / "trillim_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(adapter_metadata["source_model"], "")
+
+            self.assertFalse(output._load_optional_json(root / "missing.json"))
+            payload_path = root / "not-dict.json"
+            payload_path.write_text("[]", encoding="utf-8")
+            self.assertIsNone(output._load_optional_json(payload_path))
+
+            refs = output._collect_remote_code_class_refs(
+                {
+                    "config": {
+                        "auto_map": {
+                            "AutoTokenizer": ["tokenizer_mod.Tokenizer", "tokenizer_mod.Tokenizer"],
+                            "AutoConfig": "config_mod.Config",
+                        }
+                    },
+                    "tokenizer_config": {
+                        "auto_map": ["tokenizer_mod.Tokenizer", None],
+                    },
+                }
+            )
+            self.assertEqual(refs, ["tokenizer_mod.Tokenizer", "config_mod.Config"])
+            self.assertEqual(
+                output._extract_auto_map_refs({"auto_map": ["a.A", "", None]}, key="AutoTokenizer"),
+                ["a.A"],
+            )
+            self.assertEqual(
+                output._extract_auto_map_refs({"auto_map": {"AutoConfig": ["x.Y", None]}}, key="AutoConfig"),
+                ["x.Y"],
+            )
+            self.assertEqual(output._extract_auto_map_refs(None, key="AutoTokenizer"), [])
+            self.assertEqual(
+                output._parse_remote_code_module_path("tokenizer_mod.Tokenizer"),
+                Path("tokenizer_mod.py"),
+            )
+            with self.assertRaisesRegex(ValueError, "External remote-code repositories"):
+                output._parse_remote_code_module_path("repo--tokenizer_mod.Tokenizer")
+            with self.assertRaisesRegex(ValueError, "currently unsupported"):
+                output._parse_remote_code_module_path("TokenizerOnly")
+            with self.assertRaisesRegex(ValueError, "Package-scoped remote-code entry points"):
+                output._parse_remote_code_module_path("pkg.tokenizer_mod.Tokenizer")
+
+            module_path = root / "imports.py"
+            module_path.write_text(
+                "from .sibling import thing\nfrom . import cousin\nfrom . import cousin\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                output._relative_import_module_names(module_path),
+                ["sibling", "cousin"],
+            )
+            module_path.write_text("from ..parent import thing\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Parent relative imports"):
+                output._relative_import_module_names(module_path)
+            module_path.write_text("from .pkg.module import thing\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Package-scoped relative imports"):
+                output._relative_import_module_names(module_path)
+            module_path.write_text("from pkg import thing\n", encoding="utf-8")
+            self.assertEqual(output._relative_import_module_names(module_path), [])
+            module_path.write_text("from . import *\n", encoding="utf-8")
+            self.assertEqual(output._relative_import_module_names(module_path), [])
+
+            model_dir = _write_remote_code_model(
+                root,
+                name="remote-code",
+                config_payload={
+                    "auto_map": {"AutoConfig": "config_mod.Config"},
+                    "text_config": {"auto_map": {"AutoTokenizer": "tokenizer_mod.Tokenizer"}},
+                },
+                tokenizer_payload={"auto_map": ["tokenizer_mod.Tokenizer"]},
+                files={
+                    "config_mod.py": "from .shared import value\nclass Config: pass\n",
+                    "tokenizer_mod.py": "from .shared import value\nclass Tokenizer: pass\n",
+                    "shared.py": "value = 1\n",
+                },
+            )
+            self.assertTrue(output._has_remote_code_references(model_dir))
+            self.assertEqual(
+                sorted(str(path) for path in output._collect_remote_code_files(model_dir)),
+                ["config_mod.py", "shared.py", "tokenizer_mod.py"],
+            )
+
+            missing_remote_model = _write_remote_code_model(
+                root,
+                name="remote-missing",
+                config_payload={"auto_map": {"AutoConfig": "missing_mod.Config"}},
+                files={},
+            )
+            with self.assertRaisesRegex(ValueError, "Remote-code module not found"):
+                output._collect_remote_code_files(missing_remote_model)
+
+            deep_remote_model = _write_remote_code_model(
+                root,
+                name="remote-deep",
+                config_payload={"auto_map": {"AutoConfig": "config_mod.Config"}},
+                files={
+                    "config_mod.py": "from .shared import value\nclass Config: pass\n",
+                    "shared.py": "from .leaf import value\n",
+                    "leaf.py": "value = 1\n",
+                },
+            )
+            with patch("trillim.quantize._output._MAX_REMOTE_CODE_DEPTH", 0):
+                with self.assertRaisesRegex(ValueError, "supported depth"):
+                    output._collect_remote_code_files(deep_remote_model)
+
+            wide_remote_model = _write_remote_code_model(
+                root,
+                name="remote-wide",
+                config_payload={"auto_map": {"AutoConfig": "config_mod.Config"}},
+                files={
+                    "config_mod.py": "from .one import a\nfrom .two import b\nclass Config: pass\n",
+                    "one.py": "a = 1\n",
+                    "two.py": "b = 2\n",
+                },
+            )
+            with patch("trillim.quantize._output._MAX_REMOTE_CODE_FILES", 2):
+                with self.assertRaisesRegex(ValueError, "supported file budget"):
+                    output._collect_remote_code_files(wide_remote_model)
+
+            large_remote_model = _write_remote_code_model(
+                root,
+                name="remote-large",
+                config_payload={"auto_map": {"AutoConfig": "config_mod.Config"}},
+                files={"config_mod.py": "x = '" + ("y" * 64) + "'\nclass Config: pass\n"},
+            )
+            with patch("trillim.quantize._output._MAX_REMOTE_CODE_BYTES", 32):
+                with self.assertRaisesRegex(ValueError, "supported byte budget"):
+                    output._collect_remote_code_files(large_remote_model)
+
+            package_remote_model = _write_remote_code_model(
+                root,
+                name="remote-package",
+                config_payload={"auto_map": {"AutoConfig": "config_mod.Config"}},
+                files={
+                    "config_mod.py": "from .pkg import value\nclass Config: pass\n",
+                    "pkg/__init__.py": "value = 1\n",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "Package-scoped relative imports"):
+                output._collect_remote_code_files(package_remote_model)
+
+            resolved_import = output._resolve_relative_import_module_path(
+                source_relative_path=Path("tokenizer_mod.py"),
+                module_name="shared",
+                model_dir=model_dir,
+            )
+            self.assertEqual(resolved_import, Path("shared.py"))
+
+            model_dir_with_pkg = _write_remote_code_model(
+                root,
+                name="remote-package-init",
+                config_payload={"auto_map": {"AutoConfig": "config_mod.Config"}},
+                files={
+                    "config_mod.py": "class Config: pass\n",
+                    "pkg/__init__.py": "value = 1\n",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "Package-scoped relative imports"):
+                output._resolve_relative_import_module_path(
+                    source_relative_path=Path("config_mod.py"),
+                    module_name="pkg",
+                    model_dir=model_dir_with_pkg,
+                )
+
+            with patch(
+                "trillim.quantize._output.importlib_metadata.version",
+                side_effect=output.importlib_metadata.PackageNotFoundError,
+            ):
+                self.assertEqual(output._project_version(), "0.6.0")
+            with patch(
+                "trillim.quantize._output.importlib_metadata.version",
+                return_value="9.9.9",
+            ):
+                self.assertEqual(output._project_version(), "9.9.9")
+
+            real_stdin = os.sys.stdin
+            real_stdout = os.sys.stdout
+            try:
+                os.sys.stdin = object()
+                os.sys.stdout = object()
+                self.assertFalse(output.sys_stdin_isatty())
+                self.assertFalse(output.sys_stdout_isatty())
+            finally:
+                os.sys.stdin = real_stdin
+                os.sys.stdout = real_stdout
+
+            with patch("builtins.input", return_value="no"):
+                self.assertFalse(output._confirm_overwrite(Path("bundle")))
+
+            with patched_model_store() as store_root:
+                inside_store = store_root / "Local" / "managed"
+                inside_store.mkdir(parents=True)
+                with self.assertRaisesRegex(ValueError, "must not be inside"):
+                    entrypoint._normalize_source_dir(inside_store, label="Model directory")
+
+            file_path = root / "not-a-dir.txt"
+            file_path.write_text("x", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "is not a directory"):
+                entrypoint._normalize_source_dir(file_path, label="Model directory")
+
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+            self.assertEqual(
+                entrypoint._normalize_source_dir(outside_dir, label="Model directory"),
+                outside_dir.resolve(),
+            )
+
+            with patch(
+                "trillim.quantize._entrypoint._normalize_source_dir",
+                side_effect=[Path("/tmp/model"), Path("/tmp/model")],
+            ):
+                with self.assertRaisesRegex(ValueError, "must be different"):
+                    entrypoint.quantize("model", "adapter")
+
+            entrypoint_model_root = root / "entrypoint-model-root"
+            entrypoint_model_root.mkdir()
+            model_config = entrypoint.load_model_config(_write_llama_model(entrypoint_model_root))
+            with patch(
+                "trillim.quantize._entrypoint._normalize_source_dir",
+                return_value=Path("/tmp/model"),
+            ), patch(
+                "trillim.quantize._entrypoint.load_model_config",
+                return_value=model_config,
+            ), patch(
+                "trillim.quantize._entrypoint.determine_language_model_only",
+                return_value=False,
+            ), patch(
+                "trillim.quantize._entrypoint.resolve_quantize_binary",
+                return_value=Path("/tmp/binary"),
+            ), patch(
+                "trillim.quantize._entrypoint.prepare_output_target",
+                return_value=Path("/tmp/target"),
+            ), patch(
+                "trillim.quantize._entrypoint.build_staging_dir",
+                return_value=Path("/tmp/staging"),
+            ), patch(
+                "trillim.quantize._entrypoint.run_model_quantizer",
+            ) as run_model_quantizer, patch(
+                "trillim.quantize._entrypoint.copy_model_support_files",
+            ) as copy_model_support_files, patch(
+                "trillim.quantize._entrypoint.write_model_metadata",
+            ) as write_model_metadata, patch(
+                "trillim.quantize._entrypoint.mark_staging_complete",
+            ) as mark_complete, patch(
+                "trillim.quantize._entrypoint.publish_staging_dir",
+            ) as publish_staging_dir:
+                result = entrypoint.quantize("/tmp/model")
+            self.assertEqual(result.bundle_type, "model")
+            run_model_quantizer.assert_called_once()
+            copy_model_support_files.assert_called_once()
+            write_model_metadata.assert_called_once()
+            mark_complete.assert_called_once()
+            publish_staging_dir.assert_called_once()
+
+            with patch(
+                "trillim.quantize._entrypoint._normalize_source_dir",
+                side_effect=[Path("/tmp/model"), Path("/tmp/adapter")],
+            ), patch(
+                "trillim.quantize._entrypoint.load_model_config",
+                return_value=model_config,
+            ), patch(
+                "trillim.quantize._entrypoint.determine_language_model_only",
+                return_value=True,
+            ), patch(
+                "trillim.quantize._entrypoint.resolve_quantize_binary",
+                return_value=Path("/tmp/binary"),
+            ), patch(
+                "trillim.quantize._entrypoint.validate_adapter_source",
+            ) as validate_adapter_source, patch(
+                "trillim.quantize._entrypoint.prepare_output_target",
+                return_value=Path("/tmp/adapter-target"),
+            ), patch(
+                "trillim.quantize._entrypoint.build_staging_dir",
+                return_value=Path("/tmp/adapter-staging"),
+            ), patch(
+                "trillim.quantize._entrypoint.run_adapter_quantizer",
+            ) as run_adapter_quantizer, patch(
+                "trillim.quantize._entrypoint.copy_adapter_support_files",
+            ) as copy_adapter_support_files, patch(
+                "trillim.quantize._entrypoint.write_adapter_metadata",
+            ) as write_adapter_metadata, patch(
+                "trillim.quantize._entrypoint.mark_staging_complete",
+            ) as mark_complete, patch(
+                "trillim.quantize._entrypoint.publish_staging_dir",
+            ) as publish_staging_dir, redirect_stdout(io.StringIO()) as output_text:
+                result = entrypoint.quantize("/tmp/model", "/tmp/adapter")
+            self.assertEqual(result.bundle_type, "adapter")
+            self.assertTrue(result.used_language_model_only)
+            self.assertIn("text inference", output_text.getvalue())
+            validate_adapter_source.assert_called_once()
+            run_adapter_quantizer.assert_called_once()
+            copy_adapter_support_files.assert_called_once()
+            write_adapter_metadata.assert_called_once()
+            mark_complete.assert_called_once()
+            publish_staging_dir.assert_called_once()
 
 
 if __name__ == "__main__":  # pragma: no cover
