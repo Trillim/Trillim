@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from trillim import _model_store
+from trillim._bundle_metadata import CURRENT_FORMAT_VERSION, compute_base_model_config_hash
 from trillim.components.llm._config import (
     ActivationType,
     ArchitectureType,
@@ -17,7 +18,6 @@ from trillim.components.llm._config import (
     SamplingDefaults,
 )
 from trillim.components.llm._engine import EngineCrashedError, EngineProgressTimeoutError
-from trillim.components.llm._model_dir import _compute_base_model_config_hash
 
 
 class FakeTokenizer:
@@ -259,6 +259,20 @@ def write_model_bundle(
     )
     (path / "qmodel.tensors").write_bytes(b"quantized-model")
     (path / "rope.cache").write_bytes(b"rope-cache")
+    (path / "trillim_config.json").write_text(
+        json.dumps(
+            {
+                "format_version": CURRENT_FORMAT_VERSION,
+                "type": "model",
+                "quantization": "ternary",
+                "architecture": architecture.lower(),
+                "platforms": ["x86_64", "aarch64"],
+                "source_model": "",
+                "base_model_config_hash": compute_base_model_config_hash(path),
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 @contextmanager
@@ -299,13 +313,13 @@ def write_adapter_bundle(
     *,
     model_root: Path | None = None,
     base_model_config_hash: str | None = None,
-    format_version: int = 3,
+    format_version: int = CURRENT_FORMAT_VERSION,
 ) -> None:
     """Write a minimal adapter bundle that satisfies the runtime contract."""
     adapter_dir.mkdir(parents=True, exist_ok=True)
     (adapter_dir / "qmodel.lora").write_bytes(b"adapter")
     if base_model_config_hash is None and model_root is not None:
-        base_model_config_hash = _compute_base_model_config_hash(model_root)
+        base_model_config_hash = compute_base_model_config_hash(model_root)
     payload: dict[str, object] = {"format_version": format_version}
     if base_model_config_hash is not None:
         payload["base_model_config_hash"] = base_model_config_hash

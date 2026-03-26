@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import errno
-import hashlib
 import json
 import os
 import shutil
@@ -14,6 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from trillim._bundle_metadata import (
+    CURRENT_FORMAT_VERSION,
+    canonicalize_model_config as _canonicalize_model_config,
+    compute_base_model_config_hash as _compute_base_model_config_hash,
+)
 from trillim.components.llm._config import (
     ActivationType,
     ArchitectureType,
@@ -49,7 +53,7 @@ _TOKENIZER_FALLBACK_FILES = (
 _MAX_REMOTE_CODE_DEPTH = 16
 _MAX_REMOTE_CODE_FILES = 64
 _MAX_REMOTE_CODE_BYTES = 4 * 1024 * 1024
-_SUPPORTED_ADAPTER_FORMAT_VERSION = 3
+_SUPPORTED_ADAPTER_FORMAT_VERSION = CURRENT_FORMAT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,12 +146,18 @@ def validate_model_dir(
             symlink_message="Metadata directory must not use symlinks",
         )
     )
+    _validate_model_bundle_metadata(path)
     config_path = metadata_path / "config.json"
     _raise_if_symlink(config_path, "Model bundle must not use symlinks")
     if not config_path.is_file():
         raise ModelValidationError(f"config.json not found in {metadata_path}")
     _require_runtime_artifacts(path)
-    config = _canonicalize_model_config(_load_json(config_path))
+    config_payload = _load_json(config_path)
+    if not isinstance(config_payload, dict):
+        raise ModelValidationError(
+            f"config.json must be a JSON object in {metadata_path}"
+        )
+    config = _canonicalize_model_config(config_payload)
     arch_info = _resolve_arch_info(config)
     dimensions = _extract_dimensions(config)
     eos_tokens = _collect_eos_tokens(config, arch_info.arch_type, metadata_path)
@@ -233,28 +243,28 @@ def prepare_runtime_files(
     )
 
 
-def _load_json(path: Path) -> dict:
+def _load_json(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelValidationError(f"Could not read JSON from {path}") from exc
 
 
-def _canonicalize_model_config(config: dict) -> dict:
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict) and text_config:
-        normalized = {
-            key: value
-            for key, value in config.items()
-            if key != "text_config"
-        }
-        normalized = _merge_json_payloads(normalized, text_config) or {}
-        normalized["architectures"] = config.get(
-            "architectures",
-            text_config.get("architectures", normalized.get("architectures", [])),
+def _validate_model_bundle_metadata(model_dir: Path) -> None:
+    config_path = model_dir / "trillim_config.json"
+    _raise_if_symlink(config_path, "Model bundle must not use symlinks")
+    if not config_path.is_file():
+        raise ModelValidationError(
+            f"Model bundle metadata is missing or unsupported in {model_dir}"
         )
-        return normalized
-    return dict(config)
+    payload = _load_json(config_path)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format_version") != CURRENT_FORMAT_VERSION
+    ):
+        raise ModelValidationError(
+            f"Model bundle metadata is missing or unsupported in {model_dir}"
+        )
 
 
 def _resolve_arch_info(config: dict) -> _ArchitectureInfo:
@@ -305,8 +315,7 @@ def _validate_adapter_metadata(
     format_version = adapter_config.get("format_version", 1)
     stored_hash = adapter_config.get("base_model_config_hash")
     if (
-        not isinstance(format_version, int)
-        or format_version < _SUPPORTED_ADAPTER_FORMAT_VERSION
+        format_version != _SUPPORTED_ADAPTER_FORMAT_VERSION
         or not isinstance(stored_hash, str)
         or not stored_hash
     ):
@@ -322,7 +331,12 @@ def _validate_adapter_compatibility(
     model_dir: Path,
 ) -> None:
     stored_hash = adapter_config["base_model_config_hash"]
-    current_hash = _compute_base_model_config_hash(model_dir)
+    try:
+        current_hash = _compute_base_model_config_hash(model_dir)
+    except ValueError as exc:
+        raise ModelValidationError(
+            f"Could not validate adapter compatibility against {model_dir}"
+        ) from exc
     if current_hash != stored_hash:
         source_model = adapter_config.get("source_model")
         detail = (
@@ -333,31 +347,6 @@ def _validate_adapter_compatibility(
         raise ModelValidationError(
             f"Adapter/model mismatch: {detail}"
         )
-
-
-def _compute_base_model_config_hash(model_dir: Path) -> str:
-    config = _canonicalize_model_config(_load_json(model_dir / "config.json"))
-    num_heads = _require_positive_int(
-        config.get("num_attention_heads"),
-        "num_attention_heads",
-    )
-    num_kv_heads = _require_positive_int(
-        config.get("num_key_value_heads", num_heads),
-        "num_key_value_heads",
-    )
-    identity = {
-        "architectures": config.get("architectures", []),
-        "hidden_size": config.get("hidden_size"),
-        "intermediate_size": config.get("intermediate_size"),
-        "num_hidden_layers": config.get("num_hidden_layers"),
-        "num_attention_heads": num_heads,
-        "num_key_value_heads": num_kv_heads,
-        "vocab_size": config.get("vocab_size"),
-    }
-    payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _extract_dimensions(config: dict) -> dict[str, int]:

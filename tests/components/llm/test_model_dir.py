@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._config import ActivationType, ArchitectureType, InitConfig
 from trillim.components.llm._model_dir import (
     prepare_runtime_files,
@@ -35,6 +36,32 @@ class ModelDirectoryTests(unittest.TestCase):
         self.assertEqual(info.arch_type, ArchitectureType.LLAMA)
         self.assertEqual(info.activation, ActivationType.SILU)
         self.assertEqual(info.eos_tokens, (2,))
+
+    def test_validate_model_dir_requires_current_bundle_metadata(self):
+        with model_dir() as root:
+            (root / "trillim_config.json").unlink()
+            with self.assertRaisesRegex(ModelValidationError, "missing or unsupported"):
+                validate_model_dir(root)
+
+        with model_dir() as root:
+            (root / "trillim_config.json").write_text(
+                json.dumps({"format_version": CURRENT_FORMAT_VERSION - 1}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ModelValidationError, "missing or unsupported"):
+                validate_model_dir(root)
+
+    def test_validate_model_dir_rejects_non_object_bundle_metadata(self):
+        with model_dir() as root:
+            (root / "trillim_config.json").write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ModelValidationError, "missing or unsupported"):
+                validate_model_dir(root)
+
+    def test_validate_model_dir_rejects_non_object_config_json(self):
+        with model_dir() as root:
+            (root / "config.json").write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ModelValidationError, "config.json must be a JSON object"):
+                validate_model_dir(root)
 
     def test_validate_model_dir_rejects_missing_weights(self):
         with model_dir() as root:
@@ -165,7 +192,7 @@ class ModelDirectoryTests(unittest.TestCase):
             adapter.mkdir()
             (adapter / "qmodel.lora").write_bytes(b"adapter")
             (adapter / "trillim_config.json").write_text(
-                json.dumps({"format_version": 3}),
+                json.dumps({"format_version": CURRENT_FORMAT_VERSION - 1}),
                 encoding="utf-8",
             )
 
@@ -207,6 +234,41 @@ class ModelDirectoryTests(unittest.TestCase):
             resolved = validate_lora_dir(adapter, model_dir=explicit_root)
 
         self.assertEqual(resolved, adapter)
+
+    def test_validate_lora_dir_wraps_invalid_base_model_config_as_validation_error(self):
+        with model_dir() as root, tempfile.TemporaryDirectory() as temp_dir:
+            adapter = Path(temp_dir) / "adapter"
+            write_adapter_bundle(adapter, model_root=root)
+
+            for invalid_payload in (None, "{"):
+                with self.subTest(invalid_payload=invalid_payload):
+                    if invalid_payload is None:
+                        (root / "config.json").unlink()
+                    else:
+                        (root / "config.json").write_text(invalid_payload, encoding="utf-8")
+
+                    with self.assertRaisesRegex(
+                        ModelValidationError,
+                        "Could not validate adapter compatibility",
+                    ):
+                        validate_lora_dir(adapter, model_dir=root)
+
+                    write_model = {
+                        "architectures": ["LlamaForCausalLM"],
+                        "hidden_size": 128,
+                        "intermediate_size": 256,
+                        "num_attention_heads": 4,
+                        "num_hidden_layers": 2,
+                        "num_key_value_heads": 4,
+                        "vocab_size": 256,
+                        "max_position_embeddings": 512,
+                        "hidden_act": "silu",
+                        "eos_token_id": 2,
+                    }
+                    (root / "config.json").write_text(
+                        json.dumps(write_model),
+                        encoding="utf-8",
+                    )
 
     def test_prepare_runtime_files_merges_lora_metadata_and_prefers_adapter_truth(self):
         with model_dir(

@@ -18,13 +18,14 @@ from prompt_toolkit import prompt as better_input
 from prompt_toolkit.key_binding import KeyBindings
 
 from trillim import LLM, STT, TTS, Runtime, Server, _model_store
+from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._model_dir import validate_lora_dir, validate_model_dir
 from trillim.errors import ModelValidationError
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
-SUPPORTED_FORMAT_VERSION = 3
+SUPPORTED_FORMAT_VERSION = CURRENT_FORMAT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,12 +405,11 @@ def _run_serve(model_id: str, *, voice: bool) -> int:
     return 0
 
 
-def _run_quantize_placeholder() -> int:
-    print(
-        "trillim quantize is not implemented yet. The quantizer RFC will define this command later.",
-        file=sys.stderr,
-    )
-    return 1
+def _run_quantize_command(args: argparse.Namespace) -> int:
+    from trillim.quantize import quantize
+
+    quantize(args.model_dir, args.adapter_dir)
+    return 0
 
 
 def _run_pull_command(args: argparse.Namespace) -> int:
@@ -483,7 +483,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable STT and TTS components",
     )
 
-    subparsers.add_parser("quantize", help="Placeholder for the future quantizer CLI")
+    quantize_parser = subparsers.add_parser(
+        "quantize",
+        help="Quantize one local model directory or adapter directory into Local/",
+    )
+    quantize_parser.add_argument("model_dir", help="Local filesystem path to the source model directory")
+    quantize_parser.add_argument(
+        "adapter_dir",
+        nargs="?",
+        help="Optional local filesystem path to the source adapter directory",
+    )
     return parser
 
 
@@ -499,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         "models": _run_models_command,
         "chat": lambda: _run_chat(args.model_dir, args.adapter_dir),
         "serve": lambda: _run_serve(args.model_dir, voice=args.voice),
-        "quantize": _run_quantize_placeholder,
+        "quantize": lambda: _run_quantize_command(args),
     }
     try:
         return handlers[args.command]()

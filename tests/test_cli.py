@@ -262,14 +262,20 @@ class CLITests(unittest.TestCase):
     def test_iter_local_bundles_skips_invalid_entries_and_reports_models_and_adapters(self):
         with self._patched_model_roots():
             downloaded_model = cli._model_store.DOWNLOADED_ROOT / "downloaded-model"
+            invalid_model = cli._model_store.DOWNLOADED_ROOT / "invalid-model"
             local_adapter = cli._model_store.LOCAL_ROOT / "local-adapter"
             invalid_adapter = cli._model_store.LOCAL_ROOT / "invalid-adapter"
             invalid = cli._model_store.DOWNLOADED_ROOT / "invalid"
             write_model_bundle(downloaded_model)
+            write_model_bundle(invalid_model)
             write_model_bundle(cli._model_store.LOCAL_ROOT / "base-model")
             write_adapter_bundle(
                 local_adapter,
                 model_root=cli._model_store.LOCAL_ROOT / "base-model",
+            )
+            (invalid_model / "trillim_config.json").write_text(
+                "[]",
+                encoding="utf-8",
             )
             invalid_adapter.mkdir(parents=True)
             (invalid_adapter / "qmodel.lora").write_bytes(b"adapter")
@@ -608,12 +614,12 @@ class CLITests(unittest.TestCase):
         tts_ctor.assert_called_once_with()
         self.assertEqual(server_ctor.call_args.args, (llm, "stt", "tts"))
 
-    def test_run_quantize_placeholder_writes_to_stderr(self):
-        error = io.StringIO()
-        with redirect_stderr(error):
-            result = cli._run_quantize_placeholder()
-        self.assertEqual(result, 1)
-        self.assertIn("not implemented yet", error.getvalue())
+    def test_run_quantize_command_invokes_quantizer(self):
+        args = SimpleNamespace(model_dir="/tmp/model", adapter_dir="/tmp/adapter")
+        with patch("trillim.quantize.quantize") as quantize:
+            result = cli._run_quantize_command(args)
+        self.assertEqual(result, 0)
+        quantize.assert_called_once_with("/tmp/model", "/tmp/adapter")
 
     def test_run_list_command_prints_downloaded_and_local_sections(self):
         with patch("trillim.cli._iter_local_bundles", side_effect=[[], []]), patch(
@@ -643,6 +649,9 @@ class CLITests(unittest.TestCase):
         self.assertTrue(args.voice)
         args = parser.parse_args(["chat", "Trillim/model", "Local/adapter"])
         self.assertEqual(args.adapter_dir, "Local/adapter")
+        args = parser.parse_args(["quantize", "/tmp/model", "/tmp/adapter"])
+        self.assertEqual(args.model_dir, "/tmp/model")
+        self.assertEqual(args.adapter_dir, "/tmp/adapter")
 
     def test_main_prints_help_when_no_command_is_given(self):
         output = io.StringIO()
@@ -667,9 +676,9 @@ class CLITests(unittest.TestCase):
         with patch("trillim.cli._run_serve", return_value=9) as run_serve:
             self.assertEqual(cli.main(["serve", "Trillim/demo"]), 9)
             run_serve.assert_called_once_with("Trillim/demo", voice=False)
-        with patch("trillim.cli._run_quantize_placeholder", return_value=1) as run_quantize:
-            self.assertEqual(cli.main(["quantize"]), 1)
-            run_quantize.assert_called_once_with()
+        with patch("trillim.cli._run_quantize_command", return_value=1) as run_quantize:
+            self.assertEqual(cli.main(["quantize", "/tmp/model"]), 1)
+            run_quantize.assert_called_once()
 
     def test_main_prints_error_for_runtime_failures(self):
         error = io.StringIO()
