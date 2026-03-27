@@ -122,11 +122,15 @@ def recover_publish_state(target: Path) -> None:
 
 
 def copy_model_support_files(model_dir: Path, output_dir: Path) -> None:
+    metadata, normalized_tokenizer_config = _load_bundle_support_metadata(model_dir)
     for filename in _MODEL_ALLOWLIST:
+        if filename == "tokenizer_config.json" and normalized_tokenizer_config is not None:
+            _write_json(output_dir / filename, normalized_tokenizer_config)
+            continue
         source_path = model_dir / filename
         if source_path.is_file():
             _copy_file(source_path, output_dir / filename)
-    for relative_path in _collect_remote_code_files(model_dir):
+    for relative_path in _collect_bundle_support_code_files(model_dir, metadata):
         _copy_file(model_dir / relative_path, output_dir / relative_path)
 
 
@@ -146,6 +150,7 @@ def write_model_metadata(
     config: ModelQuantizeConfig,
     model_dir: Path,
 ) -> None:
+    metadata, _normalized_tokenizer_config = _load_bundle_support_metadata(model_dir)
     payload = {
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
@@ -155,7 +160,7 @@ def write_model_metadata(
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
         "base_model_config_hash": compute_base_model_config_hash(model_dir),
-        "remote_code": _has_remote_code_references(model_dir),
+        "remote_code": _bundle_requires_remote_code(metadata),
     }
     _write_json(output_dir / "trillim_config.json", payload)
 
@@ -263,9 +268,119 @@ def _project_version() -> str:
         return str(payload["project"]["version"])
 
 
+def _load_bundle_support_metadata(
+    model_dir: Path,
+) -> tuple[dict[str, dict | None], dict | None]:
+    metadata = _load_remote_code_metadata(model_dir)
+    normalized_tokenizer_config = _build_bundle_tokenizer_config(
+        model_dir,
+        tokenizer_config=metadata["tokenizer_config"],
+    )
+    if normalized_tokenizer_config is None:
+        return metadata, None
+    return (
+        {
+            "config": metadata["config"],
+            "tokenizer_config": normalized_tokenizer_config,
+        },
+        normalized_tokenizer_config,
+    )
+
+
+def _build_bundle_tokenizer_config(
+    model_dir: Path,
+    *,
+    tokenizer_config: dict | None,
+) -> dict | None:
+    if not isinstance(tokenizer_config, dict):
+        return None
+    if _extract_auto_map_refs(tokenizer_config, key="AutoTokenizer"):
+        return None
+    tokenizer_class = tokenizer_config.get("tokenizer_class")
+    if not isinstance(tokenizer_class, str) or not tokenizer_class:
+        return None
+    module_path = _find_local_class_module(model_dir, class_name=tokenizer_class)
+    if module_path is None:
+        return None
+    normalized = dict(tokenizer_config)
+    auto_map = normalized.get("auto_map")
+    updated_auto_map = dict(auto_map) if isinstance(auto_map, dict) else {}
+    updated_auto_map["AutoTokenizer"] = [f"{module_path.stem}.{tokenizer_class}", None]
+    normalized["auto_map"] = updated_auto_map
+    return normalized
+
+
+def _find_local_class_module(model_dir: Path, *, class_name: str) -> Path | None:
+    matches: list[Path] = []
+    for source_path in sorted(model_dir.glob("*.py")):
+        if _module_defines_class(source_path, class_name=class_name):
+            matches.append(source_path.relative_to(model_dir))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    tokenizer_matches = [path for path in matches if path.stem.startswith("tokenization")]
+    if len(tokenizer_matches) == 1:
+        return tokenizer_matches[0]
+    raise ValueError(
+        f"Tokenizer class {class_name!r} is defined in multiple local modules: "
+        f"{', '.join(str(path) for path in matches)}"
+    )
+
+
+def _module_defines_class(source_path: Path, *, class_name: str) -> bool:
+    content = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(content, filename=str(source_path))
+    return any(
+        isinstance(node, ast.ClassDef) and node.name == class_name
+        for node in ast.walk(tree)
+    )
+
+
+def _collect_bundle_support_code_files(
+    model_dir: Path,
+    metadata: dict[str, dict | None],
+) -> list[Path]:
+    return _collect_remote_code_files_from_refs(
+        model_dir,
+        _collect_bundle_support_class_refs(metadata),
+    )
+
+
+def _bundle_requires_remote_code(metadata: dict[str, dict | None]) -> bool:
+    return bool(_collect_bundle_support_class_refs(metadata))
+
+
+def _collect_bundle_support_class_refs(metadata: dict[str, dict | None]) -> list[str]:
+    refs: list[str] = []
+    for payload, key in (
+        (metadata["tokenizer_config"], "AutoTokenizer"),
+        (metadata["config"], "AutoTokenizer"),
+    ):
+        refs.extend(_extract_auto_map_refs(payload, key=key))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        deduped.append(ref)
+    return deduped
+
+
 def _collect_remote_code_files(model_dir: Path) -> list[Path]:
     metadata = _load_remote_code_metadata(model_dir)
-    queue = deque((_parse_remote_code_module_path(ref), 0) for ref in _collect_remote_code_class_refs(metadata))
+    return _collect_remote_code_files_from_refs(
+        model_dir,
+        _collect_remote_code_class_refs(metadata),
+    )
+
+
+def _collect_remote_code_files_from_refs(
+    model_dir: Path,
+    class_refs: list[str],
+) -> list[Path]:
+    queue = deque((_parse_remote_code_module_path(ref), 0) for ref in class_refs)
     collected: list[Path] = []
     seen: set[Path] = set()
     total_bytes = 0

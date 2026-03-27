@@ -15,6 +15,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from transformers import AutoTokenizer
+
 from trillim._bundle_metadata import (
     CURRENT_FORMAT_VERSION,
     compute_base_model_config_hash,
@@ -712,8 +714,8 @@ class QuantizeTests(unittest.TestCase):
 
             self.assertTrue((model_output_dir / "config.json").is_file())
             self.assertTrue((model_output_dir / "tokenization_trillim.py").is_file())
-            self.assertTrue((model_output_dir / "configuration_trillim.py").is_file())
             self.assertTrue((model_output_dir / "shared.py").is_file())
+            self.assertFalse((model_output_dir / "configuration_trillim.py").exists())
             self.assertFalse((model_output_dir / "weights.safetensors").exists())
             self.assertFalse((model_output_dir / "unused.bin").exists())
             self.assertTrue((adapter_output_dir / "adapter_config.json").is_file())
@@ -730,6 +732,121 @@ class QuantizeTests(unittest.TestCase):
             self.assertEqual(adapter_metadata["type"], "lora_adapter")
             self.assertEqual(model_metadata["remote_code"], True)
             self.assertEqual(adapter_metadata["remote_code"], False)
+
+    def test_copy_model_support_files_infers_local_tokenizer_auto_map(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_config_only_model(root, name="custom-tokenizer-model")
+            (model_dir / "vocab.txt").write_text("<unk>\nhello\nworld\n", encoding="utf-8")
+            (model_dir / "special_tokens_map.json").write_text(
+                json.dumps({"unk_token": "<unk>"}),
+                encoding="utf-8",
+            )
+            (model_dir / "tokenizer_config.json").write_text(
+                json.dumps({"tokenizer_class": "ExampleTokenizer", "unk_token": "<unk>"}),
+                encoding="utf-8",
+            )
+            (model_dir / "tokenization_example.py").write_text(
+                "\n".join(
+                    [
+                        "from transformers.tokenization_utils import PreTrainedTokenizer",
+                        "",
+                        'VOCAB_FILES_NAMES = {"vocab_file": "vocab.txt"}',
+                        "",
+                        "class ExampleTokenizer(PreTrainedTokenizer):",
+                        "    vocab_files_names = VOCAB_FILES_NAMES",
+                        '    model_input_names = ["input_ids", "attention_mask"]',
+                        "",
+                        '    def __init__(self, vocab_file, unk_token="<unk>", **kwargs):',
+                        "        self.vocab_file = vocab_file",
+                        "        with open(vocab_file, encoding='utf-8') as handle:",
+                        "            tokens = [line.strip() for line in handle if line.strip()]",
+                        "        self._token_to_id = {token: index for index, token in enumerate(tokens)}",
+                        "        self._id_to_token = {index: token for token, index in self._token_to_id.items()}",
+                        "        super().__init__(unk_token=unk_token, **kwargs)",
+                        "",
+                        "    @property",
+                        "    def vocab_size(self):",
+                        "        return len(self._token_to_id)",
+                        "",
+                        "    def get_vocab(self):",
+                        "        return dict(self._token_to_id)",
+                        "",
+                        "    def _tokenize(self, text):",
+                        "        return text.split()",
+                        "",
+                        "    def _convert_token_to_id(self, token):",
+                        "        return self._token_to_id.get(token, self._token_to_id[self.unk_token])",
+                        "",
+                        "    def _convert_id_to_token(self, index):",
+                        "        return self._id_to_token[index]",
+                        "",
+                        "    def save_vocabulary(self, save_directory, filename_prefix=None):",
+                        "        return (self.vocab_file,)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            model_output_dir = root / "model-out"
+            model_output_dir.mkdir()
+            config = entrypoint.load_model_config(model_dir)
+
+            output.copy_model_support_files(model_dir, model_output_dir)
+            output.write_model_metadata(model_output_dir, config=config, model_dir=model_dir)
+
+            copied_tokenizer_config = json.loads(
+                (model_output_dir / "tokenizer_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                copied_tokenizer_config["auto_map"]["AutoTokenizer"],
+                ["tokenization_example.ExampleTokenizer", None],
+            )
+            self.assertTrue((model_output_dir / "tokenization_example.py").is_file())
+            model_metadata = json.loads(
+                (model_output_dir / "trillim_config.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(model_metadata["remote_code"])
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_output_dir,
+                trust_remote_code=True,
+                use_fast=False,
+            )
+            self.assertEqual(type(tokenizer).__name__, "ExampleTokenizer")
+
+    def test_copy_model_support_files_ignores_missing_config_only_remote_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_config_only_model(
+                root,
+                name="stale-remote-model",
+                payload={
+                    "architectures": ["LlamaForCausalLM"],
+                    "auto_map": {"AutoConfig": "configuration_missing.MissingConfig"},
+                    "hidden_size": 130,
+                    "intermediate_size": 129,
+                    "num_attention_heads": 5,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 32,
+                },
+            )
+            (model_dir / "tokenizer_config.json").write_text(
+                json.dumps({"tokenizer_class": "PreTrainedTokenizerFast"}),
+                encoding="utf-8",
+            )
+            model_output_dir = root / "model-out"
+            model_output_dir.mkdir()
+            config = entrypoint.load_model_config(model_dir)
+
+            output.copy_model_support_files(model_dir, model_output_dir)
+            output.write_model_metadata(model_output_dir, config=config, model_dir=model_dir)
+
+            self.assertFalse((model_output_dir / "configuration_missing.py").exists())
+            model_metadata = json.loads(
+                (model_output_dir / "trillim_config.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(model_metadata["remote_code"])
 
     def test_prepare_output_target_prompts_dedups_and_recovers(self):
         with patched_model_store() as root:
@@ -1814,6 +1931,21 @@ class QuantizeInternalTests(unittest.TestCase):
                 ["x.Y"],
             )
             self.assertEqual(output._extract_auto_map_refs(None, key="AutoTokenizer"), [])
+            self.assertIsNone(
+                output._build_bundle_tokenizer_config(
+                    root,
+                    tokenizer_config={
+                        "auto_map": {"AutoTokenizer": "tokenizer_mod.Tokenizer"},
+                        "tokenizer_class": "Tokenizer",
+                    },
+                )
+            )
+            self.assertIsNone(
+                output._build_bundle_tokenizer_config(
+                    root,
+                    tokenizer_config={"tokenizer_class": ""},
+                )
+            )
             self.assertEqual(
                 output._parse_remote_code_module_path("tokenizer_mod.Tokenizer"),
                 Path("tokenizer_mod.py"),
@@ -1824,6 +1956,52 @@ class QuantizeInternalTests(unittest.TestCase):
                 output._parse_remote_code_module_path("TokenizerOnly")
             with self.assertRaisesRegex(ValueError, "Package-scoped remote-code entry points"):
                 output._parse_remote_code_module_path("pkg.tokenizer_mod.Tokenizer")
+
+            no_match_model = root / "bundle-no-match"
+            no_match_model.mkdir()
+            (no_match_model / "helper.py").write_text("class Other: pass\n", encoding="utf-8")
+            self.assertIsNone(
+                output._find_local_class_module(no_match_model, class_name="MissingTokenizer")
+            )
+
+            preferred_module_model = root / "bundle-preferred"
+            preferred_module_model.mkdir()
+            (preferred_module_model / "alpha.py").write_text("class Tokenizer: pass\n", encoding="utf-8")
+            (preferred_module_model / "tokenization_alpha.py").write_text(
+                "class Tokenizer: pass\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                output._find_local_class_module(preferred_module_model, class_name="Tokenizer"),
+                Path("tokenization_alpha.py"),
+            )
+
+            ambiguous_module_model = root / "bundle-ambiguous"
+            ambiguous_module_model.mkdir()
+            (ambiguous_module_model / "alpha.py").write_text(
+                "class Tokenizer: pass\n",
+                encoding="utf-8",
+            )
+            (ambiguous_module_model / "beta.py").write_text(
+                "class Tokenizer: pass\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "defined in multiple local modules"):
+                output._find_local_class_module(ambiguous_module_model, class_name="Tokenizer")
+
+            self.assertEqual(
+                output._collect_bundle_support_class_refs(
+                    {
+                        "config": {
+                            "auto_map": {"AutoTokenizer": "tokenizer_mod.Tokenizer"},
+                        },
+                        "tokenizer_config": {
+                            "auto_map": {"AutoTokenizer": ["tokenizer_mod.Tokenizer", None]},
+                        },
+                    }
+                ),
+                ["tokenizer_mod.Tokenizer"],
+            )
 
             module_path = root / "imports.py"
             module_path.write_text(
