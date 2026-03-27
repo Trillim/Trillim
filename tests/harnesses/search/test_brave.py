@@ -193,3 +193,59 @@ class BraveProviderTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].title, "https://example.com")
+
+    def test_brave_provider_handles_nonstandard_grounding_shapes_and_empty_results(self):
+        payload = json.dumps(
+            {
+                "grounding": {
+                    "generic": {"bad": "shape"},
+                    "poi": [],
+                    "map": {"also": "bad"},
+                },
+                "sources": [],
+            }
+        ).encode("utf-8")
+        with patch.dict(os.environ, {"SEARCH_API_KEY": "good-key"}, clear=True):
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_ResponseStub(payload),
+            ):
+                with self.assertRaisesRegex(SearchError, "no usable results"):
+                    BraveSearchProvider(token_budget=32).search("cats", max_results=5)
+
+        payload = json.dumps({"grounding": [], "sources": {}}).encode("utf-8")
+        with patch.dict(os.environ, {"SEARCH_API_KEY": "good-key"}, clear=True):
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_ResponseStub(payload),
+            ):
+                with self.assertRaisesRegex(SearchError, "no usable results"):
+                    BraveSearchProvider(token_budget=32).search("cats", max_results=5)
+
+        payload = json.dumps(
+            {
+                "grounding": {
+                    "generic": [
+                        {
+                            "url": "",
+                            "title": "skip",
+                            "snippets": [],
+                        },
+                        {
+                            "url": "https://example.com",
+                            "title": "Example",
+                            "snippets": "not-a-list",
+                        }
+                    ]
+                },
+                "sources": {},
+            }
+        ).encode("utf-8")
+        with patch.dict(os.environ, {"SEARCH_API_KEY": "good-key"}, clear=True):
+            with patch(
+                "urllib.request.urlopen",
+                return_value=_ResponseStub(payload),
+            ):
+                results = BraveSearchProvider(token_budget=32).search("cats", max_results=5)
+
+        self.assertEqual(results[0].snippet, "")

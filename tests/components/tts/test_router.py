@@ -6,6 +6,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -227,6 +228,19 @@ class TTSRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.wait_for(session.collect(), timeout=1))
         await tts.stop()
 
+    async def test_read_bounded_body_fails_when_no_time_budget_remains(self):
+        request = FakeRequest(
+            headers={"content-length": "1", "voice": "alba"},
+            chunks=[b"x"],
+        )
+
+        with patch("trillim.components.tts._router.PROGRESS_TIMEOUT_SECONDS", 0), patch(
+            "trillim.components.tts._router.TOTAL_UPLOAD_TIMEOUT_SECONDS",
+            0,
+        ):
+            with self.assertRaisesRegex(ProgressTimeoutError, "timed out"):
+                await _read_bounded_body(request, limit=10)
+
     async def test_audio_speech_rejects_busy_request_before_reading_body(self):
         started = asyncio.Event()
         release = asyncio.Event()
@@ -317,3 +331,36 @@ class TTSRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_as_http_error(InvalidRequestError("bad")).status_code, 400)
         self.assertEqual(_as_http_error(AdmissionRejectedError("busy")).status_code, 429)
         self.assertEqual(_as_http_error(ProgressTimeoutError("slow")).status_code, 504)
+
+    def test_as_http_error_preserves_http_exceptions_and_maps_missing_voices(self):
+        http_error = HTTPException(status_code=418, detail="teapot")
+
+        self.assertIs(_as_http_error(http_error), http_error)
+        self.assertEqual(_as_http_error(KeyError("missing")).status_code, 404)
+
+    async def test_voice_routes_wrap_list_and_delete_failures(self):
+        async def bad_list() -> list[str]:
+            raise InvalidRequestError("bad list")
+
+        async def bad_delete(_name: str) -> str:
+            raise KeyError("missing")
+
+        tts = SimpleNamespace(
+            speed=1.0,
+            default_voice="alba",
+            list_voices=bad_list,
+            delete_voice=bad_delete,
+        )
+        router = build_router(tts)
+        list_endpoint = next(route.endpoint for route in router.routes if route.path == "/v1/voices")
+        delete_endpoint = next(
+            route.endpoint for route in router.routes if route.path == "/v1/voices/{voice_name}"
+        )
+
+        with self.assertRaises(HTTPException) as list_error:
+            await list_endpoint()
+        with self.assertRaises(HTTPException) as delete_error:
+            await delete_endpoint("missing")
+
+        self.assertEqual(list_error.exception.status_code, 400)
+        self.assertEqual(delete_error.exception.status_code, 404)

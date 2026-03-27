@@ -57,3 +57,11 @@ class ComponentSkeletonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.component_name, "llm")
         self.assertEqual(STT().component_name, "stt")
         self.assertEqual(TTS().component_name, "tts")
+
+    async def test_base_component_defaults_are_safe_noops(self):
+        component = Component()
+
+        self.assertEqual(component.component_name, "component")
+        self.assertIsInstance(component.router(), APIRouter)
+        self.assertIsNone(await component.start())
+        self.assertIsNone(await component.stop())

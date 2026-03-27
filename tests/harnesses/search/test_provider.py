@@ -2,12 +2,14 @@
 
 import unittest
 
+from trillim.components.llm._limits import MAX_MESSAGE_CHARS
 from trillim.harnesses.search.provider import (
     SearchError,
     coerce_search_result,
     extract_search_query,
     normalize_provider_name,
     resolve_search_token_budget,
+    validate_search_query,
     validate_harness_name,
 )
 
@@ -38,6 +40,15 @@ class SearchProviderHelperTests(unittest.TestCase):
             resolve_search_token_budget(2048, max_context_tokens=1024),
             256,
         )
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            resolve_search_token_budget(0, max_context_tokens=1024)
+
+    def test_validate_search_query_truncates_overlong_queries(self):
+        query = "x" * (MAX_MESSAGE_CHARS + 10)
+
+        normalized = validate_search_query(query)
+
+        self.assertEqual(len(normalized), MAX_MESSAGE_CHARS)
 
     def test_coerce_search_result_drops_missing_urls(self):
         self.assertIsNone(coerce_search_result(title="x", url="", snippet="y"))

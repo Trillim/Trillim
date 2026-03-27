@@ -42,6 +42,18 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
                 await stt.start()
         self.assertFalse(stt._started)
 
+    async def test_start_is_idempotent_and_track_active_task_keeps_new_owner(self):
+        stt = await self._start_stt()
+        await stt.start()
+
+        replacement = asyncio.create_task(asyncio.sleep(0))
+        async with stt._track_active_task():
+            stt._active_task = replacement
+
+        self.assertIs(stt._active_task, replacement)
+        await replacement
+        await stt.stop()
+
     async def test_transcribe_bytes_returns_text_and_cleans_up_owned_temp_file(self):
         stt = await self._start_stt()
         seen_path: dict[str, Path] = {}

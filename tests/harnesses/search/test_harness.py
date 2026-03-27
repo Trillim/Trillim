@@ -23,6 +23,7 @@ from tests.components.llm.support import (
     make_runtime_model,
     patched_model_store,
 )
+from trillim.harnesses.search._harness import _SearchHarness
 
 
 class _SuccessfulSearch:
@@ -237,4 +238,63 @@ class SearchHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.messages[3]["content"], "<search>dogs</search>")
         self.assertEqual(session.messages[-1]["content"], "done")
         self.assertEqual(events[-1].text, "done")
+        await llm.stop()
+
+    async def test_search_harness_skips_empty_decode_chunks_in_final_streaming_phase(self):
+        class _Engine:
+            def __init__(self) -> None:
+                self.tokenizer = FakeTokenizer()
+                self.last_prompt_tokens = 3
+                self.last_completion_tokens = 1
+                self.last_cache_hit = 0
+
+            async def generate(self, token_ids, **sampling):
+                del token_ids, sampling
+                yield 1
+                yield 2
+
+        class _Session:
+            def __init__(self) -> None:
+                self.messages = ({"role": "user", "content": "Find cats"},)
+                self.committed = None
+
+            def _prepare_generation(self, messages=None):
+                del messages
+                return [1, 2, 3]
+
+            def _commit_messages(self, messages):
+                self.committed = tuple(messages)
+
+        harness = _SearchHarness(_Engine(), search_provider="ddgs", search_token_budget=16)
+        harness._search = _SuccessfulSearch("curated cat results")
+        session = _Session()
+
+        with patch.object(
+            harness,
+            "_generate_buffered",
+            return_value="<search>cats</search>",
+        ), patch(
+            "trillim.harnesses.search._harness.IncrementalDecoder.decode",
+            side_effect=["", "k"],
+        ):
+            events = [event async for event in harness.stream_events(session, max_tokens=8)]
+
+        self.assertEqual([event.type for event in events], ["token", "final_text"])
+        self.assertEqual(events[-1].text, "k")
+        self.assertEqual(session.committed[-1]["content"], "k")
+
+    async def test_search_harness_skips_empty_decode_chunks_in_final_generation(self):
+        llm = self._make_llm(responses=["ab"])
+        await llm.start()
+
+        with patch(
+            "trillim.harnesses.search._harness.IncrementalDecoder.decode",
+            side_effect=["", "b"],
+        ):
+            async with llm.open_session([{"role": "user", "content": "Say hi"}]) as session:
+                events = [event async for event in session.stream_chat(max_tokens=8)]
+
+        self.assertEqual([event.type for event in events], ["token", "final_text", "done"])
+        self.assertEqual(events[-1].text, "b")
+        self.assertEqual(session.messages[-1]["content"], "b")
         await llm.stop()

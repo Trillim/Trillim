@@ -7,8 +7,11 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from trillim import _model_store
 from trillim.components.llm import ChatDoneEvent, ChatTokenEvent, ChatUsage
@@ -25,6 +28,36 @@ from tests.components.llm.support import (
     write_adapter_bundle,
     write_model_bundle,
 )
+
+
+class _PassiveCancelScope:
+    def cancel(self) -> None:
+        return None
+
+
+class _ManualTaskGroup:
+    def __init__(self, *, mutate_cancel=None) -> None:
+        self.cancel_scope = _PassiveCancelScope()
+        self._mutate_cancel = mutate_cancel
+        self._tasks: list[asyncio.Task] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        results = await asyncio.gather(*self._tasks, return_exceptions=True)
+        if exc_type is None:
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result,
+                    asyncio.CancelledError,
+                ):
+                    raise result
+
+    def start_soon(self, func, *args) -> None:
+        if getattr(func, "__name__", "") == "cancel_for_disconnect" and self._mutate_cancel is not None:
+            self._mutate_cancel(func)
+        self._tasks.append(asyncio.create_task(func(*args)))
 
 
 class LLMRouterTests(unittest.TestCase):
@@ -61,6 +94,30 @@ class LLMRouterTests(unittest.TestCase):
             rep_penalty_lookback=None,
             max_tokens=None,
         )
+
+    def _make_request(self, *, body_chunks: list[bytes], headers: dict[str, str] | None = None) -> Request:
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [
+                (name.lower().encode("latin-1"), value.encode("latin-1"))
+                for name, value in (headers or {}).items()
+            ],
+        }
+        chunks = list(body_chunks)
+
+        async def receive():
+            if chunks:
+                body = chunks.pop(0)
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": bool(chunks),
+                }
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return Request(scope, receive)
 
     def test_models_route_reports_truthful_model(self):
         with TestClient(self._make_server().app) as client:
@@ -109,6 +166,23 @@ class LLMRouterTests(unittest.TestCase):
             response.json()["choices"][0]["message"]["content"],
             "hello",
         )
+
+    def test_chat_completions_maps_non_stream_errors_to_http(self):
+        server = self._make_server(responses=["hello"])
+        llm = server.components[0]
+
+        async def reject_chat(*_args, **_kwargs):
+            raise AdmissionRejectedError("LLM is busy")
+
+        llm._collect_chat = reject_chat
+        with TestClient(server.app, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "Say hi"}]},
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["detail"], "LLM is busy")
 
     def test_chat_completions_reports_current_model_after_swap(self):
         models = [
@@ -228,6 +302,52 @@ class LLMRouterTests(unittest.TestCase):
             await response({"type": "http"}, receive, send)
             self.assertEqual(llm._admission.active_count, 0)
             await llm.stop()
+
+        asyncio.run(run())
+
+    def test_router_helpers_cover_json_body_and_http_exception_paths(self):
+        async def run() -> None:
+            request = self._make_request(
+                body_chunks=[b'{"ok": true}'],
+                headers={"content-length": "12"},
+            )
+            self.assertEqual(await llm_router._read_json_body(request, 32), {"ok": True})
+
+            with self.assertRaises(HTTPException) as invalid_length:
+                await llm_router._read_json_body(
+                    self._make_request(body_chunks=[b"{}"], headers={"content-length": "nope"}),
+                    32,
+                )
+            self.assertEqual(invalid_length.exception.status_code, 400)
+
+            with self.assertRaises(HTTPException) as too_large:
+                await llm_router._read_json_body(
+                    self._make_request(body_chunks=[b"{}", b"overflow"], headers=None),
+                    4,
+                )
+            self.assertEqual(too_large.exception.status_code, 413)
+
+            with self.assertRaises(HTTPException) as invalid_json:
+                await llm_router._read_json_body(
+                    self._make_request(body_chunks=[b"{"]),
+                    32,
+                )
+            self.assertEqual(invalid_json.exception.status_code, 400)
+
+        asyncio.run(run())
+
+        passthrough = HTTPException(status_code=418, detail="teapot")
+        self.assertIs(llm_router._as_http_error(passthrough), passthrough)
+        self.assertIsNone(llm_router._init_config_payload(SimpleNamespace(init_config=None)))
+
+    def test_read_json_body_rejects_oversized_content_length_before_streaming(self):
+        async def run() -> None:
+            with self.assertRaises(HTTPException) as too_large:
+                await llm_router._read_json_body(
+                    self._make_request(body_chunks=[b"{}"], headers={"content-length": "33"}),
+                    32,
+                )
+            self.assertEqual(too_large.exception.status_code, 413)
 
         asyncio.run(run())
 
@@ -583,6 +703,609 @@ class LLMRouterTests(unittest.TestCase):
         asyncio.run(run())
         self.assertEqual(messages[0]["type"], "http.response.start")
         self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_duplicate_disconnect_cancellation_is_idempotent(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                return ChatTokenEvent(text="a"), "a"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        class _CancelScope:
+            def cancel(self) -> None:
+                return None
+
+        class _FakeTaskGroup:
+            def __init__(self) -> None:
+                self.cancel_scope = _CancelScope()
+                self._tasks: list[asyncio.Task] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                results = await asyncio.gather(*self._tasks, return_exceptions=True)
+                if exc_type is None:
+                    for result in results:
+                        if isinstance(result, BaseException) and not isinstance(
+                            result,
+                            asyncio.CancelledError,
+                        ):
+                            raise result
+
+            def start_soon(self, func, *args) -> None:
+                self._tasks.append(asyncio.create_task(func(*args)))
+                if getattr(func, "__name__", "") == "cancel_for_disconnect":
+                    self._tasks.append(asyncio.create_task(func(*args)))
+
+        async def fake_stream(*_args, **_kwargs):
+            yield "data: hello\n\n"
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+        start_attempted = asyncio.Event()
+        receive_calls = 0
+
+        async def receive():
+            nonlocal receive_calls
+            receive_calls += 1
+            if receive_calls == 1:
+                return {"type": "http.request"}
+            await start_attempted.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.start":
+                start_attempted.set()
+                raise OSError("disconnect")
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_FakeTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router._stream_chat_response",
+                fake_stream,
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages[0]["type"], "http.response.start")
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_skips_headers_after_disconnect_when_cancel_loses_session_reference(self):
+        import ctypes
+        import inspect
+
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        prepared = asyncio.Event()
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                frame = inspect.currentframe()
+                while frame is not None:
+                    if "disconnect_cancel_requested" in frame.f_locals and "session" in frame.f_locals:
+                        frame.f_locals["session"] = None
+                        ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frame), ctypes.c_int(1))
+                        break
+                    frame = frame.f_back
+                prepared.set()
+                return ChatTokenEvent(text="a"), "a"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                raise AssertionError("session.close should not run once the closure loses its session")
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                return None
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        async def checkpoint() -> None:
+            await asyncio.sleep(0)
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+
+        async def receive():
+            await prepared.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router.anyio.lowlevel.checkpoint",
+                side_effect=checkpoint,
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages, [])
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_skips_first_body_when_disconnect_wins_after_headers(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        closed = asyncio.Event()
+        header_sent = asyncio.Event()
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                return ChatTokenEvent(text="a"), "a"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                closed.set()
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                return None
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        async def fake_stream(*_args, **_kwargs):
+            await closed.wait()
+            yield "data: body\n\n"
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+
+        async def receive():
+            await header_sent.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.start":
+                header_sent.set()
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router._stream_chat_response",
+                fake_stream,
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual([message["type"] for message in messages], ["http.response.start"])
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_returns_after_body_send_disconnect_with_manual_task_group(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        closed = asyncio.Event()
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                return ChatTokenEvent(text="a"), "a"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                closed.set()
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                return None
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        async def fake_stream(*_args, **_kwargs):
+            yield "data: body\n\n"
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+
+        async def receive():
+            await closed.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.body":
+                raise OSError("disconnect")
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router._stream_chat_response",
+                fake_stream,
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages[0]["type"], "http.response.start")
+        self.assertEqual(messages[1]["type"], "http.response.body")
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_skips_final_empty_body_after_disconnect(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        closed = asyncio.Event()
+        body_sent = asyncio.Event()
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                return ChatTokenEvent(text="a"), "a"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                closed.set()
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                return None
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        async def fake_stream(*_args, **_kwargs):
+            yield "data: body\n\n"
+            await closed.wait()
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+
+        async def receive():
+            await body_sent.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.body" and message["more_body"]:
+                body_sent.set()
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router._stream_chat_response",
+                fake_stream,
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(
+            [message["type"] for message in messages],
+            ["http.response.start", "http.response.body"],
+        )
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_swallows_session_closed_after_disconnect_before_commit(self):
+        class _Lease:
+            def __init__(self) -> None:
+                self.release_count = 0
+
+            async def release(self) -> None:
+                self.release_count += 1
+
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        class _Session:
+            def _prepare_stream_chat(self, **_kwargs):
+                return "sampling"
+
+            async def _start_prepared_stream(self, _sampling):
+                started.set()
+                await closed.wait()
+                raise SessionClosedError("ChatSession is closed")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def close(self) -> None:
+                closed.set()
+
+        class _LLM:
+            def __init__(self) -> None:
+                self._lease = _Lease()
+                self._session = _Session()
+
+            def model_info(self):
+                return SimpleNamespace(name="fake")
+
+            def open_session(self, _messages):
+                return self._session
+
+            async def _recover_from_engine_failure(self) -> None:
+                return None
+
+            class _Admission:
+                def __init__(self, lease) -> None:
+                    self._lease = lease
+
+                async def acquire(self):
+                    return self._lease
+
+        llm = _LLM()
+        llm._admission = llm._Admission(llm._lease)
+        response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+        messages = []
+
+        async def receive():
+            await started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        async def run() -> None:
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ):
+                await response({"type": "http"}, receive, send)
+
+        asyncio.run(run())
+        self.assertEqual(messages, [])
+        self.assertEqual(llm._lease.release_count, 1)
+
+    def test_chat_stream_response_swallows_poststart_engine_failures_after_disconnect(self):
+        async def run_case(exc_factory) -> tuple[list[dict[str, object]], int]:
+            class _Lease:
+                def __init__(self) -> None:
+                    self.release_count = 0
+
+                async def release(self) -> None:
+                    self.release_count += 1
+
+            closed = asyncio.Event()
+            body_sent = asyncio.Event()
+
+            class _Session:
+                def _prepare_stream_chat(self, **_kwargs):
+                    return "sampling"
+
+                async def _start_prepared_stream(self, _sampling):
+                    return ChatTokenEvent(text="a"), "a"
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb) -> None:
+                    return None
+
+                async def close(self) -> None:
+                    closed.set()
+
+            class _LLM:
+                def __init__(self) -> None:
+                    self._lease = _Lease()
+                    self._session = _Session()
+                    self.recoveries = 0
+
+                def model_info(self):
+                    return SimpleNamespace(name="fake")
+
+                def open_session(self, _messages):
+                    return self._session
+
+                async def _recover_from_engine_failure(self) -> None:
+                    self.recoveries += 1
+
+                class _Admission:
+                    def __init__(self, lease) -> None:
+                        self._lease = lease
+
+                    async def acquire(self):
+                        return self._lease
+
+            async def fake_stream(*_args, **_kwargs):
+                yield "data: body\n\n"
+                await closed.wait()
+                raise exc_factory("boom")
+
+            llm = _LLM()
+            llm._admission = llm._Admission(llm._lease)
+            response = llm_router._ChatStreamResponse(llm, self._stream_request_model())
+            messages = []
+
+            async def receive():
+                await body_sent.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                messages.append(message)
+                if message["type"] == "http.response.body" and message["more_body"]:
+                    body_sent.set()
+
+            with patch(
+                "trillim.components.llm._router.anyio.create_task_group",
+                return_value=_ManualTaskGroup(),
+            ), patch(
+                "trillim.components.llm._router._stream_chat_response",
+                fake_stream,
+            ):
+                await response({"type": "http"}, receive, send)
+            return messages, llm.recoveries
+
+        progress_messages, progress_recoveries = asyncio.run(
+            run_case(EngineProgressTimeoutError)
+        )
+        crash_messages, crash_recoveries = asyncio.run(run_case(EngineCrashedError))
+        self.assertEqual(
+            [message["type"] for message in progress_messages],
+            ["http.response.start", "http.response.body"],
+        )
+        self.assertEqual(
+            [message["type"] for message in crash_messages],
+            ["http.response.start", "http.response.body"],
+        )
+        self.assertEqual(progress_recoveries, 1)
+        self.assertEqual(crash_recoveries, 1)
 
     def test_chat_stream_response_drains_when_body_send_disconnects(self):
         class _Lease:

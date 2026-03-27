@@ -80,6 +80,28 @@ class TTSSegmenterTests(unittest.TestCase):
 
         self.assertEqual(list(_iter_paragraph_segments(" \n ", self.tokenizer)), [])
 
+    def test_hard_split_unit_covers_first_word_overflow_and_reset_without_reslicing(self):
+        long_word = "x" * (HARD_TEXT_SEGMENT_CAP + 10)
+        capped_word = "y" * HARD_TEXT_SEGMENT_CAP
+
+        self.assertEqual(
+            _hard_split_unit(long_word, self.tokenizer),
+            ["x" * HARD_TEXT_SEGMENT_CAP, "x" * 10],
+        )
+        self.assertEqual(
+            _hard_split_unit(f"{capped_word} z", self.tokenizer),
+            [capped_word, "z"],
+        )
+
+    def test_iter_paragraph_segments_skips_blank_pieces_after_hard_split(self):
+        with patch(
+            "trillim.components.tts._segmenter._hard_split_unit",
+            return_value=["   ", "alpha"],
+        ):
+            segments = list(_iter_paragraph_segments("ignored", self.tokenizer))
+
+        self.assertEqual(segments, ["alpha"])
+
     def test_load_pocket_tts_tokenizer_uses_lookup_configuration(self):
         captured: list[tuple[int, str]] = []
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import runpy
 import struct
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import torch
+import trillim.components.tts._worker as tts_worker_module
 
 from trillim.components.tts._validation import load_safe_voice_state_bytes
 from trillim.errors import ProgressTimeoutError
@@ -241,6 +243,41 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ProgressTimeoutError, "voice-state build timed out"):
                 await build_voice_state(audio_path)
 
+    async def test_synthesize_segment_timeout_and_nonzero_exit_surface_worker_failures(self):
+        process = SimpleNamespace(returncode=None)
+        with patch(
+            "trillim.components.tts._worker.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ), patch(
+            "trillim.components.tts._worker._collect_worker_output",
+            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+        ), patch(
+            "trillim.components.tts._worker._stop_process",
+            new=AsyncMock(),
+        ) as stop_process:
+            with self.assertRaisesRegex(ProgressTimeoutError, "chunk timed out"):
+                await synthesize_segment(
+                    "tiny prompt",
+                    voice_kind="predefined",
+                    voice_reference="alba",
+                )
+        stop_process.assert_awaited_once_with(process)
+
+        process = SimpleNamespace(returncode=1)
+        with patch(
+            "trillim.components.tts._worker.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ), patch(
+            "trillim.components.tts._worker._collect_worker_output",
+            new=AsyncMock(return_value=(b"", b"worker boom")),
+        ):
+            with self.assertRaisesRegex(WorkerFailureError, "worker boom"):
+                await synthesize_segment(
+                    "tiny prompt",
+                    voice_kind="predefined",
+                    voice_reference="alba",
+                )
+
     async def test_persistent_session_worker_times_out_and_rejects_malformed_stdout(self):
         with patch(
             "trillim.components.tts._worker._worker_command",
@@ -259,6 +296,81 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
                     await worker.synthesize("hello")
             finally:
                 await worker.close()
+
+    async def test_persistent_worker_internal_error_paths_cover_closed_cancelled_and_pipe_failures(self):
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+        await worker.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            await worker.synthesize("hello")
+
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+        process = SimpleNamespace(returncode=None, stdin=SimpleNamespace(close=lambda: None))
+
+        async def cancelled_write(_process, _text):
+            raise asyncio.CancelledError()
+
+        worker._ensure_process = AsyncMock(return_value=process)
+        worker._write_request = AsyncMock(side_effect=cancelled_write)
+        worker.close = AsyncMock()
+        with self.assertRaises(asyncio.CancelledError):
+            await worker.synthesize("hello")
+        worker.close.assert_awaited()
+
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+        worker._stderr_task = None
+        with self.assertRaises(WorkerFailureError):
+            await worker._write_request(SimpleNamespace(stdin=None), "hello")
+
+        class _BrokenWriter:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> None:
+                self.writes.append(data)
+
+            async def drain(self) -> None:
+                raise BrokenPipeError("boom")
+
+        broken_stdin = _BrokenWriter()
+        process = SimpleNamespace(
+            stdin=broken_stdin,
+            returncode=1,
+            wait=AsyncMock(return_value=1),
+        )
+        worker._stderr_chunks = bytearray(b"stderr boom")
+        worker._stderr_task = None
+        with self.assertRaisesRegex(WorkerFailureError, "stderr boom"):
+            await worker._write_request(process, "hello")
+
+        worker._stderr_chunks = bytearray(b"stdout gone")
+        with self.assertRaisesRegex(WorkerFailureError, "stdout gone"):
+            await worker._read_response(SimpleNamespace(stdout=None))
+
+        header = _RESPONSE_HEADER.pack(b"A", 0)
+
+        class _Reader:
+            async def readexactly(self, size: int) -> bytes:
+                return header if size == _RESPONSE_HEADER.size else b""
+
+        process = SimpleNamespace(stdout=_Reader(), returncode=1, wait=AsyncMock(return_value=1))
+        worker._stderr_chunks = bytearray(b"response boom")
+        worker._stderr_task = None
+        with self.assertRaisesRegex(WorkerFailureError, "response boom"):
+            await worker._read_response(process)
+
+        wait_process = SimpleNamespace(returncode=None, wait=AsyncMock(return_value=1))
+        worker._stderr_task = None
+        await worker._await_process_error(wait_process)
+        wait_process.wait.assert_awaited_once()
 
         malformed_script = (
             "import sys, struct; "
@@ -371,6 +483,106 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hanging.kill_calls, 1)
         self.assertGreaterEqual(hanging.wait_calls, 1)
         self.assertEqual(_error_message(b" \n"), "TTS worker failed")
+
+    async def test_persistent_worker_private_helpers_cover_stderr_waits_and_short_reads(self):
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+
+        process = SimpleNamespace(returncode=0, stdin=None)
+        stderr_task = asyncio.create_task(asyncio.sleep(0))
+        worker._process = process
+        worker._stderr_task = stderr_task
+        with patch("trillim.components.tts._worker._stop_process", new=AsyncMock()) as stop_process:
+            await worker.close()
+        stop_process.assert_awaited_once_with(process)
+
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+        wait_process = SimpleNamespace(returncode=None, wait=AsyncMock(return_value=1))
+        worker._stderr_task = asyncio.create_task(asyncio.sleep(0))
+        await worker._await_process_error(wait_process)
+        wait_process.wait.assert_awaited_once()
+
+        class _OversizedReader:
+            async def readexactly(self, size: int) -> bytes:
+                if size == _RESPONSE_HEADER.size:
+                    return _RESPONSE_HEADER.pack(b"A", 2)
+                raise AssertionError("payload should not be read after oversize header")
+
+        worker = create_session_worker(
+            voice_kind="predefined",
+            voice_reference="alba",
+        )
+        worker._stderr_task = None
+        with patch("trillim.components.tts._worker.MAX_PCM_CHUNK_BYTES", 1):
+            with self.assertRaisesRegex(Exception, "oversized stdout"):
+                await worker._read_response(
+                    SimpleNamespace(stdout=_OversizedReader(), returncode=None)
+                )
+
+    def test_run_session_worker_rejects_short_payload_reads(self):
+        class _FakeModel:
+            def generate_audio(self, model_state, text_to_generate, max_tokens=20):
+                del model_state, text_to_generate, max_tokens
+                return [0.0]
+
+        fake_pocket_tts = SimpleNamespace(
+            TTSModel=SimpleNamespace(load_model=lambda: _FakeModel())
+        )
+        stdin_buffer = io.BytesIO(_REQUEST_HEADER.pack(4) + b"ab")
+        stdout_buffer = io.BytesIO()
+
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch(
+            "trillim.components.tts._worker._load_worker_state",
+            return_value={"prompt": "voice"},
+        ), patch(
+            "trillim.components.tts._worker.sys.stdin",
+            SimpleNamespace(buffer=stdin_buffer),
+        ), patch(
+            "trillim.components.tts._worker.sys.stdout",
+            SimpleNamespace(buffer=stdout_buffer),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed stdin input"):
+                _run_session_worker(
+                    voice_kind="predefined",
+                    voice_reference="alba",
+                )
+
+    def test_worker_module_main_raises_system_exit_under_dunder_main(self):
+        audio_path = self.root / "voice.txt"
+        audio_path.write_text("voice", encoding="latin-1")
+
+        class _FakeModel:
+            def get_state_for_audio_prompt(self, audio_conditioning):
+                return {"prompt": Path(audio_conditioning).read_text(encoding="latin-1")}
+
+        fake_pocket_tts = SimpleNamespace(
+            TTSModel=SimpleNamespace(load_model=lambda: _FakeModel())
+        )
+        argv = [
+            "trillim.components.tts._worker",
+            "voice-state",
+            "--audio-path",
+            str(audio_path),
+        ]
+        stdout = SimpleNamespace(buffer=io.BytesIO())
+
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch.object(
+            sys,
+            "argv",
+            argv,
+        ), patch(
+            "sys.stdout",
+            stdout,
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                runpy.run_path(str(Path(tts_worker_module.__file__)), run_name="__main__")
+
+        self.assertEqual(exc.exception.code, 0)
 
     def test_worker_entrypoints_cover_direct_session_and_cli_branches(self):
         audio_path = self.root / "voice.txt"

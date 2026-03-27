@@ -8,8 +8,10 @@ from pathlib import Path
 import unittest
 
 from trillim import _model_store
-from trillim.components.llm import ChatDoneEvent, ChatTokenEvent, ChatUsage
+from trillim.components.llm import ChatDoneEvent, ChatFinalTextEvent, ChatTokenEvent, ChatUsage
 from trillim.components.llm._engine import EngineCrashedError, EngineProgressTimeoutError
+from trillim.components.llm._limits import SESSION_TOKEN_LIMIT
+from trillim.components.llm._session import _CHAT_SESSION_OWNER_TOKEN, _ChatSession
 from trillim.components.llm.public import LLM
 from trillim.errors import (
     ContextOverflowError,
@@ -86,6 +88,40 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.messages[-1]["content"], "hello")
         await llm.stop()
 
+    async def test_collect_chat_uses_token_final_and_done_events(self):
+        llm = self._make_llm()
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def stream_chat(self, **_kwargs):
+                yield ChatTokenEvent(text="a")
+                yield ChatFinalTextEvent(text="partial")
+                yield object()
+                yield ChatDoneEvent(text="done", usage=ChatUsage(1, 1, 2, 0))
+
+        llm.open_session = lambda _messages: _Session()
+
+        text, usage = await llm._collect_chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(text, "done")
+        self.assertEqual(usage.total_tokens, 2)
+
+    def test_private_chat_session_init_rejects_invalid_owner_and_missing_args(self):
+        session = object.__new__(_ChatSession)
+        session._active_task = None
+        with self.assertRaisesRegex(TypeError, "use LLM.open_session"):
+            _ChatSession.__init__(session, object(), (), _owner_token=None)
+
+        session = object.__new__(_ChatSession)
+        session._active_task = None
+        with self.assertRaisesRegex(TypeError, "use LLM.open_session"):
+            _ChatSession.__init__(session, None, None, _owner_token=_CHAT_SESSION_OWNER_TOKEN)
+
     async def test_session_is_single_consumer(self):
         llm = self._make_llm(responses=["ok"])
         await llm.start()
@@ -119,6 +155,18 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(SessionClosedError, "closed"):
             session.add_user("x")
+        await llm.stop()
+
+    async def test_session_add_system_and_cached_token_count_properties(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+        session._cached_token_count = 12
+
+        session.add_system("facts")
+
+        self.assertEqual(session.messages[-1], {"role": "system", "content": "facts"})
+        self.assertEqual(session.cached_token_count, 12)
         await llm.stop()
 
     async def test_session_close_waits_for_active_consumer_cleanup(self):
@@ -396,6 +444,33 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session._terminated.is_set())
         await llm.stop()
 
+    async def test_session_chat_requires_a_done_event(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        async def final_only_stream(**_kwargs):
+            yield ChatFinalTextEvent(text="partial")
+
+        session.stream_chat = final_only_stream
+        with self.assertRaisesRegex(RuntimeError, "without a done event"):
+            await session.chat(max_tokens=8)
+        await llm.stop()
+
+    async def test_session_chat_ignores_unknown_events_before_done(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        async def odd_stream(**_kwargs):
+            yield object()
+            yield ChatDoneEvent(text="done", usage=ChatUsage(1, 1, 2, 0))
+
+        session.stream_chat = odd_stream
+
+        self.assertEqual(await session.chat(max_tokens=8), "done")
+        await llm.stop()
+
     async def test_session_cancel_during_started_stream_marks_session_closed(self):
         llm = self._make_llm(responses=["ok"])
         await llm.start()
@@ -512,6 +587,176 @@ class ChatSessionTests(unittest.IsolatedAsyncioTestCase):
         session._mark_stream_failed(Exception)
         self.assertEqual(session.state, "closed")
         await llm.stop()
+
+    async def test_session_turn_startable_rejects_empty_and_assistant_terminated_histories(self):
+        llm = self._make_llm()
+        await llm.start()
+        empty = llm.open_session()
+
+        with self.assertRaisesRegex(ValueError, "has no messages"):
+            empty._prepare_stream_chat(max_tokens=8)
+
+        answered = llm.open_session([{"role": "user", "content": "hello"}])
+        answered._messages.append({"role": "assistant", "content": "done"})
+        with self.assertRaisesRegex(ValueError, "already has an assistant reply"):
+            answered._prepare_stream_chat(max_tokens=8)
+        await llm.stop()
+
+    async def test_begin_consumer_rejects_duplicate_active_consumer(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        await session._begin_consumer()
+        with self.assertRaisesRegex(SessionBusyError, "active consumer"):
+            await session._begin_consumer()
+
+        session._consumer_active = False
+        session._active_task = None
+        session._terminated.set()
+        await llm.stop()
+
+    async def test_begin_consumer_private_helper_raises_when_already_busy(self):
+        session = object.__new__(_ChatSession)
+        session._consumer_active = True
+        session._active_task = None
+
+        with self.assertRaisesRegex(SessionBusyError, "active consumer"):
+            await session._begin_consumer()
+
+    async def test_prepare_generation_marks_exhaustion_and_context_overflow(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session([{"role": "user", "content": "hello"}])
+
+        llm._runtime_model = make_runtime_model(Path("/tmp/context-small"))
+        llm._runtime_model = llm._runtime_model.__class__(
+            name=llm._runtime_model.name,
+            path=llm._runtime_model.path,
+            arch_type=llm._runtime_model.arch_type,
+            activation=llm._runtime_model.activation,
+            hidden_dim=llm._runtime_model.hidden_dim,
+            intermediate_dim=llm._runtime_model.intermediate_dim,
+            num_layers=llm._runtime_model.num_layers,
+            num_heads=llm._runtime_model.num_heads,
+            num_kv_heads=llm._runtime_model.num_kv_heads,
+            vocab_size=llm._runtime_model.vocab_size,
+            head_dim=llm._runtime_model.head_dim,
+            max_position_embeddings=1,
+            norm_eps=llm._runtime_model.norm_eps,
+            rope_theta=llm._runtime_model.rope_theta,
+            eos_tokens=llm._runtime_model.eos_tokens,
+            has_qkv_bias=llm._runtime_model.has_qkv_bias,
+            tie_word_embeddings=llm._runtime_model.tie_word_embeddings,
+            has_attn_sub_norm=llm._runtime_model.has_attn_sub_norm,
+            has_ffn_sub_norm=llm._runtime_model.has_ffn_sub_norm,
+        )
+        with self.assertRaises(ContextOverflowError):
+            session._prepare_generation()
+
+        llm._runtime_model = llm._runtime_model.__class__(
+            name=llm._runtime_model.name,
+            path=llm._runtime_model.path,
+            arch_type=llm._runtime_model.arch_type,
+            activation=llm._runtime_model.activation,
+            hidden_dim=llm._runtime_model.hidden_dim,
+            intermediate_dim=llm._runtime_model.intermediate_dim,
+            num_layers=llm._runtime_model.num_layers,
+            num_heads=llm._runtime_model.num_heads,
+            num_kv_heads=llm._runtime_model.num_kv_heads,
+            vocab_size=llm._runtime_model.vocab_size,
+            head_dim=llm._runtime_model.head_dim,
+            max_position_embeddings=SESSION_TOKEN_LIMIT + 10,
+            norm_eps=llm._runtime_model.norm_eps,
+            rope_theta=llm._runtime_model.rope_theta,
+            eos_tokens=llm._runtime_model.eos_tokens,
+            has_qkv_bias=llm._runtime_model.has_qkv_bias,
+            tie_word_embeddings=llm._runtime_model.tie_word_embeddings,
+            has_attn_sub_norm=llm._runtime_model.has_attn_sub_norm,
+            has_ffn_sub_norm=llm._runtime_model.has_ffn_sub_norm,
+        )
+        llm._tokenizer.encode = lambda *_args, **_kwargs: list(range(SESSION_TOKEN_LIMIT + 1))
+        with self.assertRaisesRegex(SessionExhaustedError, "token lifetime limit"):
+            session._prepare_generation()
+
+        self.assertEqual(session.state, "exhausted")
+        await llm.stop()
+
+    async def test_render_prompt_and_termination_helpers_cover_empty_and_closed_paths(self):
+        llm = self._make_llm()
+        await llm.start()
+        session = llm.open_session()
+
+        self.assertEqual(session._render_prompt(add_generation_prompt=False), "")
+        self.assertEqual(session._render_prompt(add_generation_prompt=True), "assistant: ")
+
+        cancelled: list[str] = []
+
+        class _Task:
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> None:
+                cancelled.append("cancelled")
+
+        session._active_task = _Task()
+        session._mark_owner_stopped()
+        self.assertEqual(cancelled, ["cancelled"])
+
+        session._active_task = asyncio.current_task()
+        await session._wait_for_termination()
+        session._active_task = None
+
+        session._state = "closed"
+        done = session._finish_stream_success("done")
+        self.assertIsInstance(done, ChatDoneEvent)
+        self.assertEqual(session.state, "closed")
+        await llm.stop()
+
+    def test_chat_session_destructor_swallows_task_cleanup_errors(self):
+        class _BrokenTask:
+            def done(self) -> bool:
+                raise RuntimeError("done boom")
+
+            def cancel(self) -> None:
+                raise RuntimeError("cancel boom")
+
+        session = object.__new__(_ChatSession)
+        session._active_task = _BrokenTask()
+
+        session.__del__()
+
+    def test_chat_session_destructor_cancels_live_tasks(self):
+        class _Task:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        task = _Task()
+        session = object.__new__(_ChatSession)
+        session._active_task = task
+
+        session.__del__()
+
+        self.assertTrue(task.cancelled)
+
+    async def test_chat_session_destructor_cancels_real_asyncio_tasks(self):
+        async def sleeper() -> None:
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(sleeper())
+        session = object.__new__(_ChatSession)
+        session._active_task = task
+
+        session.__del__()
+        await asyncio.sleep(0)
+
+        self.assertTrue(task.cancelled())
 
     async def test_prepared_stream_rechecks_closed_session_before_start(self):
         llm = self._make_llm(responses=["ok"])

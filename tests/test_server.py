@@ -186,3 +186,16 @@ class ServerTests(unittest.TestCase):
                 pass
 
         self.assertEqual(calls, ["ok.start", "bad.start", "ok.stop"])
+
+    def test_server_shutdown_attempts_all_components_even_if_multiple_stops_fail(self):
+        calls: list[str] = []
+        server = Server(
+            _BrokenStopComponent(calls, "one"),
+            _BrokenStopComponent(calls, "two"),
+        )
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "Component shutdown failed"):
+            with TestClient(server.app):
+                pass
+
+        self.assertEqual(calls, ["one.start", "two.start", "two.stop", "one.stop"])

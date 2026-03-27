@@ -36,3 +36,29 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(waiter.done())
         await lease.release()
         await waiter
+
+    async def test_admission_release_and_drain_helpers_cover_noop_paths(self):
+        admission = GenerationAdmission()
+        lease = await admission.acquire()
+
+        await admission.start_draining()
+        self.assertFalse(admission.accepting)
+        self.assertFalse(admission._idle.is_set())
+
+        await admission.finish_swapping()
+        self.assertTrue(admission.accepting)
+        self.assertFalse(admission._idle.is_set())
+
+        await lease.release()
+        await lease.release()
+        self.assertEqual(admission.active_count, 0)
+
+        admission._active = 2
+        admission._idle.clear()
+        await admission._release()
+        self.assertEqual(admission.active_count, 1)
+        self.assertFalse(admission._idle.is_set())
+
+        admission._active = 0
+        await admission._release()
+        self.assertTrue(admission._idle.is_set())

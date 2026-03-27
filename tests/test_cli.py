@@ -111,6 +111,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual(cli._human_size(10), "10 B")
         self.assertEqual(cli._human_size(1536), "1.5 KB")
 
+    def test_human_size_formats_petabytes(self):
+        self.assertEqual(cli._human_size(1024**5), "1.0 PB")
+
     def test_validate_pull_id_only_accepts_trillim_namespace(self):
         self.assertEqual(cli._validate_pull_id("Trillim/demo"), "Trillim/demo")
         with self.assertRaisesRegex(RuntimeError, "only supports Hugging Face IDs"):
@@ -171,6 +174,10 @@ class CLITests(unittest.TestCase):
             with patch("trillim.cli.platform.machine", return_value="arm64"), redirect_stdout(output):
                 cli._warn_on_trillim_config(root)
         self.assertEqual(output.getvalue(), "")
+
+    def test_normalize_platform_name_maps_x86_aliases_and_passthrough(self):
+        self.assertEqual(cli._normalize_platform_name("AMD64"), "x86_64")
+        self.assertEqual(cli._normalize_platform_name("custom"), "custom")
 
     def test_require_remote_code_opt_in_ignores_missing_and_invalid_metadata(self):
         with self._patched_model_roots():
@@ -311,6 +318,14 @@ class CLITests(unittest.TestCase):
             [("Local/base-model", "model"), ("Local/local-adapter", "adapter")],
         )
 
+    def test_iter_local_bundles_handles_missing_namespaces_and_skips_non_directories(self):
+        with self._patched_model_roots():
+            self.assertEqual(cli._iter_local_bundles("Trillim"), [])
+            cli._model_store.DOWNLOADED_ROOT.mkdir(parents=True, exist_ok=True)
+            (cli._model_store.DOWNLOADED_ROOT / "not-a-dir").write_text("x", encoding="utf-8")
+
+            self.assertEqual(cli._iter_local_bundles("Trillim"), [])
+
     def test_print_local_table_renders_empty_and_non_empty_sections(self):
         output = io.StringIO()
         with redirect_stdout(output):
@@ -373,6 +388,20 @@ class CLITests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Failed to fetch models from Hugging Face"):
                 cli._list_remote_models()
 
+    def test_list_remote_models_ignores_quantized_and_adapter_base_model_tags(self):
+        repo = SimpleNamespace(
+            id="Trillim/model-a",
+            siblings=[SimpleNamespace(rfilename="qmodel.tensors")],
+            tags=["base_model:quantized:ignored", "base_model:adapter:ignored"],
+            downloads=1,
+            last_modified=None,
+        )
+
+        with patch("huggingface_hub.list_models", return_value=[repo]):
+            entries = cli._list_remote_models()
+
+        self.assertEqual(entries[0]["base_model"], "")
+
     def test_print_available_table_renders_empty_and_non_empty_sections(self):
         output = io.StringIO()
         with redirect_stdout(output):
@@ -428,6 +457,21 @@ class CLITests(unittest.TestCase):
         self.assertIs(result, session)
         self.assertIn("hello", output.getvalue())
 
+    def test_stream_assistant_turn_prints_done_text_when_only_empty_tokens_arrive(self):
+        session = _FakeSession(
+            stream=_FakeStream(
+                [
+                    ChatTokenEvent(""),
+                    ChatDoneEvent("fallback", ChatUsage(1, 1, 2, 0)),
+                ]
+            )
+        )
+        runtime = SimpleNamespace(llm=SimpleNamespace(open_session=lambda messages: _FakeSession(messages=messages)))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            cli._stream_assistant_turn(runtime, session, session.messages)
+        self.assertIn("fallback", output.getvalue())
+
     def test_stream_assistant_turn_propagates_keyboard_interrupt_after_cleanup(self):
         runtime = SimpleNamespace(llm=SimpleNamespace(open_session=lambda messages: None))
         session = _FakeSession(
@@ -456,6 +500,42 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(session.close_calls, 1)
         self.assertIn("Generation cancelled.", output.getvalue())
+
+    def test_stream_assistant_turn_swallows_session_close_failures_on_interrupt(self):
+        runtime = SimpleNamespace(llm=SimpleNamespace(open_session=lambda messages: None))
+        session = _FakeSession(
+            messages=({"role": "user", "content": "retry"},),
+            stream=_FakeStream(next_exception=KeyboardInterrupt()),
+        )
+
+        def failing_close() -> None:
+            session.close_calls += 1
+            raise RuntimeError("close failed")
+
+        session.close = failing_close
+        output = io.StringIO()
+
+        with redirect_stdout(output), self.assertRaises(KeyboardInterrupt):
+            cli._stream_assistant_turn(runtime, session, session.messages)
+
+        self.assertEqual(session.close_calls, 1)
+
+    def test_stream_assistant_turn_swallows_session_close_failures_on_errors(self):
+        session = _FakeSession(stream=_FakeStream(next_exception=RuntimeError("boom")))
+        runtime = SimpleNamespace(
+            llm=SimpleNamespace(open_session=lambda messages: _FakeSession(messages=messages))
+        )
+
+        def failing_close() -> None:
+            session.close_calls += 1
+            raise RuntimeError("close failed")
+
+        session.close = failing_close
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            cli._stream_assistant_turn(runtime, session, session.messages)
+
+        self.assertEqual(session.close_calls, 1)
 
     def test_stream_assistant_turn_ignores_close_errors(self):
         session = _FakeSession(
@@ -693,6 +773,38 @@ class CLITests(unittest.TestCase):
         self.assertTrue(fake_runtime.entered)
         self.assertTrue(fake_runtime.exited)
         self.assertIn("assistant: ", output.getvalue())
+
+    def test_run_chat_exits_on_eof_and_swallows_final_close_failures(self):
+        session = _FakeSession()
+
+        def failing_close() -> None:
+            session.close_calls += 1
+            raise RuntimeError("close failed")
+
+        session.close = failing_close
+        fake_runtime = _FakeRuntime(object())
+        fake_runtime.llm.open_session = unittest.mock.Mock(return_value=session)
+
+        with patch("trillim.cli._require_remote_code_opt_in"), patch(
+            "trillim.cli.Runtime",
+            return_value=fake_runtime,
+        ), patch(
+            "trillim.cli.LLM",
+            return_value=object(),
+        ), patch(
+            "trillim.cli._make_chat_key_bindings",
+            return_value=object(),
+        ), patch(
+            "trillim.cli.better_input",
+            side_effect=EOFError(),
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cli._run_chat("Trillim/model", None)
+
+        self.assertEqual(result, 0)
+        self.assertGreaterEqual(session.close_calls, 1)
+        self.assertIn("Commands: /new to reset, q to quit, Ctrl+G for editor", output.getvalue())
 
     def test_run_chat_requires_trust_remote_code_for_model_and_adapter_metadata(self):
         with self._patched_model_roots(), patch("trillim.cli.LLM") as llm_ctor:

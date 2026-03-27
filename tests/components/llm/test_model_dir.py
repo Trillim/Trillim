@@ -13,6 +13,29 @@ from unittest.mock import patch
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._config import ActivationType, ArchitectureType, InitConfig
 from trillim.components.llm._model_dir import (
+    _ARCH_REGISTRY,
+    _OverlayMetadata,
+    _collect_added_tokens,
+    _collect_eos_tokens,
+    _collect_remote_code_class_refs,
+    _collect_remote_code_files,
+    _extract_auto_map_refs,
+    _extract_dimensions,
+    _filesystem_device,
+    _load_json,
+    _load_optional_json,
+    _load_optional_json_with_message,
+    _load_required_json_strict,
+    _materialize_file,
+    _materialize_required_file,
+    _merge_json_payloads,
+    _module_name_to_relative_path,
+    _parse_remote_code_module_path,
+    _relative_import_module_names,
+    _require_positive_int,
+    _resolve_activation,
+    _resolve_directory,
+    _resolve_rope_theta,
     prepare_runtime_files,
     validate_lora_dir,
     validate_model_dir,
@@ -780,6 +803,261 @@ class ModelDirectoryTests(unittest.TestCase):
                     InitConfig(model_dir=root, lora_dir=adapter),
                     trust_remote_code=True,
                 )
+
+    def test_model_dir_private_json_helpers_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            broken = root / "broken.json"
+            broken.write_text("{", encoding="utf-8")
+
+            with self.assertRaisesRegex(ModelValidationError, "Could not read JSON"):
+                _load_json(broken)
+
+            self.assertIsNone(_load_optional_json(broken))
+            self.assertIsNone(
+                _load_optional_json_with_message(
+                    broken,
+                    symlink_message="Model bundle must not use symlinks",
+                )
+            )
+
+            with self.assertRaisesRegex(ModelValidationError, "missing.json not found"):
+                _load_required_json_strict(
+                    root / "missing.json",
+                    symlink_message="Model bundle must not use symlinks",
+                )
+
+    def test_model_dir_numeric_and_activation_helpers_cover_error_paths(self):
+        arch_info = _ARCH_REGISTRY["llamaforcausallm"]
+        self.assertEqual(_resolve_activation({}, arch_info), ActivationType.SILU)
+
+        with self.assertRaisesRegex(ModelValidationError, "Unsupported activation function"):
+            _resolve_activation({"hidden_act": "bogus"}, arch_info)
+
+        with self.assertRaisesRegex(ModelValidationError, "rope_theta must be numeric"):
+            _resolve_rope_theta({"rope_theta": "bogus"})
+
+        with self.assertRaisesRegex(ModelValidationError, "head_dim must be a positive integer"):
+            _extract_dimensions(
+                {
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 2,
+                    "num_key_value_heads": 4,
+                    "vocab_size": 256,
+                    "max_position_embeddings": 512,
+                    "head_dim": 0,
+                }
+            )
+
+        for value in (True, "bad", 0):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ModelValidationError, "hidden_size must be a positive integer"):
+                    _require_positive_int(value, "hidden_size")
+
+    def test_model_dir_eos_and_added_token_helpers_cover_edge_cases(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metadata_dir = Path(temp_dir)
+            self.assertEqual(
+                _collect_eos_tokens(
+                    {"eos_token_id": [1, 2]},
+                    ArchitectureType.LLAMA,
+                    metadata_dir,
+                ),
+                [1, 2],
+            )
+
+            with self.assertRaisesRegex(ModelValidationError, "No EOS tokens"):
+                _collect_eos_tokens(
+                    {"eos_token_id": []},
+                    ArchitectureType.LLAMA,
+                    metadata_dir,
+                )
+
+        with self.assertRaisesRegex(ModelValidationError, "added_tokens metadata is malformed"):
+            _collect_added_tokens([{"content": "</s>", "id": 2}])
+
+        with self.assertRaisesRegex(ModelValidationError, "added_tokens metadata is malformed"):
+            _collect_added_tokens({"added_tokens": "oops"})
+
+        self.assertEqual(
+            _collect_added_tokens({"added_tokens": [{"content": "other"}]}),
+            [],
+        )
+        self.assertEqual(_collect_added_tokens("oops"), [])
+
+    def test_model_dir_directory_and_materialization_helpers_cover_missing_and_oserror_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            file_path = root / "file.txt"
+            file_path.write_text("data", encoding="utf-8")
+
+            with self.assertRaisesRegex(ModelValidationError, "is not a directory"):
+                _resolve_directory(
+                    file_path,
+                    label="Model directory",
+                    symlink_message="Model directory must not use symlinks",
+                )
+
+            overlay = root / "overlay"
+            source_dir = root / "source"
+            source_dir.mkdir()
+            with self.assertRaisesRegex(ModelValidationError, "missing.txt not found"):
+                _materialize_required_file(
+                    overlay,
+                    source_dir=source_dir,
+                    relative_path=Path("missing.txt"),
+                    symlink_message="Model bundle must not use symlinks",
+                    mode="copy",
+                )
+
+            source_path = source_dir / "source.txt"
+            source_path.write_text("fresh", encoding="utf-8")
+            destination = overlay / "source.txt"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("stale", encoding="utf-8")
+            _materialize_file(destination, source_path, mode="copy")
+            self.assertEqual(destination.read_text(encoding="utf-8"), "fresh")
+
+            with patch(
+                "trillim.components.llm._model_dir.os.link",
+                side_effect=OSError(errno.EPERM, "denied"),
+            ):
+                with self.assertRaisesRegex(ModelValidationError, "Could not hardlink runtime artifact"):
+                    _materialize_file(overlay / "linked.bin", source_path, mode="hardlink")
+
+        with patch.object(Path, "stat", side_effect=OSError("boom")):
+            with self.assertRaisesRegex(ModelValidationError, "Could not inspect filesystem"):
+                _filesystem_device(Path("/tmp"))
+
+    def test_model_dir_remote_code_helpers_cover_duplicates_and_invalid_inputs(self):
+        self.assertEqual(_extract_auto_map_refs(None, key="AutoTokenizer"), [])
+        self.assertEqual(
+            _extract_auto_map_refs(
+                {"auto_map": ["tokenization.AdapterTokenizer", None]},
+                key="AutoTokenizer",
+            ),
+            ["tokenization.AdapterTokenizer"],
+        )
+
+        with self.assertRaisesRegex(ModelValidationError, "currently unsupported"):
+            _parse_remote_code_module_path("BrokenRef")
+
+        with self.assertRaisesRegex(ModelValidationError, "currently unsupported"):
+            _module_name_to_relative_path("")
+
+        metadata = _OverlayMetadata(
+            config={"auto_map": {"AutoConfig": "tokenization.AdapterTokenizer"}},
+            added_tokens=None,
+            generation_config=None,
+            special_tokens_map=None,
+            tokenizer_config={
+                "auto_map": {
+                    "AutoTokenizer": ["tokenization.AdapterTokenizer", None]
+                }
+            },
+        )
+        self.assertEqual(
+            _collect_remote_code_class_refs(metadata),
+            ["tokenization.AdapterTokenizer"],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_root = root / "model"
+            adapter_root = root / "adapter"
+            model_root.mkdir()
+            adapter_root.mkdir()
+            (model_root / "tokenization.py").write_text(
+                "from os import path\nfrom . import helper\nfrom . import helper\nfrom . import *\n",
+                encoding="utf-8",
+            )
+            (model_root / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            self.assertEqual(
+                _relative_import_module_names(model_root / "tokenization.py"),
+                ["helper"],
+            )
+            self.assertEqual(
+                _collect_remote_code_files(model_root, adapter_root, metadata),
+                [Path("tokenization.py"), Path("helper.py")],
+            )
+
+            (model_root / "fanout.py").write_text(
+                "from . import helper\nfrom . import branch\n",
+                encoding="utf-8",
+            )
+            (model_root / "branch.py").write_text("from . import helper\n", encoding="utf-8")
+            duplicate_queue_metadata = _OverlayMetadata(
+                config=None,
+                added_tokens=None,
+                generation_config=None,
+                special_tokens_map=None,
+                tokenizer_config={
+                    "auto_map": {
+                        "AutoTokenizer": ["fanout.AdapterTokenizer", None]
+                    }
+                },
+            )
+            self.assertEqual(
+                _collect_remote_code_files(model_root, adapter_root, duplicate_queue_metadata),
+                [Path("fanout.py"), Path("helper.py"), Path("branch.py")],
+            )
+
+            (model_root / "cycle_a.py").write_text(
+                "from . import cycle_b\n",
+                encoding="utf-8",
+            )
+            (model_root / "cycle_b.py").write_text(
+                "from . import cycle_a\n",
+                encoding="utf-8",
+            )
+            cycle_metadata = _OverlayMetadata(
+                config=None,
+                added_tokens=None,
+                generation_config=None,
+                special_tokens_map=None,
+                tokenizer_config={
+                    "auto_map": {
+                        "AutoTokenizer": ["cycle_a.AdapterTokenizer", None]
+                    }
+                },
+            )
+            self.assertEqual(
+                _collect_remote_code_files(model_root, adapter_root, cycle_metadata),
+                [Path("cycle_a.py"), Path("cycle_b.py")],
+            )
+
+            with self.assertRaisesRegex(ModelValidationError, "Could not read Python module"):
+                _relative_import_module_names(model_root / "missing.py")
+
+            broken = model_root / "broken.py"
+            broken.write_text("def broken(:\n", encoding="utf-8")
+            with self.assertRaisesRegex(ModelValidationError, "Could not parse Python module"):
+                _relative_import_module_names(broken)
+
+            package_scoped = model_root / "package_scoped.py"
+            package_scoped.write_text("from .pkg.sub import helper\n", encoding="utf-8")
+            with self.assertRaisesRegex(ModelValidationError, "Package-scoped relative imports"):
+                _relative_import_module_names(package_scoped)
+
+            missing_metadata = _OverlayMetadata(
+                config=None,
+                added_tokens=None,
+                generation_config=None,
+                special_tokens_map=None,
+                tokenizer_config={
+                    "auto_map": {
+                        "AutoTokenizer": ["missing.AdapterTokenizer", None]
+                    }
+                },
+            )
+            with self.assertRaisesRegex(ModelValidationError, "Remote-code module not found"):
+                _collect_remote_code_files(model_root, adapter_root, missing_metadata)
+
+    def test_model_dir_merge_json_payloads_prefers_override_for_non_dict_payloads(self):
+        self.assertEqual(_merge_json_payloads(["base"], ["override"]), ["override"])
 
     def test_prepare_runtime_files_rejects_remote_code_file_budget_overflow(self):
         with model_dir() as root, tempfile.TemporaryDirectory() as temp_dir:

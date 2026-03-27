@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
+import runpy
+import sys
 import tempfile
 import types
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -109,6 +113,25 @@ class STTWorkerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(WorkerFailureError, "oversized stderr"):
                 await transcribe_owned_audio_file(self.audio_path, language=None)
 
+    async def test_transcribe_owned_audio_file_cancellation_stops_worker(self):
+        with patch.object(
+            _worker,
+            "_worker_command",
+            return_value=python_command(
+                "import signal",
+                "import time",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+                "time.sleep(60)",
+            ),
+        ), patch.object(_worker, "WORKER_KILL_AFTER_SECONDS", 0.01):
+            task = asyncio.create_task(
+                transcribe_owned_audio_file(self.audio_path, language=None)
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
     def test_main_returns_one_on_local_transcription_failure(self):
         with patch(
             "trillim.components.stt._worker._transcribe_locally",
@@ -128,6 +151,10 @@ class STTWorkerTests(unittest.IsolatedAsyncioTestCase):
     def test_parse_worker_output_rejects_missing_text(self):
         with self.assertRaisesRegex(WorkerFailureError, "malformed output"):
             _worker._parse_worker_output(b"{}")
+
+    def test_parse_worker_output_rejects_non_dict_payload(self):
+        with self.assertRaisesRegex(WorkerFailureError, "malformed output"):
+            _worker._parse_worker_output(b"[]")
 
     def test_transcribe_locally_uses_fixed_worker_config(self):
         captured: dict[str, object] = {}
@@ -156,3 +183,114 @@ class STTWorkerTests(unittest.IsolatedAsyncioTestCase):
         command = _worker._worker_command(self.audio_path, language="en")
         self.assertEqual(command[1:4], ("-m", "trillim.components.stt._worker", "--audio-path"))
         self.assertEqual(command[-2:], ("--language", "en"))
+
+    def test_worker_command_omits_language_and_stop_process_noops_for_exited_workers(self):
+        command = _worker._worker_command(self.audio_path, language=None)
+        self.assertNotIn("--language", command)
+
+        class _ExitedProcess:
+            returncode = 0
+
+            def terminate(self):
+                raise AssertionError("terminate should not be called")
+
+        asyncio.run(_worker._stop_process(_ExitedProcess()))
+
+    def test_stop_process_kills_workers_that_ignore_termination(self):
+        class _HungProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.terminate_calls = 0
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                self.wait_calls += 1
+                return 0 if self.returncode is None else self.returncode
+
+        async def fake_wait_for(awaitable, timeout):
+            del timeout
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.TimeoutError
+
+        hung = _HungProcess()
+        with patch("trillim.components.stt._worker.asyncio.wait_for", side_effect=fake_wait_for):
+            asyncio.run(_worker._stop_process(hung))
+
+        self.assertEqual(hung.terminate_calls, 1)
+        self.assertEqual(hung.kill_calls, 1)
+        self.assertGreaterEqual(hung.wait_calls, 1)
+
+    async def test_stop_process_timeout_kills_live_workers_in_async_context(self):
+        class _HungProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.terminate_calls = 0
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                self.wait_calls += 1
+                return 0 if self.returncode is None else self.returncode
+
+        async def timed_out_wait(awaitable, timeout):
+            del timeout
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.TimeoutError
+
+        hung = _HungProcess()
+        with patch("trillim.components.stt._worker.asyncio.wait_for", side_effect=timed_out_wait):
+            await _worker._stop_process(hung)
+
+        self.assertEqual(hung.terminate_calls, 1)
+        self.assertEqual(hung.kill_calls, 1)
+        self.assertGreaterEqual(hung.wait_calls, 1)
+
+    def test_module_main_entrypoint_runs_under_dunder_main(self):
+        class _Segment:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class _WhisperModel:
+            def __init__(self, *_args, **_kwargs) -> None:
+                return None
+
+            def transcribe(self, audio_path, language=None):
+                self.last_call = (audio_path, language)
+                return ([_Segment("hello")], None)
+
+        fake_module = types.SimpleNamespace(WhisperModel=_WhisperModel)
+        argv = [
+            "trillim.components.stt._worker",
+            "--audio-path",
+            str(self.audio_path),
+        ]
+        with patch.dict("sys.modules", {"faster_whisper": fake_module}), patch.object(
+            sys,
+            "argv",
+            argv,
+        ), patch("sys.stdout", new=io.StringIO()):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                with self.assertRaises(SystemExit) as exit_error:
+                    runpy.run_module("trillim.components.stt._worker", run_name="__main__")
+
+        self.assertEqual(exit_error.exception.code, 0)

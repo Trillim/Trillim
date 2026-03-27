@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from trillim.components.stt._router import _as_http_error, _handle_transcription_request
@@ -172,6 +173,8 @@ class STTRouterTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
     def test_as_http_error_maps_known_cases(self):
+        passthrough = HTTPException(status_code=418, detail="teapot")
+        self.assertIs(_as_http_error(passthrough), passthrough)
         self.assertEqual(_as_http_error(PayloadTooLargeError("too big")).status_code, 413)
         self.assertEqual(_as_http_error(InvalidRequestError("bad")).status_code, 400)
         self.assertEqual(_as_http_error(AdmissionRejectedError("busy")).status_code, 429)

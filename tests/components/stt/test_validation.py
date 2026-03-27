@@ -36,6 +36,8 @@ class STTValidationTests(unittest.TestCase):
             validate_language("a" * 33)
 
     def test_validate_audio_bytes_rejects_empty_and_oversize_inputs(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must be bytes"):
+            validate_audio_bytes("abc")  # type: ignore[arg-type]
         with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
             validate_audio_bytes(b"")
         with patch(
@@ -48,6 +50,8 @@ class STTValidationTests(unittest.TestCase):
     def test_validate_source_file_requires_a_path_and_normalizes_it(self):
         with self.assertRaisesRegex(InvalidRequestError, "path is required"):
             validate_source_file("")
+        with self.assertRaisesRegex(InvalidRequestError, "path is required"):
+            validate_source_file(Path(""))
         self.assertEqual(validate_source_file("~/audio.wav"), Path("~/audio.wav").expanduser())
 
     def test_open_validated_source_file_rejects_missing_non_file_and_oversize_paths(self):
@@ -101,6 +105,55 @@ class STTValidationTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(InvalidRequestError, "must not use symlinks"):
                     open_validated_source_file(audio)
+
+    def test_open_validated_source_file_wraps_open_and_fstat_failures(self):
+        audio = Path("/tmp/audio.wav")
+        path_stat = SimpleNamespace(st_mode=stat.S_IFREG, st_size=1)
+
+        with patch(
+            "trillim.components.stt._validation.Path.is_symlink",
+            return_value=False,
+        ), patch(
+            "trillim.components.stt._validation.os.stat",
+            return_value=path_stat,
+        ), patch(
+            "trillim.components.stt._validation.os.open",
+            side_effect=FileNotFoundError("gone"),
+        ):
+            with self.assertRaisesRegex(InvalidRequestError, "does not exist"):
+                open_validated_source_file(audio)
+
+        with patch(
+            "trillim.components.stt._validation.Path.is_symlink",
+            return_value=False,
+        ), patch(
+            "trillim.components.stt._validation.os.stat",
+            return_value=path_stat,
+        ), patch(
+            "trillim.components.stt._validation.os.open",
+            side_effect=OSError(errno.EACCES, "denied"),
+        ):
+            with self.assertRaisesRegex(InvalidRequestError, "could not be opened"):
+                open_validated_source_file(audio)
+
+        with patch(
+            "trillim.components.stt._validation.Path.is_symlink",
+            return_value=False,
+        ), patch(
+            "trillim.components.stt._validation.os.stat",
+            return_value=path_stat,
+        ), patch(
+            "trillim.components.stt._validation.os.open",
+            return_value=123,
+        ), patch(
+            "trillim.components.stt._validation.os.fstat",
+            return_value=SimpleNamespace(st_mode=stat.S_IFIFO, st_size=0),
+        ), patch(
+            "trillim.components.stt._validation.os.close",
+        ) as close_fd:
+            with self.assertRaisesRegex(InvalidRequestError, "not a regular file"):
+                open_validated_source_file(audio)
+        close_fd.assert_called_once_with(123)
 
     def test_open_validated_source_file_wraps_symlink_permission_errors(self):
         audio = Path("/tmp/audio.wav")
@@ -175,6 +228,12 @@ class STTValidationTests(unittest.TestCase):
     def test_validate_http_request_rejects_invalid_headers(self):
         with self.assertRaisesRegex(InvalidRequestError, "content-type"):
             validate_http_request(
+                content_type=None,
+                content_length=None,
+                language=None,
+            )
+        with self.assertRaisesRegex(InvalidRequestError, "content-type"):
+            validate_http_request(
                 content_type="text/plain",
                 content_length=None,
                 language=None,
@@ -188,6 +247,12 @@ class STTValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(InvalidRequestError, "invalid content-length"):
             validate_http_request(
                 content_type="audio/wav",
+                content_length="-1",
+                language=None,
+            )
+        with self.assertRaisesRegex(InvalidRequestError, "invalid content-length"):
+            validate_http_request(
+                content_type="audio/wav",
                 content_length="abc",
                 language=None,
             )
@@ -196,6 +261,12 @@ class STTValidationTests(unittest.TestCase):
                 content_type="audio/wav",
                 content_length=None,
                 language="en_us",
+            )
+        with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
+            validate_http_request(
+                content_type="audio/wav",
+                content_length=None,
+                language="   ",
             )
 
     def test_validate_http_request_accepts_allowed_media_types(self):

@@ -10,8 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import APIRouter
+
 from trillim.components.tts._limits import MAX_EMITTED_AUDIO_CHUNKS
-from trillim.components.tts.public import TTS
+from trillim.components.tts._session import _create_tts_session
+from trillim.components.tts.public import TTS, _StreamingPCMStretcher
 from trillim.components.tts._worker import WorkerFailureError
 from trillim.errors import (
     AdmissionRejectedError,
@@ -45,11 +48,44 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("timed out waiting for condition")
             await asyncio.sleep(0)
 
+    def _make_internal_session(self, tts: TTS):
+        return _create_tts_session(
+            tts,
+            text="hello world",
+            voice="alba",
+            voice_kind="predefined",
+            voice_reference="alba",
+            speed=1.0,
+            cleanup_path=None,
+            session_worker=SimpleNamespace(close=lambda: None),
+        )
+
     async def test_start_requires_known_default_voice(self):
         tts, imports_patch, builtins_patch = make_started_tts(default_voice="missing")
         with patch("trillim.components.tts.public.VOICE_STORE_ROOT", self.voice_root), builtins_patch, imports_patch:
             with self.assertRaisesRegex(ValueError, "unknown default_voice"):
                 await tts.start()
+
+    async def test_public_properties_router_and_idempotent_start(self):
+        tts = await self._start_tts()
+
+        self.assertEqual(tts.default_voice, "alba")
+        self.assertEqual(tts.speed, 1.0)
+        self.assertIsInstance(tts.router(), APIRouter)
+
+        await tts.start()
+        await tts.stop()
+
+    async def test_start_accepts_existing_custom_default_voice(self):
+        initial = await self._start_tts()
+        await initial.register_voice("custom", b"voice")
+        await initial.stop()
+
+        tts, imports_patch, builtins_patch = make_started_tts(default_voice="custom")
+        tts._spool_dir = self.spool_dir
+        with patch("trillim.components.tts.public.VOICE_STORE_ROOT", self.voice_root), builtins_patch, imports_patch:
+            await tts.start()
+        await tts.stop()
 
     async def test_register_list_and_delete_voice(self):
         tts = await self._start_tts()
@@ -93,6 +129,12 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await tts.register_voice("custom", str(source)), "custom")
         with self.assertRaisesRegex(Exception, "already exists"):
             await tts.register_voice("custom", str(source))
+        await tts.stop()
+
+    async def test_register_voice_rejects_invalid_audio_types(self):
+        tts = await self._start_tts()
+        with self.assertRaisesRegex(InvalidRequestError, "audio must be bytes, str, or Path"):
+            await tts.register_voice("custom", 123)  # type: ignore[arg-type]
         await tts.stop()
 
     async def test_register_voice_maps_worker_failure_to_invalid_request(self):
@@ -143,6 +185,15 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"hello world", pcm)
         wav = await tts.synthesize_wav("tiny prompt")
         self.assertTrue(wav.startswith(b"RIFF"))
+        await tts.stop()
+
+    async def test_synthesize_stream_yields_pcm_chunks(self):
+        tts = await self._start_tts()
+
+        chunks = [chunk async for chunk in tts.synthesize_stream("hello world")]
+
+        self.assertTrue(chunks)
+        self.assertTrue(all(isinstance(chunk, bytes) for chunk in chunks))
         await tts.stop()
 
     async def test_speak_with_speed_change_uses_multi_chunk_stretching_without_crashing(self):
@@ -328,6 +379,279 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         await tts.stop()
         self.assertIsNone(tts._reserved_slot)
 
+    async def test_release_reserved_slot_ignores_stale_tokens(self):
+        tts = await self._start_tts()
+        reservation = await tts._reserve_session_slot()
+
+        await tts._release_reserved_slot(object())
+
+        self.assertIs(tts._reserved_slot, reservation)
+        await tts._release_reserved_slot(reservation)
+        self.assertIsNone(tts._reserved_slot)
+        await tts.stop()
+
+    async def test_internal_get_tokenizer_loads_once_for_concurrent_callers(self):
+        calls = 0
+        tokenizer = object()
+
+        def load_tokenizer():
+            nonlocal calls
+            calls += 1
+            return tokenizer
+
+        tts = TTS(_tokenizer_loader=load_tokenizer)
+
+        first, second = await asyncio.gather(tts._get_tokenizer(), tts._get_tokenizer())
+
+        self.assertIs(first, tokenizer)
+        self.assertIs(second, tokenizer)
+        self.assertEqual(calls, 1)
+        self.assertIs(await tts._get_tokenizer(), tokenizer)
+
+    async def test_scheduler_helper_noops_and_cancellation_paths(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+
+        await tts._pause_session(session)
+        self.assertEqual(session.state, "running")
+
+        tts._active_session = session
+        await tts._pause_session(session)
+        self.assertEqual(session.state, "paused")
+        await tts._pause_session(session)
+        self.assertEqual(session.state, "paused")
+        await tts._resume_session(session)
+        self.assertEqual(session.state, "running")
+
+        waiter = asyncio.create_task(asyncio.sleep(0))
+        session._task = waiter
+        await tts._cancel_session(session)
+        self.assertEqual(session.state, "cancelled")
+        self.assertEqual(session.speed, 1.0)
+        await tts.stop()
+
+    async def test_wait_for_turn_and_start_session_helpers_cover_internal_branches(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+        existing_task = asyncio.create_task(asyncio.sleep(0))
+        session._task = existing_task
+        tts._start_session_locked(session)
+        self.assertIs(session._task, existing_task)
+
+        tts._active_session = None
+        tts._pause_active_locked(session)
+        self.assertEqual(session.state, "running")
+
+        tts._active_session = session
+        session._done_event.set()
+        session._resume_event.set()
+        with self.assertRaises(OperationCancelledError):
+            await tts._wait_for_turn(session)
+
+        session = self._make_internal_session(tts)
+        tts._active_session = session
+        session._pause_requested = True
+        session._resume_event.set()
+
+        async def release_pause() -> None:
+            await asyncio.sleep(0)
+            session._pause_requested = False
+            session._set_running()
+
+        releaser = asyncio.create_task(release_pause())
+        self.assertEqual(await tts._wait_for_turn(session), 1.0)
+        await releaser
+        await tts.stop()
+
+    async def test_check_can_accept_and_require_started_fail_closed(self):
+        tts = TTS()
+
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            tts._require_started()
+
+        tts._accepting = False
+        with self.assertRaisesRegex(AdmissionRejectedError, "draining"):
+            tts._check_can_accept_locked()
+
+        tts._accepting = True
+        tts._reserved_slot = object()
+        with self.assertRaisesRegex(AdmissionRejectedError, "only one live session"):
+            tts._check_can_accept_locked()
+
+    async def test_resume_session_and_set_speed_cover_remaining_scheduler_branches(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+
+        await tts._resume_session(session)
+        self.assertEqual(session.state, "running")
+
+        tts._active_session = session
+        await tts._set_session_speed(session, 1.5)
+        self.assertEqual(session.speed, 1.5)
+
+        await tts._resume_session(session)
+        self.assertEqual(session.state, "running")
+        await tts.stop()
+
+    async def test_cancel_session_without_task_waits_for_explicit_finish(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+        tts._active_session = session
+
+        async def finish_soon() -> None:
+            await asyncio.sleep(0)
+            await session._finish("cancelled", session._cancel_error())
+
+        finisher = asyncio.create_task(finish_soon())
+        await tts._cancel_session(session)
+        await finisher
+
+        self.assertEqual(session.state, "cancelled")
+        await tts.stop()
+
+    async def test_cancel_session_waits_for_inactive_session_cleanup(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+
+        async def finish_soon() -> None:
+            await asyncio.sleep(0)
+            await session._finish("cancelled", session._cancel_error())
+
+        finisher = asyncio.create_task(finish_soon())
+        await tts._cancel_session(session)
+        await finisher
+
+        self.assertEqual(session.state, "cancelled")
+        await tts.stop()
+
+    async def test_wait_for_turn_handles_inactive_session_before_owner_switches(self):
+        tts = await self._start_tts()
+        session = self._make_internal_session(tts)
+        tts._active_session = self._make_internal_session(tts)
+        session._resume_event.set()
+
+        class _YieldingLock:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def __aenter__(self):
+                self.calls += 1
+                if self.calls == 2:
+                    tts._active_session = session
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+
+        tts._scheduler_lock = _YieldingLock()
+        self.assertEqual(await tts._wait_for_turn(session), 1.0)
+        await tts.stop()
+
+    async def test_get_tokenizer_double_checked_lock_and_streaming_stretcher_edges(self):
+        calls = 0
+        tokenizer = object()
+
+        def load_tokenizer():
+            nonlocal calls
+            calls += 1
+            return tokenizer
+
+        class _GateLock:
+            def __init__(self) -> None:
+                self._lock = asyncio.Lock()
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+                self._first = True
+
+            async def __aenter__(self):
+                await self._lock.acquire()
+                if self._first:
+                    self._first = False
+                    self.entered.set()
+                    await self.release.wait()
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+                self._lock.release()
+
+        tts = TTS(_tokenizer_loader=load_tokenizer)
+        tts._tokenizer_lock = _GateLock()
+        first = asyncio.create_task(tts._get_tokenizer())
+        await tts._tokenizer_lock.entered.wait()
+        second = asyncio.create_task(tts._get_tokenizer())
+        tts._tokenizer_lock.release.set()
+        self.assertEqual(await first, tokenizer)
+        self.assertEqual(await second, tokenizer)
+        self.assertEqual(calls, 1)
+
+        import numpy as np
+
+        with patch("numpy.hanning", return_value=np.zeros(1024, dtype=np.float32)):
+            zero_window = _StreamingPCMStretcher(1.25)
+        self.assertTrue(np.all(zero_window._window == 1.0))
+
+        stretcher = _StreamingPCMStretcher(1.25)
+        self.assertEqual(stretcher.finish(), b"")
+        self.assertEqual(stretcher.push(b"\x00"), b"")
+        self.assertEqual(stretcher._pending_byte, b"\x00")
+        self.assertEqual(stretcher.push(b"\x00\x00"), b"")
+        self.assertEqual(stretcher.push(b"\x00\x00"), b"")
+        self.assertIsNone(stretcher._get_spectrum(999))
+        stretcher._process_output_frames(final=False)
+        stretcher._processed_output_frames = 1
+        self.assertEqual(stretcher._emit_ready(final=False), b"")
+        stretcher._drop_consumed_spectra(2)
+
+        np_module = stretcher._np
+        stretcher._output = np_module.zeros(stretcher.frame_size * 2, dtype=np_module.float32)
+        stretcher._weights = np_module.zeros(stretcher.frame_size * 2, dtype=np_module.float32)
+        stretcher._processed_output_frames = 0
+        stretcher._add_output_frame(
+            np_module.zeros(stretcher.frame_size, dtype=np_module.float32)
+        )
+
+        stretcher = _StreamingPCMStretcher(1.5)
+        stretcher.push((b"\x00\x00") * 10)
+        self.assertIsInstance(stretcher.finish(), bytes)
+
+        broken = _StreamingPCMStretcher(1.5)
+        fake_spectrum = broken._np.zeros(broken.frame_size // 2 + 1, dtype=broken._np.complex64)
+        broken._spectra.append(fake_spectrum)
+        broken._spectra_base = 1
+        broken._phase = broken._np.zeros(
+            broken.frame_size // 2 + 1,
+            dtype=broken._np.float32,
+        )
+        broken._next_time_step = 0.25
+        broken._process_output_frames(final=True)
+
+        class _ReportedShortInput:
+            def __init__(self, np_module, *, reported_size: int, actual_size: int) -> None:
+                self._np = np_module
+                self.size = reported_size
+                self._actual = np_module.zeros(actual_size, dtype=np_module.float32)
+
+            def __getitem__(self, item):
+                if (
+                    isinstance(item, slice)
+                    and item.stop is None
+                    and item.start == forced.hop_size
+                ):
+                    return self._actual.copy()
+                return self._actual[item]
+
+        forced = _StreamingPCMStretcher(1.25)
+        forced._input = _ReportedShortInput(
+            forced._np,
+            reported_size=forced.frame_size,
+            actual_size=forced.frame_size,
+        )
+        forced._total_samples = forced.frame_size
+        forced._next_analysis_frame = 1
+        forced._materialize_analysis_frames(final=True)
+        self.assertEqual(len(forced._spectra), 1)
+
     async def test_second_request_is_rejected_while_paused(self):
         first_segment_started = asyncio.Event()
         first_segment_release = asyncio.Event()
@@ -460,6 +784,22 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         await tts.stop()
         with self.assertRaises(SessionClosedError):
             await consumer
+
+    async def test_completed_sessions_ignore_pause_resume_cancel_and_speed_updates(self):
+        tts = await self._start_tts()
+        session = await tts.speak("hello world")
+        self.assertTrue(await asyncio.wait_for(session.collect(), timeout=1))
+        self.assertEqual(session.state, "completed")
+        original_speed = session.speed
+
+        await session.pause()
+        await session.resume()
+        await session.cancel()
+        await session.set_speed(1.5)
+
+        self.assertEqual(session.state, "completed")
+        self.assertEqual(session.speed, original_speed)
+        await tts.stop()
 
     async def test_pause_then_cancel_under_backpressure_cancels_blocked_put(self):
         allow_progress = asyncio.Event()

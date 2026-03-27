@@ -7,11 +7,20 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from trillim import _model_store
 from trillim.components.llm._config import LLMState
-from trillim.components.llm._swap import _best_effort_stop, _wait_for_idle_or_cancel, restart_model
+from trillim.components.llm._swap import (
+    _best_effort_stop,
+    _discard_runtime_after_stop,
+    _stop_requested_since,
+    _wait_for_idle_or_cancel,
+    restart_model,
+    swap_model,
+)
 from trillim.components.llm.public import LLM
+from trillim.errors import AdmissionRejectedError, ComponentLifecycleError
 from trillim.harnesses.search._harness import _SearchHarness
 from tests.components.llm.support import (
     FakeEngineFactory,
@@ -322,6 +331,147 @@ class SwapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, ["server_error"])
 
+    async def test_wait_for_idle_or_cancel_skips_engine_stop_when_runtime_is_missing(self):
+        calls: list[str] = []
+
+        async def cancel_active_sessions() -> None:
+            calls.append("cancel")
+
+        llm = SimpleNamespace(
+            _admission=_Admission([TimeoutError(), TimeoutError(), None]),
+            _cancel_active_sessions=cancel_active_sessions,
+            _engine=None,
+        )
+
+        await _wait_for_idle_or_cancel(llm)
+
+        self.assertEqual(calls, ["cancel"])
+
+    async def test_swap_helpers_cover_stop_won_fallbacks_and_noop_branches(self):
+        await _best_effort_stop(None)
+        self.assertFalse(_stop_requested_since(SimpleNamespace(), 1))
+
+        runtime_files = _RuntimeFiles()
+        engine = _SwapEngine()
+        await _discard_runtime_after_stop(
+            SimpleNamespace(),
+            SimpleNamespace(runtime_files=runtime_files, engine=engine),
+        )
+        self.assertTrue(runtime_files.cleaned)
+        self.assertEqual(engine.stop_calls, 1)
+
+        llm = SimpleNamespace(
+            _stop_in_progress=lambda: True,
+            _mark_model_transition_active=lambda: None,
+            _finish_model_transition_active=lambda: None,
+        )
+        with self.assertRaisesRegex(ComponentLifecycleError, "stopped during model swap"):
+            await swap_model(llm, init_config=object())
+
+    async def test_restart_model_returns_early_when_stop_or_claim_failure_wins(self):
+        calls: list[str] = []
+        stopped = SimpleNamespace(
+            _stop_in_progress=lambda: True,
+            _mark_model_transition_active=lambda: calls.append("mark"),
+            _finish_model_transition_active=lambda: calls.append("finish"),
+        )
+
+        await restart_model(stopped)
+        self.assertEqual(calls, ["mark", "finish"])
+
+        running_calls: list[str] = []
+        running = SimpleNamespace(
+            _stop_in_progress=lambda: False,
+            _claim_model_transition=lambda: (_ for _ in ()).throw(
+                AdmissionRejectedError("busy")
+            ),
+            _state=LLMState.RUNNING,
+            _set_server_error=lambda: running_calls.append("server_error"),
+            _mark_model_transition_active=lambda: running_calls.append("mark"),
+            _finish_model_transition_active=lambda: running_calls.append("finish"),
+        )
+        await restart_model(running)
+        self.assertEqual(running_calls, ["mark", "server_error", "finish"])
+
+        quiet_calls: list[str] = []
+        quiet = SimpleNamespace(
+            _stop_in_progress=lambda: False,
+            _claim_model_transition=lambda: (_ for _ in ()).throw(
+                AdmissionRejectedError("busy")
+            ),
+            _state=LLMState.SERVER_ERROR,
+            _mark_model_transition_active=lambda: quiet_calls.append("mark"),
+            _finish_model_transition_active=lambda: quiet_calls.append("finish"),
+        )
+        await restart_model(quiet)
+        self.assertEqual(quiet_calls, ["mark", "finish"])
+
+        running_without_handler_calls: list[str] = []
+        running_without_handler = SimpleNamespace(
+            _stop_in_progress=lambda: False,
+            _claim_model_transition=lambda: (_ for _ in ()).throw(
+                AdmissionRejectedError("busy")
+            ),
+            _state=LLMState.RUNNING,
+            _mark_model_transition_active=lambda: running_without_handler_calls.append("mark"),
+            _finish_model_transition_active=lambda: running_without_handler_calls.append("finish"),
+        )
+        await restart_model(running_without_handler)
+        self.assertEqual(running_without_handler_calls, ["mark", "finish"])
+
+    async def test_restart_model_covers_missing_old_engine_and_built_runtime_failure_cleanup(self):
+        cleanup_calls: list[str] = []
+        built_runtime = SimpleNamespace(
+            runtime_files=SimpleNamespace(cleanup=lambda: cleanup_calls.append("cleanup")),
+            engine=_SwapEngine(start_error=RuntimeError("boom")),
+        )
+        best_effort: list[object] = []
+
+        async def finish_swapping() -> None:
+            return None
+
+        async def begin_swap() -> None:
+            return None
+
+        llm = SimpleNamespace(
+            _stop_in_progress=lambda: False,
+            _claim_model_transition=lambda: None,
+            _release_model_transition=lambda: None,
+            _mark_model_transition_active=lambda: None,
+            _finish_model_transition_active=lambda: None,
+            _capture_stop_epoch=lambda: 1,
+            _stop_requested_since=lambda _epoch: False,
+            _swap_lock=asyncio.Lock(),
+            _runtime_model=object(),
+            _engine=None,
+            _configured_init_config=object(),
+            _configured_harness_name="default",
+            _configured_search_provider="ddgs",
+            _configured_search_token_budget=32,
+            _build_runtime=lambda *_args, **_kwargs: built_runtime,
+            _begin_swap=begin_swap,
+            _clear_runtime=lambda: None,
+            _bind_runtime=lambda _runtime: None,
+            _admission=SimpleNamespace(finish_swapping=finish_swapping),
+            _set_server_error=lambda: cleanup_calls.append("server_error"),
+        )
+
+        original_best_effort_stop = _best_effort_stop
+
+        async def tracked_best_effort_stop(engine) -> None:
+            best_effort.append(engine)
+            await original_best_effort_stop(engine)
+
+        with patch(
+            "trillim.components.llm._swap._best_effort_stop",
+            side_effect=tracked_best_effort_stop,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await restart_model(llm)
+
+        self.assertEqual(cleanup_calls, ["cleanup", "server_error"])
+        self.assertEqual(best_effort, [built_runtime.engine, None])
+
     async def test_restart_model_cleans_up_failed_rebuilds(self):
         calls: list[str] = []
         old_engine = _SwapEngine()
@@ -355,6 +505,32 @@ class SwapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_engine.stop_calls, 2)
         self.assertEqual(failed_engine.stop_calls, 1)
         self.assertEqual(calls, ["clear_runtime", "server_error"])
+
+    async def test_restart_model_stops_old_engine_when_runtime_build_raises_before_assignment(self):
+        calls: list[str] = []
+        old_engine = _SwapEngine()
+        llm = SimpleNamespace(
+            _swap_lock=asyncio.Lock(),
+            _runtime_model=object(),
+            _configured_init_config="init",
+            _configured_harness_name="search",
+            _configured_search_provider="brave",
+            _configured_search_token_budget=1024,
+            _engine=old_engine,
+            _state=LLMState.RUNNING,
+            _admission=_Admission(),
+            _build_runtime=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("build boom")),
+            _begin_swap=lambda: asyncio.sleep(0),
+            _clear_runtime=lambda: calls.append("clear_runtime"),
+            _bind_runtime=lambda runtime: calls.append(f"bind:{runtime!r}"),
+            _set_server_error=lambda: calls.append("server_error"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "build boom"):
+            await restart_model(llm)
+
+        self.assertEqual(old_engine.stop_calls, 1)
+        self.assertEqual(calls, ["server_error"])
 
     async def test_wait_for_idle_or_cancel_handles_success_cancellation_and_failure(self):
         llm = SimpleNamespace(

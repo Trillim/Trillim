@@ -10,6 +10,7 @@ from trillim.utils.cancellation import CancellationSource
 class CancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_token_waits_and_raises(self):
         source = CancellationSource()
+        source.token.raise_if_cancelled()
 
         async def _cancel_later():
             await asyncio.sleep(0)
@@ -21,4 +22,3 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(source.cancelled())
         with self.assertRaises(OperationCancelledError):
             source.token.raise_if_cancelled()
-

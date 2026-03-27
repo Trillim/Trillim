@@ -200,6 +200,36 @@ class SearchFetchTests(unittest.TestCase):
         self.assertEqual(_truncate_at_sentence("Hello. Goodbye.", 7), "Hello.")
         self.assertEqual(_truncate_at_sentence("abcdef", 3), "abc")
 
+    def test_truncate_to_token_budget_prefers_truncated_best_match_when_nothing_else_fits(self):
+        long_match = "cats " + ("x" * 200)
+        fallback = "dogs only"
+
+        selected = truncate_to_token_budget(
+            f"{long_match}\n\n{fallback}",
+            "cats",
+            token_budget=4,
+        )
+
+        self.assertEqual(selected, long_match[:16])
+
+    def test_truncate_to_token_budget_breaks_after_budget_runs_out_with_prior_selection(self):
+        selected = truncate_to_token_budget(
+            "cats short\n\n" + ("cats " + ("x" * 60)),
+            "cats",
+            token_budget=5,
+        )
+
+        self.assertEqual(selected, "cats short")
+
+    def test_truncate_to_token_budget_keeps_multiple_ranked_paragraphs_when_all_fit(self):
+        selected = truncate_to_token_budget(
+            "cats alpha\n\ncats beta",
+            "cats",
+            token_budget=20,
+        )
+
+        self.assertEqual(selected, "cats alpha\n\ncats beta")
+
     def test_fetch_and_extract_reads_html_and_uses_trafilatura(self):
         fake_module = types.SimpleNamespace(
             extract=lambda html, **_kwargs: f"parsed:{html[:5]}"

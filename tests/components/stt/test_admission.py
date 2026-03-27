@@ -43,3 +43,27 @@ class STTAdmissionTests(unittest.IsolatedAsyncioTestCase):
         await lease.release()
         await lease.release()
         self.assertEqual(admission.active_count, 0)
+
+    async def test_accepting_property_and_idle_paths_cover_no_active_transitions(self):
+        admission = TranscriptionAdmission()
+
+        self.assertTrue(admission.accepting)
+        await admission.start_draining()
+        self.assertFalse(admission.accepting)
+        await admission.wait_for_idle()
+        await admission.finish_starting()
+        self.assertTrue(admission.accepting)
+        await admission._release()
+        self.assertEqual(admission.active_count, 0)
+
+    async def test_internal_release_and_finish_starting_cover_active_nonzero_branches(self):
+        admission = TranscriptionAdmission()
+        admission._active = 2
+        admission._idle.clear()
+
+        await admission.finish_starting()
+        self.assertFalse(admission._idle.is_set())
+
+        await admission._release()
+        self.assertEqual(admission.active_count, 1)
+        self.assertFalse(admission._idle.is_set())

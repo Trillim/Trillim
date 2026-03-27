@@ -8,6 +8,8 @@ from pathlib import Path, PureWindowsPath
 import tempfile
 import typing
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from trillim import _model_store
 import trillim.components.llm as llm_exports
@@ -16,7 +18,7 @@ from trillim.components.llm import ChatSession
 from trillim.components.llm._config import LLMState
 from trillim.components.llm._engine import EngineCrashedError
 from trillim.components.llm._session import _ChatSession
-from trillim.components.llm.public import LLM
+from trillim.components.llm.public import LLM, _make_init_config
 from trillim.errors import AdmissionRejectedError, ComponentLifecycleError
 from trillim.harnesses.search._harness import _SearchHarness
 from tests.components.llm.support import (
@@ -53,6 +55,13 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
             _engine_factory=FakeEngineFactory(responses=responses or ["ok"]),
         )
 
+    def test_public_llm_constructor_rejects_missing_model_dir_and_zero_search_budget(self):
+        with self.assertRaisesRegex(ValueError, "model_dir is required"):
+            LLM("")
+
+        with self.assertRaisesRegex(ValueError, "search_token_budget must be at least 1"):
+            LLM("Trillim/fake", search_token_budget=0)
+
     async def test_public_llm_start_stop_chat_and_stream(self):
         llm = self._make_llm(responses=["hello", "world"])
         await llm.start()
@@ -66,6 +75,272 @@ class PublicLLMTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].text, "world")
         await llm.stop()
         self.assertEqual(llm.model_info().state.value, "unavailable")
+
+    async def test_public_llm_max_context_requires_runtime_and_start_is_idempotent(self):
+        llm = self._make_llm()
+
+        with self.assertRaisesRegex(RuntimeError, "LLM not started"):
+            _ = llm.max_context_tokens
+
+        await llm.start()
+        engine = llm._engine
+        self.assertEqual(llm.max_context_tokens, 4096)
+
+        await llm.start()
+
+        self.assertIs(llm._engine, engine)
+        self.assertEqual(engine.start_calls, 1)
+        await llm.stop()
+
+    async def test_public_llm_start_rejects_when_stop_is_already_in_progress(self):
+        llm = self._make_llm()
+        llm._stop_requests = 1
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "stopping"):
+            await llm.start()
+
+    async def test_public_llm_start_aborts_if_stop_wins_after_runtime_build(self):
+        llm = self._make_llm()
+        original = llm._stop_requested_since
+        calls = {"count": 0}
+
+        def stop_requested_since(epoch):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return True
+            return original(epoch)
+
+        llm._stop_requested_since = stop_requested_since
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "stopped during startup"):
+            await llm.start()
+
+        self.assertEqual(llm.state, LLMState.UNAVAILABLE)
+
+    async def test_public_llm_start_discards_runtime_when_stop_is_marked_during_build(self):
+        llm = self._make_llm()
+        original_build_runtime = llm._build_runtime
+
+        def stopping_build_runtime(*args, **kwargs):
+            built_runtime = original_build_runtime(*args, **kwargs)
+            llm._mark_stop_requested()
+            return built_runtime
+
+        llm._build_runtime = stopping_build_runtime
+
+        with self.assertRaisesRegex(ComponentLifecycleError, "stopped during startup"):
+            await llm.start()
+
+        self.assertEqual(llm.state, LLMState.UNAVAILABLE)
+        self.assertIsNone(llm._engine)
+        self.assertIsNone(llm.model_name)
+
+    async def test_public_llm_start_sets_server_error_and_clears_runtime_when_engine_start_fails(self):
+        self._ensure_store_dir("Trillim/fake")
+        llm = LLM(
+            "Trillim/fake",
+            _model_validator=lambda _: make_runtime_model(Path("/tmp/fake-model")),
+            _tokenizer_loader=lambda *_args, **_kwargs: FakeTokenizer(),
+            _engine_factory=FakeEngineFactory(start_error=RuntimeError("boom")),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            await llm.start()
+
+        self.assertEqual(llm.state, LLMState.SERVER_ERROR)
+        self.assertIsNone(llm.model_name)
+        self.assertIsNone(llm._engine)
+
+    async def test_public_llm_start_sets_server_error_when_runtime_build_fails_before_binding(self):
+        llm = self._make_llm()
+
+        def broken_build(*_args, **_kwargs):
+            raise RuntimeError("build boom")
+
+        llm._build_runtime = broken_build
+        with self.assertRaisesRegex(RuntimeError, "build boom"):
+            await llm.start()
+
+        self.assertEqual(llm.state, LLMState.SERVER_ERROR)
+        self.assertIsNone(llm._engine)
+
+    async def test_public_llm_stop_sets_server_error_if_engine_stop_fails(self):
+        llm = self._make_llm()
+        await llm.start()
+
+        async def broken_stop() -> None:
+            raise RuntimeError("stop boom")
+
+        llm._engine.stop = broken_stop
+
+        with self.assertRaisesRegex(RuntimeError, "stop boom"):
+            await llm.stop()
+
+        self.assertEqual(llm.state, LLMState.SERVER_ERROR)
+
+    async def test_collect_chat_ignores_unknown_events_and_requires_done(self):
+        llm = self._make_llm()
+
+        class _Session:
+            def __init__(self, events) -> None:
+                self._events = list(events)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            async def stream_chat(self, **_kwargs):
+                for event in self._events:
+                    yield event
+
+        done_session = _Session(
+            [
+                object(),
+                SimpleNamespace(text="partial"),
+                SimpleNamespace(text="done", usage="usage"),
+            ]
+        )
+        llm.open_session = lambda _messages: done_session
+
+        text, usage = await llm._collect_chat([{"role": "user", "content": "hi"}])
+
+        self.assertEqual(text, "done")
+        self.assertEqual(usage, "usage")
+
+        llm.open_session = lambda _messages: _Session([SimpleNamespace(text="partial")])
+        with self.assertRaisesRegex(RuntimeError, "without a done event"):
+            await llm._collect_chat([{"role": "user", "content": "hi"}])
+
+    def test_build_runtime_cleans_up_prepared_files_when_setup_fails(self):
+        self._ensure_store_dir("Trillim/fake")
+        llm = LLM(
+            "Trillim/fake",
+            _tokenizer_loader=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("tokenizer boom")
+            ),
+            _engine_factory=FakeEngineFactory(responses=["ok"]),
+        )
+        cleaned: list[str] = []
+
+        class _RuntimeFiles:
+            def __init__(self) -> None:
+                self.model_dir = Path("/tmp/model")
+                self.metadata_dir = Path("/tmp/metadata")
+                self.adapter_dir = None
+
+            def cleanup(self) -> None:
+                cleaned.append("cleanup")
+
+        llm._validate_runtime_model = lambda *_args, **_kwargs: make_runtime_model(
+            Path("/tmp/model")
+        )
+
+        with patch(
+            "trillim.components.llm.public.prepare_runtime_files",
+            return_value=_RuntimeFiles(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tokenizer boom"):
+                llm._build_runtime(llm._configured_init_config)
+
+        self.assertEqual(cleaned, ["cleanup"])
+
+    async def test_discard_runtime_after_stop_clears_bound_runtime_and_drains(self):
+        llm = self._make_llm()
+        built_runtime = llm._build_runtime(llm._configured_init_config)
+        llm._bind_runtime(built_runtime)
+        llm._state = LLMState.RUNNING
+
+        await llm._discard_runtime_after_stop(built_runtime)
+
+        self.assertEqual(llm.state, LLMState.UNAVAILABLE)
+        self.assertIsNone(llm.model_name)
+        self.assertFalse(llm._admission.accepting)
+        self.assertEqual(built_runtime.engine.stop_calls, 1)
+
+    async def test_cancel_active_sessions_allows_success_and_preserves_first_error(self):
+        class _Session:
+            def __init__(self, exc: Exception | None = None) -> None:
+                self.exc = exc
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                if self.exc is not None:
+                    raise self.exc
+
+        await LLM._cancel_active_sessions(type("_LLM", (), {"_sessions": [_Session(), _Session()]})())
+
+        first = _Session(RuntimeError("first"))
+        second = _Session(RuntimeError("second"))
+        with self.assertRaisesRegex(RuntimeError, "first"):
+            await LLM._cancel_active_sessions(type("_LLM", (), {"_sessions": [first, second]})())
+
+        self.assertEqual(first.close_calls, 1)
+        self.assertEqual(second.close_calls, 1)
+
+    def test_make_init_config_rejects_invalid_inputs(self):
+        with self.assertRaisesRegex(ValueError, "model_dir is required"):
+            _make_init_config(
+                model_dir="",
+                num_threads=0,
+                lora_dir=None,
+                lora_quant=None,
+                unembed_quant=None,
+            )
+
+        with self.assertRaisesRegex(ValueError, "num_threads must be between 0 and"):
+            _make_init_config(
+                model_dir="Trillim/fake",
+                num_threads=-1,
+                lora_dir=None,
+                lora_quant=None,
+                unembed_quant=None,
+            )
+
+        self._ensure_store_dir("Trillim/fake")
+        with self.assertRaisesRegex(ValueError, "model_dir must not be empty"):
+            _make_init_config(
+                model_dir="   ",
+                num_threads=0,
+                lora_dir=None,
+                lora_quant=None,
+                unembed_quant=None,
+            )
+
+        with self.assertRaisesRegex(ValueError, "lora_quant must not be empty"):
+            _make_init_config(
+                model_dir="Trillim/fake",
+                num_threads=0,
+                lora_dir=None,
+                lora_quant="   ",
+                unembed_quant=None,
+            )
+
+    def test_public_llm_internal_counters_cover_noop_and_nonzero_transition_paths(self):
+        llm = self._make_llm()
+
+        llm._finish_stop_request()
+        self.assertEqual(llm._stop_requests, 0)
+
+        llm._mark_model_transition_active()
+        llm._mark_model_transition_active()
+        llm._finish_model_transition_active()
+        self.assertEqual(llm._active_model_transitions, 1)
+        self.assertFalse(llm._model_transitions_idle.is_set())
+
+    def test_public_llm_internal_counter_helpers_cover_zero_transition_exit_paths(self):
+        llm = self._make_llm()
+
+        llm._stop_requests = 1
+        llm._finish_stop_request()
+        self.assertEqual(llm._stop_requests, 0)
+
+        llm._model_transitions_idle.clear()
+        llm._finish_model_transition_active()
+        self.assertEqual(llm._active_model_transitions, 0)
+        self.assertTrue(llm._model_transitions_idle.is_set())
 
     async def test_cancel_active_sessions_attempts_all_sessions_even_if_one_close_fails(self):
         class _Session:

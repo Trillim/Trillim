@@ -335,6 +335,9 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(EngineCrashedError, "Inference engine crashed$"):
             await engine._readline("token_id")
 
+        engine.process = None
+        await engine._kill_process()
+
         async def fake_wait_for(awaitable, timeout):
             del timeout
             close = getattr(awaitable, "close", None)
@@ -373,3 +376,21 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("boom")
 
         self.assertEqual(await _read_stderr(SimpleNamespace(stderr=_BadReader())), "")
+
+    async def test_generate_keeps_live_process_reference_when_kill_is_noop(self):
+        engine = self._make_engine()
+        process = _FakeProcess(lines=[b"65\n"])
+        engine.process = process
+
+        async def noop_kill() -> None:
+            return None
+
+        with patch.object(
+            engine,
+            "_write_block",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ), patch.object(engine, "_kill_process", new=AsyncMock(side_effect=noop_kill)):
+            with self.assertRaises(asyncio.CancelledError):
+                [token async for token in engine.generate([1], max_tokens=8)]
+
+        self.assertIs(engine.process, process)

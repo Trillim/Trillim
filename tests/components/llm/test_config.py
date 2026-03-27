@@ -14,6 +14,7 @@ from trillim.components.llm._config import (
     ModelInfo,
     RuntimeInitInfo,
     SamplingDefaults,
+    MAX_OUTPUT_TOKENS,
     load_sampling_defaults,
 )
 
@@ -84,3 +85,39 @@ class LLMConfigTests(unittest.TestCase):
 
         self.assertEqual(defaults.rep_penalty_lookback, 128)
         self.assertIsInstance(defaults.rep_penalty_lookback, int)
+
+    def test_load_sampling_defaults_falls_back_on_invalid_and_bool_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(load_sampling_defaults(root), SamplingDefaults())
+
+            (root / "generation_config.json").write_text("{bad", encoding="utf-8")
+            self.assertEqual(load_sampling_defaults(root), SamplingDefaults())
+
+            (root / "generation_config.json").write_text(
+                json.dumps(
+                    {
+                        "temperature": True,
+                        "top_k": False,
+                        "top_p": True,
+                        "repetition_penalty": False,
+                        "rep_penalty_lookback": True,
+                        "max_new_tokens": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            defaults = load_sampling_defaults(root)
+            self.assertEqual(defaults, SamplingDefaults())
+
+            (root / "generation_config.json").write_text(
+                json.dumps({"max_new_tokens": "not-an-int"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_sampling_defaults(root).max_tokens, SamplingDefaults().max_tokens)
+
+            (root / "generation_config.json").write_text(
+                json.dumps({"max_new_tokens": MAX_OUTPUT_TOKENS + 100}),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_sampling_defaults(root).max_tokens, MAX_OUTPUT_TOKENS)

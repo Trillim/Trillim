@@ -2,6 +2,7 @@
 
 import unittest
 
+from trillim.components.llm._limits import MAX_MESSAGE_CHARS, MAX_MESSAGES
 from trillim.components.llm._validation import (
     validate_chat_request,
     validate_messages,
@@ -116,3 +117,56 @@ class ValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(validated[-1].role, "search")
+
+    def test_validate_chat_request_rejects_empty_and_oversized_message_content(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
+            validate_chat_request(
+                {
+                    "messages": [{"role": "user", "content": ""}],
+                },
+                active_model_name=None,
+            )
+
+        with self.assertRaisesRegex(InvalidRequestError, "character limit"):
+            validate_chat_request(
+                {
+                    "messages": [{"role": "user", "content": "x" * (MAX_MESSAGE_CHARS + 1)}],
+                },
+                active_model_name=None,
+            )
+
+    def test_validate_chat_request_rejects_empty_and_oversized_message_lists(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
+            validate_chat_request(
+                {"messages": []},
+                active_model_name=None,
+            )
+
+        with self.assertRaisesRegex(InvalidRequestError, "messages exceed the limit"):
+            validate_chat_request(
+                {
+                    "messages": [
+                        {"role": "user", "content": f"message-{index}"}
+                        for index in range(MAX_MESSAGES + 1)
+                    ],
+                },
+                active_model_name=None,
+            )
+
+    def test_validate_messages_rejects_empty_and_oversized_sdk_sequences(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
+            validate_messages(
+                [],
+                require_user_turn=False,
+                allow_empty=False,
+            )
+
+        with self.assertRaisesRegex(InvalidRequestError, "messages exceed the limit"):
+            validate_messages(
+                [
+                    {"role": "user", "content": f"message-{index}"}
+                    for index in range(MAX_MESSAGES + 1)
+                ],
+                require_user_turn=False,
+                allow_empty=True,
+            )

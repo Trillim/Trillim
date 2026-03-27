@@ -43,3 +43,11 @@ class TokenizerLoaderTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ModelValidationError, "encode/decode"):
                 load_tokenizer(Path("/tmp/model"), trust_remote_code=False)
+
+    def test_load_tokenizer_wraps_pretrained_loader_errors(self):
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaisesRegex(ModelValidationError, "Could not load tokenizer"):
+                load_tokenizer(Path("/tmp/model"), trust_remote_code=False)
