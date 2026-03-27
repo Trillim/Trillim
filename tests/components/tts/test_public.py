@@ -65,14 +65,25 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         source.write_bytes(b"voice")
         second_source = Path(self._temp_dir.name) / "voice-2.wav"
         second_source.write_bytes(b"voice-2")
-        self.assertEqual(await tts.register_voice("custom-path", source), "custom-path")
-        self.assertEqual(await tts.register_voice("custom-str", str(second_source)), "custom-str")
+        self.assertEqual(await tts.register_voice("custompath", source), "custompath")
+        self.assertEqual(await tts.register_voice("customstr", str(second_source)), "customstr")
         await tts.stop()
 
     async def test_register_voice_rejects_empty_path_objects(self):
         tts = await self._start_tts()
         with self.assertRaisesRegex(InvalidRequestError, "path is required"):
             await tts.register_voice("custom", Path(""))
+        await tts.stop()
+
+    async def test_register_voice_rejects_non_alphanumeric_names(self):
+        tts = await self._start_tts()
+        for name in ("bad/name", "../escape", "bad-name", "bad_name", "bad.name"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    InvalidRequestError,
+                    "must contain only letters and digits",
+                ):
+                    await tts.register_voice(name, b"voice")
         await tts.stop()
 
     async def test_register_voice_rejects_duplicate_names(self):

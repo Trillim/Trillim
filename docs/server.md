@@ -303,6 +303,7 @@ Response:
 Important facts:
 
 - max upload size: `10 MiB`
+- custom voice names and `voice` selectors accept only ASCII letters and digits
 - custom voice storage lives under `~/.trillim/voices`
 - voice cloning support requires accepting the `kyutai/pocket-tts` terms and authenticating with Hugging Face
 

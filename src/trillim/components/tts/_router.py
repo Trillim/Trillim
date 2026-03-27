@@ -46,7 +46,7 @@ def build_router(tts) -> APIRouter:
             raise _as_http_error(exc) from exc
         return {"name": name, "status": "created"}
 
-    @router.delete("/v1/voices/{voice_name:path}")
+    @router.delete("/v1/voices/{voice_name}")
     async def delete_voice(voice_name: str):
         try:
             deleted_name = await tts.delete_voice(voice_name)

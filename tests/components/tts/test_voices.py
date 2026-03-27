@@ -167,6 +167,74 @@ class TTSVoiceStoreTests(unittest.IsolatedAsyncioTestCase):
         resolved = await self.store.resolve_for_session("alba", spool_dir=self.spool_dir)
         self.assertEqual(resolved.reference, "alba")
 
+    async def test_manifest_with_path_like_voice_name_fails_closed(self):
+        for name in ("../escape", "bad-name"):
+            with self.subTest(name=name):
+                state_bytes = _valid_state_bytes()
+                storage_id = _storage_id_for_name(name)
+                self.root.mkdir(parents=True, exist_ok=True)
+                (self.root / f"{storage_id}.state").write_bytes(state_bytes)
+                (self.root / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "voices": [
+                                {
+                                    "name": name,
+                                    "storage_id": storage_id,
+                                    "size_bytes": len(state_bytes),
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(VoiceStoreTamperedError, "tampered"):
+                    await self.store.list_names()
+                self.store = VoiceStore(
+                    self.root,
+                    built_in_voice_names=("alba", "marius"),
+                )
+                for child in self.root.iterdir():
+                    child.unlink()
+
+    async def test_store_methods_reject_non_alphanumeric_voice_names(self):
+        upload = await spool_voice_bytes(b"voice", spool_dir=self.spool_dir)
+
+        async def fail_builder(_path: Path) -> bytes:
+            raise AssertionError("build_voice_state should not be called")
+
+        try:
+            with self.assertRaisesRegex(
+                InvalidRequestError,
+                "must contain only letters and digits",
+            ):
+                await self.store.ensure_name_available("bad-name")
+            with self.assertRaisesRegex(
+                InvalidRequestError,
+                "must contain only letters and digits",
+            ):
+                await self.store.register_owned_upload(
+                    name="bad-name",
+                    upload=upload,
+                    build_voice_state=fail_builder,
+                )
+            with self.assertRaisesRegex(
+                InvalidRequestError,
+                "must contain only letters and digits",
+            ):
+                await self.store.delete("bad-name")
+            with self.assertRaisesRegex(
+                InvalidRequestError,
+                "must contain only letters and digits",
+            ):
+                await self.store.resolve_for_session(
+                    "bad-name",
+                    spool_dir=self.spool_dir,
+                )
+        finally:
+            upload.path.unlink(missing_ok=True)
+
     async def test_non_directory_voice_store_root_fails_closed(self):
         self.root.write_text("not a directory", encoding="utf-8")
         with self.assertRaisesRegex(VoiceStoreTamperedError, "tampered"):
@@ -287,3 +355,29 @@ class TTSVoiceStoreTests(unittest.IsolatedAsyncioTestCase):
             r"Delete stale \.state files",
         ):
             await self.store.ensure_name_available("fresh")
+
+    async def test_resolve_unknown_voice_and_delete_builtin_voice_are_rejected(self):
+        with self.assertRaisesRegex(InvalidRequestError, "unknown voice"):
+            await self.store.resolve_for_session("missing", spool_dir=self.spool_dir)
+        with self.assertRaisesRegex(InvalidRequestError, "built in"):
+            await self.store.delete("alba")
+
+    async def test_spool_request_stream_and_copy_source_audio_enforce_size_and_empty_limits(self):
+        with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
+            await spool_request_voice_stream(_Chunks([b"", b""]), spool_dir=self.spool_dir)
+        self.assertEqual(list(self.spool_dir.glob("*")), [])
+
+        with patch("trillim.components.tts._voices.MAX_VOICE_UPLOAD_BYTES", 3):
+            with self.assertRaisesRegex(InvalidRequestError, "byte limit"):
+                await spool_request_voice_stream(
+                    _Chunks([b"ab", b"cd"]),
+                    spool_dir=self.spool_dir,
+                )
+        self.assertEqual(list(self.spool_dir.glob("*")), [])
+
+        source = Path(self._temp_dir.name) / "large-voice.wav"
+        source.write_bytes(b"abcdef")
+        with patch("trillim.components.tts._voices.MAX_VOICE_UPLOAD_BYTES", 3):
+            with self.assertRaisesRegex(InvalidRequestError, "byte limit"):
+                await copy_source_audio(source, spool_dir=self.spool_dir)
+        self.assertEqual(list(self.spool_dir.glob("*")), [])

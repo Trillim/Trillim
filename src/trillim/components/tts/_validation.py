@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import errno
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from trillim.components.tts._limits import (
     MIN_SPEED,
 )
 from trillim.errors import InvalidRequestError
+
+_VOICE_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
 
 
 class PayloadTooLargeError(InvalidRequestError):
@@ -146,6 +149,10 @@ def normalize_optional_name(name: str | None, *, field_name: str) -> str | None:
     value = str(name).strip()
     if not value:
         raise InvalidRequestError(f"{field_name} must not be empty")
+    if _VOICE_NAME_RE.fullmatch(value) is None:
+        raise InvalidRequestError(
+            f"{field_name} must contain only letters and digits"
+        )
     return value
 
 

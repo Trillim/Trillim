@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 import os
+import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import torch
 
@@ -17,11 +20,18 @@ from trillim.errors import ProgressTimeoutError
 from trillim.components.tts._worker import (
     WorkerFailureError,
     _VOICE_CLONE_AUTH_ERROR,
+    _REQUEST_HEADER,
+    _RESPONSE_HEADER,
     _audio_tensor_to_pcm_bytes,
+    _collect_worker_output,
+    _error_message,
     _load_worker_state,
+    _run_session_worker,
+    _stop_process,
     build_voice_state,
     create_session_worker,
     is_voice_cloning_auth_error,
+    main,
     synthesize_segment,
 )
 from tests.components.tts.support import prepend_pythonpath, write_fake_pocket_tts_package
@@ -137,6 +147,7 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
     def test_audio_tensor_to_pcm_bytes_and_auth_error_detection(self):
         self.assertEqual(len(_audio_tensor_to_pcm_bytes([0.0, 0.5])), 4)
         self.assertTrue(is_voice_cloning_auth_error(_VOICE_CLONE_AUTH_ERROR.upper()))
+        self.assertFalse(is_voice_cloning_auth_error("not an auth error"))
 
     def test_load_worker_state_rejects_unsafe_serialized_state(self):
         good_path = self.root / "voice.state"
@@ -157,6 +168,13 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(),
                 voice_kind="state_file",
                 voice_reference=str(bad_path),
+            )
+
+        with self.assertRaisesRegex(ValueError, "unsupported voice kind"):
+            _load_worker_state(
+                SimpleNamespace(),
+                voice_kind="unknown",
+                voice_reference="ignored",
             )
 
     async def test_worker_helpers_bound_stdout_and_stderr(self):
@@ -263,3 +281,193 @@ class TTSWorkerTests(unittest.IsolatedAsyncioTestCase):
                     await worker.synthesize("hello")
             finally:
                 await worker.close()
+
+    async def test_worker_helper_paths_cover_cancellation_and_process_shutdown(self):
+        process = SimpleNamespace(returncode=None)
+        with patch(
+            "trillim.components.tts._worker.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ), patch(
+            "trillim.components.tts._worker._collect_worker_output",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ), patch(
+            "trillim.components.tts._worker._stop_process",
+            new=AsyncMock(),
+        ) as stop_process:
+            with self.assertRaises(asyncio.CancelledError):
+                await synthesize_segment(
+                    "tiny prompt",
+                    voice_kind="predefined",
+                    voice_reference="alba",
+                )
+        stop_process.assert_awaited_once_with(process)
+
+        process = SimpleNamespace(returncode=None)
+        with patch(
+            "trillim.components.tts._worker.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ), patch(
+            "trillim.components.tts._worker._collect_worker_output",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ), patch(
+            "trillim.components.tts._worker._stop_process",
+            new=AsyncMock(),
+        ) as stop_process:
+            with self.assertRaises(asyncio.CancelledError):
+                await build_voice_state(self.root / "voice.txt")
+        stop_process.assert_awaited_once_with(process)
+
+        class _CollectedProcess:
+            def __init__(self) -> None:
+                self.stdout = asyncio.StreamReader()
+                self.stderr = asyncio.StreamReader()
+                self.returncode = None
+                self.stdout.feed_data(b"pcm")
+                self.stdout.feed_eof()
+                self.stderr.feed_data(b"stderr")
+                self.stderr.feed_eof()
+
+            async def wait(self) -> int:
+                self.returncode = 0
+                return 0
+
+        stdout, stderr = await _collect_worker_output(
+            _CollectedProcess(),
+            stdout_limit=8,
+            timeout=None,
+        )
+        self.assertEqual(stdout, b"pcm")
+        self.assertEqual(stderr, b"stderr")
+
+        class _HangingProcess:
+            def __init__(self) -> None:
+                self.returncode = None
+                self.terminate_calls = 0
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                self.wait_calls += 1
+                return 0 if self.returncode is None else self.returncode
+
+        async def fake_wait_for(awaitable, timeout):
+            del timeout
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.TimeoutError
+
+        hanging = _HangingProcess()
+        with patch("trillim.components.tts._worker.asyncio.wait_for", side_effect=fake_wait_for):
+            await _stop_process(hanging)
+        self.assertEqual(hanging.terminate_calls, 1)
+        self.assertEqual(hanging.kill_calls, 1)
+        self.assertGreaterEqual(hanging.wait_calls, 1)
+        self.assertEqual(_error_message(b" \n"), "TTS worker failed")
+
+    def test_worker_entrypoints_cover_direct_session_and_cli_branches(self):
+        audio_path = self.root / "voice.txt"
+        audio_path.write_text("voice", encoding="latin-1")
+
+        class _FakeModel:
+            def get_state_for_audio_prompt(self, audio_conditioning):
+                text = str(audio_conditioning)
+                if text in {"alba", "marius"}:
+                    return {"prompt": text}
+                return {"prompt": Path(text).read_text(encoding="latin-1")}
+
+            def generate_audio(self, model_state, text_to_generate, max_tokens=20):
+                del model_state, text_to_generate, max_tokens
+                return [0.0, 0.25, -0.25]
+
+        fake_pocket_tts = SimpleNamespace(
+            TTSModel=SimpleNamespace(load_model=lambda: _FakeModel())
+        )
+
+        synth_stdout = SimpleNamespace(buffer=io.BytesIO())
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch(
+            "trillim.components.tts._worker.sys.stdout",
+            synth_stdout,
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "synthesize",
+                        "--text",
+                        "tiny prompt",
+                        "--voice-kind",
+                        "predefined",
+                        "--voice-reference",
+                        "alba",
+                    ]
+                ),
+                0,
+            )
+        self.assertTrue(synth_stdout.buffer.getvalue())
+
+        state_stdout = SimpleNamespace(buffer=io.BytesIO())
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch(
+            "trillim.components.tts._worker.sys.stdout",
+            state_stdout,
+        ):
+            self.assertEqual(
+                main(["voice-state", "--audio-path", str(audio_path)]),
+                0,
+            )
+        self.assertIn("prompt", load_safe_voice_state_bytes(state_stdout.buffer.getvalue()))
+
+        request = _REQUEST_HEADER.pack(len(b"hello")) + b"hello"
+        session_stdin = SimpleNamespace(buffer=io.BytesIO(request))
+        session_stdout = SimpleNamespace(buffer=io.BytesIO())
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch(
+            "trillim.components.tts._worker.sys.stdin",
+            session_stdin,
+        ), patch(
+            "trillim.components.tts._worker.sys.stdout",
+            session_stdout,
+        ):
+            self.assertEqual(
+                _run_session_worker(
+                    voice_kind="predefined",
+                    voice_reference="alba",
+                ),
+                0,
+            )
+        payload = session_stdout.buffer.getvalue()
+        kind, size = _RESPONSE_HEADER.unpack(payload[: _RESPONSE_HEADER.size])
+        self.assertEqual(kind, b"A")
+        self.assertEqual(len(payload) - _RESPONSE_HEADER.size, size)
+
+        bad_stdin = SimpleNamespace(buffer=io.BytesIO(b"\x00\x00"))
+        bad_stdout = SimpleNamespace(buffer=io.BytesIO())
+        bad_stderr = io.StringIO()
+        with patch.dict(sys.modules, {"pocket_tts": fake_pocket_tts}), patch(
+            "trillim.components.tts._worker.sys.stdin",
+            bad_stdin,
+        ), patch(
+            "trillim.components.tts._worker.sys.stdout",
+            bad_stdout,
+        ), patch(
+            "trillim.components.tts._worker.sys.stderr",
+            bad_stderr,
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "session",
+                        "--voice-kind",
+                        "predefined",
+                        "--voice-reference",
+                        "alba",
+                    ]
+                ),
+                1,
+            )
+        self.assertIn("malformed stdin", bad_stderr.getvalue())

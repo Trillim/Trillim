@@ -267,6 +267,8 @@ Public helpers:
 - `str`
 - `Path`
 
+Custom voice names and `voice` selectors accept only ASCII letters and digits.
+
 Session rules that matter:
 
 - `TTSSession` is created by `TTS.speak()`. You do not construct it directly.

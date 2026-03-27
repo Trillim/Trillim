@@ -141,6 +141,13 @@ class TTSValidationTests(unittest.TestCase):
         self.assertIsNone(normalize_optional_name(None, field_name="voice"))
         with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
             normalize_optional_name("  ", field_name="voice")
+        for value in ("bad/name", "../escape", "bad-name", "bad_name", "bad.name"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    InvalidRequestError,
+                    "must contain only letters and digits",
+                ):
+                    normalize_optional_name(value, field_name="voice")
         with self.assertRaisesRegex(InvalidRequestError, "header is required"):
             normalize_required_name(None, field_name="name")
         with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
@@ -151,6 +158,27 @@ class TTSValidationTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(InvalidRequestError, "must not be empty"):
                 normalize_required_name("voice", field_name="name")
+
+    def test_validate_http_requests_reject_non_alphanumeric_voice_names(self):
+        for value in ("bad/name", "bad-name"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    InvalidRequestError,
+                    "must contain only letters and digits",
+                ):
+                    validate_http_speech_request(
+                        content_length=None,
+                        voice=value,
+                        speed=None,
+                    )
+                with self.assertRaisesRegex(
+                    InvalidRequestError,
+                    "must contain only letters and digits",
+                ):
+                    validate_http_voice_upload_request(
+                        content_length=None,
+                        name=value,
+                    )
 
     def test_validate_source_audio_path_and_open_reject_symlink_and_non_regular_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +16,9 @@ from trillim.components.llm._engine import (
     EngineProgressTimeoutError,
     EngineProtocolError,
     InferenceEngine,
+    _PromptCache,
+    _first_protocol_line,
+    _read_stderr,
 )
 from tests.components.llm.support import FakeTokenizer, make_runtime_model
 
@@ -242,3 +246,130 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(EngineCrashedError, "boom"):
             [token async for token in engine.generate([1], max_tokens=8)]
+
+    def test_prompt_cache_commit_rejects_invalid_kv_positions(self):
+        cache = _PromptCache()
+        plan = cache.plan([1, 2])
+
+        with self.assertRaisesRegex(EngineProtocolError, "Invalid kv_position -1"):
+            cache.commit(plan, [65], -1)
+
+    async def test_start_stop_and_generate_helper_paths(self):
+        engine = self._make_engine()
+        running = _FakeProcess()
+        engine.process = running
+        with patch(
+            "trillim.components.llm._engine.asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=AssertionError("should not launch")),
+        ):
+            await engine.start()
+
+        engine = self._make_engine()
+        failed_process = _FakeProcess()
+        with patch.object(
+            engine,
+            "_write_block",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ), patch(
+            "trillim.components.llm._engine.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=failed_process),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await engine.start()
+        self.assertTrue(failed_process.killed)
+        self.assertIsNone(engine.process)
+
+        engine = self._make_engine()
+        await engine.stop()
+        dead_process = _FakeProcess()
+        dead_process.returncode = 0
+        engine.process = dead_process
+        await engine.stop()
+
+        broken_process = _FakeProcess(drain_error=BrokenPipeError("boom"))
+        engine.process = broken_process
+        await engine.stop()
+        self.assertTrue(broken_process.killed)
+
+        cancelled_process = _FakeProcess()
+        engine.process = cancelled_process
+        with patch.object(
+            engine,
+            "_write_block",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                [token async for token in engine.generate([1], max_tokens=8)]
+        self.assertTrue(cancelled_process.killed)
+
+        oserror_process = _FakeProcess()
+        engine.process = oserror_process
+        with patch.object(
+            engine,
+            "_write_block",
+            new=AsyncMock(side_effect=OSError("boom")),
+        ):
+            with self.assertRaisesRegex(EngineCrashedError, "Inference engine crashed"):
+                [token async for token in engine.generate([1], max_tokens=8)]
+        self.assertTrue(oserror_process.killed)
+
+    async def test_engine_low_level_helpers_cover_missing_pipes_and_fallbacks(self):
+        engine = self._make_engine()
+        with self.assertRaisesRegex(EngineCrashedError, "not running"):
+            engine._require_running()
+
+        process = _FakeProcess()
+        process.stdin = None
+        engine.process = process
+        with self.assertRaisesRegex(EngineCrashedError, "stdin is unavailable"):
+            await engine._write_block("demo")
+
+        process = _FakeProcess()
+        process.stdout = None
+        engine.process = process
+        with self.assertRaisesRegex(EngineCrashedError, "stdout is unavailable"):
+            await engine._readline("token_id")
+
+        process = _FakeProcess(lines=[b""], stderr_data=b"")
+        engine.process = process
+        with self.assertRaisesRegex(EngineCrashedError, "Inference engine crashed$"):
+            await engine._readline("token_id")
+
+        async def fake_wait_for(awaitable, timeout):
+            del timeout
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise asyncio.TimeoutError
+
+        process = _FakeProcess(lines=[b"65\n"])
+        engine.process = process
+        with patch("trillim.components.llm._engine.asyncio.wait_for", side_effect=fake_wait_for):
+            with self.assertRaisesRegex(EngineProgressTimeoutError, "no token_id progress"):
+                await engine._readline("token_id")
+
+        idle_process = _FakeProcess()
+        idle_process.returncode = 0
+        engine.process = idle_process
+        await engine._kill_process()
+        self.assertIsNone(engine.process)
+
+        oserror_process = _FakeProcess()
+
+        def kill_with_error() -> None:
+            raise OSError("gone")
+
+        oserror_process.kill = kill_with_error
+        engine.process = oserror_process
+        await engine._kill_process()
+        self.assertIsNone(engine.process)
+
+        self.assertEqual(_first_protocol_line("   "), "   ")
+        self.assertEqual(_first_protocol_line("first\nsecond"), "first")
+        self.assertEqual(await _read_stderr(SimpleNamespace(stderr=None)), "")
+
+        class _BadReader:
+            async def read(self) -> bytes:
+                raise RuntimeError("boom")
+
+        self.assertEqual(await _read_stderr(SimpleNamespace(stderr=_BadReader())), "")

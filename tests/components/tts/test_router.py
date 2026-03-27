@@ -75,6 +75,13 @@ class TTSRouterTests(unittest.IsolatedAsyncioTestCase):
                 deleted = client.delete("/v1/voices/custom")
                 self.assertEqual(deleted.json(), {"name": "custom", "status": "deleted"})
 
+    def test_delete_voice_route_does_not_accept_path_segments(self):
+        server, root_patch, imports_patch, builtins_patch = self._make_server()
+        with root_patch, builtins_patch, imports_patch:
+            with TestClient(server.app) as client:
+                response = client.delete("/v1/voices/bad/name")
+        self.assertEqual(response.status_code, 404)
+
     def test_audio_speech_rejects_invalid_utf8(self):
         server, root_patch, imports_patch, builtins_patch = self._make_server()
         with root_patch, builtins_patch, imports_patch:

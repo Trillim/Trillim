@@ -21,6 +21,8 @@ from trillim.components.tts._limits import (
 from trillim.components.tts._validation import (
     PayloadTooLargeError,
     load_safe_voice_state_bytes,
+    normalize_optional_name,
+    normalize_required_name,
     open_validated_source_audio_file,
     validate_source_audio_path,
     validate_voice_bytes,
@@ -80,8 +82,12 @@ class VoiceStore:
 
     async def ensure_name_available(self, name: str) -> None:
         """Fail if the requested custom voice name already exists."""
+        normalized_name = normalize_required_name(name, field_name="name")
         async with self._lock:
-            self._ensure_name_available_locked(name, self._load_manifest_locked())
+            self._ensure_name_available_locked(
+                normalized_name,
+                self._load_manifest_locked(),
+            )
 
     async def register_owned_upload(
         self,
@@ -91,9 +97,10 @@ class VoiceStore:
         build_voice_state,
     ) -> str:
         """Build and publish one custom voice from an owned upload path."""
+        normalized_name = normalize_required_name(name, field_name="name")
         async with self._lock:
             manifest = self._load_manifest_locked()
-            self._ensure_name_available_locked(name, manifest)
+            self._ensure_name_available_locked(normalized_name, manifest)
             state_bytes = validate_voice_state_bytes(
                 await build_voice_state(upload.path)
             )
@@ -110,9 +117,9 @@ class VoiceStore:
                 raise InvalidRequestError(
                     f"custom voice storage exceeds the {MAX_TOTAL_CUSTOM_VOICE_BYTES} byte limit"
                 )
-            storage_id = _storage_id_for_name(name)
+            storage_id = _storage_id_for_name(normalized_name)
             entry = ManagedVoiceEntry(
-                name=name,
+                name=normalized_name,
                 storage_id=storage_id,
                 size_bytes=len(state_bytes),
             )
@@ -121,41 +128,42 @@ class VoiceStore:
             self._raise_if_managed_symlink_locked(state_path)
             atomic_write_bytes(state_path, state_bytes)
             next_manifest = dict(manifest)
-            next_manifest[name] = entry
+            next_manifest[normalized_name] = entry
             try:
                 self._write_manifest_locked(next_manifest)
             except Exception:
                 unlink_if_exists(state_path)
                 raise
-            return name
+            return normalized_name
 
     async def delete(self, name: str, *, protected_name: str | None = None) -> str:
         """Delete one managed custom voice by name."""
+        normalized_name = normalize_required_name(name, field_name="name")
         async with self._lock:
-            if name in self._built_ins:
+            if normalized_name in self._built_ins:
                 raise InvalidRequestError(
-                    f"voice '{name}' is built in and cannot be deleted"
+                    f"voice '{normalized_name}' is built in and cannot be deleted"
                 )
-            if protected_name is not None and name == protected_name:
+            if protected_name is not None and normalized_name == protected_name:
                 raise InvalidRequestError(
-                    f"voice '{name}' is currently in use as default_voice"
+                    f"voice '{normalized_name}' is currently in use as default_voice"
                 )
             manifest = self._load_manifest_locked()
-            entry = manifest.get(name)
+            entry = manifest.get(normalized_name)
             if entry is None:
-                raise KeyError(name)
+                raise KeyError(normalized_name)
             state_path = self._state_path(entry.storage_id)
             self._raise_if_managed_symlink_locked(state_path)
             state_bytes = state_path.read_bytes()
             next_manifest = dict(manifest)
-            del next_manifest[name]
+            del next_manifest[normalized_name]
             unlink_if_exists(state_path)
             try:
                 self._write_manifest_locked(next_manifest)
             except Exception:
                 atomic_write_bytes(state_path, state_bytes)
                 raise
-            return name
+            return normalized_name
 
     async def resolve_for_session(
         self,
@@ -164,17 +172,22 @@ class VoiceStore:
         spool_dir: Path,
     ) -> ResolvedVoice:
         """Resolve one voice name into a worker-ready reference."""
+        normalized_name = normalize_required_name(name, field_name="voice")
         async with self._lock:
-            if name in self._built_ins:
-                return ResolvedVoice(name=name, kind="predefined", reference=name)
+            if normalized_name in self._built_ins:
+                return ResolvedVoice(
+                    name=normalized_name,
+                    kind="predefined",
+                    reference=normalized_name,
+                )
             manifest = self._load_manifest_locked()
-            entry = manifest.get(name)
+            entry = manifest.get(normalized_name)
             if entry is None:
-                raise InvalidRequestError(f"unknown voice: {name}")
+                raise InvalidRequestError(f"unknown voice: {normalized_name}")
             state_bytes = self._load_state_bytes_locked(entry)
         temp_path = await spool_voice_state_bytes(state_bytes, spool_dir=spool_dir)
         return ResolvedVoice(
-            name=name,
+            name=normalized_name,
             kind="state_file",
             reference=str(temp_path),
             cleanup_path=temp_path,
@@ -288,10 +301,14 @@ class VoiceStore:
             size_bytes = item["size_bytes"]
         except KeyError:
             self._mark_store_tampered_locked("voice manifest is malformed")
+        try:
+            normalized_name = normalize_optional_name(name, field_name="name")
+        except InvalidRequestError:
+            self._mark_store_tampered_locked("voice manifest is malformed")
         if (
             not isinstance(name, str)
             or not name
-            or name.strip() != name
+            or normalized_name != name
             or not isinstance(storage_id, str)
             or not isinstance(size_bytes, int)
         ):
