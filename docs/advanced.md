@@ -184,6 +184,7 @@ The runtime avoids unbounded queues and unbounded retries by design.
 
 - max stored voices: `64`
 - max upload size per voice: `10 MiB`
+- max serialized voice state per voice: `64 MiB`
 - total stored custom voice bytes: `100 MiB`
 - voice-state build timeout: `30s`
 

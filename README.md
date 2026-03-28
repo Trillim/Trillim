@@ -80,7 +80,7 @@ uv run trillim quantize /path/to/base-model /path/to/adapter
 `chat` accepts an optional second positional argument for the adapter store ID:
 
 ```bash
-uv run trillim chat Trillim/BitNet-TRNQ Local/my-adapter-TRNQ
+uv run trillim chat Trillim/BitNet-TRNQ Trillim/BitNet-GenZ-LoRA-TRNQ
 ```
 
 ### Enable Voice Support

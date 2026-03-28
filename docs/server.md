@@ -39,11 +39,7 @@ trillim serve Trillim/BitNet-TRNQ --voice
 from trillim import LLM, Server
 
 server = Server(
-    LLM(
-        "Trillim/BitNet-Search-TRNQ",
-        harness_name="search",
-        search_provider="ddgs",
-    ),
+    LLM("Trillim/BitNet-TRNQ"),
     allow_hot_swap=True,
 )
 server.run(host="127.0.0.1", port=8000)
@@ -131,14 +127,25 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Minimal Python client example:
 
 ```python
-from openai import OpenAI
+import json
+import urllib.request
 
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
-response = client.chat.completions.create(
-    model="BitNet-TRNQ",
-    messages=[{"role": "user", "content": "Say hello."}],
+body = json.dumps(
+    {
+        "model": "BitNet-TRNQ",
+        "messages": [{"role": "user", "content": "Say hello."}],
+    }
+).encode("utf-8")
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/v1/chat/completions",
+    data=body,
+    headers={"content-type": "application/json"},
+    method="POST",
 )
-print(response.choices[0].message.content)
+with urllib.request.urlopen(request, timeout=60) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+
+print(payload["choices"][0]["message"]["content"])
 ```
 
 Supported request fields:
@@ -190,11 +197,8 @@ Example:
 curl http://127.0.0.1:8000/v1/models/swap \
   -H "content-type: application/json" \
   -d '{
-    "model_dir": "Local/another-model-TRNQ",
-    "lora_dir": "Local/another-adapter-TRNQ",
-    "harness_name": "search",
-    "search_provider": "ddgs",
-    "search_token_budget": 2048
+    "model_dir": "Trillim/BitNet-TRNQ",
+    "lora_dir": "Trillim/BitNet-GenZ-LoRA-TRNQ"
   }'
 ```
 
@@ -303,9 +307,11 @@ Response:
 Important facts:
 
 - max upload size: `10 MiB`
+- max serialized custom voice state: `64 MiB`
 - custom voice names and `voice` selectors accept only ASCII letters and digits
 - custom voice storage lives under `~/.trillim/voices`
 - voice cloning support requires accepting the `kyutai/pocket-tts` terms and authenticating with Hugging Face
+- if a reference sample exceeds the serialized voice-state cap, Trillim rejects it and you should retry with a shorter sample
 
 One-time setup for custom voice cloning:
 

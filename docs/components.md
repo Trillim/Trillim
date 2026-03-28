@@ -78,7 +78,10 @@ asyncio.run(main())
 from trillim import LLM
 
 llm = LLM("Trillim/BitNet-TRNQ")
-adapter_llm = LLM("Trillim/BitNet-TRNQ", lora_dir="Local/my-adapter-TRNQ")
+adapter_llm = LLM(
+    "Trillim/BitNet-TRNQ",
+    lora_dir="Trillim/BitNet-GenZ-LoRA-TRNQ",
+)
 ```
 
 Useful constructor options:
@@ -141,12 +144,26 @@ Session rules that matter in real code:
 `model_info()` is the truthful snapshot of the active runtime:
 
 ```python
-info = llm.model_info()
-print(info.state)
-print(info.name)
-print(info.max_context_tokens)
-print(info.adapter_path)
-print(info.init_config)
+import asyncio
+
+from trillim import LLM
+
+
+async def main():
+    llm = LLM("Trillim/BitNet-TRNQ", lora_dir="Trillim/BitNet-GenZ-LoRA-TRNQ")
+    await llm.start()
+    try:
+        info = llm.model_info()
+        print(info.state)
+        print(info.name)
+        print(info.max_context_tokens)
+        print(info.adapter_path)
+        print(info.init_config)
+    finally:
+        await llm.stop()
+
+
+asyncio.run(main())
 ```
 
 ### Enable Search
@@ -154,8 +171,11 @@ print(info.init_config)
 The search harness is for models that emit `<search>...</search>` tags.
 
 ```python
+from trillim import LLM
+
 llm = LLM(
-    "Trillim/BitNet-Search-TRNQ",
+    "Trillim/BitNet-TRNQ",
+    lora_dir="Trillim/BitNet-Search-LoRA-TRNQ",
     harness_name="search",
     search_provider="ddgs",
 )
@@ -169,15 +189,26 @@ Notes:
 ### Hot-Swap a Running Model
 
 ```python
-async def swap_running_llm(llm):
-    info = await llm.swap_model(
-        "Local/another-model-TRNQ",
-        lora_dir="Local/another-adapter-TRNQ",
-        harness_name="search",
-        search_provider="ddgs",
-        search_token_budget=2048,
-    )
-    print(info.name)
+import asyncio
+
+from trillim import LLM
+
+
+async def main():
+    llm = LLM("Trillim/BitNet-TRNQ")
+    await llm.start()
+    try:
+        info = await llm.swap_model(
+            "Trillim/BitNet-TRNQ",
+            lora_dir="Trillim/BitNet-GenZ-LoRA-TRNQ",
+        )
+        print(info.name)
+        print(info.adapter_path)
+    finally:
+        await llm.stop()
+
+
+asyncio.run(main())
 ```
 
 Important hot-swap behavior:

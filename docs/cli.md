@@ -78,9 +78,8 @@ Open a simple multi-turn chat shell.
 
 ```bash
 trillim chat Trillim/BitNet-TRNQ
-trillim chat Local/my-model-TRNQ
-trillim chat Trillim/BitNet-TRNQ Local/my-adapter-TRNQ
-trillim chat Trillim/MyRemoteCodeModel --trust-remote-code
+trillim chat Trillim/BitNet-TRNQ Trillim/BitNet-GenZ-LoRA-TRNQ
+trillim chat Trillim/BitNet-Large-TRNQ --trust-remote-code
 ```
 
 Arguments:
@@ -117,7 +116,7 @@ Start the demo HTTP server.
 ```bash
 trillim serve Trillim/BitNet-TRNQ
 trillim serve Trillim/BitNet-TRNQ --voice
-trillim serve Trillim/MyRemoteCodeModel --trust-remote-code
+trillim serve Trillim/BitNet-Large-TRNQ --trust-remote-code
 ```
 
 Arguments:
