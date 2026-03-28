@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from copy import copy
 import shutil
 import subprocess
 import sys
@@ -149,10 +150,10 @@ def retag_wheel(wheel_path: Path, platform_tag: str) -> Path:
                         "py3-none-any", f"py3-none-{platform_tag}"
                     )
 
-                zout.writestr(
-                    zipfile.ZipInfo(new_filename, date_time=item.date_time),
-                    data,
-                )
+                # Preserve the original zip metadata so installed Unix binaries keep their mode bits.
+                new_item = copy(item)
+                new_item.filename = new_filename
+                zout.writestr(new_item, data)
 
     # Remove the original any-tagged wheel
     wheel_path.unlink()
