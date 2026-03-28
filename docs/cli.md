@@ -34,6 +34,11 @@ trillim models
 
 Use this when you want to see what can be pulled. It requires network access.
 
+The `STATUS` column shows:
+
+- `local` for downloaded bundles under `~/.trillim/models/Trillim/` whose `format_version` exactly matches the current Trillim version
+- `stale` for downloaded bundles under `~/.trillim/models/Trillim/` whose `format_version` no longer matches
+
 ## `trillim pull`
 
 Download one published bundle.

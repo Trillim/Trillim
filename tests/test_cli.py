@@ -344,6 +344,49 @@ class CLITests(unittest.TestCase):
         with self._patched_model_roots():
             self.assertEqual(cli._local_downloaded_ids(), set())
 
+    def test_downloaded_statuses_marks_local_and_stale_downloads(self):
+        with self._patched_model_roots():
+            current_model = cli._model_store.DOWNLOADED_ROOT / "current-model"
+            stale_model = cli._model_store.DOWNLOADED_ROOT / "stale-model"
+            invalid_model = cli._model_store.DOWNLOADED_ROOT / "invalid-model"
+            non_dir = cli._model_store.DOWNLOADED_ROOT / "not-a-dir"
+            write_model_bundle(current_model)
+            write_model_bundle(stale_model)
+            write_model_bundle(invalid_model)
+            stale_metadata_path = stale_model / "trillim_config.json"
+            stale_metadata = json.loads(stale_metadata_path.read_text(encoding="utf-8"))
+            stale_metadata["format_version"] = cli.CURRENT_FORMAT_VERSION - 1
+            stale_metadata_path.write_text(json.dumps(stale_metadata), encoding="utf-8")
+            (invalid_model / "trillim_config.json").write_text("{", encoding="utf-8")
+            non_dir.parent.mkdir(parents=True, exist_ok=True)
+            non_dir.write_text("x", encoding="utf-8")
+
+            self.assertEqual(
+                cli._downloaded_statuses(),
+                {
+                    "Trillim/current-model": "local",
+                    "Trillim/stale-model": "stale",
+                },
+            )
+
+    def test_downloaded_statuses_skips_missing_root_and_non_stale_invalid_entries(self):
+        with self._patched_model_roots():
+            self.assertEqual(cli._downloaded_statuses(), {})
+
+            missing_config = cli._model_store.DOWNLOADED_ROOT / "missing-config"
+            non_object = cli._model_store.DOWNLOADED_ROOT / "non-object"
+            current_but_invalid = cli._model_store.DOWNLOADED_ROOT / "current-but-invalid"
+            missing_config.mkdir(parents=True)
+            non_object.mkdir(parents=True)
+            current_but_invalid.mkdir(parents=True)
+            (non_object / "trillim_config.json").write_text("[]", encoding="utf-8")
+            (current_but_invalid / "trillim_config.json").write_text(
+                json.dumps({"format_version": cli.CURRENT_FORMAT_VERSION}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(cli._downloaded_statuses(), {})
+
     def test_list_remote_models_reads_trillim_org_and_marks_local_downloads(self):
         repo_model = SimpleNamespace(
             id="Trillim/model-a",
@@ -365,10 +408,32 @@ class CLITests(unittest.TestCase):
                 entries = cli._list_remote_models()
         self.assertEqual(entries[0]["type"], "model")
         self.assertEqual(entries[0]["base_model"], "meta/base-a")
+        self.assertEqual(entries[0]["status"], "local")
         self.assertTrue(entries[0]["local"])
         self.assertEqual(entries[1]["type"], "adapter")
         self.assertEqual(entries[1]["base_model"], "meta/base-b")
+        self.assertEqual(entries[1]["status"], "")
         self.assertFalse(entries[1]["local"])
+
+    def test_list_remote_models_marks_stale_downloads(self):
+        repo = SimpleNamespace(
+            id="Trillim/model-a",
+            siblings=[SimpleNamespace(rfilename="qmodel.tensors")],
+            tags=[],
+            downloads=1,
+            last_modified=None,
+        )
+        with self._patched_model_roots():
+            model = cli._model_store.DOWNLOADED_ROOT / "model-a"
+            write_model_bundle(model)
+            metadata_path = model / "trillim_config.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["format_version"] = cli.CURRENT_FORMAT_VERSION - 1
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch("huggingface_hub.list_models", return_value=[repo]):
+                entries = cli._list_remote_models()
+        self.assertEqual(entries[0]["status"], "stale")
+        self.assertFalse(entries[0]["local"])
 
     def test_list_remote_models_reports_import_errors(self):
         real_import = __import__
@@ -414,6 +479,7 @@ class CLITests(unittest.TestCase):
                         "base_model": "meta/demo",
                         "downloads": 10,
                         "last_modified": "2026-01-01",
+                        "status": "stale",
                         "local": True,
                     }
                 ],
@@ -423,7 +489,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("(none)", text)
         self.assertIn("Adapters", text)
         self.assertIn("STATUS", text)
-        self.assertIn("local", text)
+        self.assertIn("stale", text)
 
     def test_preflight_voice_dependencies_accepts_complete_install(self):
         with patch("trillim.cli.importlib.import_module", return_value=object()) as import_module:

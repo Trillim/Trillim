@@ -217,13 +217,39 @@ def _print_local_table(title: str, bundles: list[_LocalBundle]) -> None:
 
 
 def _local_downloaded_ids() -> set[str]:
-    if not _model_store.DOWNLOADED_ROOT.is_dir():
-        return set()
     return {
-        f"Trillim/{entry.name}"
-        for entry in _model_store.DOWNLOADED_ROOT.iterdir()
-        if entry.is_dir()
+        bundle.model_id
+        for bundle in _iter_local_bundles("Trillim")
     }
+
+
+def _downloaded_statuses() -> dict[str, str]:
+    statuses = {model_id: "local" for model_id in _local_downloaded_ids()}
+    if not _model_store.DOWNLOADED_ROOT.is_dir():
+        return statuses
+    for entry in _model_store.DOWNLOADED_ROOT.iterdir():
+        if not entry.is_dir():
+            continue
+        model_id = f"Trillim/{entry.name}"
+        if model_id in statuses:
+            continue
+        config_path = entry / "trillim_config.json"
+        if not config_path.is_file():
+            continue
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        format_version = payload.get("format_version")
+        if (
+            isinstance(format_version, int)
+            and not isinstance(format_version, bool)
+            and format_version != CURRENT_FORMAT_VERSION
+        ):
+            statuses[model_id] = "stale"
+    return statuses
 
 
 def _list_remote_models() -> list[dict[str, object]]:
@@ -233,7 +259,7 @@ def _list_remote_models() -> list[dict[str, object]]:
         raise RuntimeError(
             "huggingface_hub is required. Install it with: uv add huggingface_hub"
         ) from exc
-    local_ids = _local_downloaded_ids()
+    statuses = _downloaded_statuses()
     results: list[dict[str, object]] = []
     try:
         for repo in hf_list_models(author="Trillim", full=True):
@@ -256,7 +282,8 @@ def _list_remote_models() -> list[dict[str, object]]:
                     "downloads": repo.downloads or 0,
                     "last_modified": last_modified,
                     "base_model": base_model,
-                    "local": repo.id in local_ids,
+                    "status": statuses.get(repo.id, ""),
+                    "local": statuses.get(repo.id) == "local",
                 }
             )
     except Exception as exc:  # pragma: no cover - exercised via class-name branch
@@ -290,7 +317,7 @@ def _print_available_table(title: str, entries: list[dict[str, object]]) -> None
         f"{'-' * pulls_width}  {'-' * modified_width}  {'-' * status_width}"
     )
     for entry in entries:
-        status = "local" if entry.get("local") else ""
+        status = str(entry.get("status", "local" if entry.get("local") else ""))
         print(
             f"{str(entry['model_id']):<{model_width}}  "
             f"{str(entry.get('base_model', '')):<{base_width}}  "
