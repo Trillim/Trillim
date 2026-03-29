@@ -10,7 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from trillim.components.tts._limits import HARD_TEXT_SEGMENT_CAP, TARGET_TTS_TOKENS
+from trillim.components.tts._limits import (
+    HARD_TEXT_SEGMENT_CAP,
+    MIN_USEFUL_TTS_TOKENS,
+    TARGET_TTS_TOKENS,
+)
 from trillim.components.tts._segmenter import (
     _hard_split_unit,
     _iter_paragraph_segments,
@@ -68,8 +72,8 @@ class TTSSegmenterTests(unittest.TestCase):
             f"more{i}" for i in range(11)
         )
         segments = list(_iter_paragraph_segments(paragraph, self.tokenizer))
-        self.assertEqual(len(segments), 2)
-        self.assertEqual(count_tts_tokens(segments[0], self.tokenizer), 10)
+        self.assertEqual(segments, [paragraph])
+        self.assertEqual(count_tts_tokens(segments[0], self.tokenizer), 21)
 
         with patch(
             "trillim.components.tts._segmenter._hard_split_unit",
@@ -79,6 +83,25 @@ class TTSSegmenterTests(unittest.TestCase):
         self.assertEqual(segments, ["a" * 300, "b" * 300])
 
         self.assertEqual(list(_iter_paragraph_segments(" \n ", self.tokenizer)), [])
+
+    def test_iter_paragraph_segments_splits_once_combined_tokens_exceed_budget(self):
+        first_tokens = max(MIN_USEFUL_TTS_TOKENS, TARGET_TTS_TOKENS // 2)
+        if first_tokens >= TARGET_TTS_TOKENS:
+            self.skipTest("current limits make token-budget paragraph splitting unreachable")
+        second_tokens = TARGET_TTS_TOKENS - first_tokens + 1
+        first = " ".join(["a"] * first_tokens) + "."
+        second = " ".join(["b"] * second_tokens) + "."
+        combined = f"{first} {second}"
+        if len(combined) >= HARD_TEXT_SEGMENT_CAP:
+            self.skipTest("current limits trigger the hard text cap before the token budget")
+
+        segments = list(_iter_paragraph_segments(combined, self.tokenizer))
+
+        self.assertEqual(segments, [first, second])
+        self.assertLess(len(combined), HARD_TEXT_SEGMENT_CAP)
+        self.assertLessEqual(count_tts_tokens(segments[0], self.tokenizer), TARGET_TTS_TOKENS)
+        self.assertLessEqual(count_tts_tokens(segments[1], self.tokenizer), TARGET_TTS_TOKENS)
+        self.assertGreater(count_tts_tokens(combined, self.tokenizer), TARGET_TTS_TOKENS)
 
     def test_hard_split_unit_covers_first_word_overflow_and_reset_without_reslicing(self):
         long_word = "x" * (HARD_TEXT_SEGMENT_CAP + 10)
@@ -92,6 +115,19 @@ class TTSSegmenterTests(unittest.TestCase):
             _hard_split_unit(f"{capped_word} z", self.tokenizer),
             [capped_word, "z"],
         )
+
+    def test_hard_split_unit_splits_on_token_budget_without_hard_cap_overflow(self):
+        words = ["a"] * (TARGET_TTS_TOKENS + 1)
+        text = " ".join(words)
+        if len(text) >= HARD_TEXT_SEGMENT_CAP:
+            self.skipTest("current limits trigger the hard text cap before the token budget")
+
+        pieces = _hard_split_unit(text, self.tokenizer)
+
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual(count_tts_tokens(pieces[0], self.tokenizer), TARGET_TTS_TOKENS)
+        self.assertEqual(count_tts_tokens(pieces[1], self.tokenizer), 1)
+        self.assertLess(len(text), HARD_TEXT_SEGMENT_CAP)
 
     def test_iter_paragraph_segments_skips_blank_pieces_after_hard_split(self):
         with patch(

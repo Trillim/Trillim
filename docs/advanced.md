@@ -196,7 +196,7 @@ Rules:
 
 - `LLM`: the next token or output chunk must arrive within `5s`
 - `STT`: once transcription begins, the worker must complete within `180s`
-- `TTS`: the next emitted audio chunk must arrive within `15s`
+- `TTS`: the next emitted audio chunk must arrive within `60s`
 - custom voice registration must complete voice-state build within `30s`
 - non-progress heartbeats do not count
 - if progress stops, the worker is killed and the request fails

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi import APIRouter
 
-from trillim.components.tts._limits import MAX_EMITTED_AUDIO_CHUNKS
+from trillim.components.tts._limits import MAX_EMITTED_AUDIO_CHUNKS, TARGET_TTS_TOKENS
 from trillim.components.tts._session import _create_tts_session
 from trillim.components.tts.public import TTS, _StreamingPCMStretcher
 from trillim.components.tts._worker import WorkerFailureError
@@ -683,7 +683,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             return b"pcm"
 
         tts = await self._start_tts(synth=gated_synth)
-        text = " ".join(f"word{index}" for index in range(30))
+        text = " ".join(f"word{index}" for index in range(TARGET_TTS_TOKENS + 5))
         session = await tts.speak(text)
         await first_segment_started.wait()
         await session.pause()
@@ -748,11 +748,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             return text.encode("utf-8")
 
         tts = await self._start_tts(synth=blocking_synth)
-        first = await tts.speak(
-            "one two three four five six seven eight nine ten eleven twelve "
-            "thirteen fourteen fifteen sixteen seventeen eighteen nineteen "
-            "twenty twentyone twentytwo"
-        )
+        first = await tts.speak(" ".join(f"word{index}" for index in range(TARGET_TTS_TOKENS + 2)))
         await first_segment_started.wait()
         await first.pause()
         first_segment_release.set()
@@ -829,7 +825,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
 
         tts = await self._start_tts(synth=fast_synth)
         text = " ".join(
-            f"word{index}" for index in range((MAX_EMITTED_AUDIO_CHUNKS + 2) * 20)
+            f"word{index}" for index in range((MAX_EMITTED_AUDIO_CHUNKS + 2) * TARGET_TTS_TOKENS)
         )
         session = await tts.speak(text)
         original_put_chunk = session._put_chunk
