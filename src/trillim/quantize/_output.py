@@ -19,6 +19,7 @@ from trillim._bundle_metadata import (
 )
 
 from ._config import ModelQuantizeConfig
+from trillim.components.llm._config import ArchitectureType
 
 _MODEL_ALLOWLIST = (
     "added_tokens.json",
@@ -172,7 +173,9 @@ def write_model_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "model",
-        "quantization": "ternary",
+        "quantization": ("binary"
+            if config.arch_type == ArchitectureType.BONSAI
+            else "ternary"),
         "source_model": config.source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -198,7 +201,9 @@ def write_adapter_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "lora_adapter",
-        "quantization": "ternary",
+        "quantization": ("binary"
+            if config.arch_type == ArchitectureType.BONSAI
+            else "ternary"),
         "source_model": source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),

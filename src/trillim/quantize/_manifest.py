@@ -16,6 +16,7 @@ from ._config import LORA_TARGETS, ModelQuantizeConfig, layer_index_for_key
 ACTION_BF16_RAW = 0
 ACTION_TERNARY_QUANTIZE = 1
 ACTION_REPACK_TERNARY = 3
+ACTION_Q1_0_128 = 4
 
 SECTION_TEXT_CORE = 1
 
@@ -222,10 +223,16 @@ def build_manifest(
             dtype_code, _element_size = _safetensors_dtype_code(dtype_str)
 
             if is_embedding or is_lm_head:
-                action = ACTION_BF16_RAW
+                action = (
+                    ACTION_Q1_0_128
+                    if config.arch_type == ArchitectureType.BONSAI
+                    else ACTION_BF16_RAW
+                )
             elif should_quantize:
                 action = (
-                    ACTION_REPACK_TERNARY
+                    ACTION_Q1_0_128
+                    if config.arch_type == ArchitectureType.BONSAI
+                    else ACTION_REPACK_TERNARY
                     if dtype_str in {"I8", "U8"}
                     else ACTION_TERNARY_QUANTIZE
                 )
