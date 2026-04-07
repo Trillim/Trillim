@@ -222,7 +222,10 @@ class _PersistentSessionWorker:
                 self._stderr_overflow = _WorkerStreamTooLargeError(
                     "TTS worker produced oversized stderr output"
                 )
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    return
                 return
             self._stderr_chunks.extend(chunk)
 
@@ -292,11 +295,21 @@ def _worker_command(command: str, **kwargs: str) -> tuple[str, ...]:
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
-    process.terminate()
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
     try:
         await asyncio.wait_for(process.wait(), timeout=WORKER_KILL_AFTER_SECONDS)
     except asyncio.TimeoutError:
-        process.kill()
+        if process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            await process.wait()
+            return
         await process.wait()
 
 

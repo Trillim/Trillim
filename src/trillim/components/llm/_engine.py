@@ -170,7 +170,10 @@ class InferenceEngine:
             await asyncio.wait_for(process.stdin.drain(), timeout=self.progress_timeout)
             await asyncio.wait_for(process.wait(), timeout=self.progress_timeout)
         except (asyncio.TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
             await process.wait()
 
     async def generate(

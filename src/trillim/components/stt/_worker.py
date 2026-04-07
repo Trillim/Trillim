@@ -75,11 +75,21 @@ def _worker_command(audio_path: str | Path, *, language: str | None) -> tuple[st
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
-    process.terminate()
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
     try:
         await asyncio.wait_for(process.wait(), timeout=WORKER_KILL_AFTER_SECONDS)
     except asyncio.TimeoutError:
-        process.kill()
+        if process.returncode is not None:
+            return
+        try:
+            process.kill()
+        except ProcessLookupError:
+            await process.wait()
+            return
         await process.wait()
 
 
