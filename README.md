@@ -2,6 +2,8 @@
 
 Trillim is a local AI stack for CPUs. It gives you a CLI, a Python SDK, and a FastAPI server for running Trillim-formatted LLM bundles, plus optional speech-to-text and text-to-speech support.
 
+Trillim supports both BitNet-style ternary bundles and Bonsai 1-bit (binary) bundles through the same managed model store and runtime surfaces.
+
 DarkNet and the quantization tooling bundled with the package do the heavy inference work. The Python package is the orchestration layer around those binaries.
 
 ## Install
@@ -74,6 +76,8 @@ uv run trillim quantize /path/to/model
 # Quantize a LoRA adapter against its base model
 uv run trillim quantize /path/to/base-model /path/to/adapter
 ```
+
+Qwen3-based Bonsai checkpoints quantize into binary bundles, but Trillim still manages them under the same `Local/...-TRNQ` store naming and load flow.
 
 ### Use an Adapter
 
