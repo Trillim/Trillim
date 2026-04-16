@@ -15,6 +15,7 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _PUNCTUATION_SPLIT_RE = re.compile(r"(?<=[^\w\s])\s+")
 _LONG_TOKEN_RE = re.compile(r"\S{51,}")
 _LONG_TOKEN_PLACEHOLDER = "too-long-word-skipped"
+_INTER_SEGMENT_LEADIN = "  "
 
 
 def load_pocket_tts_tokenizer() -> SentencePieceTokenizer:
@@ -39,7 +40,8 @@ def iter_text_segments(text: str, tokenizer) -> Iterator[str]:
     """Yield bounded TTS segments lazily from one validated input string."""
     sanitized_text = _LONG_TOKEN_RE.sub(_LONG_TOKEN_PLACEHOLDER, text)
     for paragraph in _split_with(_PARAGRAPH_SPLIT_RE, sanitized_text):
-        yield from _iter_paragraph_segments(paragraph, tokenizer)
+        for segment in _iter_paragraph_segments(paragraph, tokenizer):
+            yield _add_leadin(segment, tokenizer)
 
 
 def count_tts_tokens(text: str, tokenizer) -> int:
@@ -67,6 +69,13 @@ def _fits_segment_limits(text: str, tokenizer) -> bool:
         len(text) <= HARD_TEXT_SEGMENT_CAP
         and count_tts_tokens(text, tokenizer) <= TARGET_TTS_TOKENS
     )
+
+
+def _add_leadin(text: str, tokenizer) -> str:
+    candidate = f"{_INTER_SEGMENT_LEADIN}{text}"
+    if _fits_segment_limits(candidate, tokenizer):
+        return candidate
+    return text
 
 
 def _iter_grouped_segments(units: list[str], tokenizer) -> Iterator[str]:

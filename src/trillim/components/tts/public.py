@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 import random
 import struct
 import tempfile
@@ -58,6 +59,8 @@ _SENTENCE_BOUNDARY_PAUSE_MS = 400
 _CLAUSE_BOUNDARY_PAUSE_MS = 200
 _BOUNDARY_PAUSE_JITTER_MIN = 0.9
 _BOUNDARY_PAUSE_JITTER_MAX = 1.1
+_SEGMENT_FADE_IN_MS = 10
+_SEGMENT_FADE_EXPONENT = 4.0
 
 
 class TTS(Component):
@@ -383,13 +386,13 @@ class TTS(Component):
                 speed = await self._wait_for_turn(session)
                 pcm = await session._session_worker.synthesize(current_segment)
                 next_segment = next(segments, None)
-                stretched = _stretch_pcm_chunk(pcm, speed)
-                pause = (
-                    _segment_pause_pcm(current_segment, speed)
-                    if next_segment is not None
-                    else b""
+                emitted = _postprocess_segment_pcm(
+                    pcm,
+                    text=current_segment,
+                    speed=speed,
+                    add_pause=next_segment is not None,
                 )
-                await session._put_chunk(stretched + pause)
+                await session._put_chunk(emitted)
                 async with self._scheduler_lock:
                     session._chunk_in_flight = False
                     if session._pause_requested and session is self._active_session:
@@ -569,6 +572,46 @@ def _pcm_silence(duration_ms: float) -> bytes:
     frame_bytes = PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES
     samples = round(PCM_SAMPLE_RATE * duration_ms / 1000.0)
     return b"\x00" * (samples * frame_bytes)
+
+
+def _postprocess_segment_pcm(
+    pcm: bytes,
+    *,
+    text: str,
+    speed: float,
+    add_pause: bool,
+) -> bytes:
+    emitted = _stretch_pcm_chunk(pcm, speed)
+    emitted = _apply_exponential_fade_in_pcm(emitted)
+    if add_pause:
+        emitted += _segment_pause_pcm(text, speed)
+    return emitted
+
+
+def _apply_exponential_fade_in_pcm(pcm: bytes) -> bytes:
+    if not pcm:
+        return pcm
+    frame_bytes = PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES
+    if len(pcm) % frame_bytes != 0:
+        return pcm
+    fade_frames = min(
+        len(pcm) // frame_bytes,
+        round(PCM_SAMPLE_RATE * _SEGMENT_FADE_IN_MS / 1000.0),
+    )
+    if fade_frames <= 1:
+        return pcm
+    scale = math.exp(_SEGMENT_FADE_EXPONENT) - 1.0
+    faded_pcm = bytearray(pcm)
+    samples = memoryview(faded_pcm).cast("h")
+    for frame_index in range(fade_frames):
+        position = frame_index / (fade_frames - 1)
+        gain = (math.exp(_SEGMENT_FADE_EXPONENT * position) - 1.0) / scale
+        sample_index = frame_index * PCM_CHANNELS
+        for channel in range(PCM_CHANNELS):
+            samples[sample_index + channel] = int(
+                round(samples[sample_index + channel] * gain)
+            )
+    return bytes(faded_pcm)
 
 
 class _StreamingPCMStretcher:
