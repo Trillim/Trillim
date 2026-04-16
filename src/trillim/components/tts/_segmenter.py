@@ -7,14 +7,12 @@ from collections.abc import Iterator
 
 from trillim.components.tts._limits import (
     HARD_TEXT_SEGMENT_CAP,
-    MIN_USEFUL_TTS_TOKENS,
     TARGET_TTS_TOKENS,
 )
 
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-_CLAUSE_SPLIT_RE = re.compile(r"(?<=[;:])\s+")
-_LINE_SPLIT_RE = re.compile(r"\n+")
+_PUNCTUATION_SPLIT_RE = re.compile(r"(?<=[^\w\s])\s+")
 _LONG_TOKEN_RE = re.compile(r"\S{51,}")
 _LONG_TOKEN_PLACEHOLDER = "too-long-word-skipped"
 
@@ -50,39 +48,54 @@ def count_tts_tokens(text: str, tokenizer) -> int:
 
 
 def _iter_paragraph_segments(paragraph: str, tokenizer) -> Iterator[str]:
-    units: list[str] = []
     for sentence in _split_with(_SENTENCE_SPLIT_RE, paragraph):
-        for clause in _split_with(_CLAUSE_SPLIT_RE, sentence):
-            units.extend(_split_with(_LINE_SPLIT_RE, clause))
+        sentence = " ".join(sentence.split())
+        if not sentence:
+            continue
+        if _fits_segment_limits(sentence, tokenizer):
+            yield sentence
+            continue
+        punctuation_units = _split_with(_PUNCTUATION_SPLIT_RE, sentence)
+        if len(punctuation_units) > 1:
+            yield from _iter_grouped_segments(punctuation_units, tokenizer)
+            continue
+        yield from _iter_whitespace_segments(sentence, tokenizer)
+
+
+def _fits_segment_limits(text: str, tokenizer) -> bool:
+    return (
+        len(text) <= HARD_TEXT_SEGMENT_CAP
+        and count_tts_tokens(text, tokenizer) <= TARGET_TTS_TOKENS
+    )
+
+
+def _iter_grouped_segments(units: list[str], tokenizer) -> Iterator[str]:
     current = ""
-    current_tokens = 0
     for unit in units:
-        pieces = _hard_split_unit(unit, tokenizer)
-        for piece in pieces:
-            piece = piece.strip()
-            if not piece:
-                continue
-            piece_tokens = count_tts_tokens(piece, tokenizer)
-            if not current:
-                current = piece
-                current_tokens = piece_tokens
-                continue
-            combined = f"{current} {piece}"
-            if len(combined) > HARD_TEXT_SEGMENT_CAP:
+        unit = " ".join(unit.split())
+        if not unit:
+            continue
+        if not _fits_segment_limits(unit, tokenizer):
+            if current:
                 yield current
-                current = piece
-                current_tokens = piece_tokens
-                continue
-            combined_tokens = count_tts_tokens(combined, tokenizer)
-            if current_tokens >= MIN_USEFUL_TTS_TOKENS and combined_tokens > TARGET_TTS_TOKENS:
-                yield current
-                current = piece
-                current_tokens = piece_tokens
-                continue
-            current = combined
-            current_tokens = combined_tokens
+                current = ""
+            yield from _iter_whitespace_segments(unit, tokenizer)
+            continue
+        candidate = unit if not current else f"{current} {unit}"
+        if not current or _fits_segment_limits(candidate, tokenizer):
+            current = candidate
+            continue
+        yield current
+        current = unit
     if current:
         yield current
+
+
+def _iter_whitespace_segments(text: str, tokenizer) -> Iterator[str]:
+    for piece in _hard_split_unit(text, tokenizer):
+        piece = piece.strip()
+        if piece:
+            yield piece
 
 
 def _hard_split_unit(unit: str, tokenizer) -> list[str]:
