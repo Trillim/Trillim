@@ -169,8 +169,8 @@ If the second positional argument is present, the command quantizes the adapter.
 
 Additional notes:
 
-- Qwen3-based Bonsai checkpoints are supported.
-- Bonsai bundles use 1-bit binary quantization metadata. Existing BitNet-style flows continue to use ternary quantization metadata.
+- Qwen3-based Bonsai checkpoints are supported, including Bonsai 1-bit (binary) and grouped-ternary bundles.
+- Bonsai bundles use binary or grouped-ternary quantization metadata. Existing BitNet-style flows continue to use ternary quantization metadata.
 - The managed store naming does not change for Bonsai bundles: the output still lands under `Local/...-TRNQ`.
 - Bonsai bundles are loaded with the same store IDs and commands as any other Trillim bundle, including `chat`, `serve`, and the Python SDK.
 - The source directories must be outside `~/.trillim/models/`.

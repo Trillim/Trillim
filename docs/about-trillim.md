@@ -14,7 +14,7 @@ Trillim ships three main entry points:
 - a Python SDK for embedding LLM, STT, and TTS directly
 - a FastAPI server with OpenAI-compatible chat routes and optional voice routes
 
-For LLM bundles, Trillim supports both BitNet-style ternary models and Bonsai 1-bit (binary) models through the same managed bundle workflow.
+For LLM bundles, Trillim supports both BitNet-style ternary models and PrismML's Bonsai (1-bit and ternary) models through the same managed bundle workflow.
 
 ## Who It Is For
 
