@@ -102,6 +102,18 @@ class ModelDirectoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ModelValidationError, "Unsupported model architecture"):
                 validate_model_dir(root)
 
+    def test_validate_model_dir_detects_bonsai_ternary_from_bundle_metadata(self):
+        with model_dir(architecture="Qwen3ForCausalLM") as root:
+            metadata = json.loads((root / "trillim_config.json").read_text(encoding="utf-8"))
+            metadata["architecture"] = "bonsai_ternary"
+            metadata["quantization"] = "grouped-ternary"
+            (root / "trillim_config.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+            info = validate_model_dir(root)
+
+        self.assertEqual(info.arch_type, ArchitectureType.BONSAI_TERNARY)
+        self.assertEqual(info.activation, ActivationType.SILU)
+
     def test_validate_model_dir_handles_text_config_models(self):
         with model_dir(
             architecture="LlamaForCausalLM",

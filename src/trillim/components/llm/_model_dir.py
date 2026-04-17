@@ -152,7 +152,7 @@ def validate_model_dir(
             symlink_message="Metadata directory must not use symlinks",
         )
     )
-    _validate_model_bundle_metadata(path)
+    bundle_metadata = _validate_model_bundle_metadata(path)
     config_path = metadata_path / "config.json"
     _raise_if_symlink(config_path, "Model bundle must not use symlinks")
     if not config_path.is_file():
@@ -164,7 +164,7 @@ def validate_model_dir(
             f"config.json must be a JSON object in {metadata_path}"
         )
     config = _canonicalize_model_config(config_payload)
-    arch_info = _resolve_arch_info(config)
+    arch_info = _resolve_arch_info(config, bundle_metadata=bundle_metadata)
     dimensions = _extract_dimensions(config)
     eos_tokens = _collect_eos_tokens(config, arch_info.arch_type, metadata_path)
     return ModelRuntimeConfig(
@@ -256,7 +256,7 @@ def _load_json(path: Path) -> object:
         raise ModelValidationError(f"Could not read JSON from {path}") from exc
 
 
-def _validate_model_bundle_metadata(model_dir: Path) -> None:
+def _validate_model_bundle_metadata(model_dir: Path) -> dict:
     config_path = model_dir / "trillim_config.json"
     _raise_if_symlink(config_path, "Model bundle must not use symlinks")
     if not config_path.is_file():
@@ -271,17 +271,31 @@ def _validate_model_bundle_metadata(model_dir: Path) -> None:
         raise ModelValidationError(
             f"Model bundle metadata is missing or unsupported in {model_dir}"
         )
+    return payload
 
 
-def _resolve_arch_info(config: dict) -> _ArchitectureInfo:
+def _resolve_arch_info(config: dict, *, bundle_metadata: dict | None = None) -> _ArchitectureInfo:
     architectures = config.get("architectures", [])
     arch_name = architectures[0] if architectures else "unknown"
     try:
-        return _ARCH_REGISTRY[arch_name.lower()]
+        arch_info = _ARCH_REGISTRY[arch_name.lower()]
     except KeyError as exc:
         raise ModelValidationError(
             f"Unsupported model architecture: {arch_name}"
         ) from exc
+    if (
+        arch_info.arch_type == ArchitectureType.BONSAI
+        and isinstance(bundle_metadata, dict)
+        and bundle_metadata.get("architecture") == "bonsai_ternary"
+    ):
+        return _ArchitectureInfo(
+            arch_type=ArchitectureType.BONSAI_TERNARY,
+            activation=arch_info.activation,
+            has_attn_sub_norm=arch_info.has_attn_sub_norm,
+            has_ffn_sub_norm=arch_info.has_ffn_sub_norm,
+            has_qkv_bias=arch_info.has_qkv_bias,
+        )
+    return arch_info
 
 
 def _require_runtime_artifacts(model_dir: Path) -> None:
