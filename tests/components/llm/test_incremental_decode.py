@@ -125,6 +125,14 @@ class IncrementalDecoderTests(unittest.TestCase):
         self.assertEqual(decoder.decode(3), "🫠")
         self.assertEqual(decoder.decode(4), " done")
 
+    def test_flush_emits_held_suffix_at_stream_end(self):
+        decoder = IncrementalDecoder(_MultiReplacementTokenizer())
+
+        self.assertEqual(decoder.decode(1), "prefix")
+        self.assertEqual(decoder.decode(2), " ")
+
+        self.assertEqual(decoder.flush(), "��")
+
     def test_decode_preserves_zero_width_joiner_emoji_sequences(self):
         decoder = IncrementalDecoder(_JoinerEmojiTokenizer())
 
