@@ -30,6 +30,10 @@ class _DefaultHarness(_Harness):
                 continue
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
+        chunk = decoder.flush()
+        if chunk:
+            full_text += chunk
+            yield ChatTokenEvent(text=chunk)
         session._commit_assistant_turn(full_text)
         self._apply_engine_usage()
         yield ChatFinalTextEvent(text=full_text)

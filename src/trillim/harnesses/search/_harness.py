@@ -88,6 +88,10 @@ class _SearchHarness(_Harness):
                 continue
             full_text += chunk
             yield ChatTokenEvent(text=chunk)
+        chunk = decoder.flush()
+        if chunk:
+            full_text += chunk
+            yield ChatTokenEvent(text=chunk)
         metrics.record_generation(
             prompt_tokens=self._engine.last_prompt_tokens,
             completion_tokens=self._engine.last_completion_tokens,
@@ -107,6 +111,7 @@ class _SearchHarness(_Harness):
         full_text = ""
         async for token_id in self._engine.generate(token_ids=token_ids, **sampling):
             full_text += decoder.decode(token_id)
+        full_text += decoder.flush()
         return full_text
 
     def _trim_search_content(self, content: str) -> str:

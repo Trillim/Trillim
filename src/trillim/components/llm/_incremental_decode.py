@@ -33,6 +33,16 @@ class IncrementalDecoder:
         self._token_ids.clear()
         self._emitted_text = ""
 
+    def flush(self) -> str:
+        """Emit any remaining decodable suffix at the end of a stream."""
+        decoded = self._decode_tokens(self._token_ids)
+        if not decoded.startswith(self._emitted_text):
+            return ""
+        text = decoded[len(self._emitted_text) :]
+        self._emitted_text = decoded
+        self._compact_pending_tokens()
+        return text
+
     def _compact_pending_tokens(self) -> None:
         overflow = len(self._token_ids) - _MAX_PENDING_TOKENS
         if overflow <= 0:
