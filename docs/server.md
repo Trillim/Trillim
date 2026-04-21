@@ -160,7 +160,7 @@ Supported request fields:
 | `top_p` | float | `> 0.0` and `<= 1.0` |
 | `repetition_penalty` | float | `> 0.0` and `<= 2.0` |
 | `rep_penalty_lookback` | int | `>= 0` |
-| `max_tokens` | int | `1` to `8192` |
+| `max_tokens` | int | `0` for unlimited, or `1` to `8192` |
 
 Notes:
 
