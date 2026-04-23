@@ -15,7 +15,6 @@ class PayloadTooLargeError(InvalidRequestError):
 
 @dataclass(frozen=True, slots=True)
 class HTTPTranscriptionRequest:
-    content_type: str
     content_length: int | None
     language: str | None
 
@@ -26,8 +25,8 @@ def validate_http_request(
     content_length: str | None,
     language: str | None,
 ) -> HTTPTranscriptionRequest:
+    _normalize_content_type(content_type)
     return HTTPTranscriptionRequest(
-        content_type=_normalize_content_type(content_type),
         content_length=_validate_content_length(content_length),
         language=_validate_language(language),
     )

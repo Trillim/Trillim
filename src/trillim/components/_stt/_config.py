@@ -3,23 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
-
-@dataclass(frozen=True, slots=True)
-class OwnedAudioInput:
-    """A Trillim-owned normalized audio file."""
-
-    path: Path
-    size_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class SourceFileSnapshot:
-    """Best-effort metadata snapshot for a caller-owned source file."""
-
-    size_bytes: int
-    modified_ns: int
 
 
 @dataclass(frozen=True, slots=True)
