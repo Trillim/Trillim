@@ -4,13 +4,17 @@ import json
 import struct
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
 from trillim.components.llm._config import ArchitectureType
+from trillim.quantize import _config as quantize_config
 from trillim.quantize._config import load_model_config
 from trillim.quantize._manifest import (
+    ACTION_BF16_RAW,
     ACTION_Q1_0_128,
+    ACTION_GROUP_TERNARY_QUANTIZE,
     ACTION_REPACK_TERNARY,
     ACTION_TERNARY_QUANTIZE,
     get_sharded_files,
@@ -60,6 +64,29 @@ def _write_safetensors(path: Path, tensors: dict[str, tuple[str, list[int], byte
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + bytes(body))
 
 
+def _read_manifest_tensors(path: Path) -> list[dict[str, int]]:
+    with path.open("rb") as handle:
+        shard_count = struct.unpack("<H", handle.read(2))[0]
+        for _ in range(shard_count):
+            shard_name_len = struct.unpack("<H", handle.read(2))[0]
+            handle.read(shard_name_len)
+        tensor_count = struct.unpack("<I", handle.read(4))[0]
+        tensors = []
+        for _ in range(tensor_count):
+            tensors.append(
+                {
+                    "action": struct.unpack("<B", handle.read(1))[0],
+                    "dtype": struct.unpack("<B", handle.read(1))[0],
+                    "row": struct.unpack("<I", handle.read(4))[0],
+                    "col": struct.unpack("<I", handle.read(4))[0],
+                    "padded_row": struct.unpack("<I", handle.read(4))[0],
+                    "padded_col": struct.unpack("<I", handle.read(4))[0],
+                }
+            )
+            handle.read(2 + 8 + 8 + 1 + 2 + 8 + 8)
+    return tensors
+
+
 class QuantizeConfigManifestTests(unittest.TestCase):
     def test_load_model_config_extracts_and_aligns_dimensions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -99,9 +126,32 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             bonsai_dir = root / "bonsai"
             bonsai_dir.mkdir()
             _write_config(bonsai_dir, architectures=["Qwen3ForCausalLM"])
-            (bonsai_dir / "README.md").write_text("ternary checkpoint\n", encoding="utf-8")
+            (bonsai_dir / "README.md").write_text(
+                "Ternary Bonsai checkpoint\n",
+                encoding="utf-8",
+            )
             bonsai = load_model_config(bonsai_dir)
             self.assertEqual(bonsai.arch_type, ArchitectureType.BONSAI_TERNARY)
+
+            binary_bonsai_dir = root / "binary-bonsai"
+            binary_bonsai_dir.mkdir()
+            _write_config(binary_bonsai_dir, architectures=["Qwen3ForCausalLM"])
+            (binary_bonsai_dir / "README.md").write_text(
+                "Bonsai 1-bit checkpoint\n",
+                encoding="utf-8",
+            )
+            binary_bonsai = load_model_config(binary_bonsai_dir)
+            self.assertEqual(binary_bonsai.arch_type, ArchitectureType.BONSAI)
+
+            dense_qwen3_dir = root / "dense-qwen3"
+            dense_qwen3_dir.mkdir()
+            _write_config(dense_qwen3_dir, architectures=["Qwen3ForCausalLM"])
+            (dense_qwen3_dir / "README.md").write_text(
+                "Official dense Qwen3 checkpoint\n",
+                encoding="utf-8",
+            )
+            dense_qwen3 = load_model_config(dense_qwen3_dir)
+            self.assertEqual(dense_qwen3.arch_type, ArchitectureType.QWEN3)
 
             bitnet_dir = root / "bitnet"
             bitnet_dir.mkdir()
@@ -168,8 +218,88 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             _quantized_tensor_action("F32", ArchitectureType.BONSAI),
             ACTION_Q1_0_128,
         )
+        self.assertEqual(
+            _quantized_tensor_action("F32", ArchitectureType.BONSAI_TERNARY),
+            ACTION_GROUP_TERNARY_QUANTIZE,
+        )
+        self.assertEqual(
+            _quantized_tensor_action("F32", ArchitectureType.QWEN3),
+            ACTION_TERNARY_QUANTIZE,
+        )
         with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
             _safetensors_dtype_code("BAD")
+
+    def test_dense_qwen3_uses_ternary_manifest_actions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "qwen3"
+            output_dir = root / "out"
+            model_dir.mkdir()
+            output_dir.mkdir()
+            _write_config(
+                model_dir,
+                architectures=["Qwen3ForCausalLM"],
+                hidden_size=128,
+                intermediate_size=256,
+                num_key_value_heads=2,
+                head_dim=32,
+            )
+            (model_dir / "README.md").write_text(
+                "Official dense Qwen3 checkpoint\n",
+                encoding="utf-8",
+            )
+            _write_safetensors(
+                model_dir / "model.safetensors",
+                {
+                    "model.layers.0.self_attn.q_proj.weight": (
+                        "F32",
+                        [128, 128],
+                        b"\0" * 128 * 128 * 4,
+                    ),
+                    "model.layers.0.self_attn.q_norm.weight": (
+                        "F32",
+                        [32],
+                        b"\0" * 32 * 4,
+                    ),
+                },
+            )
+            config = load_model_config(model_dir)
+
+            manifest_path = build_manifest(model_dir, config, output_dir=output_dir)
+            tensors = _read_manifest_tensors(manifest_path)
+
+        self.assertEqual(config.arch_type, ArchitectureType.QWEN3)
+        self.assertEqual(
+            next(entry for entry in tensors if entry["row"] == 128 and entry["col"] == 128)["action"],
+            ACTION_TERNARY_QUANTIZE,
+        )
+        self.assertEqual(
+            next(entry for entry in tensors if entry["row"] == 32 and entry["col"] == 1)["action"],
+            ACTION_BF16_RAW,
+        )
+
+    def test_qwen3_bonsai_readme_detection_warns_when_readme_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            _write_config(model_dir, architectures=["Qwen3ForCausalLM"])
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                config = load_model_config(model_dir)
+
+            self.assertEqual(config.arch_type, ArchitectureType.QWEN3)
+            self.assertEqual(len(caught), 1)
+            self.assertIn(
+                "defaulting Qwen3ForCausalLM detection to dense Qwen3",
+                str(caught[0].message),
+            )
+
+            (model_dir / "README.md").write_text(
+                "Ternary Bonsai checkpoint\n",
+                encoding="utf-8",
+            )
+            with patch.object(Path, "read_text", side_effect=OSError):
+                self.assertFalse(quantize_config._readme_indicates_bonsai_ternary(model_dir))
 
     def test_build_manifest_writes_model_tensor_entries_and_sections(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trillim.components.llm._config import SamplingDefaults, load_sampling_defaults
+from trillim.components.llm._config import (
+    ArchitectureType,
+    SamplingDefaults,
+    load_sampling_defaults,
+)
 from trillim.components.llm._limits import MAX_OUTPUT_TOKENS
 from trillim.components.llm._validation import (
     validate_chat_request,
@@ -18,6 +22,11 @@ from trillim.errors import InvalidRequestError
 
 
 class SamplingDefaultsTests(unittest.TestCase):
+    def test_architecture_enum_values_are_stable(self):
+        self.assertEqual(ArchitectureType.LLAMA, 2)
+        self.assertEqual(ArchitectureType.BONSAI_TERNARY, 5)
+        self.assertEqual(ArchitectureType.QWEN3, 6)
+
     def test_load_sampling_defaults_uses_valid_generation_config_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir)

@@ -49,6 +49,39 @@ class ModelDirTests(unittest.TestCase):
         self.assertEqual(config.eos_tokens, (2, 3, 151645))
         self.assertTrue(config.tie_word_embeddings)
 
+    def test_validate_model_dir_resolves_qwen3_and_bonsai_metadata_variants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dense_dir = write_llm_bundle(
+                root / "dense",
+                architecture="Qwen3ForCausalLM",
+            )
+            binary_dir = write_llm_bundle(
+                root / "bonsai-binary",
+                architecture="Qwen3ForCausalLM",
+            )
+            ternary_dir = write_llm_bundle(
+                root / "bonsai-ternary",
+                architecture="Qwen3ForCausalLM",
+            )
+            for model_dir, architecture, quantization in (
+                (binary_dir, "bonsai", "binary"),
+                (ternary_dir, "bonsai_ternary", "grouped-ternary"),
+            ):
+                metadata_path = model_dir / "trillim_config.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["architecture"] = architecture
+                metadata["quantization"] = quantization
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            dense = validate_model_dir(dense_dir)
+            binary = validate_model_dir(binary_dir)
+            ternary = validate_model_dir(ternary_dir)
+
+        self.assertEqual(dense.arch_type, ArchitectureType.QWEN3)
+        self.assertEqual(binary.arch_type, ArchitectureType.BONSAI)
+        self.assertEqual(ternary.arch_type, ArchitectureType.BONSAI_TERNARY)
+
     def test_validate_model_dir_supports_text_config_and_rejects_bad_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
