@@ -47,9 +47,16 @@ class STTEngine:
         await self._stop_engine()
         self._process = await self._start_engine()
 
-    async def transcribe(self, pcm: bytes, *, conditioning_text: str = "") -> str:
+    async def transcribe(
+        self,
+        pcm: bytes,
+        *,
+        conditioning_text: str = "",
+        language: str | None = None,
+    ) -> str:
         pcm = self._validate_pcm(pcm)
         conditioning_text = self._validate_conditioning_text(conditioning_text)
+        language = self._validate_language(language)
         process = self._process
         if process is None or process.returncode is not None:
             raise ComponentLifecycleError("STT engine is not running")
@@ -64,6 +71,7 @@ class STTEngine:
             {
                 "pcm": base64.b64encode(pcm).decode("ascii"),
                 "conditioning_text": conditioning_text,
+                "language": language,
             }
         ).encode("utf-8") + b"\n"
 
@@ -189,6 +197,11 @@ class STTEngine:
             raise InvalidRequestError("conditioning_text must be a string")
         return conditioning_text
 
+    def _validate_language(self, language: str | None) -> str | None:
+        if language is not None and not isinstance(language, str):
+            raise InvalidRequestError("language must be a string")
+        return language
+
 
 def _worker_main() -> int:
     def write(payload: dict[str, str]) -> None:
@@ -221,7 +234,12 @@ def _worker_main() -> int:
 
         pcm_b64 = request.get("pcm")
         conditioning_text = request.get("conditioning_text", "")
-        if not isinstance(pcm_b64, str) or not isinstance(conditioning_text, str):
+        language = request.get("language")
+        if (
+            not isinstance(pcm_b64, str)
+            or not isinstance(conditioning_text, str)
+            or (language is not None and not isinstance(language, str))
+        ):
             write({"status": "error", "message": "Malformed worker request"})
             continue
 
@@ -230,6 +248,7 @@ def _worker_main() -> int:
             audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             segments, _info = model.transcribe(
                 audio,
+                language=language,
                 initial_prompt=conditioning_text or None,
                 condition_on_previous_text=False,
                 without_timestamps=True,

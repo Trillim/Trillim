@@ -55,7 +55,7 @@ class AudioSession(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def transcribe(self, audio: bytes) -> str:
+    async def transcribe(self, audio: bytes, *, language: str | None = None) -> str:
         ...
 
 
@@ -81,7 +81,7 @@ class _AudioSession(AudioSession):
     def state(self) -> str:
         return self._state.value
 
-    async def transcribe(self, audio: bytes) -> str:
+    async def transcribe(self, audio: bytes, *, language: str | None = None) -> str:
         if self._state is _AudioSessionFSM.TRANSCRIBING:
             raise SessionBusyError("AudioSession is already transcribing")
 
@@ -92,7 +92,7 @@ class _AudioSession(AudioSession):
             pcm = self._normalize_audio(audio)
             if self._stopped():
                 return ""
-            return await self._stt._transcribe(pcm)
+            return await self._stt._transcribe(pcm, language=language)
         finally:
             self._state = _AudioSessionFSM.DONE
 

@@ -42,14 +42,14 @@ class STT:
             raise ComponentLifecycleError("STT is not running")
         return _create_audio_session(self)
 
-    async def _transcribe(self, pcm: bytes) -> str:
+    async def _transcribe(self, pcm: bytes, *, language: str | None = None) -> str:
         self._require_owner_loop()
         if not self._started or self._stop_event.is_set():
             return ""
         async with self._transcribe_lock:
             if not self._started or self._stop_event.is_set():
                 return ""
-            return await self._engine.transcribe(pcm)
+            return await self._engine.transcribe(pcm, language=language)
 
     def _require_owner_loop(self) -> None:
         loop = asyncio.get_running_loop()
