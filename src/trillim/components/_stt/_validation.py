@@ -50,17 +50,11 @@ def _validate_language(language: str | None) -> str | None:
 
 def _normalize_content_type(content_type: str | None) -> str:
     if content_type is None:
-        raise InvalidRequestError(
-            "content-type must be audio/* or application/octet-stream"
-        )
+        raise InvalidRequestError("content-type must be audio/wav or application/octet-stream")
     value = content_type.split(";", 1)[0].strip().lower()
-    if value == "application/octet-stream":
+    if value in {"application/octet-stream", "audio/wav", "audio/x-wav"}:
         return value
-    if value.startswith("audio/") and value != "audio/":
-        return value
-    raise InvalidRequestError(
-        "content-type must be audio/* or application/octet-stream"
-    )
+    raise InvalidRequestError("content-type must be audio/wav or application/octet-stream")
 
 
 def _validate_content_length(content_length: str | None) -> int | None:
