@@ -55,6 +55,18 @@ class AudioSession(abc.ABC):
         ...
 
     @abc.abstractmethod
+    async def __aenter__(self) -> AudioSession:
+        ...
+
+    @abc.abstractmethod
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def close(self) -> None:
+        ...
+
+    @abc.abstractmethod
     async def transcribe(self, audio: bytes, *, language: str | None = None) -> str:
         ...
 
@@ -80,6 +92,16 @@ class _AudioSession(AudioSession):
     @property
     def state(self) -> str:
         return self._state.value
+
+    async def __aenter__(self) -> AudioSession:
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """No-op for now since we don't have streaming behavior"""
+        return None
 
     async def transcribe(self, audio: bytes, *, language: str | None = None) -> str:
         if self._state is _AudioSessionFSM.TRANSCRIBING:
