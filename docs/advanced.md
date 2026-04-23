@@ -166,8 +166,10 @@ The runtime avoids unbounded queues and unbounded retries by design.
 ### STT
 
 - upload cap: `64 MiB`
-- active jobs: `1`
-- queue length: `0`
+- SDK engine concurrency: `1`
+- SDK queueing: unbounded cooperative wait behind the single engine slot
+- HTTP active jobs: `1`
+- HTTP queue length: `0`
 - transcription worker timeout: `180s`
 
 ### TTS
@@ -200,6 +202,11 @@ Rules:
 - custom voice registration must complete voice-state build within `30s`
 - non-progress heartbeats do not count
 - if progress stops, the worker is killed and the request fails
+
+For STT specifically:
+
+- the HTTP ingress path also enforces `content-type`, `content-length`, upload progress timeout, total upload timeout, and single-request admission before transcription begins
+- the SDK path is intentionally lighter and relies on caller discipline rather than the full HTTP hardening boundary
 
 This is why a timeout in Trillim often implies worker recovery, not just a raised error.
 

@@ -234,7 +234,7 @@ uv add "trillim[voice]"
 
 ### `POST /v1/audio/transcriptions`
 
-This is a raw-body route. Send audio bytes directly and set `content-type` to `audio/*` or `application/octet-stream`.
+This is a raw-body route. Send audio bytes directly and set `content-type` to `audio/wav`, `audio/x-wav`, or `application/octet-stream`.
 
 ```bash
 curl "http://127.0.0.1:8000/v1/audio/transcriptions?language=en" \
@@ -252,7 +252,9 @@ Key facts:
 
 - max upload size: `64 MiB`
 - `language` is optional
-- only one STT request is processed at a time
+- request bodies must contain raw `16-bit` little-endian mono `16 kHz` PCM or WAV that Trillim converts to that PCM format
+- only one HTTP STT request is processed at a time; a concurrent request fails fast with `429`
+- invalid `content-type`, invalid `content-length`, empty bodies, and mismatched body length are rejected before transcription starts
 
 ### `POST /v1/audio/speech`
 
