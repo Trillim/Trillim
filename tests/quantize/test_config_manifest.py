@@ -64,6 +64,13 @@ def _write_safetensors(path: Path, tensors: dict[str, tuple[str, list[int], byte
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + bytes(body))
 
 
+def _write_source_metadata(model_dir: Path, *, architecture: str) -> None:
+    (model_dir / "trillim_source.json").write_text(
+        json.dumps({"architecture": architecture}),
+        encoding="utf-8",
+    )
+
+
 def _read_manifest_tensors(path: Path) -> list[dict[str, int]]:
     with path.open("rb") as handle:
         shard_count = struct.unpack("<H", handle.read(2))[0]
@@ -130,6 +137,7 @@ class QuantizeConfigManifestTests(unittest.TestCase):
                 "Ternary Bonsai checkpoint\n",
                 encoding="utf-8",
             )
+            _write_source_metadata(bonsai_dir, architecture="bonsai_ternary")
             bonsai = load_model_config(bonsai_dir)
             self.assertEqual(bonsai.arch_type, ArchitectureType.BONSAI_TERNARY)
 
@@ -140,6 +148,7 @@ class QuantizeConfigManifestTests(unittest.TestCase):
                 "Bonsai 1-bit checkpoint\n",
                 encoding="utf-8",
             )
+            _write_source_metadata(binary_bonsai_dir, architecture="bonsai")
             binary_bonsai = load_model_config(binary_bonsai_dir)
             self.assertEqual(binary_bonsai.arch_type, ArchitectureType.BONSAI)
 
@@ -278,26 +287,45 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             ACTION_BF16_RAW,
         )
 
-    def test_qwen3_bonsai_readme_detection_warns_when_readme_is_missing(self):
+    def test_qwen3_source_marker_overrides_legacy_readme_detection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = Path(temp_dir)
             _write_config(model_dir, architectures=["Qwen3ForCausalLM"])
+            (model_dir / "README.md").write_text(
+                "Ternary Bonsai checkpoint\n",
+                encoding="utf-8",
+            )
+            _write_source_metadata(model_dir, architecture="qwen3")
 
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 config = load_model_config(model_dir)
 
             self.assertEqual(config.arch_type, ArchitectureType.QWEN3)
-            self.assertEqual(len(caught), 1)
-            self.assertIn(
-                "defaulting Qwen3ForCausalLM detection to dense Qwen3",
-                str(caught[0].message),
-            )
+            self.assertEqual(caught, [])
+            self.assertFalse(quantize_config._readme_indicates_bonsai_ternary(model_dir))
 
+            _write_source_metadata(model_dir, architecture="unknown")
+            with self.assertRaisesRegex(ValueError, "Unsupported source architecture marker"):
+                load_model_config(model_dir)
+
+    def test_legacy_qwen3_readme_detection_warns_without_source_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            _write_config(model_dir, architectures=["Qwen3ForCausalLM"])
             (model_dir / "README.md").write_text(
                 "Ternary Bonsai checkpoint\n",
                 encoding="utf-8",
             )
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                config = load_model_config(model_dir)
+
+            self.assertEqual(config.arch_type, ArchitectureType.BONSAI_TERNARY)
+            self.assertEqual(len(caught), 1)
+            self.assertIn("README-based Bonsai detection is deprecated", str(caught[0].message))
+
             with patch.object(Path, "read_text", side_effect=OSError):
                 self.assertFalse(quantize_config._readme_indicates_bonsai_ternary(model_dir))
 
