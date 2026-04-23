@@ -93,7 +93,7 @@ class _AudioSession(AudioSession):
             pcm = self._normalize_audio(audio)
             if self._stopped():
                 return ""
-            return await self._stt._engine.transcribe(pcm)
+            return await self._stt._transcribe(pcm)
         finally:
             self._state = _AudioSessionFSM.DONE
 

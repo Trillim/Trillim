@@ -33,95 +33,86 @@ class STTEngine:
     """Own one faster-whisper subprocess for chunked transcription."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
         self._process: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
-        async with self._lock:
-            if self._process is not None and self._process.returncode is None:
-                return
-            self._process = await self._start_engine()
+        if self._process is not None and self._process.returncode is None:
+            return
+        self._process = await self._start_engine()
 
     async def stop(self) -> None:
-        async with self._lock:
-            await self._stop_engine()
+        await self._stop_engine()
 
     async def recover(self) -> None:
-        async with self._lock:
-            await self._stop_engine()
-            self._process = await self._start_engine()
+        await self._stop_engine()
+        self._process = await self._start_engine()
 
     async def transcribe(self, pcm: bytes, *, conditioning_text: str = "") -> str:
         pcm = self._validate_pcm(pcm)
         conditioning_text = self._validate_conditioning_text(conditioning_text)
-        async with self._lock:
-            async def restart() -> None:
-                await self._stop_engine()
-                self._process = await self._start_engine()
+        process = self._process
+        if process is None or process.returncode is not None:
+            raise ComponentLifecycleError("STT engine is not running")
 
-            process = self._process
-            if process is None or process.returncode is not None:
-                raise ComponentLifecycleError("STT engine is not running")
+        stdin = process.stdin
+        stdout = process.stdout
+        if stdin is None or stdout is None:
+            await self._stop_engine()
+            raise STTEngineCatastrophicError("STT engine pipes are unavailable")
 
-            stdin = process.stdin
-            stdout = process.stdout
-            if stdin is None or stdout is None:
-                await self._stop_engine()
-                raise STTEngineCatastrophicError("STT engine pipes are unavailable")
+        request = json.dumps(
+            {
+                "pcm": base64.b64encode(pcm).decode("ascii"),
+                "conditioning_text": conditioning_text,
+            }
+        ).encode("utf-8") + b"\n"
 
-            request = json.dumps(
-                {
-                    "pcm": base64.b64encode(pcm).decode("ascii"),
-                    "conditioning_text": conditioning_text,
-                }
-            ).encode("utf-8") + b"\n"
+        try:
+            stdin.write(request)
+            await asyncio.wait_for(stdin.drain(), timeout=WORKER_KILL_AFTER_SECONDS)
+            response_line = await asyncio.wait_for(
+                stdout.readline(),
+                timeout=TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            await self.recover()
+            raise
+        except TimeoutError as exc:
+            await self.recover()
+            raise ProgressTimeoutError(
+                f"STT transcription timed out after {TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        except Exception as exc:
+            await self.recover()
+            raise STTEngineCrashedError(
+                "STT engine crashed during transcription and was recovered"
+            ) from exc
 
-            try:
-                stdin.write(request)
-                await asyncio.wait_for(stdin.drain(), timeout=WORKER_KILL_AFTER_SECONDS)
-                response_line = await asyncio.wait_for(
-                    stdout.readline(),
-                    timeout=TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS,
-                )
-            except asyncio.CancelledError:
-                await restart()
-                raise
-            except TimeoutError as exc:
-                await restart()
-                raise ProgressTimeoutError(
-                    f"STT transcription timed out after {TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS} seconds"
-                ) from exc
-            except Exception as exc:
-                await restart()
-                raise STTEngineCrashedError(
-                    "STT engine crashed during transcription and was recovered"
-                ) from exc
+        if not response_line:
+            await self.recover()
+            raise STTEngineCrashedError(
+                "STT engine exited during transcription and was recovered"
+            )
 
-            if not response_line:
-                await restart()
-                raise STTEngineCrashedError(
-                    "STT engine exited during transcription and was recovered"
-                )
-
-            try:
-                response = json.loads(response_line)
-            except json.JSONDecodeError as exc:
-                await restart()
-                raise STTEngineCrashedError(
-                    "STT engine returned malformed output and was recovered"
-                ) from exc
-
-            if response.get("status") == "text" and isinstance(response.get("text"), str):
-                return response["text"]
-
-            if response.get("status") == "error" and isinstance(response.get("message"), str):
-                await restart()
-                raise STTEngineCrashedError(response["message"])
-
-            await restart()
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError as exc:
+            await self.recover()
             raise STTEngineCrashedError(
                 "STT engine returned malformed output and was recovered"
-            )
+            ) from exc
+
+        if response.get("status") == "text" and isinstance(response.get("text"), str):
+            return response["text"]
+
+        if response.get("status") == "error" and isinstance(response.get("message"), str):
+            await self.recover()
+            raise STTEngineCrashedError(response["message"])
+
+        await self.recover()
+        raise STTEngineCrashedError(
+            "STT engine returned malformed output and was recovered"
+        )
 
     async def _start_engine(self) -> asyncio.subprocess.Process:
         process = await asyncio.create_subprocess_exec(
