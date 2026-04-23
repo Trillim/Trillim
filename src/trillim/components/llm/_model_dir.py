@@ -37,6 +37,7 @@ _DEFAULT_EOS_TOKENS = {
     ArchitectureType.BITNET: 128009,
     ArchitectureType.LLAMA: 128009,
     ArchitectureType.QWEN35: 248044,
+    ArchitectureType.QWEN3: 151645,
 }
 _MODEL_RUNTIME_ARTIFACTS = ("qmodel.tensors", "rope.cache")
 _LORA_RUNTIME_ARTIFACTS = ("qmodel.lora",)
@@ -91,7 +92,7 @@ _ARCH_REGISTRY: dict[str, _ArchitectureInfo] = {
         has_ffn_sub_norm=True,
     ),
     "qwen3forcausallm": _ArchitectureInfo(
-        arch_type=ArchitectureType.BONSAI,
+        arch_type=ArchitectureType.QWEN3,
         activation=ActivationType.SILU,
         has_attn_sub_norm=False,
         has_ffn_sub_norm=False,
@@ -283,11 +284,26 @@ def _resolve_arch_info(config: dict, *, bundle_metadata: dict | None = None) -> 
         raise ModelValidationError(
             f"Unsupported model architecture: {arch_name}"
         ) from exc
-    if (
-        arch_info.arch_type == ArchitectureType.BONSAI
-        and isinstance(bundle_metadata, dict)
-        and bundle_metadata.get("architecture") == "bonsai_ternary"
-    ):
+    if arch_info.arch_type == ArchitectureType.QWEN3:
+        return _resolve_qwen3_arch_info(arch_info, bundle_metadata=bundle_metadata)
+    return arch_info
+
+
+def _resolve_qwen3_arch_info(
+    arch_info: _ArchitectureInfo,
+    *,
+    bundle_metadata: dict | None,
+) -> _ArchitectureInfo:
+    architecture = bundle_metadata.get("architecture") if isinstance(bundle_metadata, dict) else None
+    if architecture == "bonsai":
+        return _ArchitectureInfo(
+            arch_type=ArchitectureType.BONSAI,
+            activation=arch_info.activation,
+            has_attn_sub_norm=arch_info.has_attn_sub_norm,
+            has_ffn_sub_norm=arch_info.has_ffn_sub_norm,
+            has_qkv_bias=arch_info.has_qkv_bias,
+        )
+    if architecture == "bonsai_ternary":
         return _ArchitectureInfo(
             arch_type=ArchitectureType.BONSAI_TERNARY,
             activation=arch_info.activation,

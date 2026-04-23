@@ -309,6 +309,59 @@ def _write_bonsai_source_model(
     return model_dir
 
 
+def _write_qwen3_dense_source_model(
+    root: Path,
+    *,
+    name: str = "qwen3-source",
+    include_readme: bool = True,
+) -> Path:
+    model_dir = root / name
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "vocab_size": 64,
+                "max_position_embeddings": 4096,
+                "rope_theta": 1000000.0,
+                "hidden_act": "silu",
+                "tie_word_embeddings": False,
+                "eos_token_id": 151645,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if include_readme:
+        (model_dir / "README.md").write_text("Official dense Qwen3 release model.", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    _write_safetensors(
+        model_dir / "model.safetensors",
+        {
+            "model.embed_tokens.weight": ("F16", (8, 128)),
+            "model.layers.0.input_layernorm.weight": ("F16", (128,)),
+            "model.layers.0.self_attn.k_proj.weight": ("F16", (64, 128)),
+            "model.layers.0.self_attn.v_proj.weight": ("F16", (64, 128)),
+            "model.layers.0.self_attn.q_proj.weight": ("F16", (128, 128)),
+            "model.layers.0.self_attn.q_norm.weight": ("F16", (32,)),
+            "model.layers.0.self_attn.k_norm.weight": ("F16", (32,)),
+            "model.layers.0.self_attn.o_proj.weight": ("F16", (128, 128)),
+            "model.layers.0.post_attention_layernorm.weight": ("F16", (128,)),
+            "model.layers.0.mlp.gate_proj.weight": ("F16", (256, 128)),
+            "model.layers.0.mlp.up_proj.weight": ("F16", (256, 128)),
+            "model.layers.0.mlp.down_proj.weight": ("F16", (128, 256)),
+            "model.norm.weight": ("F16", (128,)),
+            "lm_head.weight": ("F16", (8, 128)),
+        },
+    )
+    return model_dir
+
+
 def _write_adapter(
     root: Path,
     *,
@@ -574,6 +627,40 @@ class QuantizeTests(unittest.TestCase):
             )
             self.assertEqual(binary_metadata["quantization"], "binary")
             self.assertEqual(ternary_metadata["quantization"], "grouped-ternary")
+
+    def test_dense_qwen3_defaults_to_ternary_manifest_and_qwen3_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = _write_qwen3_dense_source_model(root)
+            config = entrypoint.load_model_config(model_dir)
+
+            self.assertEqual(config.arch_type, quantize_config.ArchitectureType.QWEN3)
+
+            payload = _read_manifest(
+                manifest.build_manifest(
+                    model_dir,
+                    config,
+                    output_dir=model_dir,
+                    language_model_only=False,
+                )
+            )
+
+            quantized_entry = next(
+                entry for entry in payload["tensors"] if entry["row"] == 128 and entry["col"] == 128
+            )
+            norm_entry = next(
+                entry for entry in payload["tensors"] if entry["row"] == 32 and entry["col"] == 1
+            )
+            self.assertEqual(quantized_entry["action"], manifest.ACTION_TERNARY_QUANTIZE)
+            self.assertEqual(norm_entry["action"], manifest.ACTION_BF16_RAW)
+
+            output_dir = root / "qwen3-out"
+            output_dir.mkdir()
+            output.copy_model_support_files(model_dir, output_dir)
+            output.write_model_metadata(output_dir, config=config, model_dir=model_dir)
+            metadata = json.loads((output_dir / "trillim_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["architecture"], "qwen3")
+            self.assertEqual(metadata["quantization"], "ternary")
 
     def test_build_manifest_rejects_unsupported_tensor_keys(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1458,20 +1545,19 @@ class QuantizeInternalTests(unittest.TestCase):
     def test_bonsai_readme_detection_warns_when_readme_is_missing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            model_dir = _write_bonsai_source_model(
+            model_dir = _write_qwen3_dense_source_model(
                 root,
-                name="bonsai-missing-readme",
-                readme_text="Bonsai 1-bit release model.",
+                name="qwen3-missing-readme",
+                include_readme=False,
             )
-            (model_dir / "README.md").unlink()
 
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 config = entrypoint.load_model_config(model_dir)
 
-            self.assertEqual(config.arch_type, quantize_config.ArchitectureType.BONSAI)
+            self.assertEqual(config.arch_type, quantize_config.ArchitectureType.QWEN3)
             self.assertEqual(len(caught), 1)
-            self.assertIn("defaulting Qwen3ForCausalLM Bonsai detection to binary", str(caught[0].message))
+            self.assertIn("defaulting Qwen3ForCausalLM detection to dense Qwen3", str(caught[0].message))
 
             (model_dir / "README.md").write_text("Ternary Bonsai release model.", encoding="utf-8")
             with patch.object(Path, "read_text", side_effect=OSError):

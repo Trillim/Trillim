@@ -114,6 +114,25 @@ class ModelDirectoryTests(unittest.TestCase):
         self.assertEqual(info.arch_type, ArchitectureType.BONSAI_TERNARY)
         self.assertEqual(info.activation, ActivationType.SILU)
 
+    def test_validate_model_dir_defaults_qwen3forcausallm_to_dense_qwen3(self):
+        with model_dir(architecture="Qwen3ForCausalLM") as root:
+            info = validate_model_dir(root)
+
+        self.assertEqual(info.arch_type, ArchitectureType.QWEN3)
+        self.assertEqual(info.activation, ActivationType.SILU)
+
+    def test_validate_model_dir_detects_bonsai_binary_from_bundle_metadata(self):
+        with model_dir(architecture="Qwen3ForCausalLM") as root:
+            metadata = json.loads((root / "trillim_config.json").read_text(encoding="utf-8"))
+            metadata["architecture"] = "bonsai"
+            metadata["quantization"] = "binary"
+            (root / "trillim_config.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+            info = validate_model_dir(root)
+
+        self.assertEqual(info.arch_type, ArchitectureType.BONSAI)
+        self.assertEqual(info.activation, ActivationType.SILU)
+
     def test_validate_model_dir_handles_text_config_models(self):
         with model_dir(
             architecture="LlamaForCausalLM",

@@ -121,7 +121,7 @@ _ARCH_REGISTRY: dict[str, _ArchInfo] = {
         final_norm_key="model.norm.weight",
     ),
     "qwen3forcausallm": _ArchInfo(
-        arch_type=ArchitectureType.BONSAI,
+        arch_type=ArchitectureType.QWEN3,
         component_order=(
             "input_layernorm",
             "self_attn.k_proj",
@@ -244,10 +244,11 @@ def _resolve_bitnet_arch_info(
 
 
 def _resolve_bonsai_arch_info(model_dir: Path, arch_info: _ArchInfo) -> _ArchInfo:
-    if arch_info.arch_type != ArchitectureType.BONSAI:
+    if arch_info.arch_type != ArchitectureType.QWEN3:
         return arch_info
-    if _readme_indicates_bonsai_ternary(model_dir):
-        return replace(arch_info, arch_type=ArchitectureType.BONSAI_TERNARY)
+    bonsai_arch_type = _readme_bonsai_arch_type(model_dir)
+    if bonsai_arch_type is not None:
+        return replace(arch_info, arch_type=bonsai_arch_type)
     return arch_info
 
 
@@ -359,24 +360,32 @@ def _load_tensor_names_if_available(model_dir: Path) -> list[str] | None:
     return None
 
 
-def _readme_indicates_bonsai_ternary(model_dir: Path) -> bool:
+def _readme_bonsai_arch_type(model_dir: Path) -> ArchitectureType | None:
     readme_path = model_dir / "README.md"
     if not readme_path.is_file():
         warnings.warn(
             (
-                f"Could not find {readme_path}; defaulting Qwen3ForCausalLM Bonsai "
-                "detection to binary. Grouped-ternary models may be misidentified."
+                f"Could not find {readme_path}; defaulting Qwen3ForCausalLM "
+                "detection to dense Qwen3. Bonsai checkpoints require README markers."
             ),
             stacklevel=3,
         )
-        return False
+        return None
     try:
         content = readme_path.read_text(encoding="utf-8").lower()
     except OSError:
-        return False
+        return None
+    if "bonsai" not in content:
+        return None
     has_ternary = "ternary" in content
     has_one_bit = any(token in content for token in ("1-bit", "1 bit", "1bit"))
-    return has_ternary and not has_one_bit
+    if has_ternary and not has_one_bit:
+        return ArchitectureType.BONSAI_TERNARY
+    return ArchitectureType.BONSAI
+
+
+def _readme_indicates_bonsai_ternary(model_dir: Path) -> bool:
+    return _readme_bonsai_arch_type(model_dir) == ArchitectureType.BONSAI_TERNARY
 
 
 def _align_to_128(value: int) -> int:
