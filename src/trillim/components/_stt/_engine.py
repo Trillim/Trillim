@@ -10,6 +10,7 @@ from pathlib import Path
 
 from trillim.components._stt._config import DEFAULT_WORKER_CONFIG
 from trillim.components._stt._limits import (
+    MAX_WORKER_OUTPUT_BYTES,
     TOTAL_TRANSCRIPTION_TIMEOUT_SECONDS,
     WORKER_KILL_AFTER_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
@@ -101,6 +102,9 @@ class STTEngine:
             raise STTEngineCrashedError(
                 "STT engine exited during transcription and was recovered"
             )
+        if len(response_line) > MAX_WORKER_OUTPUT_BYTES:
+            await self.recover()
+            raise STTEngineCrashedError("STT engine produced oversized stdout and was recovered")
 
         try:
             response = json.loads(response_line)
@@ -141,6 +145,8 @@ class STTEngine:
             )
             if not response_line:
                 raise STTEngineCatastrophicError("STT engine failed to start")
+            if len(response_line) > MAX_WORKER_OUTPUT_BYTES:
+                raise STTEngineCatastrophicError("STT engine produced oversized stdout")
             response = json.loads(response_line)
             if response.get("status") != "ready":
                 raise STTEngineCatastrophicError(
