@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from trillim.components._stt import STT
+from trillim.components._stt._engine import STTEngine
+from trillim.components._stt._session import AudioSession
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 from trillim.runtime import Runtime
 
@@ -52,6 +54,24 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
             wav_file.setsampwidth(1)
             wav_file.setframerate(rate)
             wav_file.writeframes(unsigned.tobytes())
+        return buffer.getvalue()
+
+    def _make_empty_wav(self) -> bytes:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"")
+        return buffer.getvalue()
+
+    def _make_24bit_wav(self) -> bytes:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(3)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00\x00" * 16)
         return buffer.getvalue()
 
     async def test_open_session_requires_started_component(self):
@@ -126,6 +146,33 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await stt.stop()
 
+    async def test_transcribe_bytes_rejects_invalid_sdk_inputs(self):
+        stt = await self._start_stt()
+        try:
+            with self.assertRaisesRegex(InvalidRequestError, "audio must be bytes"):
+                await stt.transcribe_bytes("bad")  # type: ignore[arg-type]
+            with self.assertRaisesRegex(InvalidRequestError, "audio must not be empty"):
+                await stt.transcribe_bytes(b"")
+            with self.assertRaisesRegex(InvalidRequestError, "whole 16-bit samples"):
+                await stt.transcribe_bytes(b"\x00")
+            with self.assertRaisesRegex(InvalidRequestError, "audio must not be empty"):
+                await stt.transcribe_bytes(self._make_empty_wav())
+            with self.assertRaisesRegex(InvalidRequestError, "unsupported WAV sample width"):
+                await stt.transcribe_bytes(self._make_24bit_wav())
+        finally:
+            await stt.stop()
+
+    async def test_transcribe_bytes_accepts_bytearray_and_memoryview(self):
+        stt = await self._start_stt()
+        try:
+            self.assertEqual(await stt.transcribe_bytes(bytearray(self.fixture_bytes)), EXPECTED_TEXT)
+            self.assertEqual(
+                await stt.transcribe_bytes(memoryview(self.fixture_bytes)),
+                EXPECTED_TEXT,
+            )
+        finally:
+            await stt.stop()
+
 
 class RuntimeSTTTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -139,3 +186,21 @@ class RuntimeSTTTests(unittest.TestCase):
                 self.assertEqual(session.state, "idle")
                 self.assertEqual(session.transcribe(self.fixture_bytes), EXPECTED_TEXT)
                 self.assertEqual(session.state, "done")
+
+
+class SessionAndEngineContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_audio_session_cannot_be_constructed_directly(self):
+        with self.assertRaises(TypeError):
+            AudioSession()
+
+    async def test_engine_public_lifecycle_contract(self):
+        engine = STTEngine()
+        await engine.stop()
+        with self.assertRaisesRegex(ComponentLifecycleError, "not running"):
+            await engine.transcribe(b"\x00\x00")
+        await engine.start()
+        try:
+            await engine.start()
+        finally:
+            await engine.stop()
+        await engine.stop()

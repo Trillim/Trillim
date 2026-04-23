@@ -4,9 +4,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import unittest
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from trillim.components._stt import STT
+from trillim.components._stt._admission import TranscriptionAdmission
+from trillim.components._stt._router import _as_http_error
+from trillim.components._stt._validation import PayloadTooLargeError, validate_http_request
+from trillim.errors import AdmissionRejectedError, InvalidRequestError, ProgressTimeoutError
 from trillim.server import Server
 
 EXPECTED_TEXT = (
@@ -123,3 +128,56 @@ class STTRouterTests(unittest.TestCase):
         rejected = next(response for response in responses if response.status_code == 429)
         self.assertEqual(successful.json(), {"text": EXPECTED_TEXT})
         self.assertIn("busy", rejected.json()["detail"].lower())
+
+
+class ValidationTests(unittest.TestCase):
+    def test_validate_http_request_accepts_none_language(self):
+        request = validate_http_request(
+            content_type="audio/wav",
+            content_length=None,
+            language=None,
+        )
+        self.assertIsNone(request.content_length)
+        self.assertIsNone(request.language)
+
+    def test_validate_http_request_rejects_missing_or_invalid_fields(self):
+        cases = (
+            (None, None, None, "content-type"),
+            ("audio/wav", None, "", "language must not be empty"),
+            ("audio/wav", None, "x" * 33, "character limit"),
+            ("audio/wav", "-1", None, "content-length"),
+        )
+        for content_type, content_length, language, message in cases:
+            with self.subTest(
+                content_type=content_type,
+                content_length=content_length,
+                language=language,
+            ):
+                with self.assertRaisesRegex(InvalidRequestError, message):
+                    validate_http_request(
+                        content_type=content_type,
+                        content_length=content_length,
+                        language=language,
+                    )
+
+
+class RouterErrorMappingTests(unittest.TestCase):
+    def test_as_http_error_maps_known_errors(self):
+        passthrough = HTTPException(status_code=418, detail="teapot")
+        self.assertIs(_as_http_error(passthrough), passthrough)
+        self.assertEqual(_as_http_error(PayloadTooLargeError("too big")).status_code, 413)
+        self.assertEqual(_as_http_error(InvalidRequestError("bad")).status_code, 400)
+        self.assertEqual(_as_http_error(AdmissionRejectedError("busy")).status_code, 429)
+        self.assertEqual(_as_http_error(ProgressTimeoutError("slow")).status_code, 504)
+        self.assertEqual(_as_http_error(RuntimeError("boom")).status_code, 503)
+
+
+class AdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admission_draining_and_double_release(self):
+        admission = TranscriptionAdmission()
+        lease = await admission.acquire()
+        await lease.release()
+        await lease.release()
+        await admission.start_draining()
+        with self.assertRaisesRegex(AdmissionRejectedError, "draining"):
+            await admission.acquire()
