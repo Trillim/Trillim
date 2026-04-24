@@ -351,3 +351,265 @@ class _TTSSession(TTSSession):
 
 
 _ALLOW_TTS_SESSION_SUBCLASS = False
+
+
+def _stretch_pcm_chunk(pcm: bytes, speed: float) -> bytes:
+    if speed == 1.0 or not pcm:
+        return pcm
+    stretcher = _StreamingPCMStretcher(speed)
+    return stretcher.push(pcm) + stretcher.finish()
+
+
+def _segment_pause_pcm(text: str, speed: float) -> bytes:
+    base_pause_ms = _boundary_pause_ms(text)
+    if base_pause_ms == 0:
+        return b""
+    jittered_pause_ms = base_pause_ms * random.uniform(
+        BOUNDARY_PAUSE_JITTER_MIN,
+        BOUNDARY_PAUSE_JITTER_MAX,
+    )
+    return _pcm_silence(jittered_pause_ms / speed)
+
+
+def _boundary_pause_ms(text: str) -> int:
+    stripped = text.rstrip()
+    if not stripped:
+        return 0
+    if stripped[-1] in ".!?":
+        return SENTENCE_BOUNDARY_PAUSE_MS
+    if stripped[-1] in ",;:":
+        return CLAUSE_BOUNDARY_PAUSE_MS
+    return 0
+
+
+def _pcm_silence(duration_ms: float) -> bytes:
+    if duration_ms <= 0:
+        return b""
+    frame_bytes = PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES
+    samples = round(PCM_SAMPLE_RATE * duration_ms / 1000.0)
+    return b"\x00" * (samples * frame_bytes)
+
+
+def _postprocess_segment_pcm(
+    pcm: bytes,
+    *,
+    text: str,
+    speed: float,
+    add_pause: bool,
+) -> bytes:
+    emitted = _stretch_pcm_chunk(pcm, speed)
+    emitted = _apply_exponential_fade_in_pcm(emitted)
+    if add_pause:
+        emitted += _segment_pause_pcm(text, speed)
+    return emitted
+
+
+def _apply_exponential_fade_in_pcm(pcm: bytes) -> bytes:
+    if not pcm:
+        return pcm
+    frame_bytes = PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES
+    if len(pcm) % frame_bytes != 0:
+        return pcm
+    fade_frames = min(
+        len(pcm) // frame_bytes,
+        round(PCM_SAMPLE_RATE * SEGMENT_FADE_IN_MS / 1000.0),
+    )
+    if fade_frames <= 1:
+        return pcm
+    scale = math.exp(SEGMENT_FADE_EXPONENT) - 1.0
+    faded_pcm = bytearray(pcm)
+    samples = memoryview(faded_pcm).cast("h")
+    for frame_index in range(fade_frames):
+        position = frame_index / (fade_frames - 1)
+        gain = (math.exp(SEGMENT_FADE_EXPONENT * position) - 1.0) / scale
+        sample_index = frame_index * PCM_CHANNELS
+        for channel in range(PCM_CHANNELS):
+            samples[sample_index + channel] = int(
+                round(samples[sample_index + channel] * gain)
+            )
+    return bytes(faded_pcm)
+
+
+class _StreamingPCMStretcher:
+    def __init__(self, speed: float):
+        import numpy as np
+
+        self._np = np
+        self.speed = validate_speed(speed)
+        self.frame_size = 1024
+        self.hop_size = self.frame_size // 4
+        self._window = np.hanning(self.frame_size).astype(np.float32)
+        if not np.any(self._window):
+            self._window = np.ones(self.frame_size, dtype=np.float32)
+        self._window_sq = self._window**2
+        self._phase_advance = (
+            2.0
+            * np.pi
+            * self.hop_size
+            * np.arange(self.frame_size // 2 + 1, dtype=np.float32)
+            / self.frame_size
+        )
+        self._input = np.zeros(0, dtype=np.float32)
+        self._input_base = 0
+        self._total_samples = 0
+        self._next_analysis_frame = 0
+        self._spectra = deque()
+        self._spectra_base = 0
+        self._phase = None
+        self._next_time_step = 0.0
+        self._processed_output_frames = 0
+        self._output = np.zeros(0, dtype=np.float32)
+        self._weights = np.zeros(0, dtype=np.float32)
+        self._output_base = 0
+        self._pending_byte = b""
+
+    def push(self, pcm_bytes: bytes) -> bytes:
+        self._append_pcm(pcm_bytes)
+        self._materialize_analysis_frames(final=False)
+        self._process_output_frames(final=False)
+        return self._emit_ready(final=False)
+
+    def finish(self) -> bytes:
+        self._materialize_analysis_frames(final=True)
+        self._process_output_frames(final=True)
+        return self._emit_ready(final=True)
+
+    def _append_pcm(self, pcm_bytes: bytes) -> None:
+        np = self._np
+        data = self._pending_byte + pcm_bytes
+        if len(data) % 2 == 1:
+            self._pending_byte = data[-1:]
+            data = data[:-1]
+        else:
+            self._pending_byte = b""
+        if not data:
+            return
+        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        self._input = samples.copy() if self._input.size == 0 else np.concatenate((self._input, samples))
+        self._total_samples += samples.size
+
+    def _final_frame_limit(self) -> int:
+        if self._total_samples == 0:
+            return 0
+        return max(1, self._total_samples - self.frame_size) + self.hop_size
+
+    def _materialize_analysis_frames(self, *, final: bool) -> None:
+        np = self._np
+        available_end = self._input_base + self._input.size
+        final_limit = self._final_frame_limit()
+        while True:
+            start = self._next_analysis_frame * self.hop_size
+            end = start + self.frame_size
+            if end <= available_end:
+                local_start = start - self._input_base
+                frame = self._input[local_start : local_start + self.frame_size]
+            elif final and start < final_limit:
+                local_start = start - self._input_base
+                frame = self._input[local_start:]
+                if frame.size < self.frame_size:
+                    frame = np.pad(frame, (0, self.frame_size - frame.size))
+            else:
+                break
+            spectrum = np.fft.rfft(frame * self._window).astype(np.complex64)
+            self._spectra.append(spectrum)
+            self._next_analysis_frame += 1
+        trim_to = self._next_analysis_frame * self.hop_size
+        drop = max(0, min(self._input.size, trim_to - self._input_base))
+        if drop > 0:
+            self._input = self._input[drop:]
+            self._input_base += drop
+
+    def _analysis_frame_count(self) -> int:
+        return self._spectra_base + len(self._spectra)
+
+    def _get_spectrum(self, frame_index: int):
+        local_index = frame_index - self._spectra_base
+        if local_index < 0 or local_index >= len(self._spectra):
+            return None
+        return self._spectra[local_index]
+
+    def _process_output_frames(self, *, final: bool) -> None:
+        np = self._np
+        frame_count = self._analysis_frame_count()
+        while True:
+            if self._phase is None:
+                first = self._get_spectrum(0)
+                if first is None:
+                    return
+                self._phase = np.angle(first).astype(np.float32)
+                magnitude = np.abs(first)
+                stretched = magnitude * np.exp(1j * self._phase)
+                self._add_output_frame(
+                    np.fft.irfft(stretched, n=self.frame_size).real.astype(np.float32)
+                )
+                self._next_time_step = float(self.speed)
+                continue
+            step = self._next_time_step
+            current_index = int(step)
+            if final:
+                if step >= frame_count:
+                    break
+            elif current_index + 1 >= frame_count:
+                break
+            next_index = min(current_index + 1, frame_count - 1)
+            current = self._get_spectrum(current_index)
+            following = self._get_spectrum(next_index)
+            if current is None or following is None:
+                break
+            fraction = step - current_index
+            current_mag = np.abs(current)
+            following_mag = np.abs(following)
+            magnitude = current_mag * (1.0 - fraction) + following_mag * fraction
+            delta = np.angle(following) - np.angle(current) - self._phase_advance
+            delta -= 2.0 * np.pi * np.round(delta / (2.0 * np.pi))
+            phase_increment = self._phase_advance + delta
+            self._phase = (self._phase + phase_increment).astype(np.float32)
+            stretched = magnitude * np.exp(1j * self._phase)
+            self._add_output_frame(
+                np.fft.irfft(stretched, n=self.frame_size).real.astype(np.float32)
+            )
+            self._next_time_step += self.speed
+
+    def _add_output_frame(self, frame) -> None:
+        np = self._np
+        output_start = self._output_base + (self._processed_output_frames * self.hop_size)
+        output_end = output_start + self.frame_size
+        needed = output_end - self._output_base
+        if needed > self._output.size:
+            pad = needed - self._output.size
+            self._output = np.pad(self._output, (0, pad))
+            self._weights = np.pad(self._weights, (0, pad))
+        local_start = output_start - self._output_base
+        self._output[local_start : local_start + self.frame_size] += frame * self._window
+        self._weights[local_start : local_start + self.frame_size] += self._window_sq
+        self._processed_output_frames += 1
+
+    def _emit_ready(self, *, final: bool) -> bytes:
+        np = self._np
+        if self._processed_output_frames == 0:
+            return b""
+        ready_frames = self._processed_output_frames if final else max(0, self._processed_output_frames - 2)
+        if ready_frames <= 0:
+            return b""
+        local_end = ready_frames * self.hop_size
+        audio = self._output[:local_end]
+        weights = self._weights[:local_end]
+        nonzero = weights > 1e-8
+        normalized = np.zeros_like(audio)
+        normalized[nonzero] = audio[nonzero] / weights[nonzero]
+        clipped = np.clip(normalized, -1.0, 1.0)
+        pcm = (clipped * 32767.0).astype(np.int16).tobytes()
+        self._output = self._output[local_end:]
+        self._weights = self._weights[local_end:]
+        self._output_base += local_end
+        self._drop_consumed_spectra(ready_frames)
+        self._processed_output_frames -= ready_frames
+        return pcm
+
+    def _drop_consumed_spectra(self, ready_frames: int) -> None:
+        keep_from = max(0, ready_frames - 1)
+        while self._spectra_base < keep_from:
+            if not self._spectra:
+                break
+            self._spectra.popleft()
+            self._spectra_base += 1
