@@ -119,7 +119,7 @@ async def _read_bounded_body(request: Request, limit: int) -> bytes:
 async def _stream_speech_session(session):
     try:
         async with session:
-            async for chunk in session:
+            async for chunk in session.synthesize(session._reserved_text):
                 yield _sse("audio", base64.b64encode(chunk).decode("ascii"))
         yield _sse("done", "")
     except Exception as exc:

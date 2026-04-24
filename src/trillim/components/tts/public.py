@@ -8,12 +8,14 @@ import math
 import random
 import struct
 import tempfile
+from asyncio import AbstractEventLoop
 from collections import deque
 from pathlib import Path
 
 from fastapi import APIRouter
 
 from trillim.components import Component
+from trillim.components.tts._engine import TTSEngine
 from trillim.components.tts._limits import (
     DEFAULT_SPEED,
     PCM_CHANNELS,
@@ -42,7 +44,12 @@ from trillim.components.tts._worker import (
     create_session_worker,
     is_voice_cloning_auth_error,
 )
-from trillim.errors import AdmissionRejectedError, InvalidRequestError, SessionClosedError
+from trillim.errors import (
+    AdmissionRejectedError,
+    ComponentLifecycleError,
+    InvalidRequestError,
+    SessionClosedError,
+)
 
 DEFAULT_VOICE = "alba"
 _CLIENT_VOICE_BUILD_ERROR_SNIPPETS = (
@@ -83,6 +90,8 @@ class TTS(Component):
         self._tokenizer_loader = _tokenizer_loader
         self._session_worker_factory = _session_worker_factory
         self._voice_state_builder = _voice_state_builder
+        self._engine = TTSEngine()
+        self._owner_loop: AbstractEventLoop | None = None
         self._started = False
         self._accepting = False
         self._scheduler_lock = asyncio.Lock()
@@ -109,6 +118,7 @@ class TTS(Component):
 
     async def start(self) -> None:
         """Verify optional voice dependencies and initialize the voice store."""
+        self._require_owner_loop()
         if self._started:
             return
         importlib.import_module("numpy")
@@ -124,33 +134,49 @@ class TTS(Component):
             if self._default_voice not in available:
                 raise ValueError(f"unknown default_voice: {self._default_voice}")
         self._voice_store = voice_store
+        await self._engine.start()
         self._started = True
         self._accepting = True
 
     async def stop(self) -> None:
         """Drain admissions and stop all live TTS sessions."""
+        self._require_owner_loop()
         active_session: _TTSSession | None = None
-        active_task: asyncio.Task | None = None
         async with self._scheduler_lock:
             self._accepting = False
             self._reserved_slot = None
             active_session = self._active_session
             self._active_session = None
-            if active_session is not None:
-                active_session._mark_owner_stopped()
-                active_task = active_session._task
-                if active_task is not None:
-                    active_task.cancel()
         if active_session is not None:
-            if active_task is not None:
-                await asyncio.gather(active_task, return_exceptions=True)
-            if not active_session._done_event.is_set():
-                await active_session._finish(
-                    "owner_stopped",
-                    SessionClosedError("TTSSession owner has stopped"),
-                )
-            await active_session._wait_for_done()
+            await active_session.close()
+        await self._engine.stop()
         self._started = False
+
+    async def open_session(
+        self,
+        *,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> TTSSession:
+        """Open one reusable TTS session."""
+        self._require_started()
+        resolved_voice_name = (
+            self._default_voice
+            if voice is None
+            else normalize_optional_name(voice, field_name="voice")
+        )
+        assert resolved_voice_name is not None
+        resolved_speed = self._default_speed if speed is None else validate_speed(speed)
+        session = _create_tts_session(
+            self,
+            voice=resolved_voice_name,
+            speed=resolved_speed,
+            resolve_voice=self._resolve_voice_state,
+            tokenizer_loader=self._get_tokenizer,
+            synthesize_segment=self._synthesize_segment,
+        )
+        self._active_session = session
+        return session
 
     async def list_voices(self) -> list[str]:
         """Return the visible built-in and custom voice names."""
@@ -226,8 +252,8 @@ class TTS(Component):
         speed: float | None = None,
     ) -> bytes:
         """Synthesize one whole WAV payload through the session pipeline."""
-        async with await self.speak(text, voice=voice, speed=speed) as session:
-            pcm = await session.collect()
+        async with await self.open_session(voice=voice, speed=speed) as session:
+            pcm = await session.collect(text)
         return _wav_header(data_size=len(pcm)) + pcm
 
     async def synthesize_stream(
@@ -238,8 +264,8 @@ class TTS(Component):
         speed: float | None = None,
     ):
         """Stream raw PCM bytes through the session pipeline."""
-        async with await self.speak(text, voice=voice, speed=speed) as session:
-            async for chunk in session:
+        async with await self.open_session(voice=voice, speed=speed) as session:
+            async for chunk in session.synthesize(text):
                 yield chunk
 
     async def _pause_session(self, session: _TTSSession) -> None:
@@ -308,24 +334,15 @@ class TTS(Component):
         speed: float,
     ) -> TTSSession:
         self._require_started()
-        resolved_voice = await self._require_voice_store().resolve_for_session(
-            voice,
-            spool_dir=self._spool_dir,
-        )
-        session_worker = self._session_worker_factory(
-            voice_kind=resolved_voice.kind,
-            voice_reference=resolved_voice.reference,
-        )
         session = _create_tts_session(
             self,
-            text=text,
             voice=voice,
-            voice_kind=resolved_voice.kind,
-            voice_reference=resolved_voice.reference,
             speed=speed,
-            cleanup_path=resolved_voice.cleanup_path,
-            session_worker=session_worker,
+            resolve_voice=self._resolve_voice_state,
+            tokenizer_loader=self._get_tokenizer,
+            synthesize_segment=self._synthesize_segment,
         )
+        session._reserved_text = text
         started = False
         try:
             async with self._scheduler_lock:
@@ -335,20 +352,12 @@ class TTS(Component):
                         "TTS reservation is no longer active; request cannot start"
                     )
                 self._reserved_slot = None
-                self._start_session_locked(session)
+                self._active_session = session
                 started = True
             return session
         finally:
             if not started:
-                if resolved_voice.cleanup_path is not None:
-                    try:
-                        resolved_voice.cleanup_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                try:
-                    await session_worker.close()
-                except Exception:
-                    pass
+                await session.close()
 
     async def _register_voice_http_request(self, request) -> str:
         """Handle the raw-body HTTP voice-upload request."""
@@ -376,6 +385,39 @@ class TTS(Component):
             if _is_client_voice_build_error(message):
                 raise InvalidRequestError(message) from exc
             raise
+
+    async def _normalize_voice_name(self, voice: str) -> str:
+        normalized = normalize_required_name(voice, field_name="voice")
+        resolved_voice = await self._require_voice_store().resolve_for_session(
+            normalized,
+            spool_dir=self._spool_dir,
+        )
+        if resolved_voice.cleanup_path is not None:
+            resolved_voice.cleanup_path.unlink(missing_ok=True)
+        return normalized
+
+    async def _resolve_voice_state(self, voice: str) -> tuple[object, Path | None]:
+        resolved_voice = await self._require_voice_store().resolve_for_session(
+            voice,
+            spool_dir=self._spool_dir,
+        )
+        if resolved_voice.kind == "predefined":
+            return resolved_voice.reference, resolved_voice.cleanup_path
+        if resolved_voice.kind == "state_file":
+            return Path(resolved_voice.reference).read_bytes(), resolved_voice.cleanup_path
+        raise InvalidRequestError(f"unsupported voice kind: {resolved_voice.kind}")
+
+    async def _synthesize_segment(
+        self,
+        text: str,
+        voice_state: object,
+        speed: float,
+    ) -> bytes:
+        return await self._engine.synthesize_segment(
+            text,
+            voice_state=voice_state,
+            speed=speed,
+        )
 
     async def _run_session(self, session: _TTSSession) -> None:
         try:
@@ -485,12 +527,9 @@ class TTS(Component):
     def _check_can_accept_locked(self) -> None:
         if not self._accepting:
             raise AdmissionRejectedError("TTS is draining and not accepting new requests")
-        if self._reserved_slot is not None:
-            raise AdmissionRejectedError("TTS is busy; only one live session is allowed")
-        if self._active_session is not None:
-            raise AdmissionRejectedError("TTS is busy; only one live session is allowed")
 
     def _require_started(self) -> None:
+        self._require_owner_loop()
         if not self._started:
             raise RuntimeError("TTS is not started")
 
@@ -498,6 +537,16 @@ class TTS(Component):
         self._require_started()
         assert self._voice_store is not None
         return self._voice_store
+
+    def _require_owner_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._owner_loop is None:
+            self._owner_loop = loop
+            return
+        if loop is not self._owner_loop:
+            raise ComponentLifecycleError(
+                "TTS is bound to one event loop; create a new TTS per thread/event loop"
+            )
 
 
 def _load_built_in_voice_names() -> tuple[str, ...]:
