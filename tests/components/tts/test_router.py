@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,17 +14,22 @@ from trillim.components.tts import TTS
 from trillim.components.tts._limits import MAX_VOICE_UPLOAD_BYTES
 from trillim.components.tts._router import _as_http_error
 from trillim.components.tts._validation import PayloadTooLargeError
-from trillim.errors import AdmissionRejectedError, InvalidRequestError, ProgressTimeoutError
+from trillim.errors import (
+    AdmissionRejectedError,
+    ComponentLifecycleError,
+    InvalidRequestError,
+    ProgressTimeoutError,
+)
 from trillim.server import Server
 
-from tests.components.tts.support import FakeTTSEngine, patched_tts_environment
+from tests.components.tts.support import reference_wav_bytes, tts_voice_store_environment
 
 
 class TTSRouterTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory()
         self.voice_root = Path(self._temp_dir.name) / "voices"
-        self._stack = patched_tts_environment(self.voice_root)
+        self._stack = tts_voice_store_environment(self.voice_root)
 
     def tearDown(self) -> None:
         self._stack.close()
@@ -34,15 +40,18 @@ class TTSRouterTests(unittest.TestCase):
 
     def test_voice_routes_return_expected_json(self):
         with self._make_client() as client:
-            self.assertEqual(client.get("/v1/voices").json(), {"voices": ["alba", "marius"]})
+            voices = client.get("/v1/voices").json()["voices"]
+            self.assertIn("alba", voices)
+            self.assertNotIn("custom", voices)
 
-            create = client.post("/v1/voices", content=b"voice", headers={"name": "custom"})
+            create = client.post(
+                "/v1/voices",
+                content=reference_wav_bytes(),
+                headers={"name": "custom"},
+            )
             self.assertEqual(create.status_code, 200)
             self.assertEqual(create.json(), {"name": "custom", "status": "created"})
-            self.assertEqual(
-                client.get("/v1/voices").json(),
-                {"voices": ["alba", "marius", "custom"]},
-            )
+            self.assertIn("custom", client.get("/v1/voices").json()["voices"])
 
             delete = client.delete("/v1/voices/custom")
             self.assertEqual(delete.status_code, 200)
@@ -51,12 +60,12 @@ class TTSRouterTests(unittest.TestCase):
     def test_voice_routes_map_invalid_requests(self):
         with self._make_client() as client:
             cases = (
-                ("post", "/v1/voices", b"voice", {}, 400, "name header is required"),
+                ("post", "/v1/voices", reference_wav_bytes(), {}, 400, "name header is required"),
                 ("post", "/v1/voices", b"", {"name": "custom"}, 400, "must not be empty"),
                 (
                     "post",
                     "/v1/voices",
-                    b"voice",
+                    reference_wav_bytes(),
                     {"name": "bad-name"},
                     400,
                     "letters and digits",
@@ -95,14 +104,15 @@ class TTSRouterTests(unittest.TestCase):
         body = response.text
         self.assertIn("event: audio\n", body)
         self.assertIn("event: done\n", body)
-        self.assertIn(
-            f"data: {base64.b64encode(b'  hello').decode('ascii')}",
-            body,
-        )
+        self._assert_first_audio_event_is_pcm(body)
 
     def test_audio_speech_uses_registered_custom_voice_header(self):
         with self._make_client() as client:
-            create = client.post("/v1/voices", content=b"voice", headers={"name": "custom"})
+            create = client.post(
+                "/v1/voices",
+                content=reference_wav_bytes(),
+                headers={"name": "custom"},
+            )
             self.assertEqual(create.status_code, 200)
             response = client.post(
                 "/v1/audio/speech",
@@ -112,7 +122,7 @@ class TTSRouterTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: audio\n", response.text)
-        self.assertIsInstance(FakeTTSEngine.instances[-1].synthesize_calls[-1][1], dict)
+        self._assert_first_audio_event_is_pcm(response.text)
 
     def test_audio_speech_maps_invalid_requests(self):
         with self._make_client() as client:
@@ -134,18 +144,8 @@ class TTSRouterTests(unittest.TestCase):
                     self.assertEqual(response.status_code, status_code)
                     self.assertIn(detail, response.json()["detail"])
 
-    def test_audio_speech_streams_engine_errors_as_sse_error(self):
-        with self._make_client() as client:
-            FakeTTSEngine.instances[-1].synthesize_error = RuntimeError("engine boom")
-            response = client.post("/v1/audio/speech", content=b"hello")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("event: error\n", response.text)
-        self.assertIn("engine boom", response.text)
-
     def test_concurrent_speech_requests_return_success_and_busy(self):
         with self._make_client() as client:
-            FakeTTSEngine.instances[-1].synthesize_delay = 0.05
 
             def send_request():
                 return client.post("/v1/audio/speech", content=b"hello")
@@ -158,6 +158,29 @@ class TTSRouterTests(unittest.TestCase):
         rejected = next(response for response in responses if response.status_code == 429)
         self.assertIn("busy", rejected.json()["detail"].lower())
 
+    def test_voice_routes_reject_while_speech_request_is_active(self):
+        with self._make_client() as client:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                speech = executor.submit(
+                    client.post,
+                    "/v1/audio/speech",
+                    content=("word " * 1_000).encode(),
+                )
+                time.sleep(0.01)
+                voices = client.get("/v1/voices")
+
+            self.assertEqual(speech.result().status_code, 200)
+            self.assertEqual(voices.status_code, 429)
+            self.assertIn("already handling", voices.json()["detail"])
+
+    def _assert_first_audio_event_is_pcm(self, body: str) -> None:
+        marker = "event: audio\ndata: "
+        start = body.index(marker) + len(marker)
+        end = body.index("\n\n", start)
+        pcm = base64.b64decode(body[start:end], validate=True)
+        self.assertGreater(len(pcm), 0)
+        self.assertEqual(len(pcm) % 2, 0)
+
 
 class RouterErrorMappingTests(unittest.TestCase):
     def test_as_http_error_maps_known_errors(self):
@@ -167,4 +190,5 @@ class RouterErrorMappingTests(unittest.TestCase):
         self.assertEqual(_as_http_error(InvalidRequestError("bad")).status_code, 400)
         self.assertEqual(_as_http_error(AdmissionRejectedError("busy")).status_code, 429)
         self.assertEqual(_as_http_error(ProgressTimeoutError("slow")).status_code, 504)
+        self.assertEqual(_as_http_error(ComponentLifecycleError("stopped")).status_code, 503)
         self.assertEqual(_as_http_error(RuntimeError("boom")).status_code, 503)

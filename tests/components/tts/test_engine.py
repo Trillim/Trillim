@@ -21,7 +21,7 @@ from trillim.components.tts._engine import (
 from trillim.components.tts._validation import load_safe_voice_state_safetensors_bytes
 from trillim.errors import InvalidRequestError
 
-from tests.components.tts.support import fake_voice_state
+from tests.components.tts.support import sample_voice_state
 
 
 class TTSEngineSubprocessTests(unittest.IsolatedAsyncioTestCase):
@@ -69,7 +69,7 @@ class TTSEngineHelperTests(unittest.TestCase):
 
     def test_encode_synthesis_request_for_custom_voice_state_dict(self):
         payload = json.loads(
-            _encode_synthesis_request(text="hello", voice_state=fake_voice_state())
+            _encode_synthesis_request(text="hello", voice_state=sample_voice_state())
         )
 
         self.assertEqual(payload["voice_state"]["kind"], "serialized")
@@ -80,7 +80,7 @@ class TTSEngineHelperTests(unittest.TestCase):
     def test_encode_synthesis_request_accepts_bytes_like_state(self):
         state_bytes = base64.b64decode(
             json.loads(
-                _encode_synthesis_request(text="hello", voice_state=fake_voice_state())
+                _encode_synthesis_request(text="hello", voice_state=sample_voice_state())
             )["voice_state"]["data"]
         )
 
