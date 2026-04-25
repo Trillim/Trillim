@@ -15,9 +15,13 @@ from trillim.errors import ComponentLifecycleError, InvalidRequestError, Progres
 
 def build_router(stt) -> APIRouter:
     router = APIRouter()
+    transcribe_lock = asyncio.Lock()
 
     @router.post("/v1/audio/transcriptions")
     async def audio_transcriptions(request: Request):
+        if transcribe_lock.locked():
+            raise HTTPException(status_code=429, detail="STT is already handling a request")
+        await transcribe_lock.acquire()
         try:
             validated_request = validate_http_request(
                 content_type=request.headers.get("content-type"),
@@ -35,6 +39,8 @@ def build_router(stt) -> APIRouter:
             text = await session.transcribe(audio_bytes, language=validated_request.language)
         except Exception as exc:
             raise _as_http_error(exc) from exc
+        finally:
+            transcribe_lock.release()
         return {"text": text}
 
     return router

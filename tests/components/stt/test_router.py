@@ -105,7 +105,7 @@ class STTRouterTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("content-length", response.json()["detail"])
 
-    def test_concurrent_router_requests_return_success(self):
+    def test_concurrent_router_requests_return_success_and_busy(self):
         with TestClient(self._make_server().app) as client:
             def send_request():
                 return client.post(
@@ -118,9 +118,11 @@ class STTRouterTests(unittest.TestCase):
                 responses = list(executor.map(lambda _: send_request(), range(2)))
 
         statuses = sorted(response.status_code for response in responses)
-        self.assertEqual(statuses, [200, 200])
-        for response in responses:
-            self._assert_expected_transcript(response.json()["text"])
+        self.assertEqual(statuses, [200, 429])
+        successful = next(response for response in responses if response.status_code == 200)
+        rejected = next(response for response in responses if response.status_code == 429)
+        self._assert_expected_transcript(successful.json()["text"])
+        self.assertIn("already handling", rejected.json()["detail"])
 
     def _assert_expected_transcript(self, text: str) -> None:
         self.assertIsInstance(text, str)
