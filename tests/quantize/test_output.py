@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from trillim import _model_store
@@ -189,7 +190,8 @@ class QuantizeOutputTests(unittest.TestCase):
                 (qwen3_out / "trillim_config.json").read_text(encoding="utf-8")
             )
             self.assertEqual(qwen3_payload["architecture"], "qwen3")
-            self.assertEqual(qwen3_payload["quantization"], "ternary")
+            self.assertEqual(qwen3_payload["quantization"], "q8_0")
+            self.assertEqual(_quantization_name(qwen3_config), "q8_0")
 
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -211,10 +213,9 @@ class QuantizeOutputTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "External remote-code"):
             _parse_remote_code_module_path("other--repo.module.Class")
-        self.assertEqual(_quantization_name(ArchitectureType.BONSAI), "binary")
+        self.assertEqual(_quantization_name(SimpleNamespace(arch_type=ArchitectureType.BONSAI)), "binary")
         self.assertEqual(
-            _quantization_name(ArchitectureType.BONSAI_TERNARY),
+            _quantization_name(SimpleNamespace(arch_type=ArchitectureType.BONSAI_TERNARY)),
             "grouped-ternary",
         )
-        self.assertEqual(_quantization_name(ArchitectureType.QWEN3), "ternary")
-        self.assertEqual(_quantization_name(ArchitectureType.LLAMA), "ternary")
+        self.assertEqual(_quantization_name(SimpleNamespace(arch_type=ArchitectureType.LLAMA)), "ternary")
