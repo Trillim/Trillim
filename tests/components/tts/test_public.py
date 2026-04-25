@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from trillim.components.tts import TTS, TTSSession
+from trillim.components.tts._engine import TTSEngineCrashedError
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 
 from tests.components.tts.support import make_started_tts
@@ -32,6 +33,14 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ComponentLifecycleError, "TTS is not running"):
             await tts.open_session()
 
+    async def test_start_stop_are_idempotent(self):
+        tts, engine = await self._start_tts()
+        await tts.start()
+        await tts.stop()
+        await tts.stop()
+        self.assertTrue(engine.started)
+        self.assertTrue(engine.stopped)
+
     async def test_session_collect_and_stream_use_engine_state(self):
         tts, engine = await self._start_tts()
         try:
@@ -51,6 +60,29 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(engine.synthesize_calls), 3)
             self.assertEqual(engine.synthesize_calls[0][1], "alba")
             self.assertEqual(engine.synthesize_calls[-1][1], "marius")
+        finally:
+            await tts.stop()
+
+    async def test_session_can_change_voice_after_synthesis_finishes(self):
+        tts, engine = await self._start_tts()
+        try:
+            session = await tts.open_session()
+            self.assertEqual(await session.collect("hello"), b"  hello")
+            await session.set_voice("marius")
+            self.assertEqual(session.voice, "marius")
+            self.assertEqual(await session.collect("again"), b"  again")
+            self.assertEqual(engine.synthesize_calls[-1][1], "marius")
+        finally:
+            await tts.stop()
+
+    async def test_session_propagates_synthesis_errors(self):
+        tts, engine = await self._start_tts()
+        try:
+            engine.synthesize_error = RuntimeError("engine boom")
+            session = await tts.open_session()
+            with self.assertRaisesRegex(RuntimeError, "engine boom"):
+                await session.collect("hello")
+            self.assertEqual(session.state, "idle")
         finally:
             await tts.stop()
 
@@ -136,6 +168,26 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await tts.stop()
 
+    async def test_register_voice_accepts_filesystem_paths(self):
+        tts, engine = await self._start_tts()
+        try:
+            source = Path(self._temp_dir.name) / "voice.wav"
+            source.write_bytes(b"voice")
+            self.assertEqual(await tts.register_voice("frompath", source), "frompath")
+            self.assertEqual(await tts.register_voice("fromstr", str(source)), "fromstr")
+            self.assertEqual(len(engine.voice_build_calls), 2)
+        finally:
+            await tts.stop()
+
+    async def test_register_voice_maps_client_build_errors(self):
+        tts, engine = await self._start_tts()
+        try:
+            engine.build_error = TTSEngineCrashedError("unsupported audio input")
+            with self.assertRaisesRegex(InvalidRequestError, "unsupported audio input"):
+                await tts.register_voice("custom", b"voice")
+        finally:
+            await tts.stop()
+
     async def test_register_rejects_duplicate_and_delete_rejects_invalid_names(self):
         tts, _engine = await self._start_tts()
         try:
@@ -145,6 +197,10 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
                 await tts.delete_voice("alba")
             with self.assertRaises(KeyError):
                 await tts.delete_voice("missing")
+            with self.assertRaisesRegex(InvalidRequestError, "audio must be bytes"):
+                await tts.register_voice("custom", object())
+            with self.assertRaisesRegex(InvalidRequestError, "only letters and digits"):
+                await tts.open_session(voice="bad-name")
         finally:
             await tts.stop()
 

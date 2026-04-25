@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from trillim.components.tts import TTS
+from trillim.components.tts._limits import MAX_VOICE_UPLOAD_BYTES
 from trillim.components.tts._router import _as_http_error
 from trillim.components.tts._validation import PayloadTooLargeError
 from trillim.errors import AdmissionRejectedError, InvalidRequestError, ProgressTimeoutError
@@ -47,6 +48,44 @@ class TTSRouterTests(unittest.TestCase):
             self.assertEqual(delete.status_code, 200)
             self.assertEqual(delete.json(), {"name": "custom", "status": "deleted"})
 
+    def test_voice_routes_map_invalid_requests(self):
+        with self._make_client() as client:
+            cases = (
+                ("post", "/v1/voices", b"voice", {}, 400, "name header is required"),
+                ("post", "/v1/voices", b"", {"name": "custom"}, 400, "must not be empty"),
+                (
+                    "post",
+                    "/v1/voices",
+                    b"voice",
+                    {"name": "bad-name"},
+                    400,
+                    "letters and digits",
+                ),
+                ("delete", "/v1/voices/alba", b"", {}, 400, "built in"),
+                ("delete", "/v1/voices/missing", b"", {}, 404, "missing"),
+            )
+            for method, path, body, headers, status_code, detail in cases:
+                with self.subTest(method=method, path=path):
+                    if method == "delete":
+                        response = client.delete(path, headers=headers)
+                    else:
+                        response = client.post(path, content=body, headers=headers)
+                    self.assertEqual(response.status_code, status_code)
+                    self.assertIn(detail, response.json()["detail"])
+
+    def test_voice_upload_honors_content_length_limit_before_body_read(self):
+        with self._make_client() as client:
+            response = client.post(
+                "/v1/voices",
+                content=b"x",
+                headers={
+                    "name": "custom",
+                    "content-length": str(MAX_VOICE_UPLOAD_BYTES + 1),
+                },
+            )
+
+        self.assertEqual(response.status_code, 413)
+
     def test_audio_speech_streams_sse_audio_and_done(self):
         with self._make_client() as client:
             response = client.post("/v1/audio/speech", content=b"hello")
@@ -66,8 +105,10 @@ class TTSRouterTests(unittest.TestCase):
             cases = (
                 ({}, b"", 400, "speech input must not be empty"),
                 ({"voice": "bad-name"}, b"hello", 400, "letters and digits"),
+                ({"voice": "missing"}, b"hello", 400, "unknown voice"),
                 ({"speed": "99"}, b"hello", 400, "speed"),
                 ({"content-length": "-1"}, b"hello", 400, "content-length"),
+                ({}, b"\xff", 400, "valid UTF-8"),
             )
             for headers, body, status_code, detail in cases:
                 with self.subTest(headers=headers, body=body):
