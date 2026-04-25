@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +21,6 @@ from trillim.components.tts._limits import (
 )
 from trillim.components.tts._validation import (
     PayloadTooLargeError,
-    load_safe_voice_state_bytes,
     load_safe_voice_state_safetensors,
     normalize_optional_name,
     normalize_required_name,
@@ -81,8 +80,7 @@ async def publish_custom_voice(
     root: Path,
     *,
     name: str,
-    upload: OwnedVoiceUpload,
-    build_voice_state: Callable,
+    voice_state: dict,
     existing_names: set[str],
 ) -> tuple[str, dict]:
     """Build, persist, and load one custom voice."""
@@ -97,12 +95,13 @@ async def publish_custom_voice(
             f"custom voice store already contains {MAX_CUSTOM_VOICES} voices"
         )
 
-    state = load_safe_voice_state_bytes(await build_voice_state(upload.path))
+    if not isinstance(voice_state, dict) or not voice_state:
+        raise InvalidRequestError("voice state is malformed")
     storage_id = _storage_id_for_name(normalized_name)
     final_path = _state_path(root, storage_id)
     temp_path = _create_temp_state_path(root)
     try:
-        save_voice_state_safetensors(state, temp_path)
+        save_voice_state_safetensors(voice_state, temp_path)
         loaded_state = load_safe_voice_state_safetensors(temp_path)
         size_bytes = temp_path.stat().st_size
         if size_bytes <= 0 or size_bytes > MAX_VOICE_STATE_BYTES:

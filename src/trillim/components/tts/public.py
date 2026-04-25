@@ -11,7 +11,11 @@ from pathlib import Path
 from fastapi import APIRouter
 
 from trillim.components import Component
-from trillim.components.tts._engine import TTSEngine
+from trillim.components.tts._engine import (
+    TTSEngine,
+    TTSEngineCrashedError,
+    is_voice_cloning_auth_error,
+)
 from trillim.components.tts._limits import (
     DEFAULT_SPEED,
     VOICE_STORE_ROOT,
@@ -30,11 +34,6 @@ from trillim.components.tts._voices import (
     load_custom_voice_states,
     publish_custom_voice,
     spool_voice_bytes,
-)
-from trillim.components.tts._worker import (
-    WorkerFailureError,
-    build_voice_state,
-    is_voice_cloning_auth_error,
 )
 from trillim.errors import ComponentLifecycleError, InvalidRequestError
 
@@ -55,9 +54,9 @@ class TTS(Component):
     """PocketTTS-backed text-to-speech component."""
 
     def __init__(self) -> None:
-        self._voice_state_builder = build_voice_state
         self._engine = TTSEngine()
         self._lifecycle_lock = asyncio.Lock()
+        self._synthesize_lock = asyncio.Lock()
         self._tokenizer_lock = asyncio.Lock()
         self._tokenizer = None
         self._owner_loop: AbstractEventLoop | None = None
@@ -106,7 +105,8 @@ class TTS(Component):
             self._voice_state_cache.clear()
             async with self._tokenizer_lock:
                 self._tokenizer = None
-            await self._engine.stop()
+            async with self._synthesize_lock:
+                await self._engine.stop()
 
     async def list_voices(self) -> list[str]:
         """Return the visible built-in and custom voice names."""
@@ -131,11 +131,11 @@ class TTS(Component):
         else:
             raise InvalidRequestError("audio must be bytes, str, or Path")
         try:
+            voice_state = await self._build_voice_state(owned_upload.path)
             registered_name, voice_state = await publish_custom_voice(
                 VOICE_STORE_ROOT,
                 name=normalized_name,
-                upload=owned_upload,
-                build_voice_state=self._build_voice_state,
+                voice_state=voice_state,
                 existing_names=set(self._voice_state_cache),
             )
             self._voice_state_cache[registered_name] = voice_state
@@ -200,11 +200,12 @@ class TTS(Component):
         self._require_started()
         if not isinstance(voice_state, (str, dict)):
             raise InvalidRequestError("voice state is malformed")
-        return await self._engine.synthesize_segment(
-            text,
-            voice_state=voice_state,
-            speed=speed,
-        )
+        async with self._synthesize_lock:
+            return await self._engine.synthesize_segment(
+                text,
+                voice_state=voice_state,
+                speed=speed,
+            )
 
     async def _get_tokenizer(self):
         self._require_owner_loop()
@@ -223,10 +224,11 @@ class TTS(Component):
             return cached
         raise InvalidRequestError(f"unknown voice: {normalized}")
 
-    async def _build_voice_state(self, audio_path: Path) -> bytes:
+    async def _build_voice_state(self, audio_path: Path) -> dict:
         try:
-            return await self._voice_state_builder(audio_path)
-        except WorkerFailureError as exc:
+            async with self._synthesize_lock:
+                return await self._engine.build_voice_state(audio_path)
+        except TTSEngineCrashedError as exc:
             message = str(exc)
             if _is_client_voice_build_error(message):
                 raise InvalidRequestError(message) from exc

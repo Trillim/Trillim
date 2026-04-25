@@ -14,6 +14,7 @@ from trillim.components.tts._limits import (
     MAX_VOICE_STATE_BYTES,
     PROGRESS_TIMEOUT_SECONDS,
     TARGET_TTS_TOKENS,
+    VOICE_STATE_BUILD_TIMEOUT_SECONDS,
     WORKER_KILL_AFTER_SECONDS,
 )
 from trillim.components.tts._validation import (
@@ -38,6 +39,7 @@ class TTSEngineCatastrophicError(TTSEngineError, ComponentLifecycleError):
     """Raised when the engine cannot be recovered."""
 
 
+_VOICE_CLONE_AUTH_ERROR = """ValueError: We could not download the weights for the model with voice cloning, but you're trying to use voice cloning. Without voice cloning, you can use our catalog of voices ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma']. If you want access to the model with voice cloning, go to https://huggingface.co/kyutai/pocket-tts and accept the terms, then make sure you're logged in locally with `uvx hf auth login`""".lower()
 _REQUEST_HEADER = struct.Struct(">I")
 _RESPONSE_HEADER = struct.Struct(">cI")
 # Custom voice states are base64 encoded inside JSON, so the frame limit must allow
@@ -121,6 +123,66 @@ class TTSEngine:
             raise TTSEngineCrashedError(
                 payload.decode("utf-8", errors="replace")
                 or "TTS engine failed during synthesis"
+            )
+
+        await self.recover()
+        raise TTSEngineCrashedError(
+            "TTS engine returned malformed output and was recovered"
+        )
+
+    async def build_voice_state(self, audio_path: str | Path) -> dict:
+        """Build one custom voice state through the Pocket TTS subprocess."""
+        source_path = str(audio_path)
+        if not source_path:
+            raise InvalidRequestError("path is required")
+        request = json.dumps(
+            {
+                "command": "voice_state",
+                "audio_path": source_path,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        process = self._process
+        if process is None or process.returncode is not None:
+            raise ComponentLifecycleError("TTS engine is not running")
+
+        stdin = process.stdin
+        stdout = process.stdout
+        if stdin is None or stdout is None:
+            await self._stop_engine()
+            raise TTSEngineCatastrophicError("TTS engine pipes are unavailable")
+
+        try:
+            stdin.write(_REQUEST_HEADER.pack(len(request)))
+            stdin.write(request)
+            await asyncio.wait_for(stdin.drain(), timeout=WORKER_KILL_AFTER_SECONDS)
+            kind, payload = await asyncio.wait_for(
+                _read_response(stdout),
+                timeout=VOICE_STATE_BUILD_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            await self.recover()
+            raise
+        except TimeoutError as exc:
+            await self.recover()
+            raise ProgressTimeoutError(
+                "TTS voice-state build timed out after "
+                f"{VOICE_STATE_BUILD_TIMEOUT_SECONDS} seconds"
+            ) from exc
+        except Exception as exc:
+            await self.recover()
+            raise TTSEngineCrashedError(
+                "TTS engine crashed during voice-state build and was recovered"
+            ) from exc
+
+        if kind == b"V":
+            return load_safe_voice_state_safetensors_bytes(payload)
+        if kind == b"E":
+            await self.recover()
+            raise TTSEngineCrashedError(
+                payload.decode("utf-8", errors="replace")
+                or "TTS engine failed during voice-state build"
             )
 
         await self.recover()
@@ -224,6 +286,8 @@ async def _read_response(stream: asyncio.StreamReader) -> tuple[bytes, bytes]:
     kind, size = _RESPONSE_HEADER.unpack(header)
     if size > MAX_PCM_CHUNK_BYTES and kind == b"A":
         raise TTSEngineCrashedError("TTS engine produced oversized audio output")
+    if size > MAX_VOICE_STATE_BYTES and kind == b"V":
+        raise TTSEngineCrashedError("TTS engine produced oversized voice-state output")
     if size > _MAX_REQUEST_BYTES and kind != b"A":
         raise TTSEngineCrashedError("TTS engine produced oversized control output")
     return kind, await stream.readexactly(size)
@@ -260,12 +324,19 @@ def _worker_main() -> int:
             if len(payload) != size:
                 raise RuntimeError("TTS engine received malformed stdin input")
             request = json.loads(payload)
-            if request.get("command") == "stop":
+            command = request.get("command")
+            if command == "stop":
                 return 0
-            if request.get("command") != "synthesize":
+            if command == "synthesize":
+                pcm = _synthesize_worker_request(model, request)
+                _write_response(b"A", pcm)
+                continue
+            if command == "voice_state":
+                state_bytes = _build_worker_voice_state(model, request)
+                _write_response(b"V", state_bytes)
+                continue
+            else:
                 raise RuntimeError("TTS engine received unknown command")
-            pcm = _synthesize_worker_request(model, request)
-            _write_response(b"A", pcm)
         except Exception as exc:
             _write_response(b"E", _error_payload(exc))
 
@@ -296,6 +367,16 @@ def _load_request_voice_state(model, voice_state: dict):
     raise RuntimeError("TTS engine received malformed voice_state")
 
 
+def _build_worker_voice_state(model, request: object) -> bytes:
+    if not isinstance(request, dict):
+        raise RuntimeError("TTS engine received malformed request")
+    audio_path = request.get("audio_path")
+    if not isinstance(audio_path, str) or not audio_path:
+        raise RuntimeError("TTS engine received malformed request")
+    state = model.get_state_for_audio_prompt(Path(audio_path))
+    return dump_voice_state_safetensors_bytes(state)
+
+
 def _audio_tensor_to_pcm_bytes(audio) -> bytes:
     import torch
 
@@ -306,6 +387,11 @@ def _audio_tensor_to_pcm_bytes(audio) -> bytes:
 
 def _error_payload(exc: Exception) -> bytes:
     return (str(exc) or type(exc).__name__).encode("utf-8", errors="replace")
+
+
+def is_voice_cloning_auth_error(message: str) -> bool:
+    """Return whether one engine error is the explicit HF auth/terms failure."""
+    return _VOICE_CLONE_AUTH_ERROR in message.lower()
 
 
 if __name__ == "__main__":
