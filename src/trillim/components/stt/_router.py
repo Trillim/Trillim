@@ -10,7 +10,7 @@ from trillim.components.stt._limits import (
     UPLOAD_PROGRESS_TIMEOUT_SECONDS,
 )
 from trillim.components.stt._validation import PayloadTooLargeError, validate_http_request
-from trillim.errors import InvalidRequestError, ProgressTimeoutError
+from trillim.errors import ComponentLifecycleError, InvalidRequestError, ProgressTimeoutError
 
 
 def build_router(stt) -> APIRouter:
@@ -75,4 +75,6 @@ def _as_http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, ProgressTimeoutError):
         return HTTPException(status_code=504, detail=str(exc))
+    if isinstance(exc, ComponentLifecycleError):
+        return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=503, detail=str(exc))

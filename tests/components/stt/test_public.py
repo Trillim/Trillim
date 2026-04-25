@@ -138,11 +138,12 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await stt.stop()
 
-    async def test_session_created_before_stop_returns_empty_text_after_stop(self):
+    async def test_session_created_before_stop_raises_after_stop(self):
         stt = await self._start_stt()
         session = stt.open_session()
         await stt.stop()
-        self.assertEqual(await session.transcribe(self.fixture_bytes), "")
+        with self.assertRaisesRegex(ComponentLifecycleError, "component has been stopped"):
+            await session.transcribe(self.fixture_bytes)
         self.assertEqual(session.state, "done")
 
     async def test_truncated_wav_is_rejected(self):

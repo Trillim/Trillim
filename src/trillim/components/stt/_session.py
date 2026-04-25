@@ -12,7 +12,7 @@ from trillim.components.stt._limits import (
     PCM_SAMPLE_RATE,
     PCM_WIDTH_BYTES,
 )
-from trillim.errors import InvalidRequestError, SessionBusyError
+from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 
 if TYPE_CHECKING:
     from trillim.components.stt.public import STT
@@ -112,10 +112,10 @@ class _STTSession(STTSession):
         self._state = _STTSessionFSM.TRANSCRIBING
         try:
             if self._stopped():
-                return ""
+                raise ComponentLifecycleError("STT component has been stopped")
             pcm = self._normalize_audio(audio)
             if self._stopped():
-                return ""
+                raise ComponentLifecycleError("STT component has been stopped")
             return await self._stt._transcribe(pcm, language=language)
         finally:
             self._state = _STTSessionFSM.DONE

@@ -50,10 +50,10 @@ class STT(Component):
     async def _transcribe(self, pcm: bytes, *, language: str | None = None) -> str:
         self._require_owner_loop()
         if not self._started or self._stop_event.is_set():
-            return ""
+            raise ComponentLifecycleError("STT component has been stopped")
         async with self._transcribe_lock:
             if not self._started or self._stop_event.is_set():
-                return ""
+                raise ComponentLifecycleError("STT component has been stopped")
             return await self._engine.transcribe(pcm, language=language)
 
     def _require_owner_loop(self) -> None:
