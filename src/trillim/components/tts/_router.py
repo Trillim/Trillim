@@ -9,7 +9,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from trillim.components.tts._limits import (
+    DEFAULT_SPEED,
     MAX_HTTP_TEXT_BYTES,
+    MAX_VOICE_UPLOAD_BYTES,
     PROGRESS_TIMEOUT_SECONDS,
     TOTAL_UPLOAD_TIMEOUT_SECONDS,
 )
@@ -37,11 +39,12 @@ def build_router(tts) -> APIRouter:
     @router.post("/v1/voices")
     async def create_voice(request: Request):
         try:
-            request.state.trillim_tts_voice_request = validate_http_voice_upload_request(
+            metadata = validate_http_voice_upload_request(
                 content_length=request.headers.get("content-length"),
                 name=request.headers.get("name"),
             )
-            name = await tts._register_voice_http_request(request)
+            body = await _read_bounded_body(request, MAX_VOICE_UPLOAD_BYTES)
+            name = await tts.register_voice(metadata.name, body)
         except Exception as exc:
             raise _as_http_error(exc) from exc
         return {"name": name, "status": "created"}
@@ -56,31 +59,23 @@ def build_router(tts) -> APIRouter:
 
     @router.post("/v1/audio/speech")
     async def audio_speech(request: Request):
-        reservation = None
         try:
             speech_request = validate_http_speech_request(
                 content_length=request.headers.get("content-length"),
                 voice=request.headers.get("voice"),
                 speed=request.headers.get("speed"),
-                default_speed=tts.speed,
+                default_speed=DEFAULT_SPEED,
             )
-            reservation = await tts._reserve_session_slot()
             body = await _read_bounded_body(request, MAX_HTTP_TEXT_BYTES)
             text = validate_http_speech_body(body)
-            session = await tts._start_reserved_session(
-                reservation,
-                text,
-                voice=tts.default_voice if speech_request.voice is None else speech_request.voice,
+            session = await tts.open_session(
+                voice=speech_request.voice,
                 speed=speech_request.speed,
             )
-            reservation = None
         except Exception as exc:
             raise _as_http_error(exc) from exc
-        finally:
-            if reservation is not None:
-                await tts._release_reserved_slot(reservation)
         return StreamingResponse(
-            _stream_speech_session(session),
+            _stream_speech_session(session, text),
             media_type="text/event-stream",
         )
 
@@ -116,10 +111,10 @@ async def _read_bounded_body(request: Request, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _stream_speech_session(session):
+async def _stream_speech_session(session, text: str):
     try:
         async with session:
-            async for chunk in session.synthesize(session._reserved_text):
+            async for chunk in session.synthesize(text):
                 yield _sse("audio", base64.b64encode(chunk).decode("ascii"))
         yield _sse("done", "")
     except Exception as exc:
