@@ -27,6 +27,7 @@ from trillim.errors import AdmissionRejectedError, InvalidRequestError, Progress
 def build_router(tts) -> APIRouter:
     """Build the TTS HTTP router."""
     router = APIRouter()
+    speech_lock = asyncio.Lock()
 
     @router.get("/v1/voices")
     async def list_voices():
@@ -59,6 +60,7 @@ def build_router(tts) -> APIRouter:
 
     @router.post("/v1/audio/speech")
     async def audio_speech(request: Request):
+        slot_acquired = False
         try:
             speech_request = validate_http_speech_request(
                 content_length=request.headers.get("content-length"),
@@ -66,6 +68,10 @@ def build_router(tts) -> APIRouter:
                 speed=request.headers.get("speed"),
                 default_speed=DEFAULT_SPEED,
             )
+            if speech_lock.locked():
+                raise AdmissionRejectedError("TTS is busy; only one live session is allowed")
+            await speech_lock.acquire()
+            slot_acquired = True
             body = await _read_bounded_body(request, MAX_HTTP_TEXT_BYTES)
             text = validate_http_speech_body(body)
             session = await tts.open_session(
@@ -73,9 +79,11 @@ def build_router(tts) -> APIRouter:
                 speed=speech_request.speed,
             )
         except Exception as exc:
+            if slot_acquired:
+                speech_lock.release()
             raise _as_http_error(exc) from exc
         return StreamingResponse(
-            _stream_speech_session(session, text),
+            _stream_speech_session(session, text, speech_lock),
             media_type="text/event-stream",
         )
 
@@ -111,14 +119,16 @@ async def _read_bounded_body(request: Request, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _stream_speech_session(session, text: str):
+async def _stream_speech_session(session, text: str, speech_lock: asyncio.Lock):
     try:
-        async with session:
-            async for chunk in session.synthesize(text):
-                yield _sse("audio", base64.b64encode(chunk).decode("ascii"))
+        async for chunk in session.synthesize(text):
+            yield _sse("audio", base64.b64encode(chunk).decode("ascii"))
         yield _sse("done", "")
     except Exception as exc:
         yield _sse("error", str(exc).replace("\n", " "))
+    finally:
+        await session.close()
+        speech_lock.release()
 
 
 def _sse(event: str, data: str) -> str:
