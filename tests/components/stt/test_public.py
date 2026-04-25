@@ -10,6 +10,7 @@ import numpy as np
 
 from trillim.components.stt import STT, STTSession
 from trillim.components.stt._engine import STTEngine
+from trillim.components.stt._session import _STTSession
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 from trillim.runtime import Runtime
 
@@ -73,13 +74,29 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ComponentLifecycleError, "STT is not running"):
             stt.open_session()
 
-    async def test_transcribe_bytes_and_file_return_expected_text(self):
+    async def test_start_and_stop_are_idempotent(self):
+        stt = STT()
+        await stt.start()
+        try:
+            await stt.start()
+        finally:
+            await stt.stop()
+        await stt.stop()
+
+    async def test_direct_async_use_is_bound_to_one_event_loop(self):
+        stt = STT()
+        await stt.start()
+        try:
+            with self.assertRaisesRegex(ComponentLifecycleError, "one event loop"):
+                await asyncio.to_thread(asyncio.run, stt.start())
+        finally:
+            await stt.stop()
+
+    async def test_session_transcribe_returns_expected_text(self):
         stt = await self._start_stt()
         try:
-            bytes_text = await stt.transcribe_bytes(self.fixture_bytes)
-            file_text = await stt.transcribe_file(str(self.fixture_path))
-            self.assertEqual(bytes_text, file_text)
-            self._assert_expected_transcript(bytes_text)
+            text = await stt.open_session().transcribe(self.fixture_bytes)
+            self._assert_expected_transcript(text)
         finally:
             await stt.stop()
 
@@ -110,9 +127,11 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
     async def test_sdk_concurrent_transcriptions_each_return_expected_text(self):
         stt = await self._start_stt()
         try:
+            first_session = stt.open_session()
+            second_session = stt.open_session()
             results = await asyncio.gather(
-                stt.transcribe_bytes(self.fixture_bytes),
-                stt.transcribe_file(self.fixture_path),
+                first_session.transcribe(self.fixture_bytes),
+                second_session.transcribe(self.fixture_path.read_bytes()),
             )
             self.assertEqual(results[0], results[1])
             self._assert_expected_transcript(results[0])
@@ -130,40 +149,40 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         stt = await self._start_stt()
         try:
             with self.assertRaisesRegex(InvalidRequestError, "invalid WAV audio"):
-                await stt.transcribe_bytes(self.fixture_bytes[:64])
+                await stt.open_session().transcribe(self.fixture_bytes[:64])
         finally:
             await stt.stop()
 
     async def test_8bit_wav_is_accepted(self):
         stt = await self._start_stt()
         try:
-            text = await stt.transcribe_bytes(self._make_8bit_wav())
+            text = await stt.open_session().transcribe(self._make_8bit_wav())
             self.assertIsInstance(text, str)
             self.assertIn("torpedo", text.lower())
         finally:
             await stt.stop()
 
-    async def test_transcribe_bytes_rejects_invalid_sdk_inputs(self):
+    async def test_session_transcribe_rejects_invalid_sdk_inputs(self):
         stt = await self._start_stt()
         try:
             with self.assertRaisesRegex(InvalidRequestError, "audio must be bytes"):
-                await stt.transcribe_bytes("bad")  # type: ignore[arg-type]
+                await stt.open_session().transcribe("bad")  # type: ignore[arg-type]
             with self.assertRaisesRegex(InvalidRequestError, "audio must not be empty"):
-                await stt.transcribe_bytes(b"")
+                await stt.open_session().transcribe(b"")
             with self.assertRaisesRegex(InvalidRequestError, "whole 16-bit samples"):
-                await stt.transcribe_bytes(b"\x00")
+                await stt.open_session().transcribe(b"\x00")
             with self.assertRaisesRegex(InvalidRequestError, "audio must not be empty"):
-                await stt.transcribe_bytes(self._make_empty_wav())
+                await stt.open_session().transcribe(self._make_empty_wav())
             with self.assertRaisesRegex(InvalidRequestError, "unsupported WAV sample width"):
-                await stt.transcribe_bytes(self._make_24bit_wav())
+                await stt.open_session().transcribe(self._make_24bit_wav())
         finally:
             await stt.stop()
 
-    async def test_transcribe_bytes_accepts_bytearray_and_memoryview(self):
+    async def test_session_transcribe_accepts_bytearray_and_memoryview(self):
         stt = await self._start_stt()
         try:
-            bytearray_text = await stt.transcribe_bytes(bytearray(self.fixture_bytes))
-            memoryview_text = await stt.transcribe_bytes(memoryview(self.fixture_bytes))
+            bytearray_text = await stt.open_session().transcribe(bytearray(self.fixture_bytes))
+            memoryview_text = await stt.open_session().transcribe(memoryview(self.fixture_bytes))
             self.assertEqual(bytearray_text, memoryview_text)
             self._assert_expected_transcript(bytearray_text)
         finally:
@@ -184,12 +203,11 @@ class RuntimeSTTTests(unittest.TestCase):
 
     def test_runtime_syncify_supports_component_and_session_usage(self):
         with Runtime(STT()) as runtime:
-            file_text = runtime.stt.transcribe_file(self.fixture_path)
-            self.assertIsInstance(file_text, str)
-            self.assertGreater(len(file_text), 100)
             with runtime.stt.open_session() as session:
                 self.assertEqual(session.state, "idle")
-                self.assertEqual(session.transcribe(self.fixture_bytes), file_text)
+                text = session.transcribe(self.fixture_bytes)
+                self.assertIsInstance(text, str)
+                self.assertGreater(len(text), 100)
                 self.assertEqual(session.state, "done")
 
 
@@ -197,6 +215,17 @@ class SessionAndEngineContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_stt_session_cannot_be_constructed_directly(self):
         with self.assertRaises(TypeError):
             STTSession()
+
+    async def test_stt_session_cannot_be_subclassed_publicly(self):
+        with self.assertRaisesRegex(TypeError, "cannot be subclassed"):
+
+            class CustomSession(STTSession):
+                pass
+
+    async def test_private_stt_session_requires_owner_token(self):
+        stt = STT()
+        with self.assertRaisesRegex(TypeError, "open_session"):
+            _STTSession(stt)
 
     async def test_engine_public_lifecycle_contract(self):
         engine = STTEngine()
