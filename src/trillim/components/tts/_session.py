@@ -9,7 +9,6 @@ import random
 from collections import deque
 from collections.abc import AsyncIterator
 from enum import Enum
-from pathlib import Path
 
 from trillim.components.tts._limits import (
     BOUNDARY_PAUSE_JITTER_MAX,
@@ -26,7 +25,6 @@ from trillim.components.tts._limits import (
 from trillim.components.tts._segmenter import iter_text_segments
 from trillim.components.tts._validation import validate_speed, validate_text
 from trillim.errors import SessionBusyError
-from trillim.utils.filesystem import unlink_if_exists
 
 
 _TTS_SESSION_OWNER_TOKEN = object()
@@ -169,7 +167,6 @@ class _TTSSession(TTSSession):
         self._done_event.set()
         self._task: asyncio.Task | None = None
         self._error: Exception | None = None
-        self._cleanup_path: Path | None = None
         self._stream_active = False
 
     @property
@@ -205,7 +202,7 @@ class _TTSSession(TTSSession):
 
     async def set_voice(self, voice: str) -> None:
         self._raise_if_busy("voice")
-        self._voice = await self._tts._normalize_voice_name(voice)
+        self._voice, _voice_state = await self._tts._configure_voice(voice)
 
     async def set_speed(self, speed: float) -> None:
         self._speed = validate_speed(speed)
@@ -231,8 +228,7 @@ class _TTSSession(TTSSession):
         self._resume_event.set()
         self._state = _TTSSessionFSM.RUNNING
         voice = self._voice
-        voice_state, cleanup_path = await self._tts._resolve_voice_state(voice)
-        self._cleanup_path = cleanup_path
+        self._voice, voice_state = await self._tts._configure_voice(voice)
         self._task = asyncio.create_task(
             self._produce(text, voice_state=voice_state)
         )
@@ -304,15 +300,12 @@ class _TTSSession(TTSSession):
         *,
         clear_queue: bool = False,
     ) -> None:
-        if clear_queue:
-            self._clear_queue()
         self._state = state
         self._error = error
         self._resume_event.set()
+        if clear_queue:
+            self._clear_queue()
         self._done_event.set()
-        if self._cleanup_path is not None:
-            unlink_if_exists(self._cleanup_path)
-            self._cleanup_path = None
 
     def _clear_queue(self) -> None:
         while not self._audio_queue.empty():

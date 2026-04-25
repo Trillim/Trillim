@@ -173,22 +173,21 @@ class TTS(Component):
             else normalize_optional_name(voice, field_name="voice")
         )
         assert resolved_voice is not None
-        await self._load_voice_state(resolved_voice)
+        resolved_voice, _voice_state = await self._configure_voice(resolved_voice)
         return _create_tts_session(
             self,
             voice=resolved_voice,
             speed=DEFAULT_SPEED if speed is None else validate_speed(speed),
         )
 
-    async def _normalize_voice_name(self, voice: str) -> str:
+    async def _configure_voice(self, voice: str) -> tuple[str, str | dict]:
         self._require_owner_loop()
+        self._require_started()
         normalized = normalize_required_name(voice, field_name="voice")
-        await self._load_voice_state(normalized)
-        return normalized
-
-    async def _resolve_voice_state(self, voice: str) -> tuple[str | dict, None]:
-        self._require_owner_loop()
-        return await self._load_voice_state(voice), None
+        cached = self._voice_state_cache.get(normalized)
+        if cached is None:
+            raise InvalidRequestError(f"unknown voice: {normalized}")
+        return normalized, cached
 
     async def _synthesize_segment(
         self,
@@ -200,6 +199,7 @@ class TTS(Component):
         if not isinstance(voice_state, (str, dict)):
             raise InvalidRequestError("voice state is malformed")
         async with self._synthesize_lock:
+            self._require_started()
             return await self._engine.synthesize_segment(
                 text,
                 voice_state=voice_state,
@@ -213,18 +213,10 @@ class TTS(Component):
                 self._tokenizer = load_pocket_tts_tokenizer()
             return self._tokenizer
 
-    async def _load_voice_state(self, voice: str) -> str | dict:
-        self._require_owner_loop()
-        self._require_started()
-        normalized = normalize_required_name(voice, field_name="voice")
-        cached = self._voice_state_cache.get(normalized)
-        if cached is not None:
-            return cached
-        raise InvalidRequestError(f"unknown voice: {normalized}")
-
     async def _build_voice_state(self, audio_path: Path) -> dict:
         try:
             async with self._synthesize_lock:
+                self._require_started()
                 return await self._engine.build_voice_state(audio_path)
         except TTSEngineCrashedError as exc:
             message = str(exc)
