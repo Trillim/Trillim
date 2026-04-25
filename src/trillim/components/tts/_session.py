@@ -224,15 +224,16 @@ class _TTSSession(TTSSession):
         self._stream_active = True
         self._clear_queue()
         self._error = None
+        self._task = None
         self._done_event.clear()
         self._resume_event.set()
         self._state = _TTSSessionFSM.RUNNING
-        voice = self._voice
-        self._voice, voice_state = await self._tts._configure_voice(voice)
-        self._task = asyncio.create_task(
-            self._produce(text, voice_state=voice_state)
-        )
         try:
+            voice = self._voice
+            self._voice, voice_state = await self._tts._configure_voice(voice)
+            self._task = asyncio.create_task(
+                self._produce(text, voice_state=voice_state)
+            )
             while True:
                 if self._stopped():
                     await self.close()
@@ -251,6 +252,8 @@ class _TTSSession(TTSSession):
             if self._error is not None:
                 raise self._error
         finally:
+            if self._task is None and not self._done_event.is_set():
+                await self._finish(_TTSSessionFSM.IDLE, None, clear_queue=True)
             self._stream_active = False
 
     async def _produce(self, text: str, *, voice_state: object) -> None:
