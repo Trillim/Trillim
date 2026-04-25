@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import errno
 import os
 import re
@@ -166,25 +165,6 @@ def validate_voice_state_bytes(state_bytes: bytes) -> bytes:
             f"voice state exceeds the {MAX_VOICE_STATE_BYTES} byte limit"
         )
     return state_bytes
-
-
-def load_safe_voice_state_bytes(state_bytes: bytes):
-    """Safely deserialize one bounded custom-voice state payload."""
-    import torch
-
-    payload = validate_voice_state_bytes(state_bytes)
-    try:
-        state = torch.load(
-            io.BytesIO(payload),
-            map_location="cpu",
-            weights_only=True,
-        )
-    except Exception as exc:
-        raise InvalidRequestError("voice state is malformed") from exc
-    if not isinstance(state, dict) or not state:
-        raise InvalidRequestError("voice state is malformed")
-    _validate_loaded_voice_state_value(state, torch)
-    return state
 
 
 def load_safe_voice_state_safetensors(path: str | Path):

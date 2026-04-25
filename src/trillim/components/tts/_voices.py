@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +17,8 @@ from trillim.components.tts._limits import (
     MAX_VOICE_STATE_BYTES,
     MAX_VOICE_UPLOAD_BYTES,
     VOICE_MANIFEST_NAME,
+    VOICE_STATE_SUFFIX,
+    LEGACY_VOICE_STATE_SUFFIX,
 )
 from trillim.components.tts._validation import (
     PayloadTooLargeError,
@@ -34,8 +35,6 @@ from trillim.utils.filesystem import atomic_write_bytes, unlink_if_exists
 
 
 logger = logging.getLogger(__name__)
-VOICE_STATE_SUFFIX = ".safetensors"
-LEGACY_VOICE_STATE_SUFFIX = ".state"
 
 
 class VoiceStoreTamperedError(RuntimeError):
@@ -362,33 +361,6 @@ def _raise_if_symlink_for_write(path: Path) -> None:
 
 def _warn_skip(voice_name: str, reason: str) -> None:
     logger.warning("Skipping custom TTS voice %r: %s", voice_name, reason)
-
-
-async def spool_request_voice_stream(
-    chunks: AsyncIterator[bytes],
-    *,
-    spool_dir: Path,
-) -> OwnedVoiceUpload:
-    """Copy one async voice-upload stream into Trillim-owned temp storage."""
-    fd, temp_path = _create_owned_temp_file(spool_dir)
-    total = 0
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            async for chunk in chunks:
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_VOICE_UPLOAD_BYTES:
-                    raise PayloadTooLargeError(
-                        f"voice upload exceeds the {MAX_VOICE_UPLOAD_BYTES} byte limit"
-                    )
-                handle.write(chunk)
-        if total <= 0:
-            raise InvalidRequestError("audio must not be empty")
-        return OwnedVoiceUpload(path=temp_path, size_bytes=total)
-    except BaseException:
-        unlink_if_exists(temp_path)
-        raise
 
 
 async def spool_voice_bytes(
