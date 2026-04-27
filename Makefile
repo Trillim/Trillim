@@ -25,11 +25,11 @@ help: # @help Show available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?# @help ' $(MAKEFILE_LIST) | \
 	awk 'BEGIN {FS = ":.*?# @help "}; {printf "  %-18s %s\n", $$1, $$2}'
 
-bundle: # @help Copy local-platform bundled executables from sibling repos into src/trillim/_bin
+bundle: # @help Copy local-platform bundled executables from sister worktrees into src/trillim/_bin
 ifeq ($(LOCAL_PLATFORM),)
 	@echo "Unsupported local platform: $(UNAME_S) $(UNAME_M)" >&2; exit 1
 else
-	uv run python -c "from scripts import build_wheels; build_wheels.clean_bin_dir(); build_wheels.copy_binaries('$(LOCAL_PLATFORM)')"
+	uv run python -c "from scripts import build_wheels; build_wheels.copy_local_binaries('$(LOCAL_PLATFORM)')"
 endif
 
 sync-test-env:

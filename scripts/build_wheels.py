@@ -7,7 +7,7 @@ platforms. Only Trillim developers building distribution wheels should run this.
 
 For each platform:
 1. Cleans src/trillim/_bin/
-2. Copies the correct binaries from the sibling DarkNet and DarkQuant repos
+2. Copies the correct binaries from the DarkNet and DarkQuant worktrees
 3. Builds a wheel with `uv build --wheel`
 4. Retags the wheel with the correct platform tag
 5. Moves the tagged wheel to dist/
@@ -15,11 +15,15 @@ For each platform:
 Usage:
     uv run scripts/build_wheels.py                 # Build all 6 platforms
     uv run scripts/build_wheels.py linux-x86_64    # Build one platform
+
+Set TRILLIM_DARKNET_ROOT or TRILLIM_DARKQUANT_ROOT to override worktree
+autodiscovery.
 """
 from __future__ import annotations
 
 import argparse
 from copy import copy
+import os
 import shutil
 import subprocess
 import sys
@@ -27,18 +31,21 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DARKNET = ROOT.parent / "DarkNet"
-DARKQUANT = ROOT.parent / "DarkQuant"
 BIN_DIR = ROOT / "src" / "trillim" / "_bin"
 DIST_DIR = ROOT / "dist"
+DARKNET_ENV = "TRILLIM_DARKNET_ROOT"
+DARKQUANT_ENV = "TRILLIM_DARKQUANT_ROOT"
+PRESERVED_BIN_FILES = {".gitignore"}
 
 BINARY_SOURCES = {
     "trillim-inference": {
-        "repo": DARKNET,
+        "repo_name": "DarkNet",
+        "env_var": DARKNET_ENV,
         "source_name": "trillim-inference",
     },
     "trillim-quantize": {
-        "repo": DARKQUANT,
+        "repo_name": "DarkQuant",
+        "env_var": DARKQUANT_ENV,
         "source_name": "trillim-quantize",
     },
 }
@@ -72,25 +79,161 @@ PLATFORMS: dict[str, dict] = {
 
 
 def clean_bin_dir() -> None:
-    if BIN_DIR.exists():
-        shutil.rmtree(BIN_DIR)
-    BIN_DIR.mkdir(parents=True)
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    for child in BIN_DIR.iterdir():
+        if child.name in PRESERVED_BIN_FILES:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
-def copy_binaries(platform: str) -> None:
+def _normalize_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        normalized = _normalize_path(path)
+        if normalized not in seen:
+            unique.append(normalized)
+            seen.add(normalized)
+    return unique
+
+
+def _git_common_dir(root: Path) -> Path | None:
+    git_path = root / ".git"
+    if git_path.is_dir():
+        return _normalize_path(git_path)
+    if not git_path.is_file():
+        return None
+
+    try:
+        text = git_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = "gitdir:"
+    if not first_line.startswith(prefix):
+        return None
+
+    git_dir = Path(first_line.removeprefix(prefix).strip()).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = root / git_dir
+    git_dir = _normalize_path(git_dir)
+    if git_dir.parent.name == "worktrees":
+        return git_dir.parent.parent
+    return git_dir
+
+
+def _mirrored_worktree_candidate(root: Path, repo_name: str) -> Path | None:
+    common_dir = _git_common_dir(root)
+    if common_dir is None or common_dir.name == ".git" or not common_dir.name.endswith(".git"):
+        return None
+
+    repo_container = common_dir.with_name(common_dir.name.removesuffix(".git"))
+    try:
+        worktree_relative = _normalize_path(root).relative_to(_normalize_path(repo_container))
+    except ValueError:
+        return None
+    if not worktree_relative.parts:
+        return None
+    return common_dir.parent / repo_name / worktree_relative
+
+
+def _repo_root_candidates(repo_name: str, env_var: str, *, root: Path | None = None) -> list[Path]:
+    project_root = root or ROOT
+    override = os.environ.get(env_var)
+    if override:
+        return [_normalize_path(Path(override))]
+
+    candidates: list[Path] = []
+    mirrored = _mirrored_worktree_candidate(project_root, repo_name)
+    if mirrored is not None:
+        candidates.append(mirrored)
+    candidates.append(project_root.parent / repo_name)
+    return _unique_paths(candidates)
+
+
+def _resolve_repo_root(repo_name: str, env_var: str, *, root: Path | None = None) -> Path:
+    candidates = _repo_root_candidates(repo_name, env_var, root=root)
+    for candidate in candidates:
+        if (candidate / "executables").is_dir():
+            return candidate
+
+    tried = "\n".join(f"    - {candidate}" for candidate in candidates)
+    raise RuntimeError(
+        f"could not find {repo_name} executables. Set {env_var} to the {repo_name} "
+        f"worktree root or use a mirrored worktree layout. Tried:\n{tried}"
+    )
+
+
+def _binary_candidates(
+    repo: Path,
+    platform: str,
+    source_name: str,
+    suffix: str,
+    *,
+    allow_flat: bool,
+) -> list[Path]:
+    filename = source_name + suffix
+    candidates = [repo / "executables" / platform / filename]
+    if allow_flat:
+        candidates.append(repo / "executables" / filename)
+    return candidates
+
+
+def _resolve_binary(
+    repo: Path,
+    platform: str,
+    source_name: str,
+    suffix: str,
+    *,
+    allow_flat: bool,
+) -> Path:
+    candidates = _binary_candidates(
+        repo,
+        platform,
+        source_name,
+        suffix,
+        allow_flat=allow_flat,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    tried = "\n".join(f"    - {candidate}" for candidate in candidates)
+    print(f"  ERROR: {source_name} not found. Tried:\n{tried}", file=sys.stderr)
+    sys.exit(1)
+
+
+def copy_binaries(platform: str, *, allow_flat: bool = False) -> None:
     info = PLATFORMS[platform]
     suffix: str = info["exe_suffix"]
 
     for name, binary_info in BINARY_SOURCES.items():
-        repo: Path = binary_info["repo"]
-        src_name: str = binary_info["source_name"]
-        src_dir = repo / "executables" / platform
-
-        src = src_dir / (src_name + suffix)
-        dst = BIN_DIR / (name + suffix)
-        if not src.exists():
-            print(f"  ERROR: {src} not found", file=sys.stderr)
+        try:
+            repo = _resolve_repo_root(
+                binary_info["repo_name"],
+                binary_info["env_var"],
+            )
+        except RuntimeError as exc:
+            print(f"  ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
+
+        src_name: str = binary_info["source_name"]
+        src = _resolve_binary(
+            repo,
+            platform,
+            src_name,
+            suffix,
+            allow_flat=allow_flat,
+        )
+        dst = BIN_DIR / (name + suffix)
         shutil.copy2(src, dst)
         dst.chmod(0o755)
 
@@ -100,6 +243,11 @@ def copy_binaries(platform: str) -> None:
         gitkeep.unlink()
 
     print(f"  Copied binaries for {platform}")
+
+
+def copy_local_binaries(platform: str) -> None:
+    clean_bin_dir()
+    copy_binaries(platform, allow_flat=True)
 
 
 def build_wheel() -> Path:
@@ -200,5 +348,5 @@ def main() -> None:
         print(f"  {w.name}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
