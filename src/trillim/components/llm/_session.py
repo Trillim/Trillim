@@ -468,7 +468,7 @@ class _ChatSession(ChatSession):
             if message["role"] == "search":
                 rendered.append(
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": f"Search results:\n{message['content']}",
                     }
                 )

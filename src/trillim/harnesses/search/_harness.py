@@ -7,7 +7,9 @@ from typing import Any
 
 from trillim.components.llm._events import ChatEvent, ChatFinalTextEvent, ChatTokenEvent
 from trillim.components.llm._incremental_decode import IncrementalDecoder
+from trillim.components.llm._limits import SESSION_TOKEN_LIMIT
 from trillim.components.llm._session import _ChatSession
+from trillim.errors import ContextOverflowError, SessionExhaustedError
 from trillim.harnesses._base import _Harness
 from trillim.harnesses.search.client import SearchClient
 from trillim.harnesses.search.metrics import SearchMetrics
@@ -17,6 +19,14 @@ from trillim.harnesses.search.provider import (
     SearchAuthenticationError,
     SearchError,
     extract_search_query,
+)
+
+_SEARCH_SYSTEM_PROMPT = (
+    "System: You have access to a search tool. To search the web, write "
+    "<search>your query</search> and you will receive results. Use search for "
+    "questions about current events, specific people, places, or facts you are "
+    "unsure about. Answer directly for math, reasoning, coding, or general "
+    "knowledge you are confident about.<|eot_id|>"
 )
 
 
@@ -49,7 +59,7 @@ class _SearchHarness(_Harness):
         metrics = SearchMetrics()
         for _ in range(MAX_SEARCH_ITERATIONS - 1):
             cached_tokens = session.cached_token_count
-            token_ids = session._prepare_generation(messages=session._messages)
+            token_ids = self._prepare_generation(session)
             full_text, completion_token_ids = await self._generate_buffered(
                 session,
                 token_ids,
@@ -83,7 +93,7 @@ class _SearchHarness(_Harness):
             session._messages.append({"role": "search", "content": search_content})
 
         cached_tokens = session.cached_token_count
-        token_ids = session._prepare_generation(messages=session._messages)
+        token_ids = self._prepare_generation(session)
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
         completion_token_ids: list[int] = []
@@ -129,6 +139,43 @@ class _SearchHarness(_Harness):
             await token_stream.aclose()
         full_text += decoder.flush()
         return full_text, completion_token_ids
+
+    def _prepare_generation(self, session: _ChatSession) -> list[int]:
+        if session._messages_in_kv == 0:
+            return session._prepare_generation(messages=session._messages)
+        tokenizer = self.tokenizer
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if not chat_template:
+            return session._prepare_generation(messages=session._messages)
+        prompt = tokenizer.apply_chat_template(
+            session._messages[session._messages_in_kv :],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # This search harness renders cached continuations as template
+        # fragments so strip only the bundled search template's
+        # auto-injected system prompt so it is not repeated
+        if prompt.startswith(_SEARCH_SYSTEM_PROMPT):
+            prompt = prompt[len(_SEARCH_SYSTEM_PROMPT) :]
+        token_ids = list(session._cached_token_ids)
+        token_ids.extend(
+            tokenizer.encode(
+                prompt,
+                add_special_tokens=not bool(getattr(tokenizer, "chat_template", None)),
+            )
+        )
+        prepared = list(token_ids)
+        prompt_tokens = len(prepared)
+        if prompt_tokens >= session._runtime.model.max_position_embeddings:
+            raise ContextOverflowError(
+                prompt_tokens,
+                session._runtime.model.max_position_embeddings,
+            )
+        if prompt_tokens > SESSION_TOKEN_LIMIT:
+            raise SessionExhaustedError(
+                f"Chat session exceeds the {SESSION_TOKEN_LIMIT} token lifetime limit"
+            )
+        return prepared
 
     def _trim_search_content(self, content: str) -> str:
         token_ids = list(
