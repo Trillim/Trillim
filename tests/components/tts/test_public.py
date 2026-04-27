@@ -49,7 +49,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_open_session_requires_started_component(self):
         tts = TTS()
         with self.assertRaisesRegex(ComponentLifecycleError, "TTS is not running"):
-            await tts.open_session()
+            tts.open_session()
 
     async def test_start_stop_are_idempotent(self):
         tts = await self._start_tts()
@@ -74,7 +74,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             voices = await tts.list_voices()
             self.assertIn("alba", voices)
             self.assertIn("stored", voices)
-            async with await tts.open_session(voice="stored") as session:
+            async with tts.open_session(voice="stored") as session:
                 self.assertEqual(session.voice, "stored")
         finally:
             await tts.stop()
@@ -82,14 +82,14 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_collect_and_stream_use_real_engine(self):
         tts = await self._start_tts()
         try:
-            async with await tts.open_session() as session:
+            async with tts.open_session() as session:
                 self.assertIsInstance(session, TTSSession)
                 self.assertEqual(session.state, "idle")
                 self.assertEqual(session.voice, "alba")
                 self._assert_pcm(await session.collect("hello"))
                 self.assertEqual(session.state, "done")
 
-            async with await tts.open_session(voice="marius") as session:
+            async with tts.open_session(voice="marius") as session:
                 chunks = [chunk async for chunk in session.synthesize("one. two.")]
                 self.assertGreaterEqual(len(chunks), 1)
                 for chunk in chunks:
@@ -100,8 +100,11 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_can_change_voice_after_synthesis_finishes(self):
         tts = await self._start_tts()
         try:
-            session = await tts.open_session()
+            session = tts.open_session()
             self._assert_pcm(await session.collect("hello"))
+            self.assertEqual(session.state, "done")
+            await session.close()
+            self.assertEqual(session.state, "idle")
             await session.set_voice("marius")
             self.assertEqual(session.voice, "marius")
             self._assert_pcm(await session.collect("again"))
@@ -111,7 +114,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_rejects_concurrent_synthesis_and_voice_change(self):
         tts = await self._start_tts()
         try:
-            session = await tts.open_session()
+            session = tts.open_session()
             task = asyncio.create_task(session.collect("one. two. three. four. five."))
             while session.state != "running":
                 await asyncio.sleep(0)
@@ -127,7 +130,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_set_speed_is_best_effort_for_active_session(self):
         tts = await self._start_tts()
         try:
-            session = await tts.open_session()
+            session = tts.open_session()
             await session.set_speed(1.5)
             self.assertEqual(session.speed, 1.5)
             with self.assertRaisesRegex(InvalidRequestError, "speed"):
@@ -139,7 +142,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_pause_blocks_consumer_delivery_until_resume(self):
         tts = await self._start_tts()
         try:
-            session = await tts.open_session()
+            session = tts.open_session()
             second_segment_ready = asyncio.Event()
             release_second_segment = asyncio.Event()
 
@@ -174,7 +177,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_cancels_current_synthesis_and_session_can_be_reused(self):
         tts = await self._start_tts()
         try:
-            session = await tts.open_session()
+            session = tts.open_session()
             task = asyncio.create_task(session.collect("one. two. three. four. five."))
             while session.state != "running":
                 await asyncio.sleep(0)
@@ -182,7 +185,7 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             await session.close()
             cancelled_audio = await task
             self.assertIsInstance(cancelled_audio, bytes)
-            self.assertEqual(session.state, "done")
+            self.assertEqual(session.state, "idle")
 
             self._assert_pcm(await session.collect("again"))
         finally:
@@ -196,12 +199,12 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("custom", voices)
             self.assertEqual(await tts.register_voice("custom", reference_wav_bytes()), "custom")
             self.assertIn("custom", await tts.list_voices())
-            async with await tts.open_session(voice="custom") as session:
+            async with tts.open_session(voice="custom") as session:
                 self._assert_pcm(await session.collect("hello"))
             self.assertEqual(await tts.delete_voice("custom"), "custom")
             self.assertNotIn("custom", await tts.list_voices())
             with self.assertRaisesRegex(InvalidRequestError, "unknown voice"):
-                await tts.open_session(voice="custom")
+                tts.open_session(voice="custom")
         finally:
             await tts.stop()
 
@@ -209,13 +212,13 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         tts = await self._start_tts()
         try:
             self.assertEqual(await tts.register_voice("custom", reference_wav_bytes()), "custom")
-            async with await tts.open_session(voice="custom") as session:
+            async with tts.open_session(voice="custom") as session:
                 self._assert_pcm(await session.collect("hello"))
 
             self.assertEqual(await tts.delete_voice("custom"), "custom")
             self.assertEqual(await tts.register_voice("custom", reference_wav_bytes()), "custom")
             self.assertIn("custom", await tts.list_voices())
-            async with await tts.open_session(voice="custom") as session:
+            async with tts.open_session(voice="custom") as session:
                 self._assert_pcm(await session.collect("hello"))
         finally:
             await tts.stop()
@@ -250,13 +253,13 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(InvalidRequestError, "audio must be bytes"):
                 await tts.register_voice("custom", object())
             with self.assertRaisesRegex(InvalidRequestError, "only letters and digits"):
-                await tts.open_session(voice="bad-name")
+                tts.open_session(voice="bad-name")
         finally:
             await tts.stop()
 
     async def test_session_created_before_stop_raises_after_stop(self):
         tts = await self._start_tts()
-        session = await tts.open_session()
+        session = tts.open_session()
         await tts.stop()
         with self.assertRaisesRegex(ComponentLifecycleError, "component has been stopped"):
             await session.collect("hello")
@@ -267,6 +270,12 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaisesRegex(ComponentLifecycleError, "one event loop"):
                 await asyncio.to_thread(asyncio.run, tts.list_voices())
+
+            async def open_session_from_thread() -> None:
+                tts.open_session()
+
+            with self.assertRaisesRegex(ComponentLifecycleError, "one event loop"):
+                await asyncio.to_thread(asyncio.run, open_session_from_thread())
         finally:
             await tts.stop()
 

@@ -89,6 +89,12 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
         try:
             with self.assertRaisesRegex(ComponentLifecycleError, "one event loop"):
                 await asyncio.to_thread(asyncio.run, stt.start())
+
+            async def open_session_from_thread() -> None:
+                stt.open_session()
+
+            with self.assertRaisesRegex(ComponentLifecycleError, "one event loop"):
+                await asyncio.to_thread(asyncio.run, open_session_from_thread())
         finally:
             await stt.stop()
 

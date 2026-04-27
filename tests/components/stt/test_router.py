@@ -11,7 +11,12 @@ from trillim.components.stt import STT
 from trillim.components.stt._limits import MAX_UPLOAD_BYTES
 from trillim.components.stt._router import _as_http_error
 from trillim.components.stt._validation import PayloadTooLargeError, validate_http_request
-from trillim.errors import ComponentLifecycleError, InvalidRequestError, ProgressTimeoutError
+from trillim.errors import (
+    AdmissionRejectedError,
+    ComponentLifecycleError,
+    InvalidRequestError,
+    ProgressTimeoutError,
+)
 from trillim.server import Server
 
 EXPECTED_PHRASES = (
@@ -188,5 +193,6 @@ class RouterErrorMappingTests(unittest.TestCase):
         self.assertEqual(_as_http_error(PayloadTooLargeError("too big")).status_code, 413)
         self.assertEqual(_as_http_error(InvalidRequestError("bad")).status_code, 400)
         self.assertEqual(_as_http_error(ProgressTimeoutError("slow")).status_code, 504)
+        self.assertEqual(_as_http_error(AdmissionRejectedError("busy")).status_code, 429)
         self.assertEqual(_as_http_error(ComponentLifecycleError("stopped")).status_code, 503)
         self.assertEqual(_as_http_error(RuntimeError("boom")).status_code, 503)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -127,6 +129,51 @@ class LLMRouterTests(unittest.TestCase):
         for exc, status_code in cases:
             with self.subTest(exc=type(exc).__name__):
                 self.assertEqual(_as_http_error(exc).status_code, status_code)
+
+    def test_router_rejects_all_routes_while_chat_request_body_is_in_flight(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(root / "Local" / "model")
+            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                llm = LLM("Local/model", allow_hot_swap=True)
+                from fastapi import FastAPI
+
+                app = FastAPI()
+                app.include_router(build_router(llm, allow_hot_swap=True))
+                client = TestClient(app)
+                body_started = threading.Event()
+                release_body = threading.Event()
+
+                def slow_body():
+                    yield b"{"
+                    body_started.set()
+                    self.assertTrue(release_body.wait(timeout=5.0))
+                    yield b"}"
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    slow_response = executor.submit(
+                        client.post,
+                        "/v1/chat/completions",
+                        content=slow_body(),
+                        headers={"content-type": "application/json"},
+                    )
+                    self.assertTrue(body_started.wait(timeout=5.0))
+                    models_response = client.get("/v1/models")
+                    chat_response = client.post(
+                        "/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    swap_response = client.post(
+                        "/v1/models/swap",
+                        json={"model_dir": "Local/model"},
+                    )
+                    release_body.set()
+                    first_response = slow_response.result(timeout=5.0)
+
+        self.assertEqual(first_response.status_code, 503)
+        self.assertEqual(models_response.status_code, 429)
+        self.assertEqual(chat_response.status_code, 429)
+        self.assertEqual(swap_response.status_code, 429)
 
     @unittest.skipUnless(
         BONSAI_MODEL_DIR.is_dir(),

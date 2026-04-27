@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import base64
+import threading
 import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from trillim.components.tts import TTS
 from trillim.components.tts._limits import MAX_VOICE_UPLOAD_BYTES
-from trillim.components.tts._router import _as_http_error
+from trillim.components.tts._router import build_router, _as_http_error
 from trillim.components.tts._validation import PayloadTooLargeError
 from trillim.errors import (
     AdmissionRejectedError,
@@ -172,6 +173,33 @@ class TTSRouterTests(unittest.TestCase):
             self.assertEqual(speech.result().status_code, 200)
             self.assertEqual(voices.status_code, 429)
             self.assertIn("already handling", voices.json()["detail"])
+
+    def test_all_voice_routes_reject_while_speech_body_is_in_flight(self):
+        app = FastAPI()
+        app.include_router(build_router(TTS()))
+        client = TestClient(app)
+        body_started = threading.Event()
+        release_body = threading.Event()
+
+        def slow_body():
+            yield b"hel"
+            body_started.set()
+            self.assertTrue(release_body.wait(timeout=5.0))
+            yield b"lo"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            speech = executor.submit(client.post, "/v1/audio/speech", content=slow_body())
+            self.assertTrue(body_started.wait(timeout=5.0))
+            voices = client.get("/v1/voices")
+            create = client.post("/v1/voices", content=b"x", headers={"name": "custom"})
+            delete = client.delete("/v1/voices/custom")
+            release_body.set()
+            speech_response = speech.result(timeout=5.0)
+
+        self.assertEqual(speech_response.status_code, 503)
+        self.assertEqual(voices.status_code, 429)
+        self.assertEqual(create.status_code, 429)
+        self.assertEqual(delete.status_code, 429)
 
     def _assert_first_audio_event_is_pcm(self, body: str) -> None:
         marker = "event: audio\ndata: "
