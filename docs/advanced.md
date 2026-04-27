@@ -29,6 +29,7 @@ Important rules:
 - sessions are created by their owning service and are never caller-constructed
 - the public session types are abstract handles; concrete implementations stay private
 - sessions are single-consumer
+- direct async component and session access is bound to the owning event loop
 - explicit close behavior is part of the contract
 - `Runtime` is the supported sync context-manager surface for returned session handles
 

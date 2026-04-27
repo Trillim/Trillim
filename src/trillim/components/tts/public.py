@@ -214,6 +214,7 @@ class TTS(Component):
             return self._tokenizer
 
     async def _build_voice_state(self, audio_path: Path) -> dict:
+        self._require_owner_loop()
         try:
             async with self._synthesize_lock:
                 self._require_started()

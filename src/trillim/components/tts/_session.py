@@ -172,52 +172,65 @@ class _TTSSession(TTSSession):
 
     @property
     def state(self) -> str:
+        self._tts._require_owner_loop()
         return self._state.value
 
     @property
     def voice(self) -> str:
+        self._tts._require_owner_loop()
         return self._voice
 
     @property
     def speed(self) -> float:
+        self._tts._require_owner_loop()
         return self._speed
 
     async def __aenter__(self) -> TTSSession:
+        self._tts._require_owner_loop()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._tts._require_owner_loop()
         await self.close()
 
     async def close(self) -> None:
+        self._tts._require_owner_loop()
         await self._cancel_active()
 
     async def pause(self) -> None:
+        self._tts._require_owner_loop()
         if self._state is _TTSSessionFSM.RUNNING:
             self._state = _TTSSessionFSM.PAUSED
             self._resume_event.clear()
 
     async def resume(self) -> None:
+        self._tts._require_owner_loop()
         if self._state is _TTSSessionFSM.PAUSED:
             self._state = _TTSSessionFSM.RUNNING
             self._resume_event.set()
 
     async def set_voice(self, voice: str) -> None:
+        self._tts._require_owner_loop()
         self._raise_if_busy("voice")
         self._voice, _voice_state = self._tts._configure_voice(voice)
 
     async def set_speed(self, speed: float) -> None:
+        self._tts._require_owner_loop()
         self._speed = validate_speed(speed)
 
     async def collect(self, text: str) -> bytes:
+        self._tts._require_owner_loop()
         chunks: list[bytes] = []
         async for chunk in self.synthesize(text):
             chunks.append(chunk)
         return b"".join(chunks)
 
     def synthesize(self, text: str) -> AsyncIterator[bytes]:
+        self._tts._require_owner_loop()
         return self._synthesize(validate_text(text))
 
     async def _synthesize(self, text: str) -> AsyncIterator[bytes]:
+        self._tts._require_owner_loop()
         if self._stopped():
             raise ComponentLifecycleError("TTS component has been stopped")
         if self._stream_active or not self._done_event.is_set():

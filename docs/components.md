@@ -134,6 +134,7 @@ Session rules that matter in real code:
 - When a model swap begins, existing chat sessions become stale and raise `SessionStaleError`.
 - A session in `done` state raises `SessionClosedError` if reused.
 - Very long-lived sessions can hit the lifetime token cap and raise `SessionExhaustedError`.
+- Direct async `LLM` and `ChatSession` use is bound to one event loop. Create a new `LLM()` per thread or event loop.
 
 Final practical note: avoid keeping multiple active `ChatSession` objects open from the same `LLM` component. The underlying inference engine only caches the latest chat thread. Alternating between sessions will constantly evict and rebuild that cache, which is slow and can make generation hit progress timeouts on CPU-bound machines. Prefer one live chat session per `LLM`, or run independent conversations through separate `LLM` components when isolation matters.
 
@@ -226,7 +227,7 @@ Practical notes:
 - `session.transcribe()` accepts signed 16-bit little-endian mono `16 kHz` PCM bytes or WAV that Trillim converts to that PCM format.
 - `language` is optional and must contain only letters and hyphens.
 - `STT` serializes engine use to one transcription at a time. SDK callers queue cooperatively behind that slot instead of failing fast.
-- Direct async `STT` use is bound to one event loop. Create a new `STT()` per thread or event loop.
+- Direct async `STT` and `STTSession` use is bound to one event loop. Create a new `STT()` per thread or event loop.
 
 ## Use `TTS`
 
@@ -290,7 +291,7 @@ Session rules that matter:
 - `pause()` stops yielding queued chunks to the caller until `resume()`.
 - `close()` cancels any active synthesis, clears buffered audio, and returns the session to `idle`.
 - If a session outlives `TTS.stop()`, the next synthesis raises `ComponentLifecycleError`; stopped sessions do not return successful empty audio.
-- Direct async `TTS` use is bound to one event loop. Create a new `TTS()` per thread or event loop.
+- Direct async `TTS` and `TTSSession` use is bound to one event loop. Create a new `TTS()` per thread or event loop.
 - The SDK serializes engine access internally. The HTTP router enforces one live TTS request at a time across speech and voice-management routes and rejects concurrent requests with `429`.
 
 ## Public Error Types You Will See First

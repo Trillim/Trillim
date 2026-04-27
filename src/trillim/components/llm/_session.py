@@ -183,6 +183,7 @@ class _ChatSession(ChatSession):
     @property
     def state(self) -> str:
         """Return the current session state."""
+        self._llm._require_owner_loop()
         if self._is_stale():
             return "stale"
         return self._state.value
@@ -190,11 +191,13 @@ class _ChatSession(ChatSession):
     @property
     def messages(self) -> tuple[dict[str, str], ...]:
         """Return a copy of the canonical session messages."""
+        self._llm._require_owner_loop()
         return tuple(message.copy() for message in self._messages)
 
     @property
     def cached_token_count(self) -> int:
         """Return the committed session token count."""
+        self._llm._require_owner_loop()
         return len(self._cached_token_ids)
 
     async def __aenter__(self) -> ChatSession:
@@ -203,6 +206,7 @@ class _ChatSession(ChatSession):
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._llm._require_owner_loop()
         await self.close()
 
     async def close(self) -> None:
@@ -252,6 +256,7 @@ class _ChatSession(ChatSession):
         max_tokens: int | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """Stream structured events for a new user turn."""
+        self._llm._require_owner_loop()
         sampling = validate_sampling_options(
             temperature=temperature,
             top_k=top_k,
@@ -261,7 +266,6 @@ class _ChatSession(ChatSession):
             max_tokens=max_tokens,
         )
         content = validate_user_message(user_message)
-        self._llm._require_owner_loop()
         self._ensure_idle()
         self._messages.append({"role": "user", "content": content})
         self._state = _ChatSessionFSM.STREAMING
@@ -363,6 +367,7 @@ class _ChatSession(ChatSession):
         max_tokens: int | None = None,
     ) -> str:
         """Collect a new user turn as a single assistant string."""
+        self._llm._require_owner_loop()
         text = ""
         saw_done = False
         async for event in self.generate(

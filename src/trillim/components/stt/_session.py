@@ -93,19 +93,24 @@ class _STTSession(STTSession):
 
     @property
     def state(self) -> str:
+        self._stt._require_owner_loop()
         return self._state.value
 
     async def __aenter__(self) -> STTSession:
+        self._stt._require_owner_loop()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._stt._require_owner_loop()
         await self.close()
 
     async def close(self) -> None:
         """No-op for now since we don't have streaming behavior"""
+        self._stt._require_owner_loop()
         return None
 
     async def transcribe(self, audio: bytes, *, language: str | None = None) -> str:
+        self._stt._require_owner_loop()
         if self._state is _STTSessionFSM.TRANSCRIBING:
             raise SessionBusyError("STTSession is already transcribing")
 
