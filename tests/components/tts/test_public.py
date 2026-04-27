@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from trillim.components.tts import TTS, TTSSession
 from trillim.components.tts._engine import TTSEngine
@@ -139,16 +140,33 @@ class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
         tts = await self._start_tts()
         try:
             session = await tts.open_session()
-            stream = session.synthesize("one. two. three.")
-            self._assert_pcm(await stream.__anext__())
-            await session.pause()
+            second_segment_ready = asyncio.Event()
+            release_second_segment = asyncio.Event()
 
-            next_chunk = asyncio.create_task(stream.__anext__())
-            await asyncio.sleep(0.05)
-            self.assertFalse(next_chunk.done())
+            async def synthesize_segment(text, voice_state):
+                del voice_state
+                if text == "two.":
+                    second_segment_ready.set()
+                    await release_second_segment.wait()
+                return b"\0\0"
 
-            await session.resume()
-            self._assert_pcm(await asyncio.wait_for(next_chunk, timeout=30.0))
+            with patch(
+                "trillim.components.tts._session.iter_text_segments",
+                return_value=iter(("one.", "two.")),
+            ), patch.object(tts, "_synthesize_segment", synthesize_segment):
+                stream = session.synthesize("one. two.")
+                self._assert_pcm(await stream.__anext__())
+                await session.pause()
+
+                next_chunk = asyncio.create_task(stream.__anext__())
+                await asyncio.wait_for(second_segment_ready.wait(), timeout=30.0)
+                release_second_segment.set()
+                await asyncio.wait_for(session._done_event.wait(), timeout=30.0)
+                await asyncio.sleep(0)
+                self.assertFalse(next_chunk.done())
+
+                await session.resume()
+                self._assert_pcm(await asyncio.wait_for(next_chunk, timeout=30.0))
             await session.close()
         finally:
             await tts.stop()

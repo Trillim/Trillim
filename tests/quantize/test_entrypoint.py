@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,9 +45,12 @@ class QuantizeEntrypointTests(unittest.TestCase):
                     )
                 },
             )
+            true_binary = shutil.which("true")
+            if true_binary is None:
+                self.fail("true executable is required for subprocess boundary test")
             with patch.object(_model_store, "LOCAL_ROOT", local_root), patch(
                 "trillim.quantize._entrypoint.resolve_quantize_binary",
-                return_value=Path("/bin/true"),
+                return_value=Path(true_binary),
             ):
                 result = quantize(model_dir)
 

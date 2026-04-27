@@ -218,8 +218,8 @@ class ModelDirTests(unittest.TestCase):
             )
             overlay = runtime_files.metadata_dir
 
-            self.assertEqual(runtime_files.model_dir, model_dir.resolve())
-            self.assertEqual(runtime_files.adapter_dir, adapter_dir.resolve())
+            self.assertEqual(runtime_files.model_dir.resolve(), model_dir.resolve())
+            self.assertEqual(runtime_files.adapter_dir.resolve(), adapter_dir.resolve())
             self.assertTrue((overlay / "qmodel.tensors").is_file())
             self.assertTrue((overlay / "qmodel.lora").is_file())
             self.assertTrue((overlay / "tokenizer_config.json").is_file())
@@ -235,8 +235,8 @@ class ModelDirTests(unittest.TestCase):
                 trust_remote_code=False,
             )
 
-            self.assertEqual(runtime_files.model_dir, model_dir.resolve())
-            self.assertEqual(runtime_files.metadata_dir, model_dir.resolve())
+            self.assertEqual(runtime_files.model_dir.resolve(), model_dir.resolve())
+            self.assertEqual(runtime_files.metadata_dir.resolve(), model_dir.resolve())
             self.assertIsNone(runtime_files.adapter_dir)
             runtime_files.cleanup()
 
