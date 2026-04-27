@@ -132,7 +132,7 @@ Session rules that matter in real code:
 - `new_chat()` clears committed conversation history on an idle session.
 - A session is single-consumer. Do not iterate and mutate it concurrently.
 - When a model swap begins, existing chat sessions become stale and raise `SessionStaleError`.
-- A closed session raises `SessionClosedError` if reused.
+- A session in `done` state raises `SessionClosedError` if reused.
 - Very long-lived sessions can hit the lifetime token cap and raise `SessionExhaustedError`.
 
 Final practical note: avoid keeping multiple active `ChatSession` objects open from the same `LLM` component. The underlying inference engine only caches the latest chat thread. Alternating between sessions will constantly evict and rebuild that cache, which is slow and can make generation hit progress timeouts on CPU-bound machines. Prefer one live chat session per `LLM`, or run independent conversations through separate `LLM` components when isolation matters.
@@ -246,7 +246,7 @@ async def main():
     try:
         print(await tts.list_voices())
 
-        async with await tts.open_session(voice="alba", speed=1.0) as session:
+        async with tts.open_session(voice="alba", speed=1.0) as session:
             pcm = await session.collect("Hello from Trillim.")
             Path("speech.pcm").write_bytes(pcm)
 
@@ -264,7 +264,7 @@ Public helpers:
 - `await tts.list_voices()`
 - `await tts.register_voice(name, audio)`
 - `await tts.delete_voice(name)`
-- `await tts.open_session(voice=None, speed=None)`
+- `tts.open_session(voice=None, speed=None)`
 
 `audio` for `register_voice()` can be:
 
@@ -288,7 +288,7 @@ Session rules that matter:
 - `set_voice()` is allowed only when the session is idle or done.
 - `set_speed()` is allowed during synthesis and is a best-effort live update for later segments.
 - `pause()` stops yielding queued chunks to the caller until `resume()`.
-- `close()` cancels any active synthesis, clears buffered audio, and leaves the session reusable.
+- `close()` cancels any active synthesis, clears buffered audio, and returns the session to `idle`.
 - If a session outlives `TTS.stop()`, the next synthesis raises `ComponentLifecycleError`; stopped sessions do not return successful empty audio.
 - Direct async `TTS` use is bound to one event loop. Create a new `TTS()` per thread or event loop.
 - The SDK serializes engine access internally. The HTTP router enforces one live TTS request at a time across speech and voice-management routes and rejects concurrent requests with `429`.
@@ -300,7 +300,7 @@ Session rules that matter:
 - `ContextOverflowError`: the rendered prompt exceeded the active model context window
 - `ProgressTimeoutError`: an operation stopped making required progress
 - `SessionBusyError`: a session already has an active consumer
-- `SessionClosedError`: a closed session was reused
+- `SessionClosedError`: a session in `done` state was reused
 - `SessionStaleError`: an LLM session was invalidated by model swap
 - `SessionExhaustedError`: an LLM session exceeded its lifetime token quota
 

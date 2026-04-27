@@ -42,8 +42,8 @@ Important rules:
 Important implications:
 
 - a session becomes `stale` when an LLM swap actually begins handoff after preflight succeeds
-- a session becomes `done` after `close()`, cancellation, hard engine failure, or lifetime-token exhaustion
-- `close()` waits for active-turn cleanup before returning
+- `close()` cancels an active turn, waits for cleanup, and returns the session to `idle`
+- a session becomes `done` after caller-side generator cancellation, hard engine failure, or lifetime-token exhaustion
 
 ### `STTSession` States
 
@@ -55,7 +55,7 @@ Important implications:
 
 - `transcribe(audio, language=None)` starts one transcription turn
 - a session is single-use after transcription starts; it moves to `done` when the turn finishes or fails
-- `close()` is currently a no-op because STT does not expose caller-visible streaming state
+- `close()` is currently a no-op; STT bulk transcription does not expose cancellable caller-visible streaming state
 - stopped owner components surface as `ComponentLifecycleError`
 
 ### `TTSSession` States
@@ -73,7 +73,7 @@ Important implications:
 - the producer may continue synthesizing ahead until the bounded queue fills
 - `set_voice()` is rejected while synthesis is active
 - `set_speed()` is best-effort during active synthesis and affects later post-processing
-- `close()` cancels any active synthesis, clears buffered audio, and leaves the session reusable
+- `close()` cancels any active synthesis, clears buffered audio, and returns the session to `idle`
 - stopped owner components surface as `ComponentLifecycleError`; sessions do not silently complete as successful empty audio after `TTS.stop()`
 
 ## Safe-Boundary Control Semantics
