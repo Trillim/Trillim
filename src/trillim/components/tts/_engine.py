@@ -357,8 +357,16 @@ def _load_request_voice_state(model, voice_state: dict):
         return model.get_state_for_audio_prompt(voice_state["name"])
     if kind == "serialized" and isinstance(voice_state.get("data"), str):
         state_bytes = base64.b64decode(voice_state["data"].encode("ascii"), validate=True)
-        return load_safe_voice_state_safetensors_bytes(state_bytes)
+        return _load_serialized_voice_state(model, state_bytes)
     raise RuntimeError("TTS engine received malformed voice_state")
+
+
+def _load_serialized_voice_state(model, state_bytes: bytes):
+    from pocket_tts.models.tts_model import init_states
+
+    state = load_safe_voice_state_safetensors_bytes(state_bytes)
+    init_states(model.flow_lm, batch_size=1, sequence_length=1)
+    return state
 
 
 def _build_worker_voice_state(model, request: object) -> bytes:
