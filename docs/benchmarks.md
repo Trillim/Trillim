@@ -132,7 +132,7 @@ For a useful local benchmark pass:
 
 1. Reboot or at least stop unrelated heavy processes.
 2. Pull or prepare the exact bundle you want to test.
-3. Warm up the model with a few requests before recording anything.
+3. Decide whether you are measuring cold prompt processing or warmed cache hits, and label it clearly.
 4. Record at least 5 measured runs for each configuration.
 5. Keep prompts stable across runs.
 6. Record first-token latency and full latency separately.
@@ -153,7 +153,7 @@ At minimum, report:
 
 ## Benchmark the SDK
 
-This example measures end-to-end wall time for repeated one-turn calls through the sync `Runtime` facade. It does not run extra warmups, so consumer laptops are less likely to throttle before the measured runs start.
+This example measures end-to-end wall time for repeated one-turn calls through the sync `Runtime` facade. It creates a fresh runtime for each measured request so repeated trials do not become prompt-cache hits after the first run. The timer starts after the runtime is ready, so the reported number measures request latency, not model load time.
 
 ```python
 import statistics
@@ -166,12 +166,13 @@ PROMPT = "Explain CPU inference in one sentence."
 
 def run_trials(model_id: str, *, trials: int = 5) -> None:
     durations = []
-    with Runtime(LLM(model_id)) as runtime:
-        for _ in range(trials):
-            start = time.perf_counter()
+
+    for _ in range(trials):
+        with Runtime(LLM(model_id)) as runtime:
             with runtime.llm.open_session() as session:
+                start = time.perf_counter()
                 session.collect(PROMPT)
-            durations.append(time.perf_counter() - start)
+                durations.append(time.perf_counter() - start)
 
     print("runs:", [round(value, 3) for value in durations])
     print("mean_seconds:", round(statistics.mean(durations), 3))
@@ -181,7 +182,7 @@ def run_trials(model_id: str, *, trials: int = 5) -> None:
 run_trials("Trillim/BitNet-TRNQ")
 ```
 
-If you want first-token timing instead of full-response timing, benchmark `ChatSession.generate(...)` and stop the timer on the first `ChatTokenEvent`.
+If you want repeated first-token timing instead of full-response timing, keep the same fresh-runtime-per-trial structure, benchmark `ChatSession.generate(...)`, and stop the timer on the first `ChatTokenEvent`.
 
 ## Benchmark Streaming First-Token Latency
 
@@ -210,7 +211,7 @@ If you want to measure the HTTP path instead of the SDK path, start the server f
 trillim serve Trillim/BitNet-TRNQ
 ```
 
-Then drive one stable request shape repeatedly from a client script. This example measures full-request latency with the OpenAI-compatible route:
+Then drive one stable request shape repeatedly from a client script. Because the server keeps one model runtime alive, repeated identical requests can reuse cached prompt state after the first request. Treat this example as a steady-state HTTP-path benchmark, not a cold prompt-processing benchmark. Use the SDK example above when you need each measured request to start with an empty prompt cache.
 
 ```python
 import json
