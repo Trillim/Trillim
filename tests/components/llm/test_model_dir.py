@@ -83,6 +83,18 @@ class ModelDirTests(unittest.TestCase):
         self.assertEqual(binary.arch_type, ArchitectureType.BONSAI)
         self.assertEqual(ternary.arch_type, ArchitectureType.BONSAI_TERNARY)
 
+    def test_validate_model_dir_accepts_previous_bundle_format_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = write_llm_bundle(Path(temp_dir) / "model")
+            metadata_path = model_dir / "trillim_config.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["format_version"] = 4
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            config = validate_model_dir(model_dir)
+
+        self.assertEqual(config.arch_type, ArchitectureType.LLAMA)
+
     def test_validate_model_dir_supports_text_config_and_rejects_bad_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -230,6 +242,18 @@ class ModelDirTests(unittest.TestCase):
             (model_dir / "config.json").write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ModelValidationError, "mismatch"):
                 validate_lora_dir(adapter_dir, model_dir=model_dir)
+
+    def test_validate_lora_dir_accepts_previous_bundle_format_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = write_llm_bundle(root / "model")
+            adapter_dir = write_lora_bundle(root / "adapter", model_dir=model_dir)
+            metadata_path = adapter_dir / "trillim_config.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["format_version"] = 4
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            self.assertEqual(validate_lora_dir(adapter_dir, model_dir=model_dir), adapter_dir)
 
     def test_validate_lora_dir_rejects_missing_metadata_and_bad_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:

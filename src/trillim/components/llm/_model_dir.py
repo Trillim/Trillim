@@ -54,7 +54,7 @@ _TOKENIZER_FALLBACK_FILES = (
 _MAX_REMOTE_CODE_DEPTH = 16
 _MAX_REMOTE_CODE_FILES = 64
 _MAX_REMOTE_CODE_BYTES = 4 * 1024 * 1024
-_SUPPORTED_ADAPTER_FORMAT_VERSION = CURRENT_FORMAT_VERSION
+_SUPPORTED_BUNDLE_FORMAT_VERSIONS = frozenset({4, CURRENT_FORMAT_VERSION})
 
 
 # Model metadata extraction
@@ -265,7 +265,7 @@ def _validate_model_bundle_metadata(model_dir: Path) -> dict:
     payload = _load_json(config_path)
     if (
         not isinstance(payload, dict)
-        or payload.get("format_version") != CURRENT_FORMAT_VERSION
+        or payload.get("format_version") not in _SUPPORTED_BUNDLE_FORMAT_VERSIONS
     ):
         raise ModelValidationError(
             f"Model bundle metadata is missing or unsupported in {model_dir}"
@@ -349,7 +349,7 @@ def _validate_adapter_metadata(
     format_version = adapter_config.get("format_version", 1)
     stored_hash = adapter_config.get("base_model_config_hash")
     if (
-        format_version != _SUPPORTED_ADAPTER_FORMAT_VERSION
+        format_version not in _SUPPORTED_BUNDLE_FORMAT_VERSIONS
         or not isinstance(stored_hash, str)
         or not stored_hash
     ):
