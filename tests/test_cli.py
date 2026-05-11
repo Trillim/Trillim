@@ -22,6 +22,7 @@ class CLITests(unittest.TestCase):
     def test_parser_and_main_help_paths(self):
         parser = cli.build_parser()
 
+        self.assertTrue(parser.parse_args(["--version"]).version)
         self.assertEqual(parser.parse_args(["list"]).command, "list")
         self.assertEqual(parser.parse_args(["doctor"]).command, "doctor")
         self.assertFalse(parser.parse_args(["doctor"]).deep)
@@ -32,6 +33,15 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("Trillim", stdout.getvalue())
+
+        with (
+            patch.object(cli, "_project_version", return_value="1.2.3"),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            code = cli.main(["--version"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(), "trillim 1.2.3\n")
 
     def test_pull_id_validation_and_platform_normalization(self):
         self.assertEqual(

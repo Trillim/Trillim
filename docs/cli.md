@@ -17,6 +17,7 @@ If you installed Trillim with `uv`, prefix the commands on this page with `uv ru
 
 | Command | What it does |
 | --- | --- |
+| `trillim --version` | Print the installed Trillim package version |
 | `trillim models` | List published bundles in the `Trillim` org |
 | `trillim pull` | Download one published bundle into `~/.trillim/models/Trillim/` |
 | `trillim list` | List the bundles you already have locally |

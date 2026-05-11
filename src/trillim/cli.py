@@ -749,6 +749,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="trillim",
         description="Trillim - The fastest inference framework to run AI on CPUs",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the Trillim package version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     pull_parser = subparsers.add_parser(
@@ -829,6 +834,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.version:
+        print(f"trillim {_project_version()}")
+        return 0
     if not args.command:
         parser.print_help()
         return 1
