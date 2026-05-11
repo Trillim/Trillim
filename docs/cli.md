@@ -20,6 +20,7 @@ If you installed Trillim with `uv`, prefix the commands on this page with `uv ru
 | `trillim models` | List published bundles in the `Trillim` org |
 | `trillim pull` | Download one published bundle into `~/.trillim/models/Trillim/` |
 | `trillim list` | List the bundles you already have locally |
+| `trillim doctor` | Print local installation diagnostics for support |
 | `trillim chat` | Start a local multi-turn chat shell |
 | `trillim serve` | Start the demo HTTP server on `127.0.0.1:8000` |
 | `trillim quantize` | Quantize a local model or local adapter into `~/.trillim/models/Local/` |
@@ -71,6 +72,16 @@ The output is split into:
 
 - `Downloaded`: bundles under `~/.trillim/models/Trillim/`
 - `Local`: bundles under `~/.trillim/models/Local/`
+
+## `trillim doctor`
+
+Print a local support report without contacting remote services.
+
+```bash
+trillim doctor
+```
+
+The report includes the Trillim package version, platform tag, Python version and executable, bundled binary paths and executable status, model-store path, locally available bundles, optional voice dependency status, and whether local quantization is available.
 
 ## `trillim chat`
 
