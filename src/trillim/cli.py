@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+from importlib import metadata as importlib_metadata
+from importlib import util as importlib_util
 import json
 import os
 import platform
@@ -11,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +30,22 @@ from trillim.utils.formatting import human_size as _human_size
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 SUPPORTED_FORMAT_VERSION = CURRENT_FORMAT_VERSION
+_BINARY_NAMES = ("trillim-inference", "trillim-quantize")
+_VOICE_MODULES = ("faster_whisper", "numpy", "soundfile", "pocket_tts")
+_DOCTOR_COLORS = {
+    "success": "\033[32m",
+    "warning": "\033[33m",
+    "error": "\033[31m",
+}
+_DOCTOR_COLOR_RESET = "\033[0m"
+_PLATFORM_TAGS = {
+    ("linux", "x86_64"): "manylinux_2_27_x86_64.manylinux2014_x86_64",
+    ("linux", "aarch64"): "manylinux_2_27_aarch64.manylinux2014_aarch64",
+    ("darwin", "x86_64"): "macosx_11_0_x86_64",
+    ("darwin", "aarch64"): "macosx_11_0_arm64",
+    ("windows", "x86_64"): "win_amd64",
+    ("windows", "aarch64"): "win_arm64",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +54,20 @@ class _LocalBundle:
     entry_type: str
     size_bytes: int
     size_human: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BinaryStatus:
+    name: str
+    path: Path
+    exists: bool
+    executable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _DoctorCell:
+    text: str
+    color: str | None = None
 
 
 def _validate_pull_id(model_id: str) -> str:
@@ -53,6 +86,59 @@ def _normalize_platform_name(value: str) -> str:
     if normalized in {"amd64", "x86_64"}:
         return "x86_64"
     return normalized
+
+
+def _project_version() -> str:
+    try:
+        return importlib_metadata.version("trillim")
+    except importlib_metadata.PackageNotFoundError:
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        payload = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        return str(payload["project"]["version"])
+
+
+def _platform_tag() -> str:
+    system = platform.system().strip().lower()
+    machine = _normalize_platform_name(platform.machine())
+    tag = _PLATFORM_TAGS.get((system, machine))
+    if tag is not None:
+        return tag
+    return f"unsupported ({platform.system()} {platform.machine()})"
+
+
+def _binary_path(name: str) -> Path:
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(__file__).resolve().parent / "_bin" / f"{name}{suffix}"
+
+
+def _binary_status(name: str) -> _BinaryStatus:
+    path = _binary_path(name)
+    if not path.is_file() and os.name == "nt":
+        fallback = path.with_suffix("")
+        if fallback.is_file():
+            path = fallback
+    exists = path.is_file()
+    return _BinaryStatus(
+        name=name,
+        path=path,
+        exists=exists,
+        executable=exists and os.access(path, os.X_OK),
+    )
+
+
+def _voice_dependency_statuses(*, deep: bool = False) -> dict[str, bool]:
+    statuses: dict[str, bool] = {}
+    for module_name in _VOICE_MODULES:
+        if deep:
+            try:
+                importlib.import_module(module_name)
+            except Exception:
+                statuses[module_name] = False
+            else:
+                statuses[module_name] = True
+        else:
+            statuses[module_name] = importlib_util.find_spec(module_name) is not None
+    return statuses
 
 
 def _warn_on_trillim_config(path: Path) -> None:
@@ -321,7 +407,7 @@ def _print_available_table(title: str, entries: list[dict[str, object]]) -> None
 
 def _preflight_voice_dependencies() -> None:
     missing: list[str] = []
-    for module_name in ("faster_whisper", "numpy", "soundfile", "pocket_tts"):
+    for module_name in _VOICE_MODULES:
         try:
             importlib.import_module(module_name)
         except ModuleNotFoundError:
@@ -513,10 +599,160 @@ def _run_models_command() -> int:
     return 0
 
 
+def _format_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _doctor_binary_status(binary: _BinaryStatus) -> str:
+    if binary.executable:
+        return "ready"
+    if binary.exists:
+        return "not executable"
+    return "missing"
+
+
+def _doctor_binary_status_cell(binary: _BinaryStatus) -> _DoctorCell:
+    status = _doctor_binary_status(binary)
+    if status == "ready":
+        return _doctor_cell(status, "success")
+    if status == "not executable":
+        return _doctor_cell(status, "warning")
+    return _doctor_cell(status, "error")
+
+
+def _doctor_color_enabled() -> bool:
+    return (
+        sys.stdout.isatty()
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
+def _doctor_cell(text: str, color: str | None = None) -> _DoctorCell:
+    return _DoctorCell(text=text, color=color)
+
+
+def _doctor_cell_text(value: object) -> str:
+    if isinstance(value, _DoctorCell):
+        return value.text
+    return str(value)
+
+
+def _doctor_color_text(text: str, color: str | None) -> str:
+    if color is None or not _doctor_color_enabled():
+        return text
+    return f"{_DOCTOR_COLORS[color]}{text}{_DOCTOR_COLOR_RESET}"
+
+
+def _doctor_dependency_status(available: bool, *, deep: bool = False) -> _DoctorCell:
+    if available:
+        return _doctor_cell("importable" if deep else "available", "success")
+    if deep:
+        return _doctor_cell("import failed", "warning")
+    return _doctor_cell("missing", "warning")
+
+
+def _doctor_bool_status(value: bool) -> _DoctorCell:
+    if value:
+        return _doctor_cell(_format_bool(value), "success")
+    return _doctor_cell(_format_bool(value), "warning")
+
+
+def _print_doctor_kv(rows: list[tuple[str, object]]) -> None:
+    label_width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        text = _doctor_cell_text(value)
+        color = value.color if isinstance(value, _DoctorCell) else None
+        print(f"  {label:<{label_width}}  {_doctor_color_text(text, color)}")
+
+
+def _print_doctor_table(headers: tuple[str, ...], rows: list[tuple[object, ...]]) -> None:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        widths = [
+            max(width, len(_doctor_cell_text(value)))
+            for width, value in zip(widths, row, strict=True)
+        ]
+    print(_format_doctor_table_row(headers, widths))
+    for row in rows:
+        print(_format_doctor_table_row(row, widths))
+
+
+def _format_doctor_table_row(values: tuple[object, ...], widths: list[int]) -> str:
+    rendered: list[str] = []
+    for value, width in zip(values, widths, strict=True):
+        text = _doctor_cell_text(value)
+        color = value.color if isinstance(value, _DoctorCell) else None
+        rendered.append(_doctor_color_text(text, color) + " " * (width - len(text)))
+    rendered[-1] = rendered[-1].rstrip()
+    return "  " + "  ".join(rendered)
+
+
+def _print_doctor_bundles(title: str, bundles: list[_LocalBundle]) -> None:
+    print(title)
+    if not bundles:
+        print("  (none)")
+        return
+    _print_doctor_table(
+        ("Model ID", "Type", "Size"),
+        [(bundle.model_id, bundle.entry_type, bundle.size_human) for bundle in bundles],
+    )
+
+
+def _run_doctor_command(*, deep: bool = False) -> int:
+    binaries = [_binary_status(name) for name in _BINARY_NAMES]
+    voice_statuses = _voice_dependency_statuses(deep=deep)
+    quantizer = next(binary for binary in binaries if binary.name == "trillim-quantize")
+
+    print("Trillim Doctor")
+    print()
+    print("System")
+    _print_doctor_kv(
+        [
+            ("Package", _project_version()),
+            ("Platform", _platform_tag()),
+            ("Python", platform.python_version()),
+            ("Executable", sys.executable),
+            ("Model store", _model_store.MODELS_ROOT),
+        ]
+    )
+    print()
+    print("Binaries")
+    _print_doctor_table(
+        ("Name", "Status", "Path"),
+        [
+            (binary.name, _doctor_binary_status_cell(binary), binary.path)
+            for binary in binaries
+        ],
+    )
+    print()
+    _print_doctor_bundles("Downloaded models", _iter_local_bundles("Trillim"))
+    print()
+    _print_doctor_bundles("Local models", _iter_local_bundles("Local"))
+    print()
+    print("Optional voice dependencies")
+    _print_doctor_table(
+        ("Module", "Status"),
+        [
+            (module_name, _doctor_dependency_status(installed, deep=deep))
+            for module_name, installed in voice_statuses.items()
+        ],
+    )
+    print()
+    print("Quantization")
+    _print_doctor_kv([("Available", _doctor_bool_status(quantizer.executable))])
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="trillim",
         description="Trillim - The fastest inference framework to run AI on CPUs",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the Trillim package version and exit",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -538,6 +774,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser(
         "models", help="List available models in the Trillim Hugging Face org"
+    )
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Print local installation diagnostics for support"
+    )
+    doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Import optional voice dependencies instead of only checking availability",
     )
 
     chat_parser = subparsers.add_parser(
@@ -590,6 +834,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.version:
+        print(f"trillim {_project_version()}")
+        return 0
     if not args.command:
         parser.print_help()
         return 1
@@ -597,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
         "pull": lambda: _run_pull_command(args),
         "list": _run_list_command,
         "models": _run_models_command,
+        "doctor": lambda: _run_doctor_command(deep=args.deep),
         "chat": lambda: _run_chat(
             args.model_dir,
             args.adapter_dir,
