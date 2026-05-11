@@ -155,6 +155,10 @@ def _repo_root_candidates(repo_name: str, env_var: str, *, root: Path | None = N
     mirrored = _mirrored_worktree_candidate(project_root, repo_name)
     if mirrored is not None:
         candidates.append(mirrored)
+        if mirrored.name != "main":
+            candidates.append(mirrored.with_name("main"))
+    else:
+        candidates.append(project_root.parent / repo_name / "main")
     candidates.append(project_root.parent / repo_name)
     return _unique_paths(candidates)
 
