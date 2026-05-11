@@ -24,6 +24,7 @@ from trillim.quantize._manifest import (
     _safetensors_dtype_code,
     _quantized_tensor_action,
 )
+from tests.support import requires_bundle_test
 
 
 def _write_config(path: Path, **overrides) -> None:
@@ -167,7 +168,6 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             _quantized_tensor_action("F32", ArchitectureType.BONSAI),
             ACTION_Q1_0_128,
         )
-        self.assertTrue(resolve_quantize_binary().is_file())
         with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
             _safetensors_dtype_code("BAD")
 
@@ -354,3 +354,9 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             self.assertIn("--lora-output", command)
             self.assertIn("--lora-rank", command)
             self.assertFalse((output_dir / ".quantize_manifest.bin").exists())
+
+
+@requires_bundle_test
+class QuantizeBundleTests(unittest.TestCase):
+    def test_resolve_quantize_binary_finds_bundled_binary(self):
+        self.assertTrue(resolve_quantize_binary().is_file())

@@ -19,7 +19,7 @@ LOCAL_PLATFORM := macos-arm64
 endif
 endif
 
-.PHONY: help bundle sync-test-env test coverage publish
+.PHONY: help bundle sync-test-env test test-integration test-bundle test-full coverage publish
 
 help: # @help Show available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?# @help ' $(MAKEFILE_LIST) | \
@@ -35,8 +35,16 @@ endif
 sync-test-env:
 	uv sync --extra dev --extra voice
 
-test: sync-test-env # @help Sync dev/voice extras and run the full unittest suite
+test: sync-test-env # @help Sync dev/voice extras and run the fast deterministic unittest suite
 	uv run python -m unittest discover -q
+
+test-integration: sync-test-env # @help Run unittest suite with real runtime integration tests enabled
+	TRILLIM_RUN_INTEGRATION=1 uv run python -m unittest discover -q
+
+test-bundle: sync-test-env bundle # @help Copy local binaries and run bundled-binary package smoke tests
+	TRILLIM_RUN_BUNDLE_TESTS=1 uv run python -m unittest tests.quantize.test_config_manifest.QuantizeBundleTests -q
+
+test-full: test-integration test-bundle # @help Run integration tests and bundled-binary smoke tests
 
 coverage: sync-test-env # @help Sync dev/voice extras and print the terminal coverage report
 	COVERAGE_PROCESS_START="$(PROJECT_ROOT)/pyproject.toml" uv run --extra dev python -m coverage erase

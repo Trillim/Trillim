@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import unittest
 
 from trillim._bundle_metadata import (
     CURRENT_FORMAT_VERSION,
     compute_base_model_config_hash,
 )
+
+RUN_BUNDLE_TESTS_ENV = "TRILLIM_RUN_BUNDLE_TESTS"
+RUN_INTEGRATION_ENV = "TRILLIM_RUN_INTEGRATION"
+
+
+def requires_bundle_test(obj):
+    return unittest.skipUnless(
+        os.environ.get(RUN_BUNDLE_TESTS_ENV) == "1",
+        f"set {RUN_BUNDLE_TESTS_ENV}=1 to run bundled-binary/package tests",
+    )(obj)
+
+
+def requires_integration(obj):
+    return unittest.skipUnless(
+        os.environ.get(RUN_INTEGRATION_ENV) == "1",
+        f"set {RUN_INTEGRATION_ENV}=1 to run integration tests",
+    )(obj)
 
 
 def write_llm_bundle(

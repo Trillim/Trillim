@@ -13,6 +13,7 @@ from trillim.components.stt._engine import STTEngine
 from trillim.components.stt._session import _STTSession
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 from trillim.runtime import Runtime
+from tests.support import requires_integration
 
 EXPECTED_PHRASES = (
     "torpedo",
@@ -22,6 +23,7 @@ EXPECTED_PHRASES = (
 )
 
 
+@requires_integration
 class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.fixture_path = Path(__file__).with_name("test.wav")
@@ -240,6 +242,7 @@ class PublicSTTTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(phrase, lowered)
 
 
+@requires_integration
 class RuntimeSTTTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture_path = Path(__file__).with_name("test.wav")
@@ -271,6 +274,7 @@ class SessionAndEngineContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "open_session"):
             _STTSession(stt)
 
+    @requires_integration
     async def test_engine_public_lifecycle_contract(self):
         engine = STTEngine()
         await engine.stop()

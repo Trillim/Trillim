@@ -18,13 +18,14 @@ from trillim.components.llm.public import LLM, _make_init_config, load_tokenizer
 from trillim.errors import ComponentLifecycleError, InvalidRequestError
 from trillim.errors import ModelValidationError
 
-from tests.support import write_llm_bundle
+from tests.support import requires_integration, write_llm_bundle
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
 BONSAI_MODEL_DIR = _model_store.store_path_for_id(BONSAI_MODEL_ID)
 
 
+@requires_integration
 @unittest.skipUnless(
     BONSAI_MODEL_DIR.is_dir(),
     f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",

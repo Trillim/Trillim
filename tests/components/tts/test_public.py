@@ -12,6 +12,7 @@ from trillim.components.tts._session import _TTSSession
 from trillim.components.tts._voices import publish_custom_voice
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, SessionBusyError
 
+from tests.support import requires_integration
 from tests.components.tts.support import (
     make_started_tts,
     reference_wav_bytes,
@@ -20,6 +21,7 @@ from tests.components.tts.support import (
 )
 
 
+@requires_integration
 class PublicTTSTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory()
@@ -372,6 +374,7 @@ class SessionAndEngineContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "open_session"):
             _TTSSession(tts)
 
+    @requires_integration
     async def test_engine_public_lifecycle_contract(self):
         engine = TTSEngine()
         await engine.stop()

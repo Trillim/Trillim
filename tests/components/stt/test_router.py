@@ -18,6 +18,7 @@ from trillim.errors import (
     ProgressTimeoutError,
 )
 from trillim.server import Server
+from tests.support import requires_integration
 
 EXPECTED_PHRASES = (
     "torpedo",
@@ -27,6 +28,7 @@ EXPECTED_PHRASES = (
 )
 
 
+@requires_integration
 class STTRouterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture_path = Path(__file__).with_name("test.wav")

@@ -11,7 +11,7 @@ from unittest.mock import patch
 from trillim import _model_store
 from trillim import cli
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
-from tests.support import write_llm_bundle, write_lora_bundle
+from tests.support import requires_integration, write_llm_bundle, write_lora_bundle
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -198,6 +198,7 @@ class CLITests(unittest.TestCase):
     def test_voice_dependency_preflight_passes_with_voice_extra(self):
         cli._preflight_voice_dependencies()
 
+    @requires_integration
     @unittest.skipUnless(
         BONSAI_MODEL_DIR.is_dir(),
         f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",

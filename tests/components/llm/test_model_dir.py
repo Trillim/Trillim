@@ -20,7 +20,7 @@ from trillim.components.llm._model_dir import (
 )
 from trillim.errors import ModelValidationError
 
-from tests.support import write_llm_bundle, write_lora_bundle
+from tests.support import requires_integration, write_llm_bundle, write_lora_bundle
 
 
 BITNET_MODEL_DIR = _model_store.store_path_for_id("Trillim/BitNet-TRNQ")
@@ -240,6 +240,7 @@ class ModelDirTests(unittest.TestCase):
             self.assertIsNone(runtime_files.adapter_dir)
             runtime_files.cleanup()
 
+    @requires_integration
     @unittest.skipUnless(
         BITNET_MODEL_DIR.is_dir()
         and BITNET_SEARCH_ADAPTER_DIR.is_dir()
@@ -256,6 +257,7 @@ class ModelDirTests(unittest.TestCase):
         self.assertEqual(bonsai_ternary.arch_type, ArchitectureType.BONSAI_TERNARY)
         self.assertEqual(adapter, BITNET_SEARCH_ADAPTER_DIR)
 
+    @requires_integration
     @unittest.skipUnless(
         BITNET_MODEL_DIR.is_dir() and BITNET_SEARCH_ADAPTER_DIR.is_dir(),
         "real BitNet and search adapter bundles must be installed",
