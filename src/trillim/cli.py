@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 from importlib import metadata as importlib_metadata
+from importlib import util as importlib_util
 import json
 import os
 import platform
@@ -125,15 +126,18 @@ def _binary_status(name: str) -> _BinaryStatus:
     )
 
 
-def _voice_dependency_statuses() -> dict[str, bool]:
+def _voice_dependency_statuses(*, deep: bool = False) -> dict[str, bool]:
     statuses: dict[str, bool] = {}
     for module_name in _VOICE_MODULES:
-        try:
-            importlib.import_module(module_name)
-        except Exception:
-            statuses[module_name] = False
+        if deep:
+            try:
+                importlib.import_module(module_name)
+            except Exception:
+                statuses[module_name] = False
+            else:
+                statuses[module_name] = True
         else:
-            statuses[module_name] = True
+            statuses[module_name] = importlib_util.find_spec(module_name) is not None
     return statuses
 
 
@@ -640,9 +644,11 @@ def _doctor_color_text(text: str, color: str | None) -> str:
     return f"{_DOCTOR_COLORS[color]}{text}{_DOCTOR_COLOR_RESET}"
 
 
-def _doctor_dependency_status(installed: bool) -> _DoctorCell:
-    if installed:
-        return _doctor_cell("installed", "success")
+def _doctor_dependency_status(available: bool, *, deep: bool = False) -> _DoctorCell:
+    if available:
+        return _doctor_cell("importable" if deep else "available", "success")
+    if deep:
+        return _doctor_cell("import failed", "warning")
     return _doctor_cell("missing", "warning")
 
 
@@ -693,9 +699,9 @@ def _print_doctor_bundles(title: str, bundles: list[_LocalBundle]) -> None:
     )
 
 
-def _run_doctor_command() -> int:
+def _run_doctor_command(*, deep: bool = False) -> int:
     binaries = [_binary_status(name) for name in _BINARY_NAMES]
-    voice_statuses = _voice_dependency_statuses()
+    voice_statuses = _voice_dependency_statuses(deep=deep)
     quantizer = next(binary for binary in binaries if binary.name == "trillim-quantize")
 
     print("Trillim Doctor")
@@ -728,7 +734,7 @@ def _run_doctor_command() -> int:
     _print_doctor_table(
         ("Module", "Status"),
         [
-            (module_name, _doctor_dependency_status(installed))
+            (module_name, _doctor_dependency_status(installed, deep=deep))
             for module_name, installed in voice_statuses.items()
         ],
     )
@@ -764,8 +770,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "models", help="List available models in the Trillim Hugging Face org"
     )
-    subparsers.add_parser(
+    doctor_parser = subparsers.add_parser(
         "doctor", help="Print local installation diagnostics for support"
+    )
+    doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Import optional voice dependencies instead of only checking availability",
     )
 
     chat_parser = subparsers.add_parser(
@@ -825,7 +836,7 @@ def main(argv: list[str] | None = None) -> int:
         "pull": lambda: _run_pull_command(args),
         "list": _run_list_command,
         "models": _run_models_command,
-        "doctor": _run_doctor_command,
+        "doctor": lambda: _run_doctor_command(deep=args.deep),
         "chat": lambda: _run_chat(
             args.model_dir,
             args.adapter_dir,

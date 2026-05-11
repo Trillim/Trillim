@@ -24,6 +24,8 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(parser.parse_args(["list"]).command, "list")
         self.assertEqual(parser.parse_args(["doctor"]).command, "doctor")
+        self.assertFalse(parser.parse_args(["doctor"]).deep)
+        self.assertTrue(parser.parse_args(["doctor", "--deep"]).deep)
         self.assertEqual(parser.parse_args(["chat", "Trillim/model"]).command, "chat")
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             code = cli.main([])
@@ -258,14 +260,33 @@ class CLITests(unittest.TestCase):
             self.assertTrue(status.exists)
             self.assertFalse(status.executable)
 
-    def test_voice_dependency_statuses_uses_importability(self):
+    def test_voice_dependency_statuses_uses_shallow_availability_by_default(self):
+        def find_spec(name):
+            if name == "numpy":
+                return object()
+            return None
+
+        with patch.object(cli.importlib_util, "find_spec", side_effect=find_spec):
+            statuses = cli._voice_dependency_statuses()
+
+        self.assertEqual(
+            statuses,
+            {
+                "faster_whisper": False,
+                "numpy": True,
+                "soundfile": False,
+                "pocket_tts": False,
+            },
+        )
+
+    def test_voice_dependency_statuses_deep_imports_modules(self):
         def import_module(name):
             if name == "numpy":
                 return object()
             raise ModuleNotFoundError(name)
 
         with patch.object(cli.importlib, "import_module", side_effect=import_module):
-            statuses = cli._voice_dependency_statuses()
+            statuses = cli._voice_dependency_statuses(deep=True)
 
         self.assertEqual(
             statuses,
@@ -291,6 +312,17 @@ class CLITests(unittest.TestCase):
         def iter_bundles(namespace):
             return downloaded if namespace == "Trillim" else local
 
+        voice_statuses = patch.object(
+            cli,
+            "_voice_dependency_statuses",
+            return_value={
+                "faster_whisper": False,
+                "numpy": True,
+                "soundfile": False,
+                "pocket_tts": True,
+            },
+        )
+
         with (
             patch.object(cli, "_project_version", return_value="1.2.3"),
             patch.object(cli, "_platform_tag", return_value="macosx_11_0_arm64"),
@@ -312,22 +344,14 @@ class CLITests(unittest.TestCase):
                     ),
                 ],
             ),
-            patch.object(
-                cli,
-                "_voice_dependency_statuses",
-                return_value={
-                    "faster_whisper": False,
-                    "numpy": True,
-                    "soundfile": False,
-                    "pocket_tts": True,
-                },
-            ),
+            voice_statuses as dependency_statuses,
             patch.object(cli, "_iter_local_bundles", side_effect=iter_bundles),
             contextlib.redirect_stdout(io.StringIO()) as stdout,
         ):
             code = cli.main(["doctor"])
 
         self.assertEqual(code, 0)
+        dependency_statuses.assert_called_once_with(deep=False)
         output = stdout.getvalue()
         self.assertIn("Trillim Doctor\n\nSystem", output)
         self.assertIn("System\n  Package      1.2.3", output)
@@ -340,10 +364,53 @@ class CLITests(unittest.TestCase):
         self.assertIn("trillim-quantize   not executable", output)
         self.assertIn("Trillim/model  model  1 KB", output)
         self.assertIn("Local models\n  (none)", output)
-        self.assertIn("numpy           installed", output)
+        self.assertIn("numpy           available", output)
         self.assertIn("faster_whisper  missing", output)
         self.assertIn("Quantization\n  Available  no", output)
         self.assertNotIn("\033[", output)
+
+    def test_doctor_command_deep_imports_voice_dependencies(self):
+        with (
+            patch.object(cli, "_project_version", return_value="1.2.3"),
+            patch.object(cli, "_platform_tag", return_value="macosx_11_0_arm64"),
+            patch.object(
+                cli,
+                "_binary_status",
+                side_effect=[
+                    cli._BinaryStatus(
+                        name="trillim-inference",
+                        path=Path("/tmp/trillim-inference"),
+                        exists=False,
+                        executable=False,
+                    ),
+                    cli._BinaryStatus(
+                        name="trillim-quantize",
+                        path=Path("/tmp/trillim-quantize"),
+                        exists=False,
+                        executable=False,
+                    ),
+                ],
+            ),
+            patch.object(
+                cli,
+                "_voice_dependency_statuses",
+                return_value={
+                    "faster_whisper": False,
+                    "numpy": True,
+                    "soundfile": False,
+                    "pocket_tts": True,
+                },
+            ) as dependency_statuses,
+            patch.object(cli, "_iter_local_bundles", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            code = cli.main(["doctor", "--deep"])
+
+        self.assertEqual(code, 0)
+        dependency_statuses.assert_called_once_with(deep=True)
+        output = stdout.getvalue()
+        self.assertIn("numpy           importable", output)
+        self.assertIn("faster_whisper  import failed", output)
 
     def test_doctor_binary_status_labels(self):
         ready = cli._BinaryStatus(
@@ -377,11 +444,19 @@ class CLITests(unittest.TestCase):
     def test_doctor_status_cells_classify_health(self):
         self.assertEqual(
             cli._doctor_dependency_status(True),
-            cli._DoctorCell(text="installed", color="success"),
+            cli._DoctorCell(text="available", color="success"),
         )
         self.assertEqual(
             cli._doctor_dependency_status(False),
             cli._DoctorCell(text="missing", color="warning"),
+        )
+        self.assertEqual(
+            cli._doctor_dependency_status(True, deep=True),
+            cli._DoctorCell(text="importable", color="success"),
+        )
+        self.assertEqual(
+            cli._doctor_dependency_status(False, deep=True),
+            cli._DoctorCell(text="import failed", color="warning"),
         )
         self.assertEqual(
             cli._doctor_bool_status(True),

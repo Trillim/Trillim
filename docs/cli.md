@@ -81,7 +81,13 @@ Print a local support report without contacting remote services.
 trillim doctor
 ```
 
-The report includes the Trillim package version, platform tag, Python version and executable, bundled binary paths and executable status, model-store path, locally available bundles, optional voice dependency status, and whether local quantization is available.
+The report includes the Trillim package version, platform tag, Python version and executable, bundled binary paths and executable status, model-store path, locally available bundles, optional voice dependency availability, and whether local quantization is available.
+
+By default, optional voice dependencies are checked with a shallow availability probe so the report stays fast. Use `--deep` to import those dependencies and verify they can load successfully:
+
+```bash
+trillim doctor --deep
+```
 
 ## `trillim chat`
 
