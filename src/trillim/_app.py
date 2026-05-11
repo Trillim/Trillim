@@ -45,7 +45,7 @@ def build_app(components: Iterable[Component]) -> FastAPI:
         finally:
             await _stop_components(started)
 
-    app = FastAPI(title="Trillim API", version="0.10.0", lifespan=lifespan)
+    app = FastAPI(title="Trillim API", version="0.11.0", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz():
