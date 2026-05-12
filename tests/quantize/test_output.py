@@ -190,8 +190,8 @@ class QuantizeOutputTests(unittest.TestCase):
                 (qwen3_out / "trillim_config.json").read_text(encoding="utf-8")
             )
             self.assertEqual(qwen3_payload["architecture"], "qwen3")
-            self.assertEqual(qwen3_payload["quantization"], "q8_0")
-            self.assertEqual(_quantization_name(qwen3_config), "q8_0")
+            self.assertEqual(qwen3_payload["quantization"], "bf16")
+            self.assertEqual(_quantization_name(qwen3_config), "bf16")
 
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:

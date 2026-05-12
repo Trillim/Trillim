@@ -183,6 +183,7 @@ def validate_model_dir(
         tie_word_embeddings=_resolve_tied_embeddings(config),
         has_attn_sub_norm=arch_info.has_attn_sub_norm,
         has_ffn_sub_norm=arch_info.has_ffn_sub_norm,
+        quantization=str(bundle_metadata.get("quantization", "")),
     )
 
 

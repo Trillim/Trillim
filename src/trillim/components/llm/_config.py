@@ -52,6 +52,7 @@ class ModelRuntimeConfig:
     tie_word_embeddings: bool
     has_attn_sub_norm: bool
     has_ffn_sub_norm: bool
+    quantization: str
 
 
 @dataclass(frozen=True, slots=True)

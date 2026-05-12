@@ -251,7 +251,7 @@ def _quantization_name(config: ModelQuantizeConfig) -> str:
     if config.arch_type == ArchitectureType.BONSAI_TERNARY:
         return "grouped-ternary"
     if config.arch_type == ArchitectureType.QWEN3:
-        return "q8_0"
+        return "bf16"
     return "ternary"
 
 

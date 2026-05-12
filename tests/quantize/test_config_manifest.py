@@ -15,7 +15,6 @@ from trillim.quantize._manifest import (
     ACTION_BF16_RAW,
     ACTION_Q1_0_128,
     ACTION_GROUP_TERNARY_QUANTIZE,
-    ACTION_Q8_0_BLOCKED_32_QUANTIZE,
     ACTION_REPACK_TERNARY,
     ACTION_TERNARY_QUANTIZE,
     get_sharded_files,
@@ -234,12 +233,12 @@ class QuantizeConfigManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             _quantized_tensor_action("F32", ArchitectureType.QWEN3),
-            ACTION_Q8_0_BLOCKED_32_QUANTIZE,
+            ACTION_BF16_RAW,
         )
         with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
             _safetensors_dtype_code("BAD")
 
-    def test_dense_qwen3_uses_blocked_q8_manifest_actions(self):
+    def test_dense_qwen3_uses_bf16_manifest_actions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             model_dir = root / "qwen3"
@@ -279,12 +278,12 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             tensors = _read_manifest_tensors(manifest_path)
 
         self.assertEqual(config.arch_type, ArchitectureType.QWEN3)
-        q8_entry = next(entry for entry in tensors if entry["row"] == 37 and entry["col"] == 128)
+        dense_entry = next(entry for entry in tensors if entry["row"] == 37 and entry["col"] == 128)
         self.assertEqual(
-            q8_entry["action"],
-            ACTION_Q8_0_BLOCKED_32_QUANTIZE,
+            dense_entry["action"],
+            ACTION_BF16_RAW,
         )
-        self.assertEqual(q8_entry["padded_row"], 64)
+        self.assertEqual(dense_entry["padded_row"], 37)
         self.assertEqual(
             next(entry for entry in tensors if entry["row"] == 32 and entry["col"] == 1)["action"],
             ACTION_BF16_RAW,

@@ -69,7 +69,7 @@ def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int
     if arch_type == ArchitectureType.BONSAI_TERNARY:
         return ACTION_GROUP_TERNARY_QUANTIZE
     if arch_type == ArchitectureType.QWEN3:
-        return ACTION_Q8_0_BLOCKED_32_QUANTIZE
+        return ACTION_BF16_RAW
     if dtype_str in {"I8", "U8"}:
         return ACTION_REPACK_TERNARY
     return ACTION_TERNARY_QUANTIZE

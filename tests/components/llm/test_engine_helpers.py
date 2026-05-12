@@ -45,6 +45,7 @@ def _model() -> ModelRuntimeConfig:
         tie_word_embeddings=False,
         has_attn_sub_norm=False,
         has_ffn_sub_norm=True,
+        quantization="ternary",
     )
 
 
@@ -65,6 +66,7 @@ class EngineHelperTests(unittest.TestCase):
         self.assertEqual(int(lines[0]), len(lines) - 1)
         self.assertIn("arch_type=2", lines)
         self.assertIn("activation=1", lines)
+        self.assertIn("quantization=ternary", lines)
         self.assertIn("eos_tokens=2,3", lines)
         self.assertIn("num_threads=4", lines)
         self.assertIn("lora_dir=/tmp/lora", lines)

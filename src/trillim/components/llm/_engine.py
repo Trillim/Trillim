@@ -260,6 +260,7 @@ def _build_init_block(model: ModelRuntimeConfig, init_config: InitConfig) -> str
         f"has_qkv_bias={1 if model.has_qkv_bias else 0}",
         f"has_attn_sub_norm={1 if model.has_attn_sub_norm else 0}",
         f"has_ffn_sub_norm={1 if model.has_ffn_sub_norm else 0}",
+        f"quantization={_first_protocol_line(model.quantization)}",
         f"eos_tokens={','.join(str(token_id) for token_id in model.eos_tokens)}",
     ]
     if init_config.num_threads:

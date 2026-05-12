@@ -76,7 +76,9 @@ def write_llm_bundle(
             {
                 "format_version": CURRENT_FORMAT_VERSION,
                 "type": "model",
-                "quantization": "ternary",
+                "quantization": (
+                    "bf16" if architecture == "Qwen3ForCausalLM" else "ternary"
+                ),
                 "architecture": architecture.lower(),
                 "platforms": ["x86_64"],
                 "source_model": "",
