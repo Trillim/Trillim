@@ -15,6 +15,8 @@ from trillim.quantize._manifest import (
     ACTION_BF16_RAW,
     ACTION_Q1_0_128,
     ACTION_GROUP_TERNARY_QUANTIZE,
+    ACTION_Q8_0_BLOCKED_32_QUANTIZE,
+    ACTION_Q8_0_QUANTIZE,
     ACTION_REPACK_TERNARY,
     ACTION_TERNARY_QUANTIZE,
     get_sharded_files,
@@ -26,6 +28,7 @@ from trillim.quantize._manifest import (
     validate_adapter_source,
     resolve_quantize_binary,
     _safetensors_dtype_code,
+    _quantization_target_action,
     _quantized_tensor_action,
 )
 from tests.support import requires_bundle_test
@@ -235,8 +238,26 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             _quantized_tensor_action("F32", ArchitectureType.QWEN3),
             ACTION_BF16_RAW,
         )
+        self.assertEqual(
+            _quantization_target_action("auto", "F32", ArchitectureType.QWEN3),
+            ACTION_BF16_RAW,
+        )
+        self.assertEqual(
+            _quantization_target_action("int8", "F32", ArchitectureType.QWEN3),
+            ACTION_Q8_0_BLOCKED_32_QUANTIZE,
+        )
+        self.assertEqual(
+            _quantization_target_action("q8_0", "F32", ArchitectureType.QWEN3),
+            ACTION_Q8_0_QUANTIZE,
+        )
+        self.assertEqual(
+            _quantization_target_action("bf16", "F32", ArchitectureType.LLAMA),
+            ACTION_BF16_RAW,
+        )
         with self.assertRaisesRegex(ValueError, "Unknown safetensors dtype"):
             _safetensors_dtype_code("BAD")
+        with self.assertRaisesRegex(ValueError, "Unknown quantization"):
+            _quantization_target_action("bad", "F32", ArchitectureType.LLAMA)
 
     def test_dense_qwen3_uses_bf16_manifest_actions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -364,6 +385,49 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             self.assertEqual(shard_count, 1)
             self.assertEqual(Path(shard_name), model_dir / "model.safetensors")
             self.assertEqual(tensor_count, 4)
+
+    def test_build_manifest_applies_explicit_quantization_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "model"
+            output_dir = root / "out"
+            model_dir.mkdir()
+            output_dir.mkdir()
+            _write_config(model_dir, architectures=["Qwen3ForCausalLM"], tie_word_embeddings=False)
+            _write_safetensors(
+                model_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("F32", [100, 128], b"\0" * 100 * 128 * 4),
+                    "model.norm.weight": ("F32", [128], b"\0" * 128 * 4),
+                    "model.layers.0.self_attn.q_proj.weight": (
+                        "F32",
+                        [130, 128],
+                        b"\0" * 130 * 128 * 4,
+                    ),
+                    "lm_head.weight": ("F32", [100, 128], b"\0" * 100 * 128 * 4),
+                },
+            )
+            config = load_model_config(model_dir)
+
+            manifest_path = build_manifest(
+                model_dir,
+                config,
+                output_dir=output_dir,
+                quantization="q8_0_blocked_32",
+            )
+
+            entries = _read_manifest_tensors(manifest_path)
+            self.assertEqual(
+                [entry["action"] for entry in entries],
+                [
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_Q8_0_BLOCKED_32_QUANTIZE,
+                ],
+            )
+            self.assertEqual(entries[3]["row"], 130)
+            self.assertEqual(entries[3]["padded_row"], 160)
 
     def test_build_manifest_validates_supported_tensors_and_language_model_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:

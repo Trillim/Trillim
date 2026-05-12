@@ -22,6 +22,7 @@ from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._model_dir import validate_lora_dir, validate_model_dir
 from trillim.errors import ModelValidationError
+from trillim.quantize._quantization import QUANTIZATION_CHOICES
 from trillim.utils.formatting import human_size as _human_size
 
 DEFAULT_HOST = "127.0.0.1"
@@ -487,7 +488,7 @@ def _run_serve(
 def _run_quantize_command(args: argparse.Namespace) -> int:
     from trillim.quantize import quantize
 
-    quantize(args.model_dir, args.adapter_dir)
+    quantize(args.model_dir, args.adapter_dir, quantization=args.quantization)
     return 0
 
 
@@ -583,6 +584,12 @@ def build_parser() -> argparse.ArgumentParser:
         "adapter_dir",
         nargs="?",
         help="Optional local filesystem path to the source adapter directory",
+    )
+    quantize_parser.add_argument(
+        "--quantization",
+        choices=QUANTIZATION_CHOICES,
+        default="auto",
+        help="Model tensor quantization target (default: auto)",
     )
     return parser
 

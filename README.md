@@ -72,9 +72,14 @@ uv run trillim list
 # Quantize a model bundle
 uv run trillim quantize /path/to/model
 
+# Quantize a model bundle with an explicit tensor format
+uv run trillim quantize /path/to/model --quantization q8_0_blocked_32
+
 # Quantize a LoRA adapter against its base model
 uv run trillim quantize /path/to/base-model /path/to/adapter
 ```
+
+Use `--quantization auto` to keep the default architecture-specific behavior.
 
 Qwen3-based Bonsai checkpoints quantize into binary or grouped-ternary bundles, but Trillim still manages them under the same `Local/...-TRNQ` store naming and load flow.
 

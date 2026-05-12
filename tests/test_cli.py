@@ -24,6 +24,11 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(parser.parse_args(["list"]).command, "list")
         self.assertEqual(parser.parse_args(["chat", "Trillim/model"]).command, "chat")
+        quantize_args = parser.parse_args(
+            ["quantize", "/tmp/model", "--quantization", "q8_0_blocked_32"]
+        )
+        self.assertEqual(quantize_args.command, "quantize")
+        self.assertEqual(quantize_args.quantization, "q8_0_blocked_32")
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             code = cli.main([])
 

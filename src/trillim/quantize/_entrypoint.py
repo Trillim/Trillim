@@ -25,6 +25,7 @@ from ._output import (
     write_adapter_metadata,
     write_model_metadata,
 )
+from ._quantization import normalize_quantization
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +35,13 @@ class QuantizeResult:
     used_language_model_only: bool
 
 
-def quantize(model_dir: str | Path, adapter_dir: str | Path | None = None) -> QuantizeResult:
+def quantize(
+    model_dir: str | Path,
+    adapter_dir: str | Path | None = None,
+    *,
+    quantization: str = "auto",
+) -> QuantizeResult:
+    quantization_target = normalize_quantization(quantization)
     source_model_dir = _normalize_source_dir(model_dir, label="Model directory")
     source_adapter_dir = (
         None
@@ -43,6 +50,8 @@ def quantize(model_dir: str | Path, adapter_dir: str | Path | None = None) -> Qu
     )
     if source_adapter_dir is not None and source_adapter_dir == source_model_dir:
         raise ValueError("Adapter directory must be different from model directory")
+    if source_adapter_dir is not None and quantization_target.value != "auto":
+        raise ValueError("--quantization only applies when quantizing a base model")
 
     config = load_model_config(source_model_dir)
     language_model_only = determine_language_model_only(source_model_dir, config)
@@ -89,9 +98,15 @@ def quantize(model_dir: str | Path, adapter_dir: str | Path | None = None) -> Qu
         config,
         output_dir=staging_dir,
         language_model_only=language_model_only,
+        quantization=quantization_target.value,
     )
     copy_model_support_files(source_model_dir, staging_dir)
-    write_model_metadata(staging_dir, config=config, model_dir=source_model_dir)
+    write_model_metadata(
+        staging_dir,
+        config=config,
+        model_dir=source_model_dir,
+        quantization=quantization_target.value,
+    )
     mark_staging_complete(staging_dir)
     publish_staging_dir(target)
     print(f"Quantized model ready at: {target}")

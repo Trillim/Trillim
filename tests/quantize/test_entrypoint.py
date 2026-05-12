@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -52,10 +53,26 @@ class QuantizeEntrypointTests(unittest.TestCase):
                 "trillim.quantize._entrypoint.resolve_quantize_binary",
                 return_value=Path(true_binary),
             ):
-                result = quantize(model_dir)
+                result = quantize(model_dir, quantization="int8")
 
             self.assertEqual(result.bundle_type, "model")
             self.assertFalse(result.used_language_model_only)
             self.assertEqual(result.bundle_path, local_root / "source-model-TRNQ")
             self.assertTrue((result.bundle_path / "trillim_config.json").is_file())
             self.assertTrue((result.bundle_path / "config.json").is_file())
+            metadata = json.loads(
+                (result.bundle_path / "trillim_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["quantization"], "q8_0_blocked_32")
+
+    def test_quantization_override_rejects_adapter_quantization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "source-model"
+            adapter_dir = root / "adapter"
+            model_dir.mkdir()
+            adapter_dir.mkdir()
+            _write_config(model_dir)
+
+            with self.assertRaisesRegex(ValueError, "only applies"):
+                quantize(model_dir, adapter_dir, quantization="q8_0")

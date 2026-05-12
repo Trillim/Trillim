@@ -149,6 +149,9 @@ Quantize a local checkpoint into Trillim's managed `Local/` store.
 # Quantize a base model
 trillim quantize /path/to/model
 
+# Quantize a base model with an explicit tensor format
+trillim quantize /path/to/model --quantization q8_0_blocked_32
+
 # Quantize a LoRA adapter against a base model
 trillim quantize /path/to/base-model /path/to/adapter
 ```
@@ -159,6 +162,7 @@ Arguments:
 | --- | --- |
 | `model_dir` | Required local filesystem path to the base model directory |
 | `adapter_dir` | Optional local filesystem path to a LoRA adapter directory |
+| `--quantization` | Optional base-model tensor target: `auto`, `bf16`, `q8_0`, `q8_0_blocked_32`, `int8`, `ternary`, `q1_0_128`, or `grouped_ternary_128` |
 
 Output:
 
@@ -173,6 +177,7 @@ Additional notes:
 - Legacy README-based Bonsai detection still works for older checkpoints, but it is deprecated.
 - Qwen3-based Bonsai checkpoints are supported, including Bonsai 1-bit (binary) and grouped-ternary bundles.
 - Bonsai bundles use binary or grouped-ternary quantization metadata. Existing BitNet-style flows continue to use ternary quantization metadata.
+- `--quantization auto` preserves the default architecture-specific behavior. `int8` is an alias for `q8_0_blocked_32`.
 - The managed store naming does not change for Bonsai bundles: the output still lands under `Local/...-TRNQ`.
 - Bonsai bundles are loaded with the same store IDs and commands as any other Trillim bundle, including `chat`, `serve`, and the Python SDK.
 - The source directories must be outside `~/.trillim/models/`.

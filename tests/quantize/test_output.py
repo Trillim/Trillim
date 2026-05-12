@@ -192,6 +192,10 @@ class QuantizeOutputTests(unittest.TestCase):
             self.assertEqual(qwen3_payload["architecture"], "qwen3")
             self.assertEqual(qwen3_payload["quantization"], "bf16")
             self.assertEqual(_quantization_name(qwen3_config), "bf16")
+            self.assertEqual(
+                _quantization_name(qwen3_config, quantization="int8"),
+                "q8_0_blocked_32",
+            )
 
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
