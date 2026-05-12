@@ -129,11 +129,13 @@ class LLMValidationTests(unittest.TestCase):
                 "harness_name": " Search ",
                 "search_provider": " DuckDuckGo ",
                 "search_token_budget": 5,
+                "model_quant": "int8",
             }
         )
 
         self.assertEqual(request.harness_name, " Search ")
         self.assertEqual(request.search_provider, " DuckDuckGo ")
+        self.assertEqual(request.model_quant, "int8")
 
         with self.assertRaisesRegex(InvalidRequestError, "Unknown harness"):
             validate_swap_request(

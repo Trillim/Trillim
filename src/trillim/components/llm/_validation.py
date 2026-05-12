@@ -95,11 +95,14 @@ class SwapModelRequestInput(BaseModel):
     unembed_quant: str | None = Field(
         default=None, min_length=1, max_length=MAX_MODEL_NAME_CHARS
     )
+    model_quant: str | None = Field(
+        default=None, min_length=1, max_length=MAX_MODEL_NAME_CHARS
+    )
     harness_name: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
     search_provider: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
     search_token_budget: int | None = Field(default=None, ge=1)
 
-    @field_validator("lora_dir", "lora_quant", "unembed_quant")
+    @field_validator("lora_dir", "lora_quant", "unembed_quant", "model_quant")
     @classmethod
     def _validate_non_blank_text(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():

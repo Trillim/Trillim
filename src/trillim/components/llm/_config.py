@@ -64,6 +64,7 @@ class InitConfig:
     lora_dir: Path | None = None
     lora_quant: str | None = None
     unembed_quant: str | None = None
+    model_quant: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

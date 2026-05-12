@@ -404,6 +404,7 @@ def _run_chat(
     model_id: str,
     adapter_id: str | None,
     *,
+    model_quant: str | None = None,
     trust_remote_code: bool = False,
 ) -> int:
     _require_remote_code_opt_in(
@@ -421,6 +422,7 @@ def _run_chat(
         LLM(
             model_id,
             lora_dir=adapter_id,
+            model_quant=model_quant,
             trust_remote_code=trust_remote_code,
         )
     )
@@ -468,6 +470,7 @@ def _run_serve(
     model_id: str,
     *,
     voice: bool,
+    model_quant: str | None = None,
     trust_remote_code: bool = False,
 ) -> int:
     _require_remote_code_opt_in(
@@ -477,7 +480,7 @@ def _run_serve(
     )
     if voice:
         _preflight_voice_dependencies()
-    llm = LLM(model_id, trust_remote_code=trust_remote_code)
+    llm = LLM(model_id, model_quant=model_quant, trust_remote_code=trust_remote_code)
     components = [llm]
     if voice:
         components.extend([STT(), TTS()])
@@ -557,6 +560,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow loading custom tokenizer/config code referenced by the bundle",
     )
+    chat_parser.add_argument(
+        "--model-quant",
+        choices=("int8", "q8_0"),
+        help="Runtime model weight quantization override",
+    )
 
     serve_parser = subparsers.add_parser("serve", help="Start the demo API server")
     serve_parser.add_argument(
@@ -571,6 +579,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--trust-remote-code",
         action="store_true",
         help="Allow loading custom tokenizer/config code referenced by the bundle",
+    )
+    serve_parser.add_argument(
+        "--model-quant",
+        choices=("int8", "q8_0"),
+        help="Runtime model weight quantization override",
     )
 
     quantize_parser = subparsers.add_parser(
@@ -607,11 +620,13 @@ def main(argv: list[str] | None = None) -> int:
         "chat": lambda: _run_chat(
             args.model_dir,
             args.adapter_dir,
+            model_quant=args.model_quant,
             trust_remote_code=args.trust_remote_code,
         ),
         "serve": lambda: _run_serve(
             args.model_dir,
             voice=args.voice,
+            model_quant=args.model_quant,
             trust_remote_code=args.trust_remote_code,
         ),
         "quantize": lambda: _run_quantize_command(args),

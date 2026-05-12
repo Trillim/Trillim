@@ -59,6 +59,7 @@ class EngineHelperTests(unittest.TestCase):
                 lora_dir=Path("/tmp/lora\nignored"),
                 lora_quant="q8\nignored",
                 unembed_quant="q4",
+                model_quant="int8\nignored",
             ),
         )
 
@@ -72,6 +73,7 @@ class EngineHelperTests(unittest.TestCase):
         self.assertIn("lora_dir=/tmp/lora", lines)
         self.assertIn("lora_quant=q8", lines)
         self.assertIn("unembed_quant=q4", lines)
+        self.assertIn("model_quant=int8", lines)
 
     def test_build_request_block_serializes_sampling_and_tokens(self):
         block = _build_request_block(

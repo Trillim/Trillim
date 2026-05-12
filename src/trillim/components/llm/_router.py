@@ -13,7 +13,10 @@ from fastapi.responses import StreamingResponse
 
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._limits import REQUEST_BODY_LIMIT_BYTES
-from trillim.components.llm._validation import validate_chat_request, validate_swap_request
+from trillim.components.llm._validation import (
+    validate_chat_request,
+    validate_swap_request,
+)
 from trillim.errors import (
     AdmissionRejectedError,
     ComponentLifecycleError,
@@ -35,7 +38,9 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
     @router.get("/v1/models")
     async def list_models():
         if request_lock.locked():
-            raise _as_http_error(AdmissionRejectedError("LLM is already handling a request"))
+            raise _as_http_error(
+                AdmissionRejectedError("LLM is already handling a request")
+            )
         await request_lock.acquire()
         try:
             model_name = llm._active_model_name()
@@ -51,7 +56,9 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         if request_lock.locked():
-            raise _as_http_error(AdmissionRejectedError("LLM is already handling a request"))
+            raise _as_http_error(
+                AdmissionRejectedError("LLM is already handling a request")
+            )
         await request_lock.acquire()
         release_in_router = True
         session = None
@@ -127,6 +134,7 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
                     lora_dir=swap_request.lora_dir,
                     lora_quant=swap_request.lora_quant,
                     unembed_quant=swap_request.unembed_quant,
+                    model_quant=swap_request.model_quant,
                     harness_name=swap_request.harness_name,
                     search_provider=swap_request.search_provider,
                     search_token_budget=swap_request.search_token_budget,
@@ -203,9 +211,7 @@ async def _stream_chat_response(
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_name,
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "stop"}
-                        ],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
                 )
                 break
@@ -231,7 +237,9 @@ async def _read_json_body(request: Request, limit: int) -> object:
             if int(content_length) > limit:
                 raise HTTPException(status_code=413, detail="request body too large")
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="invalid content-length header") from exc
+            raise HTTPException(
+                status_code=400, detail="invalid content-length header"
+            ) from exc
     total = 0
     chunks: list[bytes] = []
     async for chunk in request.stream():

@@ -67,7 +67,9 @@ def load_tokenizer(model_dir: Path, *, trust_remote_code: bool):
     try:
         from transformers import AutoTokenizer
     except Exception as exc:  # pragma: no cover
-        raise ModelValidationError("transformers is required to load tokenizers") from exc
+        raise ModelValidationError(
+            "transformers is required to load tokenizers"
+        ) from exc
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_dir),
@@ -97,6 +99,7 @@ class LLM(Component):
         lora_dir: str | Path | None = None,
         lora_quant: str | None = None,
         unembed_quant: str | None = None,
+        model_quant: str | None = None,
         trust_remote_code: bool = False,
         harness_name: str = "default",
         search_provider: str = "ddgs",
@@ -116,6 +119,7 @@ class LLM(Component):
             lora_dir=lora_dir,
             lora_quant=lora_quant,
             unembed_quant=unembed_quant,
+            model_quant=model_quant,
         )
         self._trust_remote_code = trust_remote_code
         self._configured_harness_name = validate_harness_name(harness_name)
@@ -206,6 +210,7 @@ class LLM(Component):
         lora_dir: str | Path | None = None,
         lora_quant: str | None = None,
         unembed_quant: str | None = None,
+        model_quant: str | None = None,
         harness_name: str | None = None,
         search_provider: str | None = None,
         search_token_budget: int | None = None,
@@ -233,6 +238,7 @@ class LLM(Component):
                             lora_dir=lora_dir,
                             lora_quant=lora_quant,
                             unembed_quant=unembed_quant,
+                            model_quant=model_quant,
                         ),
                         harness_name=harness_name,
                         search_provider=search_provider,
@@ -268,7 +274,9 @@ class LLM(Component):
                 self._runtime = new_runtime
                 self._configured_init_config = new_runtime.init_config
                 self._configured_harness_name = new_runtime.harness_config.name
-                self._configured_search_provider = new_runtime.harness_config.search_provider
+                self._configured_search_provider = (
+                    new_runtime.harness_config.search_provider
+                )
                 self._configured_search_token_budget = (
                     new_runtime.harness_config.requested_search_token_budget
                 )
@@ -359,7 +367,8 @@ class LLM(Component):
                 init_config,
                 trust_remote_code=self._trust_remote_code,
             )
-            if self._model_validator is validate_model_dir or init_config.lora_dir is not None
+            if self._model_validator is validate_model_dir
+            or init_config.lora_dir is not None
             else RuntimeFiles(
                 model_dir=Path(init_config.model_dir),
                 metadata_dir=Path(init_config.model_dir),
@@ -371,6 +380,7 @@ class LLM(Component):
             lora_dir=runtime_files.adapter_dir,
             lora_quant=init_config.lora_quant,
             unembed_quant=init_config.unembed_quant,
+            model_quant=init_config.model_quant,
         )
         try:
             model = self._validate_runtime_model(
@@ -396,7 +406,9 @@ class LLM(Component):
             )
             harness_config = _HarnessConfig(
                 name=validate_harness_name(
-                    self._configured_harness_name if harness_name is None else harness_name
+                    self._configured_harness_name
+                    if harness_name is None
+                    else harness_name
                 ),
                 search_provider=normalize_provider_name(
                     self._configured_search_provider
@@ -488,6 +500,7 @@ def _make_init_config(
     lora_dir: str | Path | None,
     lora_quant: str | None,
     unembed_quant: str | None,
+    model_quant: str | None,
 ) -> InitConfig:
     if not model_dir:
         raise ValueError("model_dir is required")
@@ -499,6 +512,7 @@ def _make_init_config(
         lora_dir=_normalize_optional_store_id("lora_dir", lora_dir),
         lora_quant=_normalize_optional_text("lora_quant", lora_quant),
         unembed_quant=_normalize_optional_text("unembed_quant", unembed_quant),
+        model_quant=_normalize_optional_text("model_quant", model_quant),
     )
 
 
@@ -515,7 +529,9 @@ def _normalize_store_id(field_name: str, value: str | Path) -> Path:
         raise InvalidRequestError(f"{field_name}: {exc}") from exc
 
 
-def _normalize_optional_store_id(field_name: str, value: str | Path | None) -> Path | None:
+def _normalize_optional_store_id(
+    field_name: str, value: str | Path | None
+) -> Path | None:
     if value is None:
         return None
     return _normalize_store_id(field_name, value)

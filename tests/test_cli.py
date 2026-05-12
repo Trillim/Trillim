@@ -23,7 +23,15 @@ class CLITests(unittest.TestCase):
         parser = cli.build_parser()
 
         self.assertEqual(parser.parse_args(["list"]).command, "list")
-        self.assertEqual(parser.parse_args(["chat", "Trillim/model"]).command, "chat")
+        chat_args = parser.parse_args(
+            ["chat", "Trillim/model", "--model-quant", "int8"]
+        )
+        self.assertEqual(chat_args.command, "chat")
+        self.assertEqual(chat_args.model_quant, "int8")
+        serve_args = parser.parse_args(
+            ["serve", "Trillim/model", "--model-quant", "q8_0"]
+        )
+        self.assertEqual(serve_args.model_quant, "q8_0")
         quantize_args = parser.parse_args(
             ["quantize", "/tmp/model", "--quantization", "q8_0_blocked_32"]
         )
@@ -36,7 +44,9 @@ class CLITests(unittest.TestCase):
         self.assertIn("Trillim", stdout.getvalue())
 
     def test_pull_id_validation_and_platform_normalization(self):
-        self.assertEqual(cli._validate_pull_id(" Trillim/BitNet-TRNQ "), "Trillim/BitNet-TRNQ")
+        self.assertEqual(
+            cli._validate_pull_id(" Trillim/BitNet-TRNQ "), "Trillim/BitNet-TRNQ"
+        )
         self.assertEqual(cli._normalize_platform_name("ARM64"), "aarch64")
         self.assertEqual(cli._normalize_platform_name("amd64"), "x86_64")
         self.assertEqual(cli._normalize_platform_name("riscv64"), "riscv64")
@@ -84,9 +94,13 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             bundle = write_llm_bundle(root / "Trillim" / "remote")
-            payload = json.loads((bundle / "trillim_config.json").read_text(encoding="utf-8"))
+            payload = json.loads(
+                (bundle / "trillim_config.json").read_text(encoding="utf-8")
+            )
             payload["remote_code"] = True
-            (bundle / "trillim_config.json").write_text(json.dumps(payload), encoding="utf-8")
+            (bundle / "trillim_config.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
 
             with patch.object(_model_store, "DOWNLOADED_ROOT", root / "Trillim"):
                 with self.assertRaisesRegex(RuntimeError, "trust_remote_code"):
@@ -187,13 +201,17 @@ class CLITests(unittest.TestCase):
             local_dir.mkdir(parents=True)
             with patch.object(_model_store, "DOWNLOADED_ROOT", root / "Trillim"):
                 with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                    result = cli._pull_model("Trillim/model", revision=None, force=False)
+                    result = cli._pull_model(
+                        "Trillim/model", revision=None, force=False
+                    )
 
         self.assertEqual(result, local_dir)
         self.assertIn("already exists", stdout.getvalue())
 
     def test_main_reports_runtime_errors(self):
-        with patch.object(cli, "_run_models_command", side_effect=RuntimeError("offline")):
+        with patch.object(
+            cli, "_run_models_command", side_effect=RuntimeError("offline")
+        ):
             with contextlib.redirect_stderr(io.StringIO()) as stderr:
                 code = cli.main(["models"])
 
