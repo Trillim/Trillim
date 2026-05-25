@@ -7,11 +7,7 @@ import os
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
-from trillim.components.llm._config import (
-    InitConfig,
-    ModelRuntimeConfig,
-    SamplingDefaults,
-)
+from trillim.components.llm._config import InitConfig, ModelRuntimeConfig, SamplingDefaults
 
 
 class EngineError(RuntimeError):
@@ -46,7 +42,9 @@ class InferenceEngine:
         self.tokenizer = tokenizer
         self.defaults = defaults
         self.init_config = (
-            InitConfig(model_dir=model.path) if init_config is None else init_config
+            InitConfig(model_dir=model.path)
+            if init_config is None
+            else init_config
         )
         self.progress_timeout = progress_timeout
         self.binary_path = _bundled_binary_path()
@@ -116,9 +114,7 @@ class InferenceEngine:
                 _build_request_block(
                     kv_position=kv_position,
                     tokens=request_tokens[kv_position:],
-                    temperature=self.defaults.temperature
-                    if temperature is None
-                    else temperature,
+                    temperature=self.defaults.temperature if temperature is None else temperature,
                     top_k=self.defaults.top_k if top_k is None else top_k,
                     top_p=self.defaults.top_p if top_p is None else top_p,
                     repetition_penalty=(
@@ -131,9 +127,7 @@ class InferenceEngine:
                         if rep_penalty_lookback is None
                         else rep_penalty_lookback
                     ),
-                    max_tokens=self.defaults.max_tokens
-                    if max_tokens is None
-                    else max_tokens,
+                    max_tokens=self.defaults.max_tokens if max_tokens is None else max_tokens,
                 )
             )
             while True:
@@ -236,7 +230,7 @@ async def _read_stderr(process: asyncio.subprocess.Process) -> str:
 
 
 def _bundled_binary_path() -> str:
-    suffix = ".exe" if os.name == "nt" else ""
+    suffix = ".exe" if os.name =="nt" else ""
     bin_dir = Path(__file__).resolve().parents[2] / "_bin"
     bundled = bin_dir / f"trillim-inference{suffix}"
     if bundled.is_file():
@@ -266,7 +260,6 @@ def _build_init_block(model: ModelRuntimeConfig, init_config: InitConfig) -> str
         f"has_qkv_bias={1 if model.has_qkv_bias else 0}",
         f"has_attn_sub_norm={1 if model.has_attn_sub_norm else 0}",
         f"has_ffn_sub_norm={1 if model.has_ffn_sub_norm else 0}",
-        f"quantization={_first_protocol_line(model.quantization)}",
         f"eos_tokens={','.join(str(token_id) for token_id in model.eos_tokens)}",
     ]
     if init_config.num_threads:
@@ -277,8 +270,6 @@ def _build_init_block(model: ModelRuntimeConfig, init_config: InitConfig) -> str
         pairs.append(f"lora_quant={_first_protocol_line(init_config.lora_quant)}")
     if init_config.unembed_quant is not None:
         pairs.append(f"unembed_quant={_first_protocol_line(init_config.unembed_quant)}")
-    if init_config.model_quant is not None:
-        pairs.append(f"model_quant={_first_protocol_line(init_config.model_quant)}")
     return f"{len(pairs)}\n" + "".join(f"{pair}\n" for pair in pairs)
 
 

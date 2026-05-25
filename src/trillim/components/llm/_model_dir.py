@@ -37,7 +37,6 @@ _DEFAULT_EOS_TOKENS = {
     ArchitectureType.BITNET: 128009,
     ArchitectureType.LLAMA: 128009,
     ArchitectureType.QWEN35: 248044,
-    ArchitectureType.QWEN3: 151645,
 }
 _MODEL_RUNTIME_ARTIFACTS = ("qmodel.tensors", "rope.cache")
 _LORA_RUNTIME_ARTIFACTS = ("qmodel.lora",)
@@ -54,7 +53,7 @@ _TOKENIZER_FALLBACK_FILES = (
 _MAX_REMOTE_CODE_DEPTH = 16
 _MAX_REMOTE_CODE_FILES = 64
 _MAX_REMOTE_CODE_BYTES = 4 * 1024 * 1024
-_SUPPORTED_BUNDLE_FORMAT_VERSIONS = frozenset({4, CURRENT_FORMAT_VERSION})
+_SUPPORTED_ADAPTER_FORMAT_VERSION = CURRENT_FORMAT_VERSION
 
 
 # Model metadata extraction
@@ -94,7 +93,7 @@ _ARCH_REGISTRY: dict[str, _ArchitectureInfo] = {
         has_ffn_sub_norm=True,
     ),
     "qwen3forcausallm": _ArchitectureInfo(
-        arch_type=ArchitectureType.QWEN3,
+        arch_type=ArchitectureType.BONSAI,
         activation=ActivationType.SILU,
         has_attn_sub_norm=False,
         has_ffn_sub_norm=False,
@@ -183,7 +182,6 @@ def validate_model_dir(
         tie_word_embeddings=_resolve_tied_embeddings(config),
         has_attn_sub_norm=arch_info.has_attn_sub_norm,
         has_ffn_sub_norm=arch_info.has_ffn_sub_norm,
-        quantization=str(bundle_metadata.get("quantization", "")),
     )
 
 
@@ -266,7 +264,7 @@ def _validate_model_bundle_metadata(model_dir: Path) -> dict:
     payload = _load_json(config_path)
     if (
         not isinstance(payload, dict)
-        or payload.get("format_version") not in _SUPPORTED_BUNDLE_FORMAT_VERSIONS
+        or payload.get("format_version") != CURRENT_FORMAT_VERSION
     ):
         raise ModelValidationError(
             f"Model bundle metadata is missing or unsupported in {model_dir}"
@@ -283,26 +281,11 @@ def _resolve_arch_info(config: dict, *, bundle_metadata: dict | None = None) -> 
         raise ModelValidationError(
             f"Unsupported model architecture: {arch_name}"
         ) from exc
-    if arch_info.arch_type == ArchitectureType.QWEN3:
-        return _resolve_qwen3_arch_info(arch_info, bundle_metadata=bundle_metadata)
-    return arch_info
-
-
-def _resolve_qwen3_arch_info(
-    arch_info: _ArchitectureInfo,
-    *,
-    bundle_metadata: dict | None,
-) -> _ArchitectureInfo:
-    architecture = bundle_metadata.get("architecture") if isinstance(bundle_metadata, dict) else None
-    if architecture == "bonsai":
-        return _ArchitectureInfo(
-            arch_type=ArchitectureType.BONSAI,
-            activation=arch_info.activation,
-            has_attn_sub_norm=arch_info.has_attn_sub_norm,
-            has_ffn_sub_norm=arch_info.has_ffn_sub_norm,
-            has_qkv_bias=arch_info.has_qkv_bias,
-        )
-    if architecture == "bonsai_ternary":
+    if (
+        arch_info.arch_type == ArchitectureType.BONSAI
+        and isinstance(bundle_metadata, dict)
+        and bundle_metadata.get("architecture") == "bonsai_ternary"
+    ):
         return _ArchitectureInfo(
             arch_type=ArchitectureType.BONSAI_TERNARY,
             activation=arch_info.activation,
@@ -350,7 +333,7 @@ def _validate_adapter_metadata(
     format_version = adapter_config.get("format_version", 1)
     stored_hash = adapter_config.get("base_model_config_hash")
     if (
-        format_version not in _SUPPORTED_BUNDLE_FORMAT_VERSIONS
+        format_version != _SUPPORTED_ADAPTER_FORMAT_VERSION
         or not isinstance(stored_hash, str)
         or not stored_hash
     ):
@@ -481,13 +464,6 @@ def _collect_eos_tokens(
         eos_tokens = [int(token_id) for token_id in eos_raw]
     else:
         eos_tokens = [int(eos_raw)]
-    generation_config = _load_optional_json(metadata_dir / "generation_config.json")
-    if isinstance(generation_config, dict) and "eos_token_id" in generation_config:
-        generation_eos_raw = generation_config["eos_token_id"]
-        if isinstance(generation_eos_raw, list):
-            eos_tokens.extend(int(token_id) for token_id in generation_eos_raw)
-        else:
-            eos_tokens.append(int(generation_eos_raw))
     tokenizer_payload = _load_optional_json(metadata_dir / "tokenizer.json")
     added_tokens_payload = _load_optional_json(metadata_dir / "added_tokens.json")
     eos_tokens.extend(_collect_added_tokens(tokenizer_payload))

@@ -19,7 +19,6 @@ from trillim._bundle_metadata import (
 )
 
 from ._config import ModelQuantizeConfig
-from ._quantization import normalize_quantization
 from trillim.components.llm._config import ArchitectureType
 
 _MODEL_ALLOWLIST = (
@@ -168,14 +167,13 @@ def write_model_metadata(
     *,
     config: ModelQuantizeConfig,
     model_dir: Path,
-    quantization: str = "auto",
 ) -> None:
     metadata, _normalized_tokenizer_config = _load_bundle_support_metadata(model_dir)
     payload = {
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "model",
-        "quantization": _quantization_name(config, quantization=quantization),
+        "quantization": _quantization_name(config.arch_type),
         "source_model": config.source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -201,7 +199,7 @@ def write_adapter_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "lora_adapter",
-        "quantization": _quantization_name(config),
+        "quantization": _quantization_name(config.arch_type),
         "source_model": source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -247,16 +245,11 @@ def _copy_file(source_path: Path, destination: Path) -> None:
     shutil.copy2(source_path, destination)
 
 
-def _quantization_name(config: ModelQuantizeConfig, *, quantization: str = "auto") -> str:
-    quantization_target = normalize_quantization(quantization)
-    if quantization_target.value != "auto":
-        return quantization_target.display_name
-    if config.arch_type == ArchitectureType.BONSAI:
+def _quantization_name(arch_type: ArchitectureType) -> str:
+    if arch_type == ArchitectureType.BONSAI:
         return "binary"
-    if config.arch_type == ArchitectureType.BONSAI_TERNARY:
+    if arch_type == ArchitectureType.BONSAI_TERNARY:
         return "grouped-ternary"
-    if config.arch_type == ArchitectureType.QWEN3:
-        return "bf16"
     return "ternary"
 
 

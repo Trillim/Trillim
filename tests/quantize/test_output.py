@@ -4,7 +4,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from trillim import _model_store
@@ -176,27 +175,6 @@ class QuantizeOutputTests(unittest.TestCase):
             self.assertEqual(adapter_payload["source_model"], "base-model")
             self.assertTrue(adapter_payload["remote_code"])
 
-            qwen3_dir = root / "qwen3"
-            qwen3_out = root / "qwen3-out"
-            qwen3_dir.mkdir()
-            _write_config(qwen3_dir, architectures=["Qwen3ForCausalLM"])
-            (qwen3_dir / "README.md").write_text(
-                "Official dense Qwen3 checkpoint\n",
-                encoding="utf-8",
-            )
-            qwen3_config = load_model_config(qwen3_dir)
-            write_model_metadata(qwen3_out, config=qwen3_config, model_dir=qwen3_dir)
-            qwen3_payload = json.loads(
-                (qwen3_out / "trillim_config.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(qwen3_payload["architecture"], "qwen3")
-            self.assertEqual(qwen3_payload["quantization"], "bf16")
-            self.assertEqual(_quantization_name(qwen3_config), "bf16")
-            self.assertEqual(
-                _quantization_name(qwen3_config, quantization="int8"),
-                "q8_0_blocked_32",
-            )
-
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = Path(temp_dir)
@@ -217,9 +195,9 @@ class QuantizeOutputTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "External remote-code"):
             _parse_remote_code_module_path("other--repo.module.Class")
-        self.assertEqual(_quantization_name(SimpleNamespace(arch_type=ArchitectureType.BONSAI)), "binary")
+        self.assertEqual(_quantization_name(ArchitectureType.BONSAI), "binary")
         self.assertEqual(
-            _quantization_name(SimpleNamespace(arch_type=ArchitectureType.BONSAI_TERNARY)),
+            _quantization_name(ArchitectureType.BONSAI_TERNARY),
             "grouped-ternary",
         )
-        self.assertEqual(_quantization_name(SimpleNamespace(arch_type=ArchitectureType.LLAMA)), "ternary")
+        self.assertEqual(_quantization_name(ArchitectureType.LLAMA), "ternary")

@@ -19,7 +19,6 @@ class ArchitectureType(IntEnum):
     QWEN35 = 3
     BONSAI = 4
     BONSAI_TERNARY = 5
-    QWEN3 = 6
 
 
 class ActivationType(IntEnum):
@@ -52,7 +51,6 @@ class ModelRuntimeConfig:
     tie_word_embeddings: bool
     has_attn_sub_norm: bool
     has_ffn_sub_norm: bool
-    quantization: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,7 +62,6 @@ class InitConfig:
     lora_dir: Path | None = None
     lora_quant: str | None = None
     unembed_quant: str | None = None
-    model_quant: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

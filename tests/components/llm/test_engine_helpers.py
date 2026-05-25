@@ -45,7 +45,6 @@ def _model() -> ModelRuntimeConfig:
         tie_word_embeddings=False,
         has_attn_sub_norm=False,
         has_ffn_sub_norm=True,
-        quantization="ternary",
     )
 
 
@@ -59,7 +58,6 @@ class EngineHelperTests(unittest.TestCase):
                 lora_dir=Path("/tmp/lora\nignored"),
                 lora_quant="q8\nignored",
                 unembed_quant="q4",
-                model_quant="int8\nignored",
             ),
         )
 
@@ -67,13 +65,11 @@ class EngineHelperTests(unittest.TestCase):
         self.assertEqual(int(lines[0]), len(lines) - 1)
         self.assertIn("arch_type=2", lines)
         self.assertIn("activation=1", lines)
-        self.assertIn("quantization=ternary", lines)
         self.assertIn("eos_tokens=2,3", lines)
         self.assertIn("num_threads=4", lines)
         self.assertIn("lora_dir=/tmp/lora", lines)
         self.assertIn("lora_quant=q8", lines)
         self.assertIn("unembed_quant=q4", lines)
-        self.assertIn("model_quant=int8", lines)
 
     def test_build_request_block_serializes_sampling_and_tokens(self):
         block = _build_request_block(

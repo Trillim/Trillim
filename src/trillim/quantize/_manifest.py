@@ -12,15 +12,12 @@ from pathlib import Path
 from trillim.components.llm._config import ArchitectureType
 
 from ._config import LORA_TARGETS, ModelQuantizeConfig, layer_index_for_key
-from ._quantization import normalize_quantization
 
 ACTION_BF16_RAW = 0
 ACTION_TERNARY_QUANTIZE = 1
 ACTION_REPACK_TERNARY = 3
 ACTION_Q1_0_128 = 4
 ACTION_GROUP_TERNARY_QUANTIZE = 5
-ACTION_Q8_0_QUANTIZE = 6
-ACTION_Q8_0_BLOCKED_32_QUANTIZE = 7
 
 SECTION_TEXT_CORE = 1
 
@@ -69,32 +66,9 @@ def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int
         return ACTION_Q1_0_128
     if arch_type == ArchitectureType.BONSAI_TERNARY:
         return ACTION_GROUP_TERNARY_QUANTIZE
-    if arch_type == ArchitectureType.QWEN3:
-        return ACTION_BF16_RAW
     if dtype_str in {"I8", "U8"}:
         return ACTION_REPACK_TERNARY
     return ACTION_TERNARY_QUANTIZE
-
-
-def _quantization_target_action(quantization: str, dtype_str: str, arch_type: ArchitectureType) -> int:
-    target = normalize_quantization(quantization)
-    if target.value == "auto":
-        return _quantized_tensor_action(dtype_str, arch_type)
-    if target.value == "bf16":
-        return ACTION_BF16_RAW
-    if target.value == "q8_0":
-        return ACTION_Q8_0_QUANTIZE
-    if target.value == "q8_0_blocked_32":
-        return ACTION_Q8_0_BLOCKED_32_QUANTIZE
-    if target.value == "ternary":
-        if dtype_str in {"I8", "U8"}:
-            return ACTION_REPACK_TERNARY
-        return ACTION_TERNARY_QUANTIZE
-    if target.value == "q1_0_128":
-        return ACTION_Q1_0_128
-    if target.value == "grouped_ternary_128":
-        return ACTION_GROUP_TERNARY_QUANTIZE
-    raise AssertionError(f"Unhandled quantization target: {target.value}")
 
 
 def resolve_quantize_binary() -> Path:
@@ -161,9 +135,7 @@ def build_manifest(
     adapter_dir: Path | None = None,
     skip_model: bool = False,
     language_model_only: bool = False,
-    quantization: str = "auto",
 ) -> Path:
-    quantization_target = normalize_quantization(quantization)
     if not skip_model:
         _validate_supported_model_tensors(
             model_dir,
@@ -269,25 +241,14 @@ def build_manifest(
 
             if is_embedding or is_lm_head:
                 action = (
-                    _quantization_target_action(
-                        quantization_target.value,
-                        dtype_str,
-                        config.arch_type,
-                    )
+                    _quantized_tensor_action(dtype_str, config.arch_type)
                     if _is_bonsai_family(config.arch_type)
                     else ACTION_BF16_RAW
                 )
             elif should_quantize:
-                action = _quantization_target_action(
-                    quantization_target.value,
-                    dtype_str,
-                    config.arch_type,
-                )
+                action = _quantized_tensor_action(dtype_str, config.arch_type)
             else:
                 action = ACTION_BF16_RAW
-
-            if action == ACTION_Q8_0_BLOCKED_32_QUANTIZE:
-                padded_row = _round_up(padded_row, 32)
 
             has_scale = 0
             scale_shard_idx = 0
@@ -393,10 +354,6 @@ def build_manifest(
     return manifest_path
 
 
-def _round_up(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
 def run_model_quantizer(
     binary_path: Path,
     model_dir: Path,
@@ -404,14 +361,12 @@ def run_model_quantizer(
     *,
     output_dir: Path,
     language_model_only: bool,
-    quantization: str = "auto",
 ) -> None:
     manifest_path = build_manifest(
         model_dir,
         config,
         output_dir=output_dir,
         language_model_only=language_model_only,
-        quantization=quantization,
     )
     command = [
         str(binary_path),

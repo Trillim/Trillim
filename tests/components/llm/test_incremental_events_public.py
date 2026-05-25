@@ -130,7 +130,6 @@ class EventAndPublicAPITests(unittest.TestCase):
                         lora_dir=None,
                         lora_quant=None,
                         unembed_quant=None,
-                        model_quant=None,
                     )
         with self.assertRaisesRegex(InvalidRequestError, "model_dir"):
             LLM("Local/does-not-exist")
