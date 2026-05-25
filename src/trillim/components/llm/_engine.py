@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 from trillim.components.llm._config import InitConfig, ModelRuntimeConfig, SamplingDefaults
+from trillim.components.llm._limits import PREFILL_TOKEN_PROGRESS_TIMEOUT_SECONDS
 
 
 class EngineError(RuntimeError):
@@ -130,8 +131,15 @@ class InferenceEngine:
                     max_tokens=self.defaults.max_tokens if max_tokens is None else max_tokens,
                 )
             )
+            first_token = True
             while True:
-                raw = await self._readline("token_id")
+                timeout = (
+                    PREFILL_TOKEN_PROGRESS_TIMEOUT_SECONDS
+                    if first_token
+                    else self.progress_timeout
+                )
+                raw = await self._readline("token_id", timeout=timeout)
+                first_token = False
                 token_id = _parse_protocol_int(raw, "token_id")
                 generated.append(token_id)
                 if token_id in self.model.eos_tokens:
@@ -183,19 +191,20 @@ class InferenceEngine:
                 f"Inference engine made no write progress for {self.progress_timeout} seconds"
             ) from exc
 
-    async def _readline(self, field_name: str) -> bytes:
+    async def _readline(self, field_name: str, *, timeout: float | None = None) -> bytes:
         process = self._require_running()
         stdout = process.stdout
         if stdout is None:
             raise EngineCrashedError("Inference process stdout is unavailable")
+        timeout_seconds = self.progress_timeout if timeout is None else timeout
         try:
             line = await asyncio.wait_for(
                 stdout.readline(),
-                timeout=self.progress_timeout,
+                timeout=timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
             raise EngineProgressTimeoutError(
-                f"Inference engine made no {field_name} progress for {self.progress_timeout} seconds"
+                f"Inference engine made no {field_name} progress for {timeout_seconds} seconds"
             ) from exc
         if not line:
             stderr = await _read_stderr(process)
