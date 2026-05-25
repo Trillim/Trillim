@@ -246,6 +246,8 @@ def _copy_file(source_path: Path, destination: Path) -> None:
 
 
 def _quantization_name(arch_type: ArchitectureType) -> str:
+    if arch_type == ArchitectureType.QWEN3:
+        return "bf16"
     if arch_type == ArchitectureType.BONSAI:
         return "binary"
     if arch_type == ArchitectureType.BONSAI_TERNARY:

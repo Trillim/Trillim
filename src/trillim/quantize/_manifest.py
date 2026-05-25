@@ -62,6 +62,10 @@ def _is_bonsai_family(arch_type: ArchitectureType) -> bool:
 
 
 def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int:
+    if arch_type == ArchitectureType.QWEN3:
+        # Dense Qwen3 model weights are stored
+        # as BF16 and quantized at load time
+        return ACTION_BF16_RAW
     if arch_type == ArchitectureType.BONSAI:
         return ACTION_Q1_0_128
     if arch_type == ArchitectureType.BONSAI_TERNARY:
