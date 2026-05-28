@@ -145,6 +145,7 @@ class InferenceEngine:
                 if token_id in self.model.eos_tokens:
                     break
                 yield token_id
+            yield token_id
             kv_line = await self._readline("kv_position")
             kv_position = _parse_protocol_int(kv_line, "kv_position")
             combined = request_tokens + tuple(generated)
