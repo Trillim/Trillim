@@ -55,7 +55,8 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.stop()
 
-        self.assertLessEqual(len(tokens), 1)
+        self.assertEqual(len(tokens), 2)
+        self.assertIn(tokens[-1], model.eos_tokens)
         self.assertGreaterEqual(cached_token_count, len(prompt_tokens))
 
     async def test_bonsai_default_session_streams_events_and_commits_usage(self):
@@ -85,7 +86,7 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[0], {"role": "user", "content": "hello"})
         self.assertEqual(messages[-1]["role"], "assistant")
         self.assertIsNotNone(usage)
-        self.assertEqual(usage.completion_tokens, 1)
+        self.assertEqual(usage.completion_tokens, 2)
         self.assertEqual(cached_tokens, usage.total_tokens)
 
     async def test_bonsai_session_public_api_is_bound_to_owner_loop(self):
@@ -168,7 +169,7 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(text, str)
         self.assertEqual(messages[-1], {"role": "assistant", "content": text})
         self.assertIsNotNone(usage)
-        self.assertEqual(usage.completion_tokens, 1)
+        self.assertEqual(usage.completion_tokens, 2)
 
     def test_bonsai_runtime_sync_proxy_collects_with_llm_component(self):
         runtime = Runtime(LLM(BONSAI_MODEL_ID))
