@@ -30,7 +30,6 @@ _STOP_TOKEN_NAMES = (
     "<|eot_id|>",
     "<|im_end|>",
     "<|end_of_text|>",
-    "<|endoftext|>",
     "</s>",
 )
 _DEFAULT_EOS_TOKENS = {
