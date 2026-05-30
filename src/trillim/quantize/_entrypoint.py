@@ -90,7 +90,7 @@ def quantize(model_dir: str | Path, adapter_dir: str | Path | None = None) -> Qu
         output_dir=staging_dir,
         language_model_only=language_model_only,
     )
-    copy_model_support_files(source_model_dir, staging_dir)
+    copy_model_support_files(source_model_dir, staging_dir, config=config)
     write_model_metadata(staging_dir, config=config, model_dir=source_model_dir)
     mark_staging_complete(staging_dir)
     publish_staging_dir(target)

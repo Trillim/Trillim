@@ -28,6 +28,25 @@ from trillim.quantize._output import (
 from tests.quantize.test_config_manifest import _write_config
 
 
+def _write_bonsai_image_config(model_dir: Path) -> None:
+    transformer_dir = model_dir / "transformer"
+    transformer_dir.mkdir(parents=True, exist_ok=True)
+    (transformer_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "Flux2Transformer2DModel",
+                "_name_or_path": "black-forest-labs/FLUX.2-klein-4B",
+                "attention_head_dim": 128,
+                "mlp_ratio": 3.0,
+                "num_attention_heads": 24,
+                "num_layers": 5,
+                "num_single_layers": 20,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class QuantizeOutputTests(unittest.TestCase):
     def test_publish_recover_and_prepare_output_target_use_managed_directories(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -95,6 +114,43 @@ class QuantizeOutputTests(unittest.TestCase):
             self.assertTrue((output_dir / "tokenization_local.py").is_file())
             self.assertTrue((output_dir / "helper.py").is_file())
             self.assertFalse((output_dir / "ignore.bin").exists())
+
+    def test_copy_model_support_files_preserves_bonsai_image_layout_without_weights(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "model"
+            output_dir = root / "out"
+            model_dir.mkdir()
+            _write_bonsai_image_config(model_dir)
+            (model_dir / "README.md").write_text("image model\n", encoding="utf-8")
+            (model_dir / "manifest.json").write_text("{}", encoding="utf-8")
+            (model_dir / "tokenizer").mkdir()
+            (model_dir / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (model_dir / "scheduler").mkdir()
+            (model_dir / "scheduler" / "scheduler_config.json").write_text("{}", encoding="utf-8")
+            (model_dir / "text_encoder").mkdir(exist_ok=True)
+            (model_dir / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
+            (model_dir / "text_encoder" / "model.safetensors").write_bytes(b"skip")
+            (model_dir / "vae").mkdir()
+            (model_dir / "vae" / "config.json").write_text("{}", encoding="utf-8")
+            (model_dir / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(b"skip")
+            config = load_model_config(model_dir)
+
+            copy_model_support_files(model_dir, output_dir, config=config)
+
+            self.assertTrue((output_dir / "README.md").is_file())
+            self.assertTrue((output_dir / "manifest.json").is_file())
+            runtime_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(runtime_config["architectures"], ["Flux2Transformer2DModel"])
+            self.assertEqual(runtime_config["hidden_size"], 3072)
+            self.assertEqual(runtime_config["intermediate_size"], 9216)
+            self.assertTrue((output_dir / "transformer" / "config.json").is_file())
+            self.assertTrue((output_dir / "tokenizer" / "tokenizer.json").is_file())
+            self.assertTrue((output_dir / "scheduler" / "scheduler_config.json").is_file())
+            self.assertTrue((output_dir / "text_encoder" / "config.json").is_file())
+            self.assertTrue((output_dir / "vae" / "config.json").is_file())
+            self.assertFalse((output_dir / "text_encoder" / "model.safetensors").exists())
+            self.assertFalse((output_dir / "vae" / "diffusion_pytorch_model.safetensors").exists())
 
     def test_copy_adapter_support_files_sanitizes_inherited_tokenizer_loader_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -174,6 +230,28 @@ class QuantizeOutputTests(unittest.TestCase):
             self.assertEqual(adapter_payload["type"], "lora_adapter")
             self.assertEqual(adapter_payload["source_model"], "base-model")
             self.assertTrue(adapter_payload["remote_code"])
+
+    def test_write_model_metadata_supports_bonsai_image_transformer_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "image-model"
+            output_dir = root / "out"
+            model_dir.mkdir()
+            _write_bonsai_image_config(model_dir)
+            config = load_model_config(model_dir)
+
+            write_model_metadata(output_dir, config=config, model_dir=model_dir)
+
+            payload = json.loads(
+                (output_dir / "trillim_config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["quantization"], "bf16-image")
+            self.assertEqual(payload["architecture"], "bonsai_image")
+            self.assertEqual(
+                payload["source_model"],
+                "black-forest-labs/FLUX.2-klein-4B",
+            )
+            self.assertEqual(len(payload["base_model_config_hash"]), 64)
 
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:

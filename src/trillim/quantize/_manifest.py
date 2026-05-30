@@ -48,6 +48,9 @@ _SHORT_TO_FULL = {
     "down_proj": "mlp.down_proj",
 }
 _QUANTIZE_BINARY_NAME = "trillim-quantize"
+_IMAGE_INDEX_NAME = "qmodel.index"
+_IMAGE_INDEX_MAGIC = b"TRIX"
+_IMAGE_INDEX_VERSION = 1
 
 
 def determine_language_model_only(model_dir: Path, config: ModelQuantizeConfig) -> bool:
@@ -361,6 +364,7 @@ def _build_bonsai_image_manifest(
         first_tensor_idx = len(tensor_entries)
         component_entries = _append_bonsai_image_component_entries(
             component_dir,
+            section_type=section_type,
             shard_path_list=shard_path_list,
             shard_idx_map=shard_idx_map,
             shard_headers=shard_headers,
@@ -386,12 +390,18 @@ def _build_bonsai_image_manifest(
         lora_entries=None,
         lora_scale=0.0,
     )
+    _write_bonsai_image_index(
+        output_dir / _IMAGE_INDEX_NAME,
+        tensor_entries=tensor_entries,
+        sections=sections,
+    )
     return manifest_path
 
 
 def _append_bonsai_image_component_entries(
     component_dir: Path,
     *,
+    section_type: int,
     shard_path_list: list[Path],
     shard_idx_map: dict[Path, int],
     shard_headers: dict[Path, dict],
@@ -438,6 +448,8 @@ def _append_bonsai_image_component_entries(
         data_offset_end = int(data_offsets[1])
         entries.append(
             {
+                "name": key,
+                "section": section_type,
                 "action": ACTION_BF16_RAW,
                 "dtype": dtype_code,
                 "row": row,
@@ -454,6 +466,34 @@ def _append_bonsai_image_component_entries(
             }
         )
     return entries
+
+
+def _write_bonsai_image_index(
+    index_path: Path,
+    *,
+    tensor_entries: list[dict[str, int]],
+    sections: list[dict[str, int]],
+) -> None:
+    qmodel_offset = 16 + len(sections) * 5
+    with index_path.open("wb") as handle:
+        handle.write(_IMAGE_INDEX_MAGIC)
+        handle.write(struct.pack("<I", _IMAGE_INDEX_VERSION))
+        handle.write(struct.pack("<I", len(tensor_entries)))
+        for entry in tensor_entries:
+            if entry["action"] != ACTION_BF16_RAW:
+                raise ValueError("Bonsai Image qmodel index only supports BF16_RAW tensors")
+            data_size = int(entry["padded_row"]) * int(entry["padded_col"]) * 2
+            encoded_name = str(entry["name"]).encode("utf-8")
+            handle.write(struct.pack("<B", int(entry["section"])))
+            handle.write(struct.pack("<H", len(encoded_name)))
+            handle.write(encoded_name)
+            handle.write(struct.pack("<I", int(entry["row"])))
+            handle.write(struct.pack("<I", int(entry["col"])))
+            handle.write(struct.pack("<I", int(entry["padded_row"])))
+            handle.write(struct.pack("<I", int(entry["padded_col"])))
+            handle.write(struct.pack("<Q", qmodel_offset))
+            handle.write(struct.pack("<Q", data_size))
+            qmodel_offset += data_size
 
 
 def _get_component_sharded_files(component_dir: Path) -> tuple[list[Path], dict[str, Path]]:

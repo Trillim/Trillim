@@ -17,7 +17,7 @@ from pathlib import Path
 from prompt_toolkit import prompt as better_input
 from prompt_toolkit.key_binding import KeyBindings
 
-from trillim import LLM, STT, TTS, Runtime, Server, _model_store
+from trillim import Image, LLM, STT, TTS, Runtime, Server, _model_store
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._model_dir import validate_lora_dir, validate_model_dir
@@ -484,6 +484,27 @@ def _run_serve(
     return 0
 
 
+def _run_image_command(args: argparse.Namespace) -> int:
+    _require_remote_code_opt_in(
+        args.model_dir,
+        label="Model",
+        trust_remote_code=args.trust_remote_code,
+    )
+    prompt = " ".join(args.prompt)
+    runtime = Runtime(Image(args.model_dir, trust_remote_code=args.trust_remote_code))
+    with runtime:
+        output_path = runtime.image.generate(
+            prompt,
+            args.output,
+            steps=args.steps,
+            seed=args.seed,
+            width=args.width,
+            height=args.height,
+        )
+    print(f"Wrote image to {output_path}")
+    return 0
+
+
 def _run_quantize_command(args: argparse.Namespace) -> int:
     from trillim.quantize import quantize
 
@@ -572,6 +593,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow loading custom tokenizer/config code referenced by the bundle",
     )
 
+    image_parser = subparsers.add_parser(
+        "image",
+        help="Generate an image from a Bonsai Image model",
+    )
+    image_parser.add_argument(
+        "model_dir", help="Store-qualified model ID (Trillim/<name> or Local/<name>)"
+    )
+    image_parser.add_argument("prompt", nargs="+", help="Text prompt to render")
+    image_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="PNG output path",
+    )
+    image_parser.add_argument(
+        "--steps",
+        type=int,
+        default=4,
+        help="Number of denoising steps",
+    )
+    image_parser.add_argument(
+        "--seed",
+        type=int,
+        help="Optional random seed",
+    )
+    image_parser.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Output image width in pixels",
+    )
+    image_parser.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="Output image height in pixels",
+    )
+    image_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading custom tokenizer/config code referenced by the bundle",
+    )
+
     quantize_parser = subparsers.add_parser(
         "quantize",
         help="Quantize one local model directory or adapter directory into Local/",
@@ -607,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
             voice=args.voice,
             trust_remote_code=args.trust_remote_code,
         ),
+        "image": lambda: _run_image_command(args),
         "quantize": lambda: _run_quantize_command(args),
     }
     try:

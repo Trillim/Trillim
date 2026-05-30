@@ -24,6 +24,11 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(parser.parse_args(["list"]).command, "list")
         self.assertEqual(parser.parse_args(["chat", "Trillim/model"]).command, "chat")
+        image_args = parser.parse_args(
+            ["image", "Local/model", "a", "small", "tree", "-o", "out.png"]
+        )
+        self.assertEqual(image_args.command, "image")
+        self.assertEqual(image_args.prompt, ["a", "small", "tree"])
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             code = cli.main([])
 
@@ -194,6 +199,50 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("offline", stderr.getvalue())
+
+    def test_image_command_validates_bonsai_image_bundle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(
+                root / "Local" / "image",
+                architecture="Flux2Transformer2DModel",
+                config_overrides={
+                    "hidden_size": 3072,
+                    "intermediate_size": 9216,
+                    "num_hidden_layers": 25,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 24,
+                    "head_dim": 128,
+                    "vocab_size": 151936,
+                    "eos_token_id": 151645,
+                },
+            )
+
+            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                args = cli.build_parser().parse_args(
+                    [
+                        "image",
+                        "Local/image",
+                        "a",
+                        "bonsai",
+                        "-o",
+                        str(root / "out.png"),
+                    ]
+                )
+                with self.assertRaisesRegex(RuntimeError, "not implemented"):
+                    cli._run_image_command(args)
+
+    def test_image_command_rejects_non_image_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(root / "Local" / "model")
+
+            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                args = cli.build_parser().parse_args(
+                    ["image", "Local/model", "prompt", "-o", str(root / "out.png")]
+                )
+                with self.assertRaisesRegex(ValueError, "Bonsai Image"):
+                    cli._run_image_command(args)
 
     def test_voice_dependency_preflight_passes_with_voice_extra(self):
         cli._preflight_voice_dependencies()

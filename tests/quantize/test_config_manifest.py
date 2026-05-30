@@ -110,6 +110,51 @@ def _read_manifest(path: Path) -> dict[str, object]:
     return {"shard_paths": shard_paths, "tensor_entries": tensor_entries, "sections": sections}
 
 
+def _read_image_index(path: Path) -> list[dict[str, object]]:
+    data = path.read_bytes()
+    offset = 0
+
+    def unpack(fmt: str):
+        nonlocal offset
+        size = struct.calcsize(fmt)
+        value = struct.unpack_from(fmt, data, offset)
+        offset += size
+        return value[0] if len(value) == 1 else value
+
+    self_magic = data[offset:offset + 4]
+    offset += 4
+    if self_magic != b"TRIX":
+        raise ValueError(f"bad image index magic: {self_magic!r}")
+    if unpack("<I") != 1:
+        raise ValueError("bad image index version")
+
+    entries = []
+    for _ in range(unpack("<I")):
+        section = unpack("<B")
+        name_len = unpack("<H")
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+        row = unpack("<I")
+        col = unpack("<I")
+        padded_row = unpack("<I")
+        padded_col = unpack("<I")
+        qmodel_offset = unpack("<Q")
+        data_size = unpack("<Q")
+        entries.append(
+            {
+                "section": section,
+                "name": name,
+                "row": row,
+                "col": col,
+                "padded_row": padded_row,
+                "padded_col": padded_col,
+                "qmodel_offset": qmodel_offset,
+                "data_size": data_size,
+            }
+        )
+    return entries
+
+
 class QuantizeConfigManifestTests(unittest.TestCase):
     def test_load_model_config_extracts_and_aligns_dimensions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,7 +379,9 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             )
             config = load_model_config(model_dir)
 
-            manifest = _read_manifest(build_manifest(model_dir, config, output_dir=output_dir))
+            manifest_path = build_manifest(model_dir, config, output_dir=output_dir)
+            manifest = _read_manifest(manifest_path)
+            image_index = _read_image_index(output_dir / "qmodel.index")
 
             self.assertEqual(len(manifest["tensor_entries"]), 4)
             self.assertEqual(
@@ -348,6 +395,18 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             for entry in manifest["tensor_entries"]:
                 self.assertEqual(entry["action"], ACTION_BF16_RAW)
                 self.assertEqual(entry["dtype"], DTYPE_BF16)
+            self.assertEqual(
+                [entry["name"] for entry in image_index],
+                [
+                    "model.embed_tokens.weight",
+                    "context_embedder.weight",
+                    "proj_out.weight",
+                    "decoder.conv_in.weight",
+                ],
+            )
+            self.assertEqual([entry["section"] for entry in image_index], [4, 5, 5, 6])
+            self.assertEqual([entry["qmodel_offset"] for entry in image_index], [31, 43, 55, 79])
+            self.assertEqual([entry["data_size"] for entry in image_index], [12, 12, 24, 8])
 
     def test_build_manifest_validates_supported_tensors_and_language_model_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:

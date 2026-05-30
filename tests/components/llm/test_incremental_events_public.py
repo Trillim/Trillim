@@ -167,3 +167,30 @@ class EventAndPublicAPITests(unittest.TestCase):
         import asyncio
 
         asyncio.run(run())
+
+    def test_bonsai_image_is_rejected_by_llm_chat_runtime(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                write_llm_bundle(
+                    root / "Local" / "image-model",
+                    architecture="Flux2Transformer2DModel",
+                    config_overrides={
+                        "hidden_size": 3072,
+                        "intermediate_size": 9216,
+                        "num_hidden_layers": 25,
+                        "num_attention_heads": 24,
+                        "num_key_value_heads": 24,
+                        "vocab_size": 1,
+                        "head_dim": 128,
+                        "eos_token_id": 151645,
+                    },
+                )
+                with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                    llm = LLM("Local/image-model")
+                    with self.assertRaisesRegex(ModelValidationError, "image generation runtime"):
+                        await llm.start()
+
+        import asyncio
+
+        asyncio.run(run())

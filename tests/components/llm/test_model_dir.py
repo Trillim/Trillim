@@ -49,6 +49,33 @@ class ModelDirTests(unittest.TestCase):
         self.assertEqual(config.eos_tokens, (2, 3, 151645))
         self.assertTrue(config.tie_word_embeddings)
 
+    def test_validate_model_dir_recognizes_bonsai_image_runtime_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = write_llm_bundle(
+                Path(temp_dir) / "image-model",
+                architecture="Flux2Transformer2DModel",
+                config_overrides={
+                    "hidden_size": 3072,
+                    "intermediate_size": 9216,
+                    "num_hidden_layers": 25,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 24,
+                    "vocab_size": 1,
+                    "head_dim": 128,
+                    "max_position_embeddings": 4096,
+                    "eos_token_id": 151645,
+                },
+            )
+
+            config = validate_model_dir(model_dir)
+
+        self.assertEqual(config.arch_type, ArchitectureType.BONSAI_IMAGE)
+        self.assertEqual(config.hidden_dim, 3072)
+        self.assertEqual(config.intermediate_dim, 9216)
+        self.assertEqual(config.num_layers, 25)
+        self.assertEqual(config.num_heads, 24)
+        self.assertEqual(config.head_dim, 128)
+
     def test_validate_model_dir_supports_text_config_and_rejects_bad_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
