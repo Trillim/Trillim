@@ -252,6 +252,8 @@ def _quantization_name(arch_type: ArchitectureType) -> str:
         return "binary"
     if arch_type == ArchitectureType.BONSAI_TERNARY:
         return "grouped-ternary"
+    if arch_type == ArchitectureType.BONSAI_IMAGE:
+        return "bf16-image"
     return "ternary"
 
 

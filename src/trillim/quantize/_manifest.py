@@ -66,6 +66,8 @@ def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int
         # Dense Qwen3 model weights are stored
         # as BF16 and quantized at load time
         return ACTION_BF16_RAW
+    if arch_type == ArchitectureType.BONSAI_IMAGE:
+        return ACTION_BF16_RAW
     if arch_type == ArchitectureType.BONSAI:
         return ACTION_Q1_0_128
     if arch_type == ArchitectureType.BONSAI_TERNARY:

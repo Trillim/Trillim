@@ -117,6 +117,40 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             self.assertIn("self_attn.inner_attn_ln", bitnet.arch_info.component_order)
             self.assertIn("mlp.ffn_layernorm", bitnet.arch_info.component_order)
 
+    def test_load_model_config_recognizes_bonsai_image_transformer_bundle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            transformer_dir = model_dir / "transformer"
+            transformer_dir.mkdir()
+            (transformer_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "Flux2Transformer2DModel",
+                        "_name_or_path": "black-forest-labs/FLUX.2-klein-4B",
+                        "attention_head_dim": 128,
+                        "eps": 1e-6,
+                        "mlp_ratio": 3.0,
+                        "num_attention_heads": 24,
+                        "num_layers": 5,
+                        "num_single_layers": 20,
+                        "rope_theta": 2000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_model_config(model_dir)
+
+        self.assertEqual(config.arch_type, ArchitectureType.BONSAI_IMAGE)
+        self.assertEqual(config.hidden_dim, 3072)
+        self.assertEqual(config.intermediate_dim, 9216)
+        self.assertEqual(config.num_layers, 25)
+        self.assertEqual(config.num_heads, 24)
+        self.assertEqual(config.num_kv_heads, 24)
+        self.assertEqual(config.head_dim, 128)
+        self.assertEqual(config.rope_theta, 2000.0)
+        self.assertEqual(config.source_model, "black-forest-labs/FLUX.2-klein-4B")
+
     def test_load_model_config_rejects_missing_or_invalid_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with self.assertRaises(FileNotFoundError):

@@ -200,4 +200,5 @@ class QuantizeOutputTests(unittest.TestCase):
             _quantization_name(ArchitectureType.BONSAI_TERNARY),
             "grouped-ternary",
         )
+        self.assertEqual(_quantization_name(ArchitectureType.BONSAI_IMAGE), "bf16-image")
         self.assertEqual(_quantization_name(ArchitectureType.LLAMA), "ternary")
