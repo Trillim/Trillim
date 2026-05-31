@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -492,17 +493,75 @@ def _run_image_command(args: argparse.Namespace) -> int:
     )
     prompt = " ".join(args.prompt)
     runtime = Runtime(Image(args.model_dir, trust_remote_code=args.trust_remote_code))
+    progress = _ImageProgressBar(_image_progress_total(args.steps))
+    started_at = time.perf_counter()
     with runtime:
-        output_path = runtime.image.generate(
-            prompt,
-            args.output,
-            steps=args.steps,
-            seed=args.seed,
-            width=args.width,
-            height=args.height,
-        )
-    print(f"Wrote image to {output_path}")
+        progress.start()
+        try:
+            output_path = runtime.image.generate(
+                prompt,
+                args.output,
+                steps=args.steps,
+                seed=args.seed,
+                width=args.width,
+                height=args.height,
+                progress_callback=progress.update,
+            )
+        finally:
+            progress.close()
+    elapsed = time.perf_counter() - started_at
+    print(f"Wrote image to {output_path} in {_format_elapsed(elapsed)}")
     return 0
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes}m {remainder:.1f}s"
+
+
+class _ImageProgressBar:
+    def __init__(self, total: int, *, stream=None, enabled: bool | None = None) -> None:
+        self.total = max(1, int(total))
+        self.stream = sys.stderr if stream is None else stream
+        self.enabled = self.stream.isatty() if enabled is None else enabled
+        self._started = False
+        self._last_done = -1
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._started = True
+        self.update(0, self.total)
+
+    def update(self, done: int, total: int) -> None:
+        if not self.enabled:
+            return
+        total = max(1, int(total))
+        done = min(max(0, int(done)), total)
+        if done == self._last_done and total == self.total:
+            return
+        self.total = total
+        self._last_done = done
+        width = 24
+        filled = round(width * done / total)
+        bar = "#" * filled + "-" * (width - filled)
+        percent = round(100 * done / total)
+        self.stream.write(f"\rGenerating image [{bar}] {done}/{total} {percent:3d}%")
+        self.stream.flush()
+
+    def close(self) -> None:
+        if self.enabled and self._started:
+            self.stream.write("\n")
+            self.stream.flush()
+        self._started = False
+
+
+def _image_progress_total(steps: int) -> int:
+    return 36 + max(0, int(steps)) * 27 + 21
 
 
 def _run_quantize_command(args: argparse.Namespace) -> int:

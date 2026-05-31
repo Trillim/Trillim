@@ -200,7 +200,23 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("offline", stderr.getvalue())
 
-    def test_image_command_validates_bonsai_image_bundle(self):
+    def test_image_command_writes_output_path(self):
+        class StubImage:
+            @property
+            def component_name(self):
+                return "image"
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+            async def generate(self, _prompt, output, **_kwargs):
+                output = Path(output)
+                output.write_bytes(b"png")
+                return output
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_llm_bundle(
@@ -218,7 +234,10 @@ class CLITests(unittest.TestCase):
                 },
             )
 
-            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Image", return_value=StubImage()),
+            ):
                 args = cli.build_parser().parse_args(
                     [
                         "image",
@@ -229,15 +248,49 @@ class CLITests(unittest.TestCase):
                         str(root / "out.png"),
                     ]
                 )
-                with self.assertRaisesRegex(RuntimeError, "not implemented"):
-                    cli._run_image_command(args)
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(cli._run_image_command(args), 0)
 
-    def test_image_command_rejects_non_image_model(self):
+        output = stdout.getvalue()
+        self.assertIn("Wrote image", output)
+        self.assertIn(" in ", output)
+
+    def test_image_progress_bar_renders_steps(self):
+        stream = io.StringIO()
+        progress = cli._ImageProgressBar(4, stream=stream, enabled=True)
+
+        progress.start()
+        progress.update(2, 4)
+        progress.update(4, 4)
+        progress.close()
+
+        output = stream.getvalue()
+        self.assertIn("Generating image", output)
+        self.assertIn("2/4", output)
+        self.assertIn("4/4", output)
+        self.assertTrue(output.endswith("\n"))
+        self.assertEqual(cli._image_progress_total(4), 165)
+
+    def test_image_command_propagates_runtime_validation_errors(self):
+        class RejectingImage:
+            @property
+            def component_name(self):
+                return "image"
+
+            async def start(self):
+                raise ValueError("image generation requires a Bonsai Image model")
+
+            async def stop(self):
+                pass
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_llm_bundle(root / "Local" / "model")
 
-            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Image", return_value=RejectingImage()),
+            ):
                 args = cli.build_parser().parse_args(
                     ["image", "Local/model", "prompt", "-o", str(root / "out.png")]
                 )
