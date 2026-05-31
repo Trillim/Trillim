@@ -31,10 +31,11 @@ def canonicalize_model_config(config: dict) -> dict:
 
 def compute_base_model_config_hash(model_dir: str | Path) -> str:
     """Compute the canonical base-model compatibility hash."""
-    model_path = Path(model_dir)
-    config_path = model_path / "config.json"
-    if not config_path.is_file():
-        return _compute_bonsai_image_config_hash(model_path)
+    root = Path(model_dir)
+    config_path = root / "config.json"
+    transformer_config_path = root / "transformer" / "config.json"
+    if not config_path.is_file() and transformer_config_path.is_file():
+        return _compute_bonsai_image_config_hash(transformer_config_path)
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -69,31 +70,36 @@ def _compute_text_config_hash(config: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _compute_bonsai_image_config_hash(model_dir: Path) -> str:
-    config_path = model_dir / "transformer" / "config.json"
+def _compute_bonsai_image_config_hash(config_path: Path) -> str:
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read model config from {config_path}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"Model config must be a JSON object in {config_path}")
+    if raw.get("_class_name") != "Flux2Transformer2DModel":
+        root_config_path = config_path.parent.parent / "config.json"
+        raise ValueError(f"Could not read model config from {root_config_path}")
+    num_heads = _require_positive_int(
+        raw.get("num_attention_heads"),
+        "num_attention_heads",
+    )
+    head_dim = _require_positive_int(
+        raw.get("attention_head_dim"),
+        "attention_head_dim",
+    )
     identity = {
-        "_class_name": raw.get("_class_name"),
-        "attention_head_dim": raw.get("attention_head_dim"),
-        "hidden_size": raw.get("hidden_size"),
-        "in_channels": raw.get("in_channels"),
-        "joint_attention_dim": raw.get("joint_attention_dim"),
-        "mlp_ratio": raw.get("mlp_ratio"),
-        "num_attention_heads": _require_positive_int(
-            raw.get("num_attention_heads"),
-            "num_attention_heads",
-        ),
+        "architecture": "bonsai_image",
+        "class_name": raw.get("_class_name"),
+        "num_attention_heads": num_heads,
+        "attention_head_dim": head_dim,
+        "hidden_size": num_heads * head_dim,
         "num_layers": _require_positive_int(raw.get("num_layers"), "num_layers"),
         "num_single_layers": _require_positive_int(
             raw.get("num_single_layers"),
             "num_single_layers",
         ),
-        "pooled_projection_dim": raw.get("pooled_projection_dim"),
+        "mlp_ratio": raw.get("mlp_ratio", 3.0),
     }
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
