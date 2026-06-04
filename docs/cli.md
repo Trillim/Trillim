@@ -109,6 +109,35 @@ Notes:
 - It does not expose sampling, search, or hot-swap flags in this implementation.
 - If you need search, custom sampling, or HTTP access, use the Python SDK or the server surface.
 
+## `trillim image`
+
+Generate a PNG from a Bonsai Image bundle.
+
+```bash
+trillim image Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ "a tiny bonsai on a desk" -o bonsai.png
+trillim image Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ "a tiny bonsai on a desk" -o bonsai.png --width 1024 --height 1024 --steps 4 --seed 123
+```
+
+Arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `model_dir` | Required store ID for a Bonsai Image model |
+| `prompt` | Text prompt to render |
+
+Flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--output`, `-o` | Required PNG output path |
+| `--steps` | Denoising step count; defaults to `4` |
+| `--seed` | Optional non-negative integer seed |
+| `--width` | Output width; defaults to `1024` |
+| `--height` | Output height; defaults to `1024` |
+| `--trust-remote-code` | Allow bundles that reference custom tokenizer or config code |
+
+`width` and `height` must be positive multiples of `16` and no larger than `4096`.
+
 ## `trillim serve`
 
 Start the demo HTTP server.
@@ -116,6 +145,7 @@ Start the demo HTTP server.
 ```bash
 trillim serve Trillim/BitNet-TRNQ
 trillim serve Trillim/BitNet-TRNQ --voice
+trillim serve Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ
 trillim serve Trillim/BitNet-Large-TRNQ --trust-remote-code
 ```
 
@@ -135,6 +165,8 @@ Flags:
 Important constraints:
 
 - The CLI server binds to `127.0.0.1:8000`.
+- Bonsai Image bundles expose `/v1/images/generations` instead of chat routes.
+- `--voice` is only supported when serving an LLM bundle.
 - The CLI server does not expose host/port flags.
 - The CLI server does not enable `/v1/models/swap`.
 - Search is not configured from the CLI in this repo.

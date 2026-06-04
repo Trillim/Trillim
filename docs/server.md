@@ -52,6 +52,7 @@ server.run(host="127.0.0.1", port=8000)
 | `/v1/models` | `GET` | active model ID |
 | `/v1/chat/completions` | `POST` | OpenAI-compatible chat completions |
 | `/v1/models/swap` | `POST` | optional hot-swap route |
+| `/v1/images/generations` | `POST` | image generation route for `Image` components |
 | `/v1/audio/transcriptions` | `POST` | optional STT route |
 | `/v1/audio/speech` | `POST` | optional TTS route |
 | `/v1/voices` | `GET` | optional voice list |
@@ -67,6 +68,46 @@ Returns `200` when the app is alive:
 ```json
 {"status": "ok"}
 ```
+
+## `POST /v1/images/generations`
+
+Run the server with a Bonsai Image bundle:
+
+```bash
+trillim serve Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ
+```
+
+Minimal request:
+
+```bash
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "content-type: application/json" \
+  -d '{
+    "prompt": "a tiny bonsai on a desk",
+    "size": "1024x1024",
+    "steps": 4,
+    "seed": 123
+  }'
+```
+
+The response contains one base64-encoded PNG:
+
+```json
+{
+  "created": 1790000000,
+  "data": [{"b64_json": "..."}]
+}
+```
+
+Accepted fields:
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | Required text prompt |
+| `size` | Optional `WIDTHxHEIGHT`; defaults to `1024x1024` |
+| `width`, `height` | Optional integer dimensions when `size` is omitted |
+| `steps` | Optional denoising steps; defaults to `4` |
+| `seed` | Optional non-negative integer seed |
 
 ## `GET /v1/models`
 

@@ -7,9 +7,12 @@ from asyncio import AbstractEventLoop
 from collections.abc import Callable
 from pathlib import Path
 
+from fastapi import APIRouter
+
 from trillim import _model_store
 from trillim.components import Component
 from trillim.components.image._engine import ImageEngine
+from trillim.components.image._router import build_router
 from trillim.components.llm._config import ArchitectureType, ModelRuntimeConfig
 from trillim.components.llm._model_dir import validate_model_dir
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, ModelValidationError
@@ -40,6 +43,10 @@ class Image(Component):
         self._model: ModelRuntimeConfig | None = None
         self._engine: ImageEngine | None = None
         self._started = False
+
+    def router(self) -> APIRouter:
+        """Return the FastAPI router for this image component."""
+        return build_router(self)
 
     async def start(self) -> None:
         """Validate the configured image model bundle and start its worker."""
@@ -96,6 +103,8 @@ class Image(Component):
         _validate_positive_int("height", height)
         if width > 4096 or height > 4096:
             raise InvalidRequestError("width and height must be <= 4096")
+        if width % 16 != 0 or height % 16 != 0:
+            raise InvalidRequestError("width and height must be multiples of 16")
         if seed is not None and (
             isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
         ):

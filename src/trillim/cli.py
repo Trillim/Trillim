@@ -19,6 +19,7 @@ from prompt_toolkit import prompt as better_input
 from prompt_toolkit.key_binding import KeyBindings
 
 from trillim import Image, LLM, STT, TTS, Runtime, Server, _model_store
+from trillim.components.llm._config import ArchitectureType
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._model_dir import validate_lora_dir, validate_model_dir
@@ -475,6 +476,15 @@ def _run_serve(
         label="Model",
         trust_remote_code=trust_remote_code,
     )
+    model_config = validate_model_dir(_model_store.resolve_existing_store_id(model_id))
+    if model_config.arch_type == ArchitectureType.BONSAI_IMAGE:
+        if voice:
+            raise ValueError("--voice is only supported when serving an LLM model")
+        Server(Image(model_id, trust_remote_code=trust_remote_code)).run(
+            host=DEFAULT_HOST,
+            port=DEFAULT_PORT,
+        )
+        return 0
     if voice:
         _preflight_voice_dependencies()
     llm = LLM(model_id, trust_remote_code=trust_remote_code)

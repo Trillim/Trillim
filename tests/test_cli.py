@@ -294,8 +294,63 @@ class CLITests(unittest.TestCase):
                 args = cli.build_parser().parse_args(
                     ["image", "Local/model", "prompt", "-o", str(root / "out.png")]
                 )
-                with self.assertRaisesRegex(ValueError, "Bonsai Image"):
-                    cli._run_image_command(args)
+            with self.assertRaisesRegex(ValueError, "Bonsai Image"):
+                cli._run_image_command(args)
+
+    def test_serve_uses_image_component_for_bonsai_image_model(self):
+        class RecordingServer:
+            component = None
+
+            def __init__(self, component):
+                RecordingServer.component = component
+
+            def run(self, **_kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(
+                root / "Local" / "image",
+                architecture="Flux2Transformer2DModel",
+                config_overrides={
+                    "hidden_size": 3072,
+                    "intermediate_size": 9216,
+                    "num_hidden_layers": 25,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 24,
+                    "head_dim": 128,
+                    "vocab_size": 1,
+                    "eos_token_id": 151645,
+                },
+            )
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Server", RecordingServer),
+            ):
+                self.assertEqual(cli._run_serve("Local/image", voice=False), 0)
+
+        self.assertIsInstance(RecordingServer.component, cli.Image)
+
+    def test_serve_rejects_voice_for_bonsai_image_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(
+                root / "Local" / "image",
+                architecture="Flux2Transformer2DModel",
+                config_overrides={
+                    "hidden_size": 3072,
+                    "intermediate_size": 9216,
+                    "num_hidden_layers": 25,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 24,
+                    "head_dim": 128,
+                    "vocab_size": 1,
+                    "eos_token_id": 151645,
+                },
+            )
+            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                with self.assertRaisesRegex(ValueError, "--voice"):
+                    cli._run_serve("Local/image", voice=True)
 
     def test_voice_dependency_preflight_passes_with_voice_extra(self):
         cli._preflight_voice_dependencies()
