@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from trillim.components.image._engine import (
+    ImageEngine,
     _build_image_init_block,
     _build_image_request_block,
     _encode_prompt_tokens,
@@ -60,9 +62,59 @@ class RecordingTokenizer:
         }
 
 
+class FakeStdin:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, payload):
+        self.writes.append(payload)
+
+    async def drain(self):
+        return None
+
+
+class FakeProcess:
+    def __init__(self):
+        self.returncode = None
+        self.stdin = FakeStdin()
+        self.stdout = object()
+        self.stderr = object()
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+
 class ImageEngineHelperTests(unittest.TestCase):
+    def test_image_engine_starts_dedicated_binary_without_image_flag(self):
+        async def run() -> tuple[tuple, bytes]:
+            process = FakeProcess()
+            calls = []
+
+            async def create_process(*args, **kwargs):
+                calls.append((args, kwargs))
+                return process
+
+            engine = ImageEngine(
+                _model(),
+                RecordingTokenizer(),
+                num_threads=4,
+                _binary_path="/tmp/trillim-image-inference",
+            )
+            with patch("asyncio.create_subprocess_exec", create_process):
+                await engine.start()
+            return calls[0][0], process.stdin.writes[0]
+
+        args, init_block = __import__("asyncio").run(run())
+
+        self.assertEqual(args[:2], ("/tmp/trillim-image-inference", "/tmp/image"))
+        self.assertNotIn("--image", args)
+        self.assertEqual(init_block, b"2\narch_type=7\nnum_threads=4\n")
+
     def test_build_image_protocol_blocks(self):
-        self.assertEqual(_build_image_init_block(_model(), 4), "2\narch_type=7\nnum_threads=4\n")
+        self.assertEqual(
+            _build_image_init_block(_model(), 4), "2\narch_type=7\nnum_threads=4\n"
+        )
         block = _build_image_request_block(
             output_path=Path("/tmp/out\nignored.rgb"),
             token_ids=[1, 2, 3],

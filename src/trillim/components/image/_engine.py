@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import os
 import struct
 import tempfile
 import zlib
@@ -15,7 +16,6 @@ from trillim.components.llm._engine import (
     EngineCrashedError,
     EngineError,
     EngineProgressTimeoutError,
-    _bundled_binary_path,
     _first_protocol_line,
     _read_stderr,
 )
@@ -33,12 +33,15 @@ class ImageEngine:
         *,
         num_threads: int = 0,
         progress_timeout: float = 600.0,
+        _binary_path: str | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.num_threads = num_threads
         self.progress_timeout = progress_timeout
-        self.binary_path = _bundled_binary_path()
+        self.binary_path = (
+            _bundled_image_binary_path() if _binary_path is None else _binary_path
+        )
         self.process: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
@@ -48,13 +51,14 @@ class ImageEngine:
         self.process = await asyncio.create_subprocess_exec(
             self.binary_path,
             str(self.model.path),
-            "--image",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await self._write_block(_build_image_init_block(self.model, self.num_threads))
+            await self._write_block(
+                _build_image_init_block(self.model, self.num_threads)
+            )
         except Exception:
             await self._kill_process()
             raise
@@ -107,18 +111,22 @@ class ImageEngine:
                 )
             )
             while True:
-                status = (await self._readline("image_status")).decode(
-                    "utf-8", errors="replace"
-                ).strip()
+                status = (
+                    (await self._readline("image_status"))
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
                 progress = _parse_progress_status(status)
                 if progress is None:
                     break
                 if progress_callback is not None:
                     progress_callback(*progress)
 
-            detail = (await self._readline("image_detail")).decode(
-                "utf-8", errors="replace"
-            ).strip()
+            detail = (
+                (await self._readline("image_detail"))
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
             if status != "ok":
                 await self._kill_process()
                 raise EngineError(detail or "Image generation failed")
@@ -193,6 +201,19 @@ class ImageEngine:
             pass
         await process.wait()
         self.process = None
+
+
+def _bundled_image_binary_path() -> str:
+    suffix = ".exe" if os.name == "nt" else ""
+    bin_dir = Path(__file__).resolve().parents[2] / "_bin"
+    bundled = bin_dir / f"trillim-image-inference{suffix}"
+    if bundled.is_file():
+        return str(bundled)
+    if suffix:
+        fallback = bin_dir / "trillim-image-inference"
+        if fallback.is_file():
+            return str(fallback)
+    raise FileNotFoundError(f"Missing bundled image inference binary: {bundled}")
 
 
 def _build_image_init_block(model: ModelRuntimeConfig, num_threads: int) -> str:
