@@ -37,7 +37,6 @@ _DEFAULT_EOS_TOKENS = {
     ArchitectureType.LLAMA: 128009,
     ArchitectureType.QWEN35: 248044,
     ArchitectureType.QWEN3: 151645,
-    ArchitectureType.BONSAI_IMAGE: 151645,
 }
 _MODEL_RUNTIME_ARTIFACTS = ("qmodel.tensors", "rope.cache")
 _LORA_RUNTIME_ARTIFACTS = ("qmodel.lora",)
@@ -95,12 +94,6 @@ _ARCH_REGISTRY: dict[str, _ArchitectureInfo] = {
     ),
     "qwen3forcausallm": _ArchitectureInfo(
         arch_type=ArchitectureType.QWEN3,
-        activation=ActivationType.SILU,
-        has_attn_sub_norm=False,
-        has_ffn_sub_norm=False,
-    ),
-    "flux2transformer2dmodel": _ArchitectureInfo(
-        arch_type=ArchitectureType.BONSAI_IMAGE,
         activation=ActivationType.SILU,
         has_attn_sub_norm=False,
         has_ffn_sub_norm=False,

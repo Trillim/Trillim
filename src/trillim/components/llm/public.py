@@ -14,7 +14,6 @@ from fastapi import APIRouter
 from trillim import _model_store
 from trillim.components import Component
 from trillim.components.llm._config import (
-    ArchitectureType,
     _HarnessConfig,
     InitConfig,
     ModelRuntimeConfig,
@@ -378,11 +377,6 @@ class LLM(Component):
                 runtime_files.model_dir,
                 metadata_dir=runtime_files.metadata_dir,
             )
-            if model.arch_type == ArchitectureType.BONSAI_IMAGE:
-                raise ModelValidationError(
-                    "Bonsai Image models cannot run through the LLM chat runtime; "
-                    "use the image generation runtime"
-                )
             tokenizer = self._tokenizer_loader(
                 runtime_files.metadata_dir,
                 trust_remote_code=self._trust_remote_code,

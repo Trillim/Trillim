@@ -11,7 +11,12 @@ from unittest.mock import patch
 from trillim import _model_store
 from trillim import cli
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
-from tests.support import requires_integration, write_llm_bundle, write_lora_bundle
+from tests.support import (
+    requires_integration,
+    write_image_bundle,
+    write_llm_bundle,
+    write_lora_bundle,
+)
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -219,19 +224,9 @@ class CLITests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            write_llm_bundle(
+            write_image_bundle(
                 root / "Local" / "image",
-                architecture="Flux2Transformer2DModel",
-                config_overrides={
-                    "hidden_size": 3072,
-                    "intermediate_size": 9216,
-                    "num_hidden_layers": 25,
-                    "num_attention_heads": 24,
-                    "num_key_value_heads": 24,
-                    "head_dim": 128,
-                    "vocab_size": 151936,
-                    "eos_token_id": 151645,
-                },
+                config_overrides={"vocab_size": 151936},
             )
 
             with (
@@ -294,8 +289,8 @@ class CLITests(unittest.TestCase):
                 args = cli.build_parser().parse_args(
                     ["image", "Local/model", "prompt", "-o", str(root / "out.png")]
                 )
-            with self.assertRaisesRegex(ValueError, "Bonsai Image"):
-                cli._run_image_command(args)
+                with self.assertRaisesRegex(ValueError, "Bonsai Image"):
+                    cli._run_image_command(args)
 
     def test_serve_uses_image_component_for_bonsai_image_model(self):
         class RecordingServer:
@@ -309,20 +304,7 @@ class CLITests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            write_llm_bundle(
-                root / "Local" / "image",
-                architecture="Flux2Transformer2DModel",
-                config_overrides={
-                    "hidden_size": 3072,
-                    "intermediate_size": 9216,
-                    "num_hidden_layers": 25,
-                    "num_attention_heads": 24,
-                    "num_key_value_heads": 24,
-                    "head_dim": 128,
-                    "vocab_size": 1,
-                    "eos_token_id": 151645,
-                },
-            )
+            write_image_bundle(root / "Local" / "image")
             with (
                 patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
                 patch.object(cli, "Server", RecordingServer),
@@ -334,20 +316,7 @@ class CLITests(unittest.TestCase):
     def test_serve_rejects_voice_for_bonsai_image_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            write_llm_bundle(
-                root / "Local" / "image",
-                architecture="Flux2Transformer2DModel",
-                config_overrides={
-                    "hidden_size": 3072,
-                    "intermediate_size": 9216,
-                    "num_hidden_layers": 25,
-                    "num_attention_heads": 24,
-                    "num_key_value_heads": 24,
-                    "head_dim": 128,
-                    "vocab_size": 1,
-                    "eos_token_id": 151645,
-                },
-            )
+            write_image_bundle(root / "Local" / "image")
             with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
                 with self.assertRaisesRegex(ValueError, "--voice"):
                     cli._run_serve("Local/image", voice=True)

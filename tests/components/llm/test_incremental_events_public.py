@@ -18,7 +18,7 @@ from trillim.components.llm.public import LLM, _make_init_config, load_tokenizer
 from trillim.errors import ComponentLifecycleError, InvalidRequestError
 from trillim.errors import ModelValidationError
 
-from tests.support import requires_integration, write_llm_bundle
+from tests.support import requires_integration, write_image_bundle, write_llm_bundle
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -168,27 +168,14 @@ class EventAndPublicAPITests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_bonsai_image_is_rejected_by_llm_chat_runtime(self):
+    def test_llm_chat_runtime_rejects_image_architecture(self):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
-                write_llm_bundle(
-                    root / "Local" / "image-model",
-                    architecture="Flux2Transformer2DModel",
-                    config_overrides={
-                        "hidden_size": 3072,
-                        "intermediate_size": 9216,
-                        "num_hidden_layers": 25,
-                        "num_attention_heads": 24,
-                        "num_key_value_heads": 24,
-                        "vocab_size": 1,
-                        "head_dim": 128,
-                        "eos_token_id": 151645,
-                    },
-                )
+                write_image_bundle(root / "Local" / "image-model")
                 with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
                     llm = LLM("Local/image-model")
-                    with self.assertRaisesRegex(ModelValidationError, "image generation runtime"):
+                    with self.assertRaisesRegex(ModelValidationError, "Unsupported model architecture"):
                         await llm.start()
 
         import asyncio

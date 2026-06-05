@@ -12,9 +12,9 @@ from fastapi import APIRouter
 from trillim import _model_store
 from trillim.components import Component
 from trillim.components.image._engine import ImageEngine
+from trillim.components.image._model_dir import validate_image_model_dir
 from trillim.components.image._router import build_router
 from trillim.components.llm._config import ArchitectureType, ModelRuntimeConfig
-from trillim.components.llm._model_dir import validate_model_dir
 from trillim.errors import ComponentLifecycleError, InvalidRequestError, ModelValidationError
 
 
@@ -27,7 +27,7 @@ class Image(Component):
         *,
         num_threads: int = 0,
         trust_remote_code: bool = False,
-        _model_validator=validate_model_dir,
+        _model_validator=validate_image_model_dir,
         _tokenizer_loader=None,
         _engine_factory=None,
     ) -> None:

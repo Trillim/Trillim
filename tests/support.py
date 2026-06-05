@@ -88,6 +88,27 @@ def write_llm_bundle(
     return path
 
 
+def write_image_bundle(path: Path, *, config_overrides: dict | None = None) -> Path:
+    path = write_llm_bundle(
+        path,
+        architecture="Flux2Transformer2DModel",
+        config_overrides={
+            "hidden_size": 3072,
+            "intermediate_size": 9216,
+            "num_hidden_layers": 25,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 24,
+            "vocab_size": 1,
+            "head_dim": 128,
+            "max_position_embeddings": 4096,
+            "eos_token_id": 151645,
+            **(config_overrides or {}),
+        },
+    )
+    (path / "qmodel.index").write_bytes(b"index")
+    return path
+
+
 def write_lora_bundle(adapter_dir: Path, *, model_dir: Path) -> Path:
     adapter_dir.mkdir(parents=True, exist_ok=True)
     (adapter_dir / "qmodel.lora").write_bytes(b"adapter")

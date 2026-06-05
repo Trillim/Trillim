@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 from trillim import _model_store
 from trillim._app import build_app
 from trillim.components.image import Image
-from tests.support import write_llm_bundle
+from trillim.components.image._model_dir import validate_image_model_dir
+from trillim.components.llm._config import ActivationType, ArchitectureType
+from trillim.errors import ModelValidationError
+from tests.support import write_image_bundle, write_llm_bundle
 
 
 class RecordingTokenizer:
@@ -49,20 +52,7 @@ class ImagePublicTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 progress = []
-                write_llm_bundle(
-                    root / "Local" / "image",
-                    architecture="Flux2Transformer2DModel",
-                    config_overrides={
-                        "hidden_size": 3072,
-                        "intermediate_size": 9216,
-                        "num_hidden_layers": 25,
-                        "num_attention_heads": 24,
-                        "num_key_value_heads": 24,
-                        "head_dim": 128,
-                        "vocab_size": 1,
-                        "eos_token_id": 151645,
-                    },
-                )
+                write_image_bundle(root / "Local" / "image")
                 with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
                     image = Image(
                         "Local/image",
@@ -89,20 +79,7 @@ class ImagePublicTests(unittest.TestCase):
     def test_image_router_generates_base64_png(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            write_llm_bundle(
-                root / "Local" / "image",
-                architecture="Flux2Transformer2DModel",
-                config_overrides={
-                    "hidden_size": 3072,
-                    "intermediate_size": 9216,
-                    "num_hidden_layers": 25,
-                    "num_attention_heads": 24,
-                    "num_key_value_heads": 24,
-                    "head_dim": 128,
-                    "vocab_size": 1,
-                    "eos_token_id": 151645,
-                },
-            )
+            write_image_bundle(root / "Local" / "image")
             with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
                 image = Image(
                     "Local/image",
@@ -126,20 +103,7 @@ class ImagePublicTests(unittest.TestCase):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
-                write_llm_bundle(
-                    root / "Local" / "image",
-                    architecture="Flux2Transformer2DModel",
-                    config_overrides={
-                        "hidden_size": 3072,
-                        "intermediate_size": 9216,
-                        "num_hidden_layers": 25,
-                        "num_attention_heads": 24,
-                        "num_key_value_heads": 24,
-                        "head_dim": 128,
-                        "vocab_size": 1,
-                        "eos_token_id": 151645,
-                    },
-                )
+                write_image_bundle(root / "Local" / "image")
                 with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
                     image = Image(
                         "Local/image",
@@ -154,3 +118,29 @@ class ImagePublicTests(unittest.TestCase):
                         await image.stop()
 
         asyncio.run(run())
+
+    def test_validate_image_model_dir_extracts_runtime_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = write_image_bundle(Path(temp_dir) / "image-model")
+
+            config = validate_image_model_dir(model_dir)
+
+        self.assertEqual(config.name, "image-model")
+        self.assertEqual(config.arch_type, ArchitectureType.BONSAI_IMAGE)
+        self.assertEqual(config.activation, ActivationType.SILU)
+        self.assertEqual(config.hidden_dim, 3072)
+        self.assertEqual(config.intermediate_dim, 9216)
+        self.assertEqual(config.num_layers, 25)
+        self.assertEqual(config.num_heads, 24)
+        self.assertEqual(config.num_kv_heads, 24)
+        self.assertEqual(config.vocab_size, 1)
+        self.assertEqual(config.head_dim, 128)
+        self.assertEqual(config.max_position_embeddings, 4096)
+        self.assertEqual(config.eos_tokens, (151645,))
+
+    def test_validate_image_model_dir_rejects_non_image_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = write_llm_bundle(Path(temp_dir) / "llm-model")
+
+            with self.assertRaisesRegex(ModelValidationError, "Unsupported image model architecture"):
+                validate_image_model_dir(model_dir)
