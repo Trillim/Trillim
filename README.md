@@ -56,7 +56,7 @@ with Runtime(LLM("Trillim/BitNet-TRNQ")) as runtime:
 Generate an image from a Bonsai Image bundle:
 
 ```bash
-uv run trillim image Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ "a tiny bonsai on a desk" -o bonsai.png
+uv run trillim image Local/Bonsai-Image-Ternary-4B-TRNQ "a tiny bonsai on a desk" -o bonsai.png
 ```
 
 ## Common Workflows

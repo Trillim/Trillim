@@ -11,7 +11,7 @@ from trillim.components.image import Image
 from tests.support import requires_integration
 
 
-BONSAI_IMAGE_MODEL_ID = "Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ"
+BONSAI_IMAGE_MODEL_ID = "Local/Bonsai-Image-Ternary-4B-TRNQ"
 BONSAI_IMAGE_MODEL_DIR = _model_store.store_path_for_id(BONSAI_IMAGE_MODEL_ID)
 
 

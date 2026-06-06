@@ -114,8 +114,8 @@ Notes:
 Generate a PNG from a Bonsai Image bundle.
 
 ```bash
-trillim image Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ "a tiny bonsai on a desk" -o bonsai.png
-trillim image Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ "a tiny bonsai on a desk" -o bonsai.png --width 1024 --height 1024 --steps 4 --seed 123
+trillim image Local/Bonsai-Image-Ternary-4B-TRNQ "a tiny bonsai on a desk" -o bonsai.png
+trillim image Local/Bonsai-Image-Ternary-4B-TRNQ "a tiny bonsai on a desk" -o bonsai.png --width 1024 --height 1024 --steps 4 --seed 123
 ```
 
 Arguments:
@@ -145,7 +145,7 @@ Start the demo HTTP server.
 ```bash
 trillim serve Trillim/BitNet-TRNQ
 trillim serve Trillim/BitNet-TRNQ --voice
-trillim serve Local/Bonsai-Image-Ternary-4B-Unpacked-TRNQ
+trillim serve Local/Bonsai-Image-Ternary-4B-TRNQ
 trillim serve Trillim/BitNet-Large-TRNQ --trust-remote-code
 ```
 
