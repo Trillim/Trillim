@@ -11,14 +11,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from prompt_toolkit import prompt as better_input
 from prompt_toolkit.key_binding import KeyBindings
 
-from trillim import LLM, STT, TTS, Runtime, Server, _model_store
+from trillim import Image, LLM, STT, TTS, Runtime, Server, _model_store
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
+from trillim.components.image._model_dir import is_image_model_dir, validate_image_model_dir
 from trillim.components.llm._events import ChatDoneEvent, ChatTokenEvent
 from trillim.components.llm._model_dir import validate_lora_dir, validate_model_dir
 from trillim.errors import ModelValidationError
@@ -474,6 +476,17 @@ def _run_serve(
         label="Model",
         trust_remote_code=trust_remote_code,
     )
+    model_dir = _model_store.resolve_existing_store_id(model_id)
+    if is_image_model_dir(model_dir):
+        validate_image_model_dir(model_dir)
+        if voice:
+            raise ValueError("--voice is only supported when serving an LLM model")
+        Server(Image(model_id, trust_remote_code=trust_remote_code)).run(
+            host=DEFAULT_HOST,
+            port=DEFAULT_PORT,
+        )
+        return 0
+    validate_model_dir(model_dir)
     if voice:
         _preflight_voice_dependencies()
     llm = LLM(model_id, trust_remote_code=trust_remote_code)
@@ -482,6 +495,85 @@ def _run_serve(
         components.extend([STT(), TTS()])
     Server(*components).run(host=DEFAULT_HOST, port=DEFAULT_PORT)
     return 0
+
+
+def _run_image_command(args: argparse.Namespace) -> int:
+    _require_remote_code_opt_in(
+        args.model_dir,
+        label="Model",
+        trust_remote_code=args.trust_remote_code,
+    )
+    prompt = " ".join(args.prompt)
+    runtime = Runtime(Image(args.model_dir, trust_remote_code=args.trust_remote_code))
+    progress = _ImageProgressBar(_image_progress_total(args.steps))
+    started_at = time.perf_counter()
+    with runtime:
+        progress.start()
+        try:
+            output_path = runtime.image.generate(
+                prompt,
+                args.output,
+                steps=args.steps,
+                seed=args.seed,
+                width=args.width,
+                height=args.height,
+                progress_callback=progress.update,
+            )
+        finally:
+            progress.close()
+    elapsed = time.perf_counter() - started_at
+    print(f"Wrote image to {output_path} in {_format_elapsed(elapsed)}")
+    return 0
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes}m {remainder:.1f}s"
+
+
+class _ImageProgressBar:
+    def __init__(self, total: int, *, stream=None, enabled: bool | None = None) -> None:
+        self.total = max(1, int(total))
+        self.stream = sys.stderr if stream is None else stream
+        self.enabled = self.stream.isatty() if enabled is None else enabled
+        self._started = False
+        self._last_done = -1
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._started = True
+        self.update(0, self.total)
+
+    def update(self, done: int, total: int) -> None:
+        if not self.enabled:
+            return
+        total = max(1, int(total))
+        done = min(max(0, int(done)), total)
+        if done == self._last_done and total == self.total:
+            return
+        self.total = total
+        self._last_done = done
+        width = 24
+        filled = round(width * done / total)
+        bar = "#" * filled + "-" * (width - filled)
+        percent = round(100 * done / total)
+        self.stream.write(f"\rGenerating image [{bar}] {done}/{total} {percent:3d}%")
+        self.stream.flush()
+
+    def close(self) -> None:
+        if self.enabled and self._started:
+            self.stream.write("\n")
+            self.stream.flush()
+        self._started = False
+
+
+def _image_progress_total(steps: int) -> int:
+    return 36 + max(0, int(steps)) * 27 + 21
 
 
 def _run_quantize_command(args: argparse.Namespace) -> int:
@@ -572,6 +664,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow loading custom tokenizer/config code referenced by the bundle",
     )
 
+    image_parser = subparsers.add_parser(
+        "image",
+        help="Generate an image from a Bonsai Image model",
+    )
+    image_parser.add_argument(
+        "model_dir", help="Store-qualified model ID (Trillim/<name> or Local/<name>)"
+    )
+    image_parser.add_argument("prompt", nargs="+", help="Text prompt to render")
+    image_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="PNG output path",
+    )
+    image_parser.add_argument(
+        "--steps",
+        type=int,
+        default=4,
+        help="Number of denoising steps",
+    )
+    image_parser.add_argument(
+        "--seed",
+        type=int,
+        help="Optional random seed",
+    )
+    image_parser.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Output image width in pixels",
+    )
+    image_parser.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="Output image height in pixels",
+    )
+    image_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading custom tokenizer/config code referenced by the bundle",
+    )
+
     quantize_parser = subparsers.add_parser(
         "quantize",
         help="Quantize one local model directory or adapter directory into Local/",
@@ -607,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
             voice=args.voice,
             trust_remote_code=args.trust_remote_code,
         ),
+        "image": lambda: _run_image_command(args),
         "quantize": lambda: _run_quantize_command(args),
     }
     try:

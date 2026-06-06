@@ -18,7 +18,7 @@ from trillim.components.llm.public import LLM, _make_init_config, load_tokenizer
 from trillim.errors import ComponentLifecycleError, InvalidRequestError
 from trillim.errors import ModelValidationError
 
-from tests.support import requires_integration, write_llm_bundle
+from tests.support import requires_integration, write_image_bundle, write_llm_bundle
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -163,6 +163,20 @@ class EventAndPublicAPITests(unittest.TestCase):
                         await llm.start()
                     self.assertIsNone(llm._runtime)
                     self.assertIsNone(llm._active_model_name())
+
+        import asyncio
+
+        asyncio.run(run())
+
+    def test_llm_chat_runtime_rejects_image_architecture(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                write_image_bundle(root / "Local" / "image-model")
+                with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                    llm = LLM("Local/image-model")
+                    with self.assertRaisesRegex(ModelValidationError, "Unsupported model architecture"):
+                        await llm.start()
 
         import asyncio
 

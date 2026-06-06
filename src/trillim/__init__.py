@@ -1,5 +1,6 @@
 """Public Trillim package exports."""
 
+from trillim.components.image import Image
 from trillim.components.llm import LLM
 from trillim.components.stt import STT
 from trillim.components.tts import TTS
@@ -25,6 +26,7 @@ __all__ = [
     "ComponentLifecycleError",
     "ContextOverflowError",
     "InvalidRequestError",
+    "Image",
     "LLM",
     "ModelValidationError",
     "OperationCancelledError",

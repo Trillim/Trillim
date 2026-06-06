@@ -19,6 +19,7 @@ Usage:
 Set TRILLIM_DARKNET_ROOT or TRILLIM_DARKQUANT_ROOT to override worktree
 autodiscovery.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,6 +43,11 @@ BINARY_SOURCES = {
         "repo_name": "DarkNet",
         "env_var": DARKNET_ENV,
         "source_name": "trillim-inference",
+    },
+    "trillim-image-inference": {
+        "repo_name": "DarkNet",
+        "env_var": DARKNET_ENV,
+        "source_name": "trillim-image-inference",
     },
     "trillim-quantize": {
         "repo_name": "DarkQuant",
@@ -132,12 +138,18 @@ def _git_common_dir(root: Path) -> Path | None:
 
 def _mirrored_worktree_candidate(root: Path, repo_name: str) -> Path | None:
     common_dir = _git_common_dir(root)
-    if common_dir is None or common_dir.name == ".git" or not common_dir.name.endswith(".git"):
+    if (
+        common_dir is None
+        or common_dir.name == ".git"
+        or not common_dir.name.endswith(".git")
+    ):
         return None
 
     repo_container = common_dir.with_name(common_dir.name.removesuffix(".git"))
     try:
-        worktree_relative = _normalize_path(root).relative_to(_normalize_path(repo_container))
+        worktree_relative = _normalize_path(root).relative_to(
+            _normalize_path(repo_container)
+        )
     except ValueError:
         return None
     if not worktree_relative.parts:
@@ -145,7 +157,9 @@ def _mirrored_worktree_candidate(root: Path, repo_name: str) -> Path | None:
     return common_dir.parent / repo_name / worktree_relative
 
 
-def _repo_root_candidates(repo_name: str, env_var: str, *, root: Path | None = None) -> list[Path]:
+def _repo_root_candidates(
+    repo_name: str, env_var: str, *, root: Path | None = None
+) -> list[Path]:
     project_root = root or ROOT
     override = os.environ.get(env_var)
     if override:
@@ -163,7 +177,9 @@ def _repo_root_candidates(repo_name: str, env_var: str, *, root: Path | None = N
     return _unique_paths(candidates)
 
 
-def _resolve_repo_root(repo_name: str, env_var: str, *, root: Path | None = None) -> Path:
+def _resolve_repo_root(
+    repo_name: str, env_var: str, *, root: Path | None = None
+) -> Path:
     candidates = _repo_root_candidates(repo_name, env_var, root=root)
     for candidate in candidates:
         if (candidate / "executables").is_dir():
