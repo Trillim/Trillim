@@ -175,6 +175,21 @@ def _iter_local_bundles(namespace: str) -> list[_LocalBundle]:
             )
             continue
         try:
+            validate_image_model_dir(entry)
+        except ModelValidationError:
+            pass
+        else:
+            size_bytes = (entry / "qmodel.tensors").stat().st_size
+            bundles.append(
+                _LocalBundle(
+                    model_id=f"{namespace}/{entry.name}",
+                    entry_type="model",
+                    size_bytes=size_bytes,
+                    size_human=_human_size(size_bytes),
+                )
+            )
+            continue
+        try:
             validate_lora_dir(entry)
         except ModelValidationError:
             continue
