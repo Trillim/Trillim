@@ -122,7 +122,7 @@ class QuantizeOutputTests(unittest.TestCase):
             output_dir = root / "out"
             model_dir.mkdir()
             _write_bonsai_image_config(model_dir)
-            (model_dir / "README.md").write_text("image model\n", encoding="utf-8")
+            (model_dir / "README.md").write_text("Bonsai Image binary 1-bit\n", encoding="utf-8")
             (model_dir / "manifest.json").write_text("{}", encoding="utf-8")
             (model_dir / "tokenizer").mkdir()
             (model_dir / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf-8")
@@ -238,20 +238,47 @@ class QuantizeOutputTests(unittest.TestCase):
             output_dir = root / "out"
             model_dir.mkdir()
             _write_bonsai_image_config(model_dir)
+            (model_dir / "README.md").write_text("Bonsai Image binary 1-bit\n", encoding="utf-8")
             config = load_model_config(model_dir)
+            self.assertIsNotNone(config.image_quantization)
+            self.assertEqual(config.image_quantization.name, "binary-image")
 
             write_model_metadata(output_dir, config=config, model_dir=model_dir)
 
             payload = json.loads(
                 (output_dir / "trillim_config.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(payload["quantization"], "bf16-image")
+            self.assertEqual(payload["quantization"], "binary-image")
             self.assertEqual(payload["architecture"], "bonsai_image")
             self.assertEqual(
                 payload["source_model"],
                 "black-forest-labs/FLUX.2-klein-4B",
             )
             self.assertEqual(len(payload["base_model_config_hash"]), 64)
+
+    def test_write_model_metadata_reports_bonsai_image_quantization_flavor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary_dir = root / "Bonsai-Image-Binary-4B"
+            ternary_dir = root / "Bonsai-Image-Ternary-4B"
+            binary_out = root / "binary-out"
+            ternary_out = root / "ternary-out"
+            binary_dir.mkdir()
+            ternary_dir.mkdir()
+            _write_bonsai_image_config(binary_dir)
+            _write_bonsai_image_config(ternary_dir)
+            (binary_dir / "README.md").write_text("Bonsai Image binary 1-bit\n", encoding="utf-8")
+            (ternary_dir / "README.md").write_text("Bonsai Image ternary\n", encoding="utf-8")
+
+            binary_config = load_model_config(binary_dir)
+            ternary_config = load_model_config(ternary_dir)
+            write_model_metadata(binary_out, config=binary_config, model_dir=binary_dir)
+            write_model_metadata(ternary_out, config=ternary_config, model_dir=ternary_dir)
+
+            binary_payload = json.loads((binary_out / "trillim_config.json").read_text(encoding="utf-8"))
+            ternary_payload = json.loads((ternary_out / "trillim_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(binary_payload["quantization"], "binary-image")
+            self.assertEqual(ternary_payload["quantization"], "grouped-ternary-image")
 
     def test_remote_code_reference_validation_and_quantization_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:

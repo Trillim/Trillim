@@ -11,7 +11,9 @@ from trillim.components.llm._config import ArchitectureType
 from trillim.quantize._config import load_model_config
 from trillim.quantize._manifest import (
     ACTION_BF16_RAW,
+    ACTION_GROUP_TERNARY_QUANTIZE,
     ACTION_Q1_0_128,
+    ACTION_Q4_0,
     ACTION_REPACK_TERNARY,
     ACTION_TERNARY_QUANTIZE,
     DTYPE_BF16,
@@ -125,12 +127,14 @@ def _read_image_index(path: Path) -> list[dict[str, object]]:
     offset += 4
     if self_magic != b"TRIX":
         raise ValueError(f"bad image index magic: {self_magic!r}")
-    if unpack("<I") != 1:
+    version = unpack("<I")
+    if version not in {1, 2}:
         raise ValueError("bad image index version")
 
     entries = []
     for _ in range(unpack("<I")):
         section = unpack("<B")
+        action = unpack("<B")
         name_len = unpack("<H")
         name = data[offset:offset + name_len].decode("utf-8")
         offset += name_len
@@ -143,6 +147,7 @@ def _read_image_index(path: Path) -> list[dict[str, object]]:
         entries.append(
             {
                 "section": section,
+                "action": action,
                 "name": name,
                 "row": row,
                 "col": col,
@@ -233,10 +238,13 @@ class QuantizeConfigManifestTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (model_dir / "README.md").write_text("Bonsai Image ternary\n", encoding="utf-8")
 
             config = load_model_config(model_dir)
 
         self.assertEqual(config.arch_type, ArchitectureType.BONSAI_IMAGE)
+        self.assertIsNotNone(config.image_quantization)
+        self.assertEqual(config.image_quantization.name, "grouped-ternary-image")
         self.assertEqual(config.hidden_dim, 3072)
         self.assertEqual(config.intermediate_dim, 9216)
         self.assertEqual(config.num_layers, 25)
@@ -245,6 +253,62 @@ class QuantizeConfigManifestTests(unittest.TestCase):
         self.assertEqual(config.head_dim, 128)
         self.assertEqual(config.rope_theta, 2000.0)
         self.assertEqual(config.source_model, "black-forest-labs/FLUX.2-klein-4B")
+
+    def test_load_model_config_uses_bf16_image_when_flavor_is_not_declared(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            transformer_dir = model_dir / "transformer"
+            transformer_dir.mkdir()
+            (transformer_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "Flux2Transformer2DModel",
+                        "attention_head_dim": 128,
+                        "mlp_ratio": 3.0,
+                        "num_attention_heads": 24,
+                        "num_layers": 5,
+                        "num_single_layers": 20,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_model_config(model_dir)
+
+            self.assertIsNotNone(config.image_quantization)
+            self.assertEqual(config.image_quantization.name, "bf16-image")
+
+    def test_load_model_config_prefers_bonsai_image_manifest_flavor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            transformer_dir = model_dir / "transformer"
+            transformer_dir.mkdir()
+            (transformer_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "Flux2Transformer2DModel",
+                        "attention_head_dim": 128,
+                        "mlp_ratio": 3.0,
+                        "num_attention_heads": 24,
+                        "num_layers": 5,
+                        "num_single_layers": 20,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "manifest.json").write_text(
+                json.dumps({"model_version": "binary g128"}),
+                encoding="utf-8",
+            )
+            (model_dir / "README.md").write_text(
+                "Links to a ternary release live here.\n",
+                encoding="utf-8",
+            )
+
+            config = load_model_config(model_dir)
+
+            self.assertIsNotNone(config.image_quantization)
+            self.assertEqual(config.image_quantization.name, "binary-image")
 
     def test_load_model_config_rejects_missing_or_invalid_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -359,15 +423,20 @@ class QuantizeConfigManifestTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (model_dir / "README.md").write_text("Bonsai Image binary 1-bit\n", encoding="utf-8")
             _write_safetensors(
                 text_encoder_dir / "model.safetensors",
-                {"model.embed_tokens.weight": ("BF16", [2, 3], b"\0" * 12)},
+                {
+                    "model.embed_tokens.weight": ("BF16", [2, 128], b"\0" * 512),
+                    "model.layers.0.input_layernorm.weight": ("BF16", [128], b"\0" * 256),
+                },
             )
             _write_safetensors(
                 transformer_dir / "diffusion_pytorch_model.safetensors",
                 {
-                    "proj_out.weight": ("BF16", [4, 3], b"\0" * 24),
-                    "context_embedder.weight": ("BF16", [3, 2], b"\0" * 12),
+                    "context_embedder.weight": ("BF16", [128, 128], b"\0" * 32768),
+                    "proj_out.weight": ("BF16", [128, 128], b"\0" * 32768),
+                    "transformer_blocks.0.attn.to_q.weight": ("BF16", [128, 128], b"\0" * 32768),
                 },
             )
             _write_safetensors(
@@ -383,30 +452,130 @@ class QuantizeConfigManifestTests(unittest.TestCase):
             manifest = _read_manifest(manifest_path)
             image_index = _read_image_index(output_dir / "qmodel.index")
 
-            self.assertEqual(len(manifest["tensor_entries"]), 4)
+            self.assertEqual(len(manifest["tensor_entries"]), 6)
             self.assertEqual(
                 manifest["sections"],
                 [
-                    (SECTION_IMAGE_TEXT_ENCODER, 0, 1),
-                    (SECTION_IMAGE_TRANSFORMER, 1, 2),
-                    (SECTION_IMAGE_VAE, 3, 1),
+                    (SECTION_IMAGE_TEXT_ENCODER, 0, 2),
+                    (SECTION_IMAGE_TRANSFORMER, 2, 3),
+                    (SECTION_IMAGE_VAE, 5, 1),
+                ],
+            )
+            self.assertEqual(
+                [entry["action"] for entry in manifest["tensor_entries"]],
+                [
+                    ACTION_Q4_0,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_Q1_0_128,
+                    ACTION_BF16_RAW,
                 ],
             )
             for entry in manifest["tensor_entries"]:
-                self.assertEqual(entry["action"], ACTION_BF16_RAW)
                 self.assertEqual(entry["dtype"], DTYPE_BF16)
             self.assertEqual(
                 [entry["name"] for entry in image_index],
                 [
                     "model.embed_tokens.weight",
+                    "model.layers.0.input_layernorm.weight",
                     "context_embedder.weight",
                     "proj_out.weight",
+                    "transformer_blocks.0.attn.to_q.weight",
                     "decoder.conv_in.weight",
                 ],
             )
-            self.assertEqual([entry["section"] for entry in image_index], [4, 5, 5, 6])
-            self.assertEqual([entry["qmodel_offset"] for entry in image_index], [31, 43, 55, 79])
-            self.assertEqual([entry["data_size"] for entry in image_index], [12, 12, 24, 8])
+            self.assertEqual([entry["section"] for entry in image_index], [4, 4, 5, 5, 5, 6])
+            self.assertEqual(
+                [entry["action"] for entry in image_index],
+                [
+                    ACTION_Q4_0,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_Q1_0_128,
+                    ACTION_BF16_RAW,
+                ],
+            )
+            self.assertEqual(
+                [entry["qmodel_offset"] for entry in image_index],
+                [31, 191, 447, 33215, 65983, 68287],
+            )
+            self.assertEqual([entry["data_size"] for entry in image_index], [160, 256, 32768, 32768, 2304, 8])
+
+    def test_build_manifest_writes_ternary_bonsai_image_linear_actions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "model"
+            output_dir = root / "out"
+            transformer_dir = model_dir / "transformer"
+            text_encoder_dir = model_dir / "text_encoder"
+            vae_dir = model_dir / "vae"
+            transformer_dir.mkdir(parents=True)
+            text_encoder_dir.mkdir()
+            vae_dir.mkdir()
+            output_dir.mkdir()
+            (model_dir / "README.md").write_text("Bonsai Image ternary\n", encoding="utf-8")
+            (transformer_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "Flux2Transformer2DModel",
+                        "attention_head_dim": 128,
+                        "mlp_ratio": 3.0,
+                        "num_attention_heads": 24,
+                        "num_layers": 5,
+                        "num_single_layers": 20,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_safetensors(
+                text_encoder_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("BF16", [2, 128], b"\0" * 512),
+                    "model.layers.0.input_layernorm.weight": ("BF16", [128], b"\0" * 256),
+                },
+            )
+            _write_safetensors(
+                transformer_dir / "diffusion_pytorch_model.safetensors",
+                {
+                    "proj_out.weight": ("BF16", [128, 128], b"\0" * 32768),
+                    "transformer_blocks.0.ff.linear_in.weight": ("BF16", [128, 128], b"\0" * 32768),
+                },
+            )
+            _write_safetensors(
+                vae_dir / "diffusion_pytorch_model.safetensors",
+                {"decoder.conv_in.weight": ("BF16", [2, 2, 1, 1], b"\0" * 8)},
+            )
+            config = load_model_config(model_dir)
+
+            manifest_path = build_manifest(model_dir, config, output_dir=output_dir)
+            manifest = _read_manifest(manifest_path)
+            image_index = _read_image_index(output_dir / "qmodel.index")
+
+            self.assertIsNotNone(config.image_quantization)
+            self.assertEqual(config.image_quantization.name, "grouped-ternary-image")
+            self.assertEqual(
+                [entry["action"] for entry in manifest["tensor_entries"]],
+                [
+                    ACTION_Q4_0,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_GROUP_TERNARY_QUANTIZE,
+                    ACTION_BF16_RAW,
+                ],
+            )
+            self.assertEqual(
+                [entry["action"] for entry in image_index],
+                [
+                    ACTION_Q4_0,
+                    ACTION_BF16_RAW,
+                    ACTION_BF16_RAW,
+                    ACTION_GROUP_TERNARY_QUANTIZE,
+                    ACTION_BF16_RAW,
+                ],
+            )
+            self.assertEqual([entry["data_size"] for entry in image_index], [160, 256, 32768, 4352, 8])
 
     def test_build_manifest_validates_supported_tensors_and_language_model_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
