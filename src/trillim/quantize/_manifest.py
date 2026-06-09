@@ -9,15 +9,21 @@ import struct
 import subprocess
 from pathlib import Path
 
+from trillim.components.image._config import ImageTensorAction
 from trillim.components.llm._config import ArchitectureType
 
-from ._config import LORA_TARGETS, ModelQuantizeConfig, layer_index_for_key
+from ._config import (
+    LORA_TARGETS,
+    ModelQuantizeConfig,
+    layer_index_for_key,
+)
 
-ACTION_BF16_RAW = 0
+ACTION_BF16_RAW = ImageTensorAction.BF16_RAW
 ACTION_TERNARY_QUANTIZE = 1
 ACTION_REPACK_TERNARY = 3
-ACTION_Q1_0_128 = 4
-ACTION_GROUP_TERNARY_QUANTIZE = 5
+ACTION_Q1_0_128 = ImageTensorAction.Q1_0_128
+ACTION_GROUP_TERNARY_QUANTIZE = ImageTensorAction.GROUP_TERNARY
+ACTION_Q4_0 = ImageTensorAction.Q4_0
 
 SECTION_TEXT_CORE = 1
 SECTION_IMAGE_TEXT_ENCODER = 4
@@ -72,8 +78,6 @@ def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int
         # Dense Qwen3 model weights are stored
         # as BF16 and quantized at load time
         return ACTION_BF16_RAW
-    if arch_type == ArchitectureType.BONSAI_IMAGE:
-        return ACTION_BF16_RAW
     if arch_type == ArchitectureType.BONSAI:
         return ACTION_Q1_0_128
     if arch_type == ArchitectureType.BONSAI_TERNARY:
@@ -83,9 +87,73 @@ def _quantized_tensor_action(dtype_str: str, arch_type: ArchitectureType) -> int
     return ACTION_TERNARY_QUANTIZE
 
 
+def _bonsai_image_tensor_action(
+    key: str,
+    shape: list[int],
+    config: ModelQuantizeConfig,
+    section_type: int,
+) -> int:
+    image_quantization = config.image_quantization
+    if image_quantization is None:
+        return ACTION_BF16_RAW
+    if section_type == SECTION_IMAGE_TEXT_ENCODER:
+        return (
+            image_quantization.text_encoder_weight_action
+            if _is_bonsai_image_text_encoder_q4_weight(key, shape)
+            else ACTION_BF16_RAW
+        )
+    if section_type != SECTION_IMAGE_TRANSFORMER:
+        return ACTION_BF16_RAW
+    return (
+        image_quantization.transformer_weight_action
+        if _is_bonsai_image_low_bit_linear(key, shape)
+        else ACTION_BF16_RAW
+    )
+
+
+def _is_bonsai_image_text_encoder_q4_weight(key: str, shape: list[int]) -> bool:
+    return len(shape) == 2 and key.endswith(".weight")
+
+
+def _is_bonsai_image_low_bit_linear(key: str, shape: list[int]) -> bool:
+    if len(shape) != 2 or not key.endswith(".weight"):
+        return False
+    if key.startswith("transformer_blocks."):
+        block_key = key.split(".", 2)[2]
+        return block_key.startswith("attn.") or block_key.startswith(
+            ("ff.", "ff_context.")
+        )
+    if key.startswith("single_transformer_blocks."):
+        block_key = key.split(".", 2)[2]
+        return block_key.startswith("attn.")
+    return False
+
+
+def _align_to_128(value: int) -> int:
+    return ((value + 127) // 128) * 128
+
+
+def _align_for_image_action(value: int, action: int, *, axis: str) -> int:
+    if action == ACTION_BF16_RAW:
+        return value
+    if action in {ACTION_Q1_0_128, ACTION_GROUP_TERNARY_QUANTIZE}:
+        return _align_to_128(value)
+    if action == ACTION_Q4_0:
+        return value if axis == "row" else _align_to_32(value)
+    raise ValueError(f"Unsupported Bonsai Image tensor action: {action}")
+
+
+def _align_to_32(value: int) -> int:
+    return ((value + 31) // 32) * 32
+
+
 def resolve_quantize_binary() -> Path:
     suffix = ".exe" if os.name == "nt" else ""
-    path = Path(__file__).resolve().parents[1] / "_bin" / f"{_QUANTIZE_BINARY_NAME}{suffix}"
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "_bin"
+        / f"{_QUANTIZE_BINARY_NAME}{suffix}"
+    )
     if not path.is_file():
         raise FileNotFoundError(f"Bundled quantizer binary not found at {path}")
     return path
@@ -121,7 +189,10 @@ def get_sharded_files(model_dir: Path) -> tuple[list[Path], dict[str, Path]]:
             raise ValueError(f"Invalid sharded safetensors index in {index_path}")
         shard_files = sorted({str(value) for value in weight_map.values()})
         shard_paths = [model_dir / shard_name for shard_name in shard_files]
-        full_weight_map = {str(name): model_dir / str(filename) for name, filename in weight_map.items()}
+        full_weight_map = {
+            str(name): model_dir / str(filename)
+            for name, filename in weight_map.items()
+        }
         return shard_paths, full_weight_map
     raise FileNotFoundError(
         f"No model.safetensors or model.safetensors.index.json found in {model_dir}"
@@ -238,10 +309,16 @@ def build_manifest(
             padded_shape = list(shape)
             needs_padding = False
             for index, dim_size in enumerate(padded_shape):
-                if dim_size == config.intermediate_dim_orig and config.intermediate_dim != config.intermediate_dim_orig:
+                if (
+                    dim_size == config.intermediate_dim_orig
+                    and config.intermediate_dim != config.intermediate_dim_orig
+                ):
                     padded_shape[index] = config.intermediate_dim
                     needs_padding = True
-                elif dim_size == config.hidden_dim_orig and config.hidden_dim != config.hidden_dim_orig:
+                elif (
+                    dim_size == config.hidden_dim_orig
+                    and config.hidden_dim != config.hidden_dim_orig
+                ):
                     padded_shape[index] = config.hidden_dim
                     needs_padding = True
             padded_row = padded_shape[0] if padded_shape else 1
@@ -277,7 +354,9 @@ def build_manifest(
             scale_size = 0
             if action == ACTION_REPACK_TERNARY:
                 scale_key = f"{key}_scale"
-                scale_file = weight_map.get(scale_key, file_path) if weight_map else file_path
+                scale_file = (
+                    weight_map.get(scale_key, file_path) if weight_map else file_path
+                )
                 if scale_file not in shard_idx_map:
                     shard_idx_map[scale_file] = len(shard_path_list)
                     shard_path_list.append(scale_file)
@@ -365,6 +444,7 @@ def _build_bonsai_image_manifest(
         component_entries = _append_bonsai_image_component_entries(
             component_dir,
             section_type=section_type,
+            config=config,
             shard_path_list=shard_path_list,
             shard_idx_map=shard_idx_map,
             shard_headers=shard_headers,
@@ -402,6 +482,7 @@ def _append_bonsai_image_component_entries(
     component_dir: Path,
     *,
     section_type: int,
+    config: ModelQuantizeConfig,
     shard_path_list: list[Path],
     shard_idx_map: dict[Path, int],
     shard_headers: dict[Path, dict],
@@ -443,6 +524,9 @@ def _append_bonsai_image_component_entries(
         shape = [int(value) for value in item["shape"]]
         row = shape[0] if shape else 1
         col = math.prod(shape[1:]) if len(shape) >= 2 else 1
+        action = _bonsai_image_tensor_action(key, shape, config, section_type)
+        padded_row = _align_for_image_action(row, action, axis="row")
+        padded_col = _align_for_image_action(col, action, axis="col")
         data_offsets = tensor_info["data_offsets"]
         data_offset_begin = int(data_offsets[0])
         data_offset_end = int(data_offsets[1])
@@ -450,12 +534,12 @@ def _append_bonsai_image_component_entries(
             {
                 "name": key,
                 "section": section_type,
-                "action": ACTION_BF16_RAW,
+                "action": action,
                 "dtype": dtype_code,
                 "row": row,
                 "col": col,
-                "padded_row": row,
-                "padded_col": col,
+                "padded_row": padded_row,
+                "padded_col": padded_col,
                 "shard_idx": shard_idx_map[file_path],
                 "data_offset": shard_data_starts[file_path] + data_offset_begin,
                 "data_size": data_offset_end - data_offset_begin,
@@ -480,11 +564,10 @@ def _write_bonsai_image_index(
         handle.write(struct.pack("<I", _IMAGE_INDEX_VERSION))
         handle.write(struct.pack("<I", len(tensor_entries)))
         for entry in tensor_entries:
-            if entry["action"] != ACTION_BF16_RAW:
-                raise ValueError("Bonsai Image qmodel index only supports BF16_RAW tensors")
-            data_size = int(entry["padded_row"]) * int(entry["padded_col"]) * 2
+            data_size = _image_qmodel_data_size(entry)
             encoded_name = str(entry["name"]).encode("utf-8")
             handle.write(struct.pack("<B", int(entry["section"])))
+            handle.write(struct.pack("<B", int(entry["action"])))
             handle.write(struct.pack("<H", len(encoded_name)))
             handle.write(encoded_name)
             handle.write(struct.pack("<I", int(entry["row"])))
@@ -496,7 +579,24 @@ def _write_bonsai_image_index(
             qmodel_offset += data_size
 
 
-def _get_component_sharded_files(component_dir: Path) -> tuple[list[Path], dict[str, Path]]:
+def _image_qmodel_data_size(entry: dict[str, int]) -> int:
+    action = int(entry["action"])
+    padded_row = int(entry["padded_row"])
+    padded_col = int(entry["padded_col"])
+    if action == ACTION_BF16_RAW:
+        return padded_row * padded_col * 2
+    if action == ACTION_Q1_0_128:
+        return padded_row * ((padded_col + 127) // 128) * 18
+    if action == ACTION_GROUP_TERNARY_QUANTIZE:
+        return padded_row * ((padded_col + 127) // 128) * 34
+    if action == ACTION_Q4_0:
+        return padded_row * ((padded_col + 31) // 32) * 20
+    raise ValueError(f"Unsupported Bonsai Image tensor action: {action}")
+
+
+def _get_component_sharded_files(
+    component_dir: Path,
+) -> tuple[list[Path], dict[str, Path]]:
     try:
         return get_sharded_files(component_dir)
     except FileNotFoundError:
@@ -609,7 +709,10 @@ def run_model_quantizer(
         "--rope-dim",
         str(int(round(config.head_dim * config.partial_rotary_factor))),
     ]
-    if config.yarn_factor is not None and config.original_max_position_embeddings is not None:
+    if (
+        config.yarn_factor is not None
+        and config.original_max_position_embeddings is not None
+    ):
         command.extend(
             [
                 "--yarn-factor",
@@ -709,7 +812,9 @@ def _ordered_text_tensors(
         if language_model_only and _is_language_model_only_skip(key):
             continue
         filtered.append(item)
-    return sorted(filtered, key=lambda item: _processing_sort_key(str(item["key"]), config))
+    return sorted(
+        filtered, key=lambda item: _processing_sort_key(str(item["key"]), config)
+    )
 
 
 def _validate_supported_model_tensors(
@@ -750,12 +855,16 @@ def _is_supported_text_tensor(key: str, config: ModelQuantizeConfig) -> bool:
 def _matches_component_key(key: str, component: str) -> bool:
     if key.endswith(f".{component}"):
         return True
-    if component.endswith((".weight", ".bias")) or component.endswith(("A_log", "dt_bias")):
+    if component.endswith((".weight", ".bias")) or component.endswith(
+        ("A_log", "dt_bias")
+    ):
         return False
     return key.endswith(f".{component}.weight") or key.endswith(f".{component}.bias")
 
 
-def _processing_sort_key(key: str, config: ModelQuantizeConfig) -> tuple[int, int, int, int]:
+def _processing_sort_key(
+    key: str, config: ModelQuantizeConfig
+) -> tuple[int, int, int, int]:
     component_order = config.arch_info.component_order
     if key == config.arch_info.embedding_key:
         return (0, -1, -1, 0)
@@ -922,7 +1031,9 @@ def _read_adapter_config_file(adapter_dir: Path) -> dict:
     return json.loads(config_path.read_text(encoding="utf-8"))
 
 
-def _find_lora_key(header: dict, layer_index: int, target: str, part: str) -> str | None:
+def _find_lora_key(
+    header: dict, layer_index: int, target: str, part: str
+) -> str | None:
     candidates = (
         f"base_model.model.model.layers.{layer_index}.{target}.lora_{part}.weight",
         f"model.layers.{layer_index}.{target}.lora_{part}.weight",

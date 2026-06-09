@@ -262,7 +262,7 @@ def write_model_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "model",
-        "quantization": _quantization_name(config.arch_type),
+        "quantization": _quantization_name(config),
         "source_model": config.source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -288,7 +288,7 @@ def write_adapter_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "lora_adapter",
-        "quantization": _quantization_name(config.arch_type),
+        "quantization": _quantization_name(config),
         "source_model": source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -334,7 +334,13 @@ def _copy_file(source_path: Path, destination: Path) -> None:
     shutil.copy2(source_path, destination)
 
 
-def _quantization_name(arch_type: ArchitectureType) -> str:
+def _quantization_name(config_or_arch_type: ModelQuantizeConfig | ArchitectureType) -> str:
+    if isinstance(config_or_arch_type, ModelQuantizeConfig):
+        if config_or_arch_type.image_quantization is not None:
+            return config_or_arch_type.image_quantization.name
+        arch_type = config_or_arch_type.arch_type
+    else:
+        arch_type = config_or_arch_type
     if arch_type == ArchitectureType.QWEN3:
         return "bf16"
     if arch_type == ArchitectureType.BONSAI:

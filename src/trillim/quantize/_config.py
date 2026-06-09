@@ -10,6 +10,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from trillim._bundle_metadata import canonicalize_model_config
+from trillim.components.image._config import (
+    ImageTensorAction,
+    ImageQuantization,
+)
 from trillim.components.llm._config import ArchitectureType
 
 LORA_TARGETS = (
@@ -165,6 +169,7 @@ class ModelQuantizeConfig:
     yarn_beta_fast: float | None
     tie_word_embeddings: bool
     source_model: str
+    image_quantization: ImageQuantization | None = None
 
 
 def load_model_config(model_dir: Path) -> ModelQuantizeConfig:
@@ -277,6 +282,36 @@ def _load_bonsai_image_config(model_dir: Path) -> ModelQuantizeConfig | None:
         yarn_beta_fast=None,
         tie_word_embeddings=False,
         source_model=str(raw.get("_name_or_path", "")),
+        image_quantization=_bonsai_image_quantization(model_dir),
+    )
+
+
+def _bonsai_image_quantization(model_dir: Path) -> ImageQuantization:
+    candidates = [model_dir.name.lower()]
+    for relative_path in (Path("manifest.json"), Path("README.md")):
+        path = model_dir / relative_path
+        if path.is_file():
+            try:
+                candidates.append(path.read_text(encoding="utf-8").lower())
+            except OSError:
+                pass
+    for signals in candidates:
+        if "ternary" in signals:
+            return ImageQuantization(
+                name="grouped-ternary-image",
+                transformer_weight_action=ImageTensorAction.GROUP_TERNARY,
+                text_encoder_weight_action=ImageTensorAction.Q4_0,
+            )
+        if any(token in signals for token in ("binary", "1-bit", "1 bit", "1bit")):
+            return ImageQuantization(
+                name="binary-image",
+                transformer_weight_action=ImageTensorAction.Q1_0_128,
+                text_encoder_weight_action=ImageTensorAction.Q4_0,
+            )
+    return ImageQuantization(
+        name="bf16-image",
+        transformer_weight_action=ImageTensorAction.BF16_RAW,
+        text_encoder_weight_action=ImageTensorAction.BF16_RAW,
     )
 
 
