@@ -84,7 +84,7 @@ curl http://127.0.0.1:8000/v1/images/generations \
   -H "content-type: application/json" \
   -d '{
     "prompt": "a tiny bonsai on a desk",
-    "size": "1024x1024",
+    "size": "320x240",
     "steps": 4,
     "seed": 123
   }'
@@ -104,7 +104,7 @@ Accepted fields:
 | Field | Meaning |
 | --- | --- |
 | `prompt` | Required text prompt |
-| `size` | Optional `WIDTHxHEIGHT`; defaults to `1024x1024` |
+| `size` | Optional `WIDTHxHEIGHT`; defaults to `320x240` |
 | `width`, `height` | Optional integer dimensions when `size` is omitted |
 | `steps` | Optional denoising steps; defaults to `4` |
 | `seed` | Optional non-negative integer seed |

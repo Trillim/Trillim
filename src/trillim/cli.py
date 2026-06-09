@@ -707,13 +707,13 @@ def build_parser() -> argparse.ArgumentParser:
     image_parser.add_argument(
         "--width",
         type=int,
-        default=1024,
+        default=320,
         help="Output image width in pixels",
     )
     image_parser.add_argument(
         "--height",
         type=int,
-        default=1024,
+        default=240,
         help="Output image height in pixels",
     )
     image_parser.add_argument(

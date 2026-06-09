@@ -89,8 +89,8 @@ class Image(Component):
         *,
         steps: int = 4,
         seed: int | None = None,
-        width: int = 1024,
-        height: int = 1024,
+        width: int = 320,
+        height: int = 240,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> Path:
         """Generate one image from text and write it to ``output_path``."""

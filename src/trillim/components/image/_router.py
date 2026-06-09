@@ -98,8 +98,8 @@ def _resolve_size(payload: dict[str, Any]) -> tuple[int, int]:
         except ValueError as exc:
             raise InvalidRequestError("size must use WIDTHxHEIGHT format") from exc
     return (
-        _positive_int(payload.get("width", 1024), "width"),
-        _positive_int(payload.get("height", 1024), "height"),
+        _positive_int(payload.get("width", 320), "width"),
+        _positive_int(payload.get("height", 240), "height"),
     )
 
 

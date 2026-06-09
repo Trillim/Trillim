@@ -55,8 +55,8 @@ with Runtime(Image("Local/Bonsai-Image-4BT-TRNQ")) as runtime:
     runtime.image.generate(
         "a tiny bonsai on a desk",
         "bonsai.png",
-        width=1024,
-        height=1024,
+        width=320,
+        height=240,
         steps=4,
         seed=123,
     )
@@ -77,8 +77,8 @@ async def main():
         await image.generate(
             "a tiny bonsai on a desk",
             "bonsai.png",
-            width=1024,
-            height=1024,
+            width=320,
+            height=240,
             steps=4,
             seed=123,
         )
@@ -91,7 +91,7 @@ asyncio.run(main())
 
 Public helper:
 
-- `await image.generate(prompt, output_path, steps=4, seed=None, width=1024, height=1024)`
+- `await image.generate(prompt, output_path, steps=4, seed=None, width=320, height=240)`
 
 Practical notes:
 

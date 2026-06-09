@@ -115,7 +115,7 @@ Generate a PNG from a Bonsai Image bundle.
 
 ```bash
 trillim image Local/Bonsai-Image-4BT-TRNQ "a tiny bonsai on a desk" -o bonsai.png
-trillim image Local/Bonsai-Image-4BT-TRNQ "a tiny bonsai on a desk" -o bonsai.png --width 1024 --height 1024 --steps 4 --seed 123
+trillim image Local/Bonsai-Image-4BT-TRNQ "a tiny bonsai on a desk" -o bonsai.png --width 320 --height 240 --steps 4 --seed 123
 ```
 
 Arguments:
@@ -132,8 +132,8 @@ Flags:
 | `--output`, `-o` | Required PNG output path |
 | `--steps` | Denoising step count; defaults to `4` |
 | `--seed` | Optional non-negative integer seed |
-| `--width` | Output width; defaults to `1024` |
-| `--height` | Output height; defaults to `1024` |
+| `--width` | Output width; defaults to `320` |
+| `--height` | Output height; defaults to `240` |
 | `--trust-remote-code` | Allow bundles that reference custom tokenizer or config code |
 
 `width` and `height` must be positive multiples of `16` and no larger than `4096`.
