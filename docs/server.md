@@ -74,7 +74,7 @@ Returns `200` when the app is alive:
 Run the server with a Bonsai Image bundle:
 
 ```bash
-trillim serve Local/Bonsai-Image-Ternary-4B-TRNQ
+trillim serve Local/Bonsai-Image-4BT-TRNQ
 ```
 
 Minimal request:

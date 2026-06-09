@@ -51,7 +51,7 @@ Synchronous image generation uses the same facade:
 ```python
 from trillim import Image, Runtime
 
-with Runtime(Image("Local/Bonsai-Image-Ternary-4B-TRNQ")) as runtime:
+with Runtime(Image("Local/Bonsai-Image-4BT-TRNQ")) as runtime:
     runtime.image.generate(
         "a tiny bonsai on a desk",
         "bonsai.png",
@@ -71,7 +71,7 @@ from trillim import Image
 
 
 async def main():
-    image = Image("Local/Bonsai-Image-Ternary-4B-TRNQ")
+    image = Image("Local/Bonsai-Image-4BT-TRNQ")
     await image.start()
     try:
         await image.generate(
