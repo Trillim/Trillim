@@ -151,7 +151,7 @@ Useful constructor options:
 
 ### One-Turn Calls and Sessions
 
-The current SDK exposes LLM generation through `ChatSession`. For a one-turn call, open a session and call `collect(user_message)`. For streaming, iterate `generate(user_message)`.
+The current SDK exposes LLM generation through `ChatSession`. For a one-turn call, open a session and call `collect(user_message)`. For streaming, iterate `generate(user_message)`. Both methods accept sampling kwargs such as `temperature`, `top_k`, `top_p`, `repetition_penalty`, `rep_penalty_lookback`, and `max_tokens`.
 
 Use `append_message(role, content)` to preload system, user, assistant, or search context before the next generated user turn.
 
@@ -184,6 +184,7 @@ Session rules that matter in real code:
 - `open_session()` does not take initial messages. Add existing context with `append_message()`.
 - `collect(user_message)` returns the final assistant string.
 - `generate(user_message)` yields `ChatTokenEvent`, `ChatFinalTextEvent`, and `ChatDoneEvent`.
+- `collect()` and `generate()` accept `chat_template_kwargs={"enable_thinking": False}` for Qwen3-style templates that support non-thinking prompt formatting.
 - `new_chat()` clears committed conversation history on an idle session.
 - A session is single-consumer. Do not iterate and mutate it concurrently.
 - When a model swap begins, existing chat sessions become stale and raise `SessionStaleError`.

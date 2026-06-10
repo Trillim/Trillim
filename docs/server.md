@@ -178,10 +178,14 @@ Supported request fields:
 | `repetition_penalty` | float | `> 0.0` and `<= 2.0` |
 | `rep_penalty_lookback` | int | `>= 0` |
 | `max_tokens` | int | `0` for unlimited, or `1` to `8192` |
+| `chat_template_kwargs` | object | optional chat-template kwargs; currently supports `enable_thinking` bool |
 
 Notes:
 
 - Typical clients should send only `system`, `user`, and `assistant` roles.
+- For Qwen3-style templates that support thinking mode, send
+  `"chat_template_kwargs": {"enable_thinking": false}` to request
+  non-thinking prompt formatting.
 - When the LLM is using the search harness, the OpenAI route still streams assistant text only. Internal search progress is not exposed on this endpoint.
 - Requests larger than the JSON body cap are rejected before processing.
 
