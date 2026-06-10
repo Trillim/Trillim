@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from trillim.components.llm._events import ChatEvent, ChatFinalTextEvent, ChatTokenEvent
@@ -52,6 +52,8 @@ class _SearchHarness(_Harness):
     async def stream_events(
         self,
         session: _ChatSession,
+        *,
+        chat_template_kwargs: Mapping[str, bool],
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Run buffered search iterations, then stream the final answer."""
@@ -59,7 +61,10 @@ class _SearchHarness(_Harness):
         metrics = SearchMetrics()
         for _ in range(MAX_SEARCH_ITERATIONS - 1):
             cached_tokens = session.cached_token_count
-            token_ids = self._prepare_generation(session)
+            token_ids = self._prepare_generation(
+                session,
+                chat_template_kwargs=chat_template_kwargs,
+            )
             full_text, completion_token_ids = await self._generate_buffered(
                 session,
                 token_ids,
@@ -93,7 +98,10 @@ class _SearchHarness(_Harness):
             session._messages.append({"role": "search", "content": search_content})
 
         cached_tokens = session.cached_token_count
-        token_ids = self._prepare_generation(session)
+        token_ids = self._prepare_generation(
+            session,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""
         completion_token_ids: list[int] = []
@@ -140,17 +148,29 @@ class _SearchHarness(_Harness):
         full_text += decoder.flush()
         return full_text, completion_token_ids
 
-    def _prepare_generation(self, session: _ChatSession) -> list[int]:
+    def _prepare_generation(
+        self,
+        session: _ChatSession,
+        *,
+        chat_template_kwargs: Mapping[str, bool],
+    ) -> list[int]:
         if session._messages_in_kv == 0:
-            return session._prepare_generation(messages=session._messages)
+            return session._prepare_generation(
+                messages=session._messages,
+                chat_template_kwargs=chat_template_kwargs,
+            )
         tokenizer = self.tokenizer
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
-            return session._prepare_generation(messages=session._messages)
+            return session._prepare_generation(
+                messages=session._messages,
+                chat_template_kwargs=chat_template_kwargs,
+            )
         prompt = tokenizer.apply_chat_template(
             session._messages[session._messages_in_kv :],
             tokenize=False,
             add_generation_prompt=True,
+            **chat_template_kwargs,
         )
         # This search harness renders cached continuations as template
         # fragments so strip only the bundled search template's

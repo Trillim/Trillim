@@ -70,6 +70,7 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
                         session,
                         final_user_content=chat_request.messages[-1].content,
                         sampling=_sampling_kwargs(chat_request),
+                        chat_template_kwargs=_chat_template_kwargs(chat_request),
                         response_id=response_id,
                         created=created,
                         model_name=model_name,
@@ -82,6 +83,7 @@ def build_router(llm, *, allow_hot_swap: bool) -> APIRouter:
             session = _session_for_request(llm, chat_request)
             text = await session.collect(
                 chat_request.messages[-1].content,
+                chat_template_kwargs=_chat_template_kwargs(chat_request),
                 **_sampling_kwargs(chat_request),
             )
             usage_payload = _usage_payload(getattr(session, "_last_usage", None))
@@ -156,6 +158,7 @@ async def _stream_chat_response(
     *,
     final_user_content: str,
     sampling: dict[str, float | int | None],
+    chat_template_kwargs: dict[str, bool],
     response_id: str,
     created: int,
     model_name: str | None,
@@ -177,7 +180,11 @@ async def _stream_chat_response(
                 ],
             }
         )
-        async for event in session.generate(final_user_content, **sampling):
+        async for event in session.generate(
+            final_user_content,
+            chat_template_kwargs=chat_template_kwargs,
+            **sampling,
+        ):
             if isinstance(event, ChatTokenEvent):
                 if not event.text:
                     continue
@@ -277,6 +284,10 @@ def _sampling_kwargs(request_model) -> dict[str, float | int | None]:
         "rep_penalty_lookback": request_model.rep_penalty_lookback,
         "max_tokens": request_model.max_tokens,
     }
+
+
+def _chat_template_kwargs(request_model) -> dict[str, bool]:
+    return request_model.chat_template_kwargs.to_kwargs()
 
 
 def _usage_payload(usage) -> dict[str, int]:

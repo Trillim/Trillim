@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from trillim.components.llm._events import ChatEvent
@@ -63,6 +63,8 @@ class _Harness(abc.ABC):
     async def stream_events(
         self,
         session: _ChatSession,
+        *,
+        chat_template_kwargs: Mapping[str, bool],
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Yield structured chat events for a single assistant turn."""

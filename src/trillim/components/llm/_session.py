@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from enum import Enum
 
 from trillim.components.llm._engine import (
@@ -21,6 +21,7 @@ from trillim.components.llm._events import (
 )
 from trillim.components.llm._limits import SESSION_TOKEN_LIMIT
 from trillim.components.llm._validation import (
+    validate_chat_template_kwargs,
     validate_messages,
     validate_sampling_options,
     validate_user_message,
@@ -124,6 +125,7 @@ class ChatSession(abc.ABC):
         repetition_penalty: float | None = None,
         rep_penalty_lookback: int | None = None,
         max_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """Stream structured events for a new user turn."""
         yield  # pragma: no cover
@@ -139,6 +141,7 @@ class ChatSession(abc.ABC):
         repetition_penalty: float | None = None,
         rep_penalty_lookback: int | None = None,
         max_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> str:
         """Collect a new user turn as a single assistant string."""
         ...  # pragma: no cover
@@ -254,6 +257,7 @@ class _ChatSession(ChatSession):
         repetition_penalty: float | None = None,
         rep_penalty_lookback: int | None = None,
         max_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """Stream structured events for a new user turn."""
         self._llm._require_owner_loop()
@@ -265,6 +269,9 @@ class _ChatSession(ChatSession):
             rep_penalty_lookback=rep_penalty_lookback,
             max_tokens=max_tokens,
         )
+        template_kwargs = validate_chat_template_kwargs(
+            chat_template_kwargs
+        ).to_kwargs()
         content = validate_user_message(user_message)
         self._ensure_idle()
         self._messages.append({"role": "user", "content": content})
@@ -276,6 +283,7 @@ class _ChatSession(ChatSession):
         old_cached_tokens = len(self._cached_token_ids)
         event_stream = self._harness.stream_events(
             self,
+            chat_template_kwargs=template_kwargs,
             **sampling.to_kwargs(),
         )
         self._active_event_stream = event_stream
@@ -365,6 +373,7 @@ class _ChatSession(ChatSession):
         repetition_penalty: float | None = None,
         rep_penalty_lookback: int | None = None,
         max_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> str:
         """Collect a new user turn as a single assistant string."""
         self._llm._require_owner_loop()
@@ -378,6 +387,7 @@ class _ChatSession(ChatSession):
             repetition_penalty=repetition_penalty,
             rep_penalty_lookback=rep_penalty_lookback,
             max_tokens=max_tokens,
+            chat_template_kwargs=chat_template_kwargs,
         ):
             if isinstance(event, ChatTokenEvent):
                 text += event.text
@@ -403,10 +413,12 @@ class _ChatSession(ChatSession):
         self,
         *,
         messages: list[dict[str, str]] | tuple[dict[str, str], ...],
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> list[int]:
         prompt = self._render_prompt(
             messages=messages,
             add_generation_prompt=True,
+            chat_template_kwargs=chat_template_kwargs,
         )
         tokenizer = self._runtime.tokenizer
         token_ids = list(self._cached_token_ids)
@@ -434,6 +446,7 @@ class _ChatSession(ChatSession):
         *,
         messages: list[dict[str, str]] | tuple[dict[str, str], ...],
         add_generation_prompt: bool,
+        chat_template_kwargs: Mapping[str, bool] | None = None,
     ) -> str:
         prompt_messages = self._renderable_messages(messages)
         if len(prompt_messages) < self._messages_in_kv:
@@ -448,6 +461,7 @@ class _ChatSession(ChatSession):
                 prompt_messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                **(chat_template_kwargs or {}),
             )
         prompt = "\n".join(
             f"{message['role']}: {message['content']}"

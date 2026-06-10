@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    field_validator,
+)
 
 from trillim.components.llm._limits import (
     MAX_MESSAGE_CHARS,
@@ -40,6 +47,18 @@ class SamplingOptions(BaseModel):
         return self.model_dump()
 
 
+class ChatTemplateKwargsInput(BaseModel):
+    """Validated chat-template kwargs for prompt rendering."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enable_thinking: StrictBool | None = None
+
+    def to_kwargs(self) -> dict[str, bool]:
+        """Convert set template kwargs to plain kwargs."""
+        return self.model_dump(exclude_none=True)
+
+
 class ChatMessageInput(BaseModel):
     """Validated external chat message input."""
 
@@ -66,6 +85,9 @@ class ChatRequestInput(SamplingOptions):
     messages: tuple[ChatMessageInput, ...]
     model: str | None = Field(default=None, max_length=MAX_MODEL_NAME_CHARS)
     stream: bool = False
+    chat_template_kwargs: ChatTemplateKwargsInput = Field(
+        default_factory=ChatTemplateKwargsInput
+    )
 
     @field_validator("messages")
     @classmethod
@@ -144,6 +166,14 @@ def validate_swap_request(payload: object) -> SwapModelRequestInput:
 def validate_sampling_options(**kwargs) -> SamplingOptions:
     """Validate SDK sampling kwargs."""
     return _validate_model(SamplingOptions, kwargs)
+
+
+def validate_chat_template_kwargs(payload: object | None) -> ChatTemplateKwargsInput:
+    """Validate SDK chat-template kwargs."""
+    return _validate_model(
+        ChatTemplateKwargsInput,
+        payload if payload is not None else {},
+    )
 
 
 def validate_user_message(content: str) -> str:
