@@ -8,6 +8,7 @@ from pathlib import Path
 from trillim.components.llm._config import SamplingDefaults, load_sampling_defaults
 from trillim.components.llm._limits import MAX_OUTPUT_TOKENS
 from trillim.components.llm._validation import (
+    validate_chat_template_kwargs,
     validate_chat_request,
     validate_messages,
     validate_sampling_options,
@@ -78,6 +79,47 @@ class LLMValidationTests(unittest.TestCase):
 
         self.assertTrue(request.stream)
         self.assertEqual(request.messages[-1].content, "hello")
+        self.assertEqual(request.chat_template_kwargs.to_kwargs(), {})
+
+    def test_validate_chat_request_accepts_only_supported_chat_template_kwargs(self):
+        request = validate_chat_request(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            active_model_name="active",
+        )
+
+        self.assertEqual(
+            request.chat_template_kwargs.to_kwargs(),
+            {"enable_thinking": False},
+        )
+
+        invalid_payloads = (
+            {"chat_template_kwargs": {"unknown": False}},
+            {"chat_template_kwargs": {"enable_thinking": "false"}},
+            {"chat_template_kwargs": []},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(InvalidRequestError):
+                    validate_chat_request(
+                        {
+                            "messages": [{"role": "user", "content": "hello"}],
+                            **payload,
+                        },
+                        active_model_name="active",
+                    )
+
+    def test_validate_chat_template_kwargs_rejects_malformed_sdk_kwargs(self):
+        self.assertEqual(
+            validate_chat_template_kwargs({"enable_thinking": False}).to_kwargs(),
+            {"enable_thinking": False},
+        )
+        self.assertEqual(validate_chat_template_kwargs(None).to_kwargs(), {})
+
+        with self.assertRaises(InvalidRequestError):
+            validate_chat_template_kwargs([])
 
     def test_validate_chat_request_rejects_wrong_model_and_non_user_final_turn(self):
         with self.assertRaisesRegex(InvalidRequestError, "does not match"):
