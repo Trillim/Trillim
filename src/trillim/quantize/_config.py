@@ -10,6 +10,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from trillim._bundle_metadata import canonicalize_model_config
+from trillim.components.image._config import (
+    ImageTensorAction,
+    ImageQuantization,
+)
 from trillim.components.llm._config import ArchitectureType
 
 LORA_TARGETS = (
@@ -121,7 +125,7 @@ _ARCH_REGISTRY: dict[str, _ArchInfo] = {
         final_norm_key="model.norm.weight",
     ),
     "qwen3forcausallm": _ArchInfo(
-        arch_type=ArchitectureType.BONSAI,
+        arch_type=ArchitectureType.QWEN3,
         component_order=(
             "input_layernorm",
             "self_attn.k_proj",
@@ -165,9 +169,14 @@ class ModelQuantizeConfig:
     yarn_beta_fast: float | None
     tie_word_embeddings: bool
     source_model: str
+    image_quantization: ImageQuantization | None = None
 
 
 def load_model_config(model_dir: Path) -> ModelQuantizeConfig:
+    image_config = _load_bonsai_image_config(model_dir)
+    if image_config is not None:
+        return image_config
+
     config_path = model_dir / "config.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"{config_path} not found")
@@ -225,6 +234,87 @@ def _resolve_arch_info(config: dict) -> _ArchInfo:
         raise ValueError(f"Unsupported architecture '{arch_name}'") from exc
 
 
+def _load_bonsai_image_config(model_dir: Path) -> ModelQuantizeConfig | None:
+    transformer_config_path = model_dir / "transformer" / "config.json"
+    if not transformer_config_path.is_file():
+        return None
+    raw = json.loads(transformer_config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Transformer config must be a JSON object in {transformer_config_path}")
+    class_name = str(raw.get("_class_name", ""))
+    if class_name != "Flux2Transformer2DModel":
+        return None
+
+    num_heads = _require_positive_int(raw.get("num_attention_heads"), "num_attention_heads")
+    head_dim = _require_positive_int(raw.get("attention_head_dim"), "attention_head_dim")
+    hidden_dim = num_heads * head_dim
+    mlp_ratio = float(raw.get("mlp_ratio", 3.0))
+    intermediate_dim = _align_to_128(int(hidden_dim * mlp_ratio))
+    double_layers = _require_positive_int(raw.get("num_layers"), "num_layers")
+    single_layers = _require_positive_int(raw.get("num_single_layers"), "num_single_layers")
+    arch_info = _ArchInfo(
+        arch_type=ArchitectureType.BONSAI_IMAGE,
+        component_order=(),
+        embedding_key="",
+        final_norm_key="",
+        layer_pattern=r"(?:^|\.)(?:transformer_blocks|single_transformer_blocks)\.(\d+)\.",
+    )
+    return ModelQuantizeConfig(
+        arch_type=arch_info.arch_type,
+        arch_name=arch_info.arch_type.name.lower(),
+        arch_info=arch_info,
+        hidden_dim=_align_to_128(hidden_dim),
+        intermediate_dim=intermediate_dim,
+        hidden_dim_orig=hidden_dim,
+        intermediate_dim_orig=int(hidden_dim * mlp_ratio),
+        num_layers=double_layers + single_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        vocab_size=1,
+        head_dim=head_dim,
+        max_position_embeddings=int(raw.get("max_image_seq_len", 4096)),
+        norm_eps=float(raw.get("eps", 1e-6)),
+        rope_theta=float(raw.get("rope_theta", 10000.0)),
+        partial_rotary_factor=1.0,
+        yarn_factor=None,
+        original_max_position_embeddings=None,
+        yarn_beta_slow=None,
+        yarn_beta_fast=None,
+        tie_word_embeddings=False,
+        source_model=str(raw.get("_name_or_path", "")),
+        image_quantization=_bonsai_image_quantization(model_dir),
+    )
+
+
+def _bonsai_image_quantization(model_dir: Path) -> ImageQuantization:
+    candidates = [model_dir.name.lower()]
+    for relative_path in (Path("manifest.json"), Path("README.md")):
+        path = model_dir / relative_path
+        if path.is_file():
+            try:
+                candidates.append(path.read_text(encoding="utf-8").lower())
+            except OSError:
+                pass
+    for signals in candidates:
+        if "ternary" in signals:
+            return ImageQuantization(
+                name="grouped-ternary-image",
+                transformer_weight_action=ImageTensorAction.GROUP_TERNARY,
+                text_encoder_weight_action=ImageTensorAction.Q4_0,
+            )
+        if any(token in signals for token in ("binary", "1-bit", "1 bit", "1bit")):
+            return ImageQuantization(
+                name="binary-image",
+                transformer_weight_action=ImageTensorAction.Q1_0_128,
+                text_encoder_weight_action=ImageTensorAction.Q4_0,
+            )
+    return ImageQuantization(
+        name="bf16-image",
+        transformer_weight_action=ImageTensorAction.BF16_RAW,
+        text_encoder_weight_action=ImageTensorAction.BF16_RAW,
+    )
+
+
 def _resolve_bitnet_arch_info(
     arch_info: _ArchInfo,
     tensor_names: list[str] | None,
@@ -244,10 +334,11 @@ def _resolve_bitnet_arch_info(
 
 
 def _resolve_bonsai_arch_info(model_dir: Path, arch_info: _ArchInfo) -> _ArchInfo:
-    if arch_info.arch_type != ArchitectureType.BONSAI:
+    if arch_info.arch_type != ArchitectureType.QWEN3:
         return arch_info
-    if _readme_indicates_bonsai_ternary(model_dir):
-        return replace(arch_info, arch_type=ArchitectureType.BONSAI_TERNARY)
+    bonsai_arch_type = _readme_bonsai_arch_type(model_dir)
+    if bonsai_arch_type is not None:
+        return replace(arch_info, arch_type=bonsai_arch_type)
     return arch_info
 
 
@@ -359,24 +450,29 @@ def _load_tensor_names_if_available(model_dir: Path) -> list[str] | None:
     return None
 
 
-def _readme_indicates_bonsai_ternary(model_dir: Path) -> bool:
+def _readme_bonsai_arch_type(model_dir: Path) -> ArchitectureType | None:
     readme_path = model_dir / "README.md"
     if not readme_path.is_file():
         warnings.warn(
             (
-                f"Could not find {readme_path}; defaulting Qwen3ForCausalLM Bonsai "
-                "detection to binary. Grouped-ternary models may be misidentified."
+                f"Could not find {readme_path}; defaulting Qwen3ForCausalLM"
+                "detection to Qwen3. Qwen3 Bonsai models may be misidentified."
             ),
             stacklevel=3,
         )
-        return False
+        return None
     try:
         content = readme_path.read_text(encoding="utf-8").lower()
     except OSError:
-        return False
+        return None
     has_ternary = "ternary" in content
     has_one_bit = any(token in content for token in ("1-bit", "1 bit", "1bit"))
-    return has_ternary and not has_one_bit
+    has_bonsai = "bonsai" in content or "trnq" in content or has_ternary or has_one_bit
+    if not has_bonsai:
+        return None
+    if has_ternary and not has_one_bit:
+        return ArchitectureType.BONSAI_TERNARY
+    return ArchitectureType.BONSAI
 
 
 def _align_to_128(value: int) -> int:

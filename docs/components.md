@@ -27,6 +27,7 @@ with Runtime(LLM("Trillim/BitNet-TRNQ")) as runtime:
 `Runtime` exposes composed components by name:
 
 - `runtime.llm`
+- `runtime.image`
 - `runtime.stt`
 - `runtime.tts`
 
@@ -44,6 +45,60 @@ with Runtime(LLM("Trillim/BitNet-TRNQ")) as runtime:
             elif isinstance(event, ChatDoneEvent):
                 print(f"\nused {event.usage.total_tokens} tokens")
 ```
+
+Synchronous image generation uses the same facade:
+
+```python
+from trillim import Image, Runtime
+
+with Runtime(Image("Local/Bonsai-Image-4BT-TRNQ")) as runtime:
+    runtime.image.generate(
+        "a tiny bonsai on a desk",
+        "bonsai.png",
+        width=320,
+        height=240,
+        steps=4,
+        seed=123,
+    )
+```
+
+## Use `Image` Directly for Async Code
+
+```python
+import asyncio
+
+from trillim import Image
+
+
+async def main():
+    image = Image("Local/Bonsai-Image-4BT-TRNQ")
+    await image.start()
+    try:
+        await image.generate(
+            "a tiny bonsai on a desk",
+            "bonsai.png",
+            width=320,
+            height=240,
+            steps=4,
+            seed=123,
+        )
+    finally:
+        await image.stop()
+
+
+asyncio.run(main())
+```
+
+Public helper:
+
+- `await image.generate(prompt, output_path, steps=4, seed=None, width=320, height=240)`
+
+Practical notes:
+
+- `Image(...)` loads a managed Bonsai Image store ID.
+- `output_path` must end in `.png`; parent directories are created automatically.
+- `width` and `height` must be positive multiples of `16` and no larger than `4096`.
+- Direct async `Image` use is bound to one event loop. Create a new `Image()` per thread or event loop.
 
 ## Use `LLM` Directly for Async Code
 
@@ -96,7 +151,7 @@ Useful constructor options:
 
 ### One-Turn Calls and Sessions
 
-The current SDK exposes LLM generation through `ChatSession`. For a one-turn call, open a session and call `collect(user_message)`. For streaming, iterate `generate(user_message)`.
+The current SDK exposes LLM generation through `ChatSession`. For a one-turn call, open a session and call `collect(user_message)`. For streaming, iterate `generate(user_message)`. Both methods accept sampling kwargs such as `temperature`, `top_k`, `top_p`, `repetition_penalty`, `rep_penalty_lookback`, and `max_tokens`.
 
 Use `append_message(role, content)` to preload system, user, assistant, or search context before the next generated user turn.
 
@@ -129,6 +184,7 @@ Session rules that matter in real code:
 - `open_session()` does not take initial messages. Add existing context with `append_message()`.
 - `collect(user_message)` returns the final assistant string.
 - `generate(user_message)` yields `ChatTokenEvent`, `ChatFinalTextEvent`, and `ChatDoneEvent`.
+- `collect()` and `generate()` accept `chat_template_kwargs={"enable_thinking": False}` for Qwen3-style templates that support non-thinking prompt formatting.
 - `new_chat()` clears committed conversation history on an idle session.
 - A session is single-consumer. Do not iterate and mutate it concurrently.
 - When a model swap begins, existing chat sessions become stale and raise `SessionStaleError`.

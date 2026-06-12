@@ -52,6 +52,7 @@ server.run(host="127.0.0.1", port=8000)
 | `/v1/models` | `GET` | active model ID |
 | `/v1/chat/completions` | `POST` | OpenAI-compatible chat completions |
 | `/v1/models/swap` | `POST` | optional hot-swap route |
+| `/v1/images/generations` | `POST` | image generation route for `Image` components |
 | `/v1/audio/transcriptions` | `POST` | optional STT route |
 | `/v1/audio/speech` | `POST` | optional TTS route |
 | `/v1/voices` | `GET` | optional voice list |
@@ -67,6 +68,46 @@ Returns `200` when the app is alive:
 ```json
 {"status": "ok"}
 ```
+
+## `POST /v1/images/generations`
+
+Run the server with a Bonsai Image bundle:
+
+```bash
+trillim serve Local/Bonsai-Image-4BT-TRNQ
+```
+
+Minimal request:
+
+```bash
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "content-type: application/json" \
+  -d '{
+    "prompt": "a tiny bonsai on a desk",
+    "size": "320x240",
+    "steps": 4,
+    "seed": 123
+  }'
+```
+
+The response contains one base64-encoded PNG:
+
+```json
+{
+  "created": 1790000000,
+  "data": [{"b64_json": "..."}]
+}
+```
+
+Accepted fields:
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | Required text prompt |
+| `size` | Optional `WIDTHxHEIGHT`; defaults to `320x240` |
+| `width`, `height` | Optional integer dimensions when `size` is omitted |
+| `steps` | Optional denoising steps; defaults to `4` |
+| `seed` | Optional non-negative integer seed |
 
 ## `GET /v1/models`
 
@@ -137,10 +178,14 @@ Supported request fields:
 | `repetition_penalty` | float | `> 0.0` and `<= 2.0` |
 | `rep_penalty_lookback` | int | `>= 0` |
 | `max_tokens` | int | `0` for unlimited, or `1` to `8192` |
+| `chat_template_kwargs` | object | optional chat-template kwargs; currently supports `enable_thinking` bool |
 
 Notes:
 
 - Typical clients should send only `system`, `user`, and `assistant` roles.
+- For Qwen3-style templates that support thinking mode, send
+  `"chat_template_kwargs": {"enable_thinking": false}` to request
+  non-thinking prompt formatting.
 - When the LLM is using the search harness, the OpenAI route still streams assistant text only. Internal search progress is not exposed on this endpoint.
 - Requests larger than the JSON body cap are rejected before processing.
 

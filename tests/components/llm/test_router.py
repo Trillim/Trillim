@@ -32,7 +32,7 @@ from trillim.errors import (
     SessionClosedError,
 )
 
-from tests.support import write_llm_bundle
+from tests.support import requires_integration, write_llm_bundle
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -175,6 +175,7 @@ class LLMRouterTests(unittest.TestCase):
         self.assertEqual(chat_response.status_code, 429)
         self.assertEqual(swap_response.status_code, 429)
 
+    @requires_integration
     @unittest.skipUnless(
         BONSAI_MODEL_DIR.is_dir(),
         f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",
@@ -226,6 +227,7 @@ class LLMRouterTests(unittest.TestCase):
         self.assertIn("chat.completion.chunk", stream_body)
         self.assertIn("data: [DONE]", stream_body)
 
+    @requires_integration
     @unittest.skipUnless(
         BONSAI_MODEL_DIR.is_dir(),
         f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",

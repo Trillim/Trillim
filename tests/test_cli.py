@@ -11,7 +11,12 @@ from unittest.mock import patch
 from trillim import _model_store
 from trillim import cli
 from trillim._bundle_metadata import CURRENT_FORMAT_VERSION
-from tests.support import write_llm_bundle, write_lora_bundle
+from tests.support import (
+    requires_integration,
+    write_image_bundle,
+    write_llm_bundle,
+    write_lora_bundle,
+)
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -28,6 +33,11 @@ class CLITests(unittest.TestCase):
         self.assertFalse(parser.parse_args(["doctor"]).deep)
         self.assertTrue(parser.parse_args(["doctor", "--deep"]).deep)
         self.assertEqual(parser.parse_args(["chat", "Trillim/model"]).command, "chat")
+        image_args = parser.parse_args(
+            ["image", "Local/model", "a", "small", "tree", "-o", "out.png"]
+        )
+        self.assertEqual(image_args.command, "image")
+        self.assertEqual(image_args.prompt, ["a", "small", "tree"])
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             code = cli.main([])
 
@@ -521,9 +531,126 @@ class CLITests(unittest.TestCase):
         self.assertIn("\033[32mready\033[0m", output)
         self.assertIn("\033[31mmissing\033[0m", output)
 
+    def test_image_command_writes_output_path(self):
+        class StubImage:
+            @property
+            def component_name(self):
+                return "image"
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+            async def generate(self, _prompt, output, **_kwargs):
+                output = Path(output)
+                output.write_bytes(b"png")
+                return output
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_image_bundle(
+                root / "Local" / "image",
+                config_overrides={"vocab_size": 151936},
+            )
+
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Image", return_value=StubImage()),
+            ):
+                args = cli.build_parser().parse_args(
+                    [
+                        "image",
+                        "Local/image",
+                        "a",
+                        "bonsai",
+                        "-o",
+                        str(root / "out.png"),
+                    ]
+                )
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(cli._run_image_command(args), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("Wrote image", output)
+        self.assertIn(" in ", output)
+
+    def test_image_progress_bar_renders_steps(self):
+        stream = io.StringIO()
+        progress = cli._ImageProgressBar(4, stream=stream, enabled=True)
+
+        progress.start()
+        progress.update(2, 4)
+        progress.update(4, 4)
+        progress.close()
+
+        output = stream.getvalue()
+        self.assertIn("Generating image", output)
+        self.assertIn("2/4", output)
+        self.assertIn("4/4", output)
+        self.assertTrue(output.endswith("\n"))
+        self.assertEqual(cli._image_progress_total(4), 165)
+
+    def test_image_command_propagates_runtime_validation_errors(self):
+        class RejectingImage:
+            @property
+            def component_name(self):
+                return "image"
+
+            async def start(self):
+                raise ValueError("image generation requires a Bonsai Image model")
+
+            async def stop(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_llm_bundle(root / "Local" / "model")
+
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Image", return_value=RejectingImage()),
+            ):
+                args = cli.build_parser().parse_args(
+                    ["image", "Local/model", "prompt", "-o", str(root / "out.png")]
+                )
+                with self.assertRaisesRegex(ValueError, "Bonsai Image"):
+                    cli._run_image_command(args)
+
+    def test_serve_uses_image_component_for_bonsai_image_model(self):
+        class RecordingServer:
+            component = None
+
+            def __init__(self, component):
+                RecordingServer.component = component
+
+            def run(self, **_kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_image_bundle(root / "Local" / "image")
+            with (
+                patch.object(_model_store, "LOCAL_ROOT", root / "Local"),
+                patch.object(cli, "Server", RecordingServer),
+            ):
+                self.assertEqual(cli._run_serve("Local/image", voice=False), 0)
+
+        self.assertIsInstance(RecordingServer.component, cli.Image)
+
+    def test_serve_rejects_voice_for_bonsai_image_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_image_bundle(root / "Local" / "image")
+            with patch.object(_model_store, "LOCAL_ROOT", root / "Local"):
+                with self.assertRaisesRegex(ValueError, "--voice"):
+                    cli._run_serve("Local/image", voice=True)
+
     def test_voice_dependency_preflight_passes_with_voice_extra(self):
         cli._preflight_voice_dependencies()
 
+    @requires_integration
     @unittest.skipUnless(
         BONSAI_MODEL_DIR.is_dir(),
         f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",

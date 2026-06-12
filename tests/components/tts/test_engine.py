@@ -21,9 +21,11 @@ from trillim.components.tts._engine import (
 from trillim.components.tts._validation import load_safe_voice_state_safetensors_bytes
 from trillim.errors import InvalidRequestError
 
+from tests.support import requires_integration
 from tests.components.tts.support import sample_voice_state
 
 
+@requires_integration
 class TTSEngineSubprocessTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_worker_synthesizes_built_in_and_custom_voice_state(self):
         engine = TTSEngine()

@@ -81,6 +81,29 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(canonical["hidden_size"], 128)
         self.assertEqual(len(digest), 64)
 
+    def test_bundle_metadata_hash_supports_bonsai_image_transformer_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir)
+            transformer_dir = model_dir / "transformer"
+            transformer_dir.mkdir()
+            (transformer_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "Flux2Transformer2DModel",
+                        "attention_head_dim": 128,
+                        "mlp_ratio": 3.0,
+                        "num_attention_heads": 24,
+                        "num_layers": 5,
+                        "num_single_layers": 20,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            digest = compute_base_model_config_hash(model_dir)
+
+        self.assertEqual(len(digest), 64)
+
     def test_bundle_metadata_rejects_invalid_hash_inputs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = Path(temp_dir)

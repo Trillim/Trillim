@@ -36,6 +36,27 @@ _MODEL_ALLOWLIST = (
     "vocab.json",
     "vocab.txt",
 )
+_BONSAI_IMAGE_SUPPORT_DIRS = (
+    "assets",
+    "scheduler",
+    "text_encoder",
+    "tokenizer",
+    "transformer",
+    "vae",
+)
+_BONSAI_IMAGE_ROOT_FILES = (
+    "LICENSE",
+    "NOTICE",
+    "NOTICE.md",
+    "README.md",
+    "manifest.json",
+)
+_BONSAI_IMAGE_SKIP_SUFFIXES = (
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".pth",
+)
 _ADAPTER_EXCLUDED_NAMES = {
     ".quantize_manifest.bin",
     "qmodel.lora",
@@ -122,7 +143,15 @@ def recover_publish_state(target: Path) -> None:
             shutil.rmtree(staging)
 
 
-def copy_model_support_files(model_dir: Path, output_dir: Path) -> None:
+def copy_model_support_files(
+    model_dir: Path,
+    output_dir: Path,
+    *,
+    config: ModelQuantizeConfig | None = None,
+) -> None:
+    if config is not None and config.arch_type == ArchitectureType.BONSAI_IMAGE:
+        _copy_bonsai_image_support_files(model_dir, output_dir, config=config)
+        return
     metadata, normalized_tokenizer_config = _load_bundle_support_metadata(model_dir)
     for filename in _MODEL_ALLOWLIST:
         if filename == "tokenizer_config.json" and normalized_tokenizer_config is not None:
@@ -133,6 +162,66 @@ def copy_model_support_files(model_dir: Path, output_dir: Path) -> None:
             _copy_file(source_path, output_dir / filename)
     for relative_path in _collect_bundle_support_code_files(model_dir, metadata):
         _copy_file(model_dir / relative_path, output_dir / relative_path)
+
+
+def _copy_bonsai_image_support_files(
+    model_dir: Path,
+    output_dir: Path,
+    *,
+    config: ModelQuantizeConfig,
+) -> None:
+    _write_bonsai_image_runtime_config(output_dir, config=config)
+    for filename in _BONSAI_IMAGE_ROOT_FILES:
+        source_path = model_dir / filename
+        if source_path.is_file():
+            _copy_file(source_path, output_dir / filename)
+
+    for dirname in _BONSAI_IMAGE_SUPPORT_DIRS:
+        source_dir = model_dir / dirname
+        if not source_dir.is_dir():
+            continue
+        for source_path in sorted(source_dir.rglob("*")):
+            if source_path.is_dir():
+                continue
+            relative_path = source_path.relative_to(model_dir)
+            if _should_skip_bonsai_image_support_path(relative_path):
+                continue
+            _copy_file(source_path, output_dir / relative_path)
+
+
+def _should_skip_bonsai_image_support_path(relative_path: Path) -> bool:
+    if "__pycache__" in relative_path.parts:
+        return True
+    name = relative_path.name
+    if name in _ADAPTER_EXCLUDED_NAMES:
+        return True
+    return name.endswith(_BONSAI_IMAGE_SKIP_SUFFIXES)
+
+
+def _write_bonsai_image_runtime_config(
+    output_dir: Path,
+    *,
+    config: ModelQuantizeConfig,
+) -> None:
+    _write_json(
+        output_dir / "config.json",
+        {
+            "architectures": ["Flux2Transformer2DModel"],
+            "hidden_size": config.hidden_dim_orig,
+            "intermediate_size": config.intermediate_dim_orig,
+            "num_hidden_layers": config.num_layers,
+            "num_attention_heads": config.num_heads,
+            "num_key_value_heads": config.num_kv_heads,
+            "vocab_size": config.vocab_size,
+            "head_dim": config.head_dim,
+            "max_position_embeddings": config.max_position_embeddings,
+            "rms_norm_eps": config.norm_eps,
+            "rope_theta": config.rope_theta,
+            "hidden_act": "silu",
+            "tie_word_embeddings": config.tie_word_embeddings,
+            "eos_token_id": 151645,
+        },
+    )
 
 
 def copy_adapter_support_files(adapter_dir: Path, output_dir: Path) -> None:
@@ -173,7 +262,7 @@ def write_model_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "model",
-        "quantization": _quantization_name(config.arch_type),
+        "quantization": _quantization_name(config),
         "source_model": config.source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -199,7 +288,7 @@ def write_adapter_metadata(
         "trillim_version": _project_version(),
         "format_version": CURRENT_FORMAT_VERSION,
         "type": "lora_adapter",
-        "quantization": _quantization_name(config.arch_type),
+        "quantization": _quantization_name(config),
         "source_model": source_model,
         "architecture": config.arch_name,
         "platforms": list(_SUPPORTED_PLATFORMS),
@@ -245,11 +334,21 @@ def _copy_file(source_path: Path, destination: Path) -> None:
     shutil.copy2(source_path, destination)
 
 
-def _quantization_name(arch_type: ArchitectureType) -> str:
+def _quantization_name(config_or_arch_type: ModelQuantizeConfig | ArchitectureType) -> str:
+    if isinstance(config_or_arch_type, ModelQuantizeConfig):
+        if config_or_arch_type.image_quantization is not None:
+            return config_or_arch_type.image_quantization.name
+        arch_type = config_or_arch_type.arch_type
+    else:
+        arch_type = config_or_arch_type
+    if arch_type == ArchitectureType.QWEN3:
+        return "bf16"
     if arch_type == ArchitectureType.BONSAI:
         return "binary"
     if arch_type == ArchitectureType.BONSAI_TERNARY:
         return "grouped-ternary"
+    if arch_type == ArchitectureType.BONSAI_IMAGE:
+        return "bf16-image"
     return "ternary"
 
 

@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import unittest
 
 from trillim._bundle_metadata import (
     CURRENT_FORMAT_VERSION,
     compute_base_model_config_hash,
 )
+
+RUN_BUNDLE_TESTS_ENV = "TRILLIM_RUN_BUNDLE_TESTS"
+RUN_INTEGRATION_ENV = "TRILLIM_RUN_INTEGRATION"
+
+
+def requires_bundle_test(obj):
+    return unittest.skipUnless(
+        os.environ.get(RUN_BUNDLE_TESTS_ENV) == "1",
+        f"set {RUN_BUNDLE_TESTS_ENV}=1 to run bundled-binary/package tests",
+    )(obj)
+
+
+def requires_integration(obj):
+    return unittest.skipUnless(
+        os.environ.get(RUN_INTEGRATION_ENV) == "1",
+        f"set {RUN_INTEGRATION_ENV}=1 to run integration tests",
+    )(obj)
 
 
 def write_llm_bundle(
@@ -66,6 +85,27 @@ def write_llm_bundle(
         ),
         encoding="utf-8",
     )
+    return path
+
+
+def write_image_bundle(path: Path, *, config_overrides: dict | None = None) -> Path:
+    path = write_llm_bundle(
+        path,
+        architecture="Flux2Transformer2DModel",
+        config_overrides={
+            "hidden_size": 3072,
+            "intermediate_size": 9216,
+            "num_hidden_layers": 25,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 24,
+            "vocab_size": 1,
+            "head_dim": 128,
+            "max_position_embeddings": 4096,
+            "eos_token_id": 151645,
+            **(config_overrides or {}),
+        },
+    )
+    (path / "qmodel.index").write_bytes(b"index")
     return path
 
 

@@ -19,6 +19,8 @@ class ArchitectureType(IntEnum):
     QWEN35 = 3
     BONSAI = 4
     BONSAI_TERNARY = 5
+    QWEN3 = 6
+    BONSAI_IMAGE = 7
 
 
 class ActivationType(IntEnum):

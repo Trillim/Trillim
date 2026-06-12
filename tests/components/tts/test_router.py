@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import threading
 import tempfile
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,9 +23,11 @@ from trillim.errors import (
 )
 from trillim.server import Server
 
+from tests.support import requires_integration
 from tests.components.tts.support import reference_wav_bytes, tts_voice_store_environment
 
 
+@requires_integration
 class TTSRouterTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory()
@@ -160,15 +162,38 @@ class TTSRouterTests(unittest.TestCase):
         self.assertIn("busy", rejected.json()["detail"].lower())
 
     def test_voice_routes_reject_while_speech_request_is_active(self):
-        with self._make_client() as client:
+        session_started = threading.Event()
+        release_session = threading.Event()
+
+        class SlowSession:
+            async def synthesize(self, text):
+                self_outer.assertEqual(text, "hello")
+                session_started.set()
+                await asyncio.to_thread(release_session.wait)
+                yield b"\0\0"
+
+            async def close(self):
+                pass
+
+        class FakeTTS:
+            async def list_voices(self):
+                return ["alba"]
+
+            def open_session(self, *, voice=None, speed=1.0):
+                self_outer.assertIsNone(voice)
+                self_outer.assertEqual(speed, 1.0)
+                return SlowSession()
+
+        self_outer = self
+        app = FastAPI()
+        app.include_router(build_router(FakeTTS()))
+
+        with TestClient(app) as client:
             with ThreadPoolExecutor(max_workers=1) as executor:
-                speech = executor.submit(
-                    client.post,
-                    "/v1/audio/speech",
-                    content=("word " * 1_000).encode(),
-                )
-                time.sleep(0.01)
+                speech = executor.submit(client.post, "/v1/audio/speech", content=b"hello")
+                self.assertTrue(session_started.wait(timeout=5.0))
                 voices = client.get("/v1/voices")
+                release_session.set()
 
             self.assertEqual(speech.result().status_code, 200)
             self.assertEqual(voices.status_code, 429)

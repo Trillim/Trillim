@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from trillim.components.llm._events import ChatEvent, ChatFinalTextEvent, ChatTokenEvent
@@ -17,12 +17,17 @@ class _DefaultHarness(_Harness):
     async def stream_events(
         self,
         session: _ChatSession,
+        *,
+        chat_template_kwargs: Mapping[str, bool],
         **sampling: Any,
     ) -> AsyncIterator[ChatEvent]:
         """Stream token and final-text events for one generation."""
         self._reset_usage()
         cached_tokens = session.cached_token_count
-        token_ids = session._prepare_generation(messages=session._messages)
+        token_ids = session._prepare_generation(
+            messages=session._messages,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         self._prompt_tokens = len(token_ids) - cached_tokens
         decoder = IncrementalDecoder(self.tokenizer)
         full_text = ""

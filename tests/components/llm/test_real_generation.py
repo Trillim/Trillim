@@ -12,6 +12,7 @@ from trillim.components.llm._events import ChatDoneEvent, ChatFinalTextEvent, Ch
 from trillim.components.llm._model_dir import validate_model_dir
 from trillim.components.llm.public import LLM, load_tokenizer
 from trillim.errors import ComponentLifecycleError
+from tests.support import requires_integration
 
 
 BONSAI_MODEL_ID = "Trillim/Bonsai-1.7B-TRNQ"
@@ -22,6 +23,7 @@ BITNET_SEARCH_ADAPTER_ID = "Trillim/BitNet-Search-LoRA-TRNQ"
 BITNET_SEARCH_ADAPTER_DIR = _model_store.store_path_for_id(BITNET_SEARCH_ADAPTER_ID)
 
 
+@requires_integration
 @unittest.skipUnless(
     BONSAI_MODEL_DIR.is_dir(),
     f"{BONSAI_MODEL_ID} must be installed in the Trillim model store",
@@ -53,7 +55,8 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await engine.stop()
 
-        self.assertLessEqual(len(tokens), 1)
+        self.assertEqual(len(tokens), 2)
+        self.assertIn(tokens[-1], model.eos_tokens)
         self.assertGreaterEqual(cached_token_count, len(prompt_tokens))
 
     async def test_bonsai_default_session_streams_events_and_commits_usage(self):
@@ -83,7 +86,7 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[0], {"role": "user", "content": "hello"})
         self.assertEqual(messages[-1]["role"], "assistant")
         self.assertIsNotNone(usage)
-        self.assertEqual(usage.completion_tokens, 1)
+        self.assertEqual(usage.completion_tokens, 2)
         self.assertEqual(cached_tokens, usage.total_tokens)
 
     async def test_bonsai_session_public_api_is_bound_to_owner_loop(self):
@@ -166,7 +169,7 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(text, str)
         self.assertEqual(messages[-1], {"role": "assistant", "content": text})
         self.assertIsNotNone(usage)
-        self.assertEqual(usage.completion_tokens, 1)
+        self.assertEqual(usage.completion_tokens, 2)
 
     def test_bonsai_runtime_sync_proxy_collects_with_llm_component(self):
         runtime = Runtime(LLM(BONSAI_MODEL_ID))
@@ -198,6 +201,7 @@ class RealLLMGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(events[-1], ChatDoneEvent)
 
 
+@requires_integration
 @unittest.skipUnless(
     BITNET_MODEL_DIR.is_dir() and BITNET_SEARCH_ADAPTER_DIR.is_dir(),
     f"{BITNET_MODEL_ID} and {BITNET_SEARCH_ADAPTER_ID} must be installed",
