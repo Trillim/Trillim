@@ -1,1 +1,0 @@
-"""Component test package."""
