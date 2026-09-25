@@ -1,0 +1,55 @@
+[project]
+name = "trillim"
+version = "0.12.2"
+description = "The Fastest AI Inference Engine"
+readme = "README.md"
+license = {file = "LICENSE"}
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES"]
+authors = [
+    { name = "Vineet-V", email = "vineetv314@gmail.com" }
+]
+keywords = ["inference", "llm", "ai"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic==2.13.5",
+]
+
+[project.scripts]
+trillim = "trillim:main"
+
+[project.urls]
+Repository = "https://github.com/Trillim/Trillim"
+Issues = "https://github.com/Trillim/Trillim/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "hypothesis==6.168.1",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+    "taskipy==1.14.1",
+]
+
+[tool.taskipy.tasks]
+lint = "ruff check ."
+fmt = "ruff format ."
+test = "pytest ."
+check = "task lint && mypy src"
+clean = "rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache .mypy_cache"
+licenses = "uvx --from pip-licenses pip-licenses --python=.venv/bin/python --from=mixed --format=plain-vertical --with-license-file --with-notice-file --no-license-path --output-file THIRD_PARTY_LICENSES"
+build = "uv build"
+rebuild = "task clean && task build"
