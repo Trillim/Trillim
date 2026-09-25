@@ -1,12 +1,14 @@
 [project]
 name = "trillim"
 version = "0.13.0"
-description = "The fastest inference framework to run AI on CPUs"
+description = "The Fastest AI Inference Engine"
 readme = "README.md"
 license = {file = "LICENSE"}
 license-files = ["LICENSE", "THIRD_PARTY_LICENSES"]
-authors = [{name = "Vineet V", email = "vineetv314@gmail.com"}]
-keywords = ["bitnet", "inference", "cpu", "ternary", "llm", "ai"]
+authors = [
+    { name = "Vineet-V", email = "vineetv314@gmail.com" }
+]
+keywords = ["inference", "llm", "ai"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -19,43 +21,35 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "transformers==4.57.1",
-    "huggingface_hub==0.36.0",
-    "prompt-toolkit==3.0.52",
-    "jinja2==3.1.0",
-    "fastapi==0.128.0",
-    "uvicorn[standard]==0.40.0",
-    "trafilatura==2.0.0",
-    "ddgs==9.10.0",
+    "pydantic==2.13.5",
 ]
 
-[project.optional-dependencies]
-dev = ["ruff==0.15.0", "coverage==7.13.4"]
-voice = ["faster-whisper==1.2.1", "pocket-tts==1.0.3", "soundfile==0.13.1", "numpy==2.4.2", "safetensors==0.5"]
-
 [project.scripts]
-trillim = "trillim.cli:main"
+trillim = "trillim:main"
 
 [project.urls]
-Repository = "https://github.com/Vineet-Vinod/Trillim"
-Issues = "https://github.com/Vineet-Vinod/Trillim/issues"
+Repository = "https://github.com/Trillim/Trillim"
+Issues = "https://github.com/Trillim/Trillim/issues"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/trillim"]
-exclude = ["src/trillim/_bin/**"]
+[dependency-groups]
+dev = [
+    "hypothesis==6.168.1",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+    "taskipy==1.14.1",
+]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/trillim/_bin" = "trillim/_bin"
-"docs" = "trillim/docs"
-
-[tool.coverage.run]
-branch = true
-parallel = true
-source = ["src/trillim"]
-
-[tool.coverage.report]
-show_missing = true
+[tool.taskipy.tasks]
+lint = "ruff check ."
+fmt = "ruff format ."
+test = "pytest ."
+check = "task lint && mypy src"
+clean = "rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache .mypy_cache"
+licenses = "uvx --from pip-licenses pip-licenses --python=.venv/bin/python --from=mixed --format=plain-vertical --with-license-file --with-notice-file --no-license-path --output-file THIRD_PARTY_LICENSES"
+build = "uv build"
+rebuild = "task clean && task build"
