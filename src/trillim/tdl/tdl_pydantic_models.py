@@ -6,17 +6,19 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     RootModel,
     field_validator,
     model_validator,
 )
 
+from .tdl_dataclasses import Shape
 from .tensor import Tensor
 from .types import DType
 
 
 class Weight(RootModel[str]):
-    model_config = ConfigDict(frozen=True)
+    _shape: Shape | None = PrivateAttr(default=None)
 
     @field_validator("root")
     @classmethod
@@ -38,6 +40,14 @@ class Weight(RootModel[str]):
     @property
     def tensor_name(self) -> str:
         return self.root.partition(".")[2]
+
+    @property
+    def shape(self) -> Shape | None:
+        return self._shape
+
+    @shape.setter
+    def shape(self, value: Shape | None) -> None:
+        self._shape = value
 
     def __str__(self) -> str:
         return self.root
