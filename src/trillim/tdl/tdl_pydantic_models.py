@@ -2,10 +2,45 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 from .tensor import Tensor
 from .types import DType
+
+
+class Weight(RootModel[str]):
+    model_config = ConfigDict(frozen=True)
+
+    @field_validator("root")
+    @classmethod
+    def validate_reference(cls, value: str) -> str:
+        model_name, separator, tensor_name = value.partition(".")
+
+        if not model_name.isalpha():
+            raise ValueError("model names must contain only letters")
+
+        if not separator or not tensor_name:
+            raise ValueError("weight must name one exact tensor as Model.tensor_name")
+
+        return value
+
+    @property
+    def model_name(self) -> str:
+        return self.root.partition(".")[0]
+
+    @property
+    def tensor_name(self) -> str:
+        return self.root.partition(".")[2]
+
+    def __str__(self) -> str:
+        return self.root
 
 
 class op_args(BaseModel):
@@ -14,6 +49,19 @@ class op_args(BaseModel):
         extra="forbid",
         arbitrary_types_allowed=True,
     )
+
+
+class LoRA(op_args):
+    """An ordered (down/A, up/B) pair; absent alpha means unit scale."""
+
+    down_up: tuple[Weight, Weight]
+    alpha: float | None = None
+
+
+class Projection(op_args):
+    weight: Weight
+    bias: Weight | None = None
+    loras: tuple[LoRA, ...] = ()
 
 
 # Activation
@@ -54,14 +102,10 @@ from .activation import ActivationOp  # noqa: I001
 class gqa_args(op_args):
     x: Tensor
     context: Tensor | None = None
-    q_proj: str
-    k_proj: str
-    v_proj: str
-    o_proj: str
-    q_bias: str | None = None
-    k_bias: str | None = None
-    v_bias: str | None = None
-    o_bias: str | None = None
+    q_proj: Projection
+    k_proj: Projection
+    v_proj: Projection
+    o_proj: Projection
     num_heads: int = Field(gt=0)
     num_kv_heads: int = Field(gt=0)
     head_dim: int = Field(gt=0)
@@ -83,15 +127,14 @@ class gqa_args(op_args):
 class mla_args(op_args):
     x: Tensor
     context: Tensor | None = None
-    q_proj: str | None = None
-    q_a_proj: str | None = None
-    q_a_norm: str | None = None
-    q_b_proj: str | None = None
-    kv_a_proj: str
-    kv_a_norm: str
-    kv_b_proj: str
-    o_proj: str
-    o_bias: str | None = None
+    q_proj: Projection | None = None
+    q_a_proj: Projection | None = None
+    q_a_norm: Weight | None = None
+    q_b_proj: Projection | None = None
+    kv_a_proj: Projection
+    kv_a_norm: Weight
+    kv_b_proj: Projection
+    o_proj: Projection
     num_heads: int = Field(gt=0)
     q_lora_rank: int | None = Field(default=None, gt=0)
     kv_lora_rank: int = Field(gt=0)
@@ -126,8 +169,8 @@ class cast_args(op_args):
 
 class conv_args(op_args):
     x: Tensor
-    weight: str
-    bias: str | None = None
+    weight: Weight
+    bias: Weight | None = None
     dimensions: Literal[1, 2, 3]
     transpose: bool = False
     stride: int | tuple[int, ...] = 1
@@ -146,7 +189,7 @@ class conv_args(op_args):
 
 class embedding_args(op_args):
     x: Tensor
-    weight: str
+    weight: Weight
     padding_idx: int | None = None
 
 
@@ -155,12 +198,9 @@ class embedding_args(op_args):
 
 class ffn_args(op_args):
     x: Tensor
-    gate_proj: str | None = None
-    up_proj: str
-    down_proj: str
-    gate_bias: str | None = None
-    up_bias: str | None = None
-    down_bias: str | None = None
+    gate_proj: Projection | None = None
+    up_proj: Projection
+    down_proj: Projection
     activation: ActivationOp
 
 
@@ -169,38 +209,44 @@ class ffn_args(op_args):
 
 class linear_args(op_args):
     x: Tensor
-    weight: str
-    bias: str | None = None
+    projection: Projection
     transpose_weight: bool = False
 
 
 # MoE
 
 
+class ExpertProjections(op_args):
+    """One expert's projections; gate is optional for ungated experts."""
+
+    gate: Projection | None = None
+    up: Projection
+    down: Projection
+
+
 class moe_args(op_args):
+    """The router's output index selects the expert at the same list index."""
+
     x: Tensor
-    router_weight: str
-    router_bias: str | None = None
-    num_experts: int = Field(gt=0)
+    router: Projection
+    experts: list[ExpertProjections] = Field(min_length=1)
     experts_per_token: int = Field(gt=0)
     expert_type: ActivationOp
-    gate_weights: list[str] | str | None = None
-    up_weights: list[str] | str
-    down_weights: list[str] | str
-    gate_biases: list[str] | str | None = None
-    up_biases: list[str] | str | None = None
-    down_biases: list[str] | str | None = None
     router_scoring: Literal["softmax", "sigmoid"] = "softmax"
     normalize_weights: bool = False
-    shared_experts: int = Field(default=0, ge=0)
-    shared_gate_weight: str | None = None
 
     @model_validator(mode="after")
     def validate_expert_count(self) -> moe_args:
-        if self.experts_per_token > self.num_experts:
-            raise ValueError("experts_per_token cannot exceed num_experts")
+        if self.experts_per_token > len(self.experts):
+            raise ValueError("experts_per_token cannot exceed the number of experts")
 
         return self
+
+
+class shared_moe_args(moe_args):
+    """Combine routed experts with always-active shared experts."""
+
+    shared_experts: list[ExpertProjections] = Field(min_length=1)
 
 
 # Math
@@ -231,30 +277,30 @@ class softmax_args(op_args):
 
 class layernorm_args(op_args):
     x: Tensor
-    weight: str | None = None
-    bias: str | None = None
+    weight: Weight | None = None
+    bias: Weight | None = None
     eps: float = Field(default=1e-5, gt=0)
 
 
 class rmsnorm_args(op_args):
     x: Tensor
-    weight: str
+    weight: Weight
     eps: float = Field(default=1e-6, gt=0)
 
 
 class batchnorm_args(op_args):
     x: Tensor
-    weight: str | None = None
-    bias: str | None = None
-    running_mean: str
-    running_var: str
+    weight: Weight | None = None
+    bias: Weight | None = None
+    running_mean: Weight
+    running_var: Weight
     eps: float = Field(default=1e-5, gt=0)
 
 
 class groupnorm_args(op_args):
     x: Tensor
-    weight: str | None = None
-    bias: str | None = None
+    weight: Weight | None = None
+    bias: Weight | None = None
     num_groups: int = Field(gt=0)
     eps: float = Field(default=1e-5, gt=0)
 
@@ -297,31 +343,31 @@ class adaptive_max_pool_args(op_args):
 
 class mamba_args(op_args):
     x: Tensor
-    in_proj: str
-    conv_weight: str
-    conv_bias: str | None = None
-    x_proj: str
-    dt_proj: str
-    dt_bias: str | None = None
-    a_log: str
-    d: str
-    out_proj: str
-    out_bias: str | None = None
+    in_proj: Weight
+    conv_weight: Weight
+    conv_bias: Weight | None = None
+    x_proj: Weight
+    dt_proj: Weight
+    dt_bias: Weight | None = None
+    a_log: Weight
+    d: Weight
+    out_proj: Weight
+    out_bias: Weight | None = None
     state_dim: int = Field(gt=0)
     conv_kernel: int = Field(gt=0)
 
 
 class mamba2_args(op_args):
     x: Tensor
-    in_proj: str
-    conv_weight: str
-    conv_bias: str | None = None
-    a_log: str
-    d: str
-    dt_bias: str | None = None
-    norm_weight: str | None = None
-    out_proj: str
-    out_bias: str | None = None
+    in_proj: Weight
+    conv_weight: Weight
+    conv_bias: Weight | None = None
+    a_log: Weight
+    d: Weight
+    dt_bias: Weight | None = None
+    norm_weight: Weight | None = None
+    out_proj: Weight
+    out_bias: Weight | None = None
     state_dim: int = Field(gt=0)
     head_dim: int = Field(gt=0)
     num_groups: int = Field(gt=0)

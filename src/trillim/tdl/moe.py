@@ -3,14 +3,15 @@ from __future__ import annotations
 from typing import Literal
 
 from .operator import _create_operator, _validate_variant
-from .tdl_pydantic_models import moe_args, op_args
+from .tdl_pydantic_models import moe_args, op_args, shared_moe_args
 from .tensor import Tensor
 
-MoEOp = Literal["moe"]
-MoEArgs = moe_args
+MoEOp = Literal["moe", "shared_moe"]
+MoEArgs = moe_args | shared_moe_args
 
 _MOE_ARGS: dict[str, type[op_args]] = {
     "moe": moe_args,
+    "shared_moe": shared_moe_args,
 }
 
 
