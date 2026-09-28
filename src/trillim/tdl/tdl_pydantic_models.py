@@ -110,12 +110,13 @@ from .activation import ActivationOp  # noqa: I001
 
 
 class gqa_args(op_args):
+    """Return concatenated attention heads before the output projection."""
+
     x: Tensor
     context: Tensor | None = None
     q_proj: Projection
     k_proj: Projection
     v_proj: Projection
-    o_proj: Projection
     num_heads: int = Field(gt=0)
     num_kv_heads: int = Field(gt=0)
     head_dim: int = Field(gt=0)
@@ -134,7 +135,31 @@ class gqa_args(op_args):
     yarn_attention_factor: float | None = None
 
 
+class gqa_norm_args(gqa_args):
+    """Apply optional per-head RMS norms to Q, K, and V after projection.
+
+    Q and K norms run before positional encoding. A weight offset of one
+    supports checkpoints that store zero-centered RMS norm weights.
+    """
+
+    q_norm: Weight | None = None
+    k_norm: Weight | None = None
+    v_norm: Weight | None = None
+    norm_eps: float = Field(default=1e-6, gt=0)
+    norm_weight_offset: Literal[0, 1] = 0
+
+
+class gated_full_attn_args(gqa_norm_args):
+    """Q projection packs (query, gate) pairs per head.
+
+    Apply sigmoid to each gate and multiply it with the attention context
+    before the separate output Linear operation.
+    """
+
+
 class mla_args(op_args):
+    """Return concatenated attention heads before the output projection."""
+
     x: Tensor
     context: Tensor | None = None
     q_proj: Projection | None = None
@@ -144,7 +169,6 @@ class mla_args(op_args):
     kv_a_proj: Projection
     kv_a_norm: Weight
     kv_b_proj: Projection
-    o_proj: Projection
     num_heads: int = Field(gt=0)
     q_lora_rank: int | None = Field(default=None, gt=0)
     kv_lora_rank: int = Field(gt=0)
@@ -235,20 +259,34 @@ class ExpertProjections(op_args):
 
 
 class moe_args(op_args):
-    """The router's output index selects the expert at the same list index."""
+    """The router's output index selects the expert at the same list index.
+
+    SparseMixer selects two experts in sequence. At each step it masks scores
+    using router_jitter_eps, then takes the selected expert's softmax weight
+    over the unmasked candidates. The two weights are not jointly normalized.
+    """
 
     x: Tensor
     router: Projection
     experts: list[ExpertProjections] = Field(min_length=1)
     experts_per_token: int = Field(gt=0)
     expert_type: ActivationOp
-    router_scoring: Literal["softmax", "sigmoid"] = "softmax"
+    router_scoring: Literal["softmax", "sigmoid", "sparsemixer"] = "softmax"
+    router_jitter_eps: float | None = Field(default=None, ge=0)
     normalize_weights: bool = False
 
     @model_validator(mode="after")
     def validate_expert_count(self) -> moe_args:
         if self.experts_per_token > len(self.experts):
             raise ValueError("experts_per_token cannot exceed the number of experts")
+
+        if self.router_scoring == "sparsemixer":
+            if self.experts_per_token != 2:
+                raise ValueError("SparseMixer requires exactly two experts per token")
+            if self.router_jitter_eps is None:
+                raise ValueError("SparseMixer requires router_jitter_eps")
+        elif self.router_jitter_eps is not None:
+            raise ValueError("router_jitter_eps is only used with SparseMixer")
 
         return self
 
