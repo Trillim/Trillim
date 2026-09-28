@@ -146,6 +146,28 @@ class gqa_norm_args(gqa_args):
     norm_weight_offset: Literal[0, 1] = 0
 
 
+class gated_delta_args(op_args):
+    """Apply causal delta-rule attention and gated RMS norm before output Linear.
+
+    The QKV projection packs query, key, and value in that order. The
+    convolution and recurrent states are implicit.
+    """
+
+    x: Tensor
+    qkv_proj: Projection
+    z_proj: Projection
+    b_proj: Projection
+    a_proj: Projection
+    conv_weight: Weight
+    conv_bias: Weight | None = None
+    dt_bias: Weight
+    a_log: Weight
+    norm_weight: Weight
+    num_key_heads: int = Field(gt=0)
+    conv_activation: ActivationOp = "silu"
+    norm_eps: float = Field(default=1e-6, gt=0)
+
+
 class gated_full_attn_args(gqa_norm_args):
     """Q projection packs (query, gate) pairs per head.
 
