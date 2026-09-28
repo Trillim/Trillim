@@ -6,8 +6,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
-    RootModel,
     field_validator,
     model_validator,
 )
@@ -17,8 +15,15 @@ from .tensor import Tensor
 from .types import DType
 
 
-class Weight(RootModel[str]):
-    _shape: Shape | None = PrivateAttr(default=None)
+class Weight(BaseModel):
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+    root: str
+    shape: Shape | None = None
+    dtype: DType | None = None
+
+    def __init__(self, root: str, *, dtype: DType | None = None) -> None:
+        super().__init__(root=root, dtype=dtype)
 
     @field_validator("root")
     @classmethod
@@ -40,14 +45,6 @@ class Weight(RootModel[str]):
     @property
     def tensor_name(self) -> str:
         return self.root.partition(".")[2]
-
-    @property
-    def shape(self) -> Shape | None:
-        return self._shape
-
-    @shape.setter
-    def shape(self, value: Shape | None) -> None:
-        self._shape = value
 
     def __str__(self) -> str:
         return self.root
