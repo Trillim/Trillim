@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
-from .tdl_pydantic_models import op_args
 from .tensor import Tensor
+
+if TYPE_CHECKING:
+    from .tdl_pydantic_models import op_args
 
 
 class Operator:
