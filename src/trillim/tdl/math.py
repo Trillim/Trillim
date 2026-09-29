@@ -3,17 +3,27 @@ from __future__ import annotations
 from typing import Literal
 
 from .operator import _create_operator, _validate_variant
-from .tdl_pydantic_models import add_args, concat_args, mul_args, op_args, softmax_args
+from .tdl_pydantic_models import (
+    add_args,
+    concat_args,
+    mul_args,
+    op_args,
+    place_args,
+    reshape_args,
+    softmax_args,
+)
 from .tensor import Tensor
 
-MathOp = Literal["add", "mul", "concat", "softmax"]
-MathArgs = add_args | mul_args | concat_args | softmax_args
+MathOp = Literal["add", "mul", "concat", "softmax", "reshape", "place"]
+MathArgs = add_args | mul_args | concat_args | softmax_args | reshape_args | place_args
 
 _MATH_ARGS: dict[str, type[op_args]] = {
     "add": add_args,
     "mul": mul_args,
     "concat": concat_args,
     "softmax": softmax_args,
+    "reshape": reshape_args,
+    "place": place_args,
 }
 
 
