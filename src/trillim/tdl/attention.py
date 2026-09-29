@@ -10,12 +10,20 @@ from .tdl_pydantic_models import (
     gqa_norm_args,
     mla_args,
     op_args,
+    vision_attention_args,
 )
 from .tensor import Tensor
 
-AttentionOp = Literal["gqa", "gqa_norm", "gated_delta", "gated_full_attn", "mla"]
+AttentionOp = Literal[
+    "gqa", "gqa_norm", "gated_delta", "gated_full_attn", "mla", "vision_attention"
+]
 AttentionArgs = (
-    gqa_args | gqa_norm_args | gated_delta_args | gated_full_attn_args | mla_args
+    gqa_args
+    | gqa_norm_args
+    | gated_delta_args
+    | gated_full_attn_args
+    | mla_args
+    | vision_attention_args
 )
 
 _ATTENTION_ARGS: dict[str, type[op_args]] = {
@@ -24,6 +32,7 @@ _ATTENTION_ARGS: dict[str, type[op_args]] = {
     "gated_delta": gated_delta_args,
     "gated_full_attn": gated_full_attn_args,
     "mla": mla_args,
+    "vision_attention": vision_attention_args,
 }
 
 

@@ -3,14 +3,19 @@ from __future__ import annotations
 from typing import Literal
 
 from .operator import _create_operator, _validate_variant
-from .tdl_pydantic_models import embedding_args, op_args
+from .tdl_pydantic_models import (
+    embedding_args,
+    interpolated_position_embedding_args,
+    op_args,
+)
 from .tensor import Tensor
 
-EmbeddingOp = Literal["embedding"]
-EmbeddingArgs = embedding_args
+EmbeddingOp = Literal["embedding", "interpolated_position_embedding"]
+EmbeddingArgs = embedding_args | interpolated_position_embedding_args
 
 _EMBEDDING_ARGS: dict[str, type[op_args]] = {
     "embedding": embedding_args,
+    "interpolated_position_embedding": interpolated_position_embedding_args,
 }
 
 

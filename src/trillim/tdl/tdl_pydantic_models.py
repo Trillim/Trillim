@@ -105,12 +105,78 @@ from .activation import ActivationOp  # noqa: I001
 
 # Attention
 
+RopeOp = Literal["standard", "yarn", "mrope", "axial"]
+
+
+class rope_args(op_args):
+    theta: float = Field(default=10_000, gt=0)
+
+
+class standard_rope_args(rope_args):
+    dim: int | None = Field(default=None, gt=0)
+
+
+class yarn_args(rope_args):
+    dim: int | None = Field(default=None, gt=0)
+    factor: float = Field(gt=0)
+    original_max_position_embeddings: int = Field(gt=0)
+    beta_fast: float | None = None
+    beta_slow: float | None = None
+    mscale: float | None = None
+    mscale_all_dim: float | None = None
+    attention_factor: float | None = None
+
+
+class mrope_args(rope_args):
+    sections: tuple[int, int, int]
+    interleaved: bool = False
+
+    @field_validator("sections")
+    @classmethod
+    def validate_sections(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        if any(section <= 0 for section in value):
+            raise ValueError("MRoPE sections must be positive")
+
+        return value
+
+
+class axial_rope_args(rope_args):
+    pass
+
+
+type RopeArgs = standard_rope_args | yarn_args | mrope_args | axial_rope_args
+
+_ROPE_ARGS: dict[RopeOp, type[rope_args]] = {
+    "standard": standard_rope_args,
+    "yarn": yarn_args,
+    "mrope": mrope_args,
+    "axial": axial_rope_args,
+}
+
+
+class Rope(op_args):
+    op: RopeOp
+    args: RopeArgs
+
+    @model_validator(mode="after")
+    def validate_variant(self) -> Rope:
+        expected = _ROPE_ARGS[self.op]
+        if type(self.args) is not expected:
+            raise TypeError(
+                f'Rope(op="{self.op}") expects '
+                f"{expected.__name__}, got {type(self.args).__name__}"
+            )
+
+        return self
+
 
 class gqa_args(op_args):
     """Return concatenated attention heads before the output projection."""
 
     x: Tensor
     context: Tensor | None = None
+    q_positions: Tensor | None = None
+    kv_positions: Tensor | None = None
     q_proj: Projection
     k_proj: Projection
     v_proj: Projection
@@ -120,16 +186,7 @@ class gqa_args(op_args):
     causal: bool = True
     scale: float | None = None
     window_size: int | None = Field(default=None, gt=0)
-    position: Literal["none", "rope"] = "none"
-    rope_theta: float | None = Field(default=None, gt=0)
-    rope_dim: int | None = Field(default=None, gt=0)
-    yarn_factor: float | None = Field(default=None, gt=0)
-    yarn_original_max_position_embeddings: int | None = Field(default=None, gt=0)
-    yarn_beta_fast: float | None = None
-    yarn_beta_slow: float | None = None
-    yarn_mscale: float | None = None
-    yarn_mscale_all_dim: float | None = None
-    yarn_attention_factor: float | None = None
+    rope: Rope | None = None
 
 
 class gqa_norm_args(gqa_args):
@@ -176,11 +233,29 @@ class gated_full_attn_args(gqa_norm_args):
     """
 
 
+class vision_attention_args(op_args):
+    """Attend within each image or frame using packed QKV and axial RoPE.
+
+    Return attention heads before the separate output Linear operation.
+    Patch positions and sequence boundaries follow grid_thw.
+    """
+
+    x: Tensor
+    grid_thw: Tensor
+    qkv_proj: Projection
+    num_heads: int = Field(gt=0)
+    q_positions: Tensor | None = None
+    kv_positions: Tensor | None = None
+    rope: Rope = Rope(op="axial", args=axial_rope_args())
+
+
 class mla_args(op_args):
     """Return concatenated attention heads before the output projection."""
 
     x: Tensor
     context: Tensor | None = None
+    q_positions: Tensor | None = None
+    kv_positions: Tensor | None = None
     q_proj: Projection | None = None
     q_a_proj: Projection | None = None
     q_a_norm: Weight | None = None
@@ -196,7 +271,7 @@ class mla_args(op_args):
     v_head_dim: int = Field(gt=0)
     causal: bool = False
     scale: float | None = None
-    rope_theta: float | None = Field(default=None, gt=0)
+    rope: Rope | None = None
 
     @model_validator(mode="after")
     def validate_query_projection(self) -> mla_args:
@@ -244,6 +319,16 @@ class embedding_args(op_args):
     x: Tensor
     weight: Weight
     padding_idx: int | None = None
+
+
+class interpolated_position_embedding_args(op_args):
+    """Interpolate a learned square position grid in merge-group patch order."""
+
+    grid_thw: Tensor
+    weight: Weight
+    spatial_merge_size: int = Field(default=2, gt=0)
+    mode: Literal["bilinear", "bicubic"] = "bilinear"
+    align_corners: bool = True
 
 
 # FFN
@@ -339,6 +424,35 @@ class softmax_args(op_args):
     axis: int = -1
 
 
+class reshape_args(op_args):
+    x: Tensor
+    shape: tuple[int, ...] = Field(min_length=1)
+
+    @field_validator("shape")
+    @classmethod
+    def validate_shape(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if value.count(-1) > 1 or any(
+            dimension == 0 or dimension < -1 for dimension in value
+        ):
+            raise ValueError("reshape dimensions must be positive, with at most one -1")
+
+        return value
+
+
+class place_args(op_args):
+    """Select x slices by index rows and replace or add matching values rows.
+
+    If x has shape [D0, ..., Dr], indices has shape [N, K], and values
+    has shape [N, Dk, ..., Dr], indices[n] selects one slice of x.
+    Repeated replace indices are invalid; repeated add indices accumulate.
+    """
+
+    x: Tensor
+    indices: Tensor
+    values: Tensor
+    mode: Literal["replace", "add"] = "replace"
+
+
 # Norm
 
 
@@ -353,6 +467,7 @@ class rmsnorm_args(op_args):
     x: Tensor
     weight: Weight
     eps: float = Field(default=1e-6, gt=0)
+    norm_weight_offset: Literal[0, 1] = 0
 
 
 class batchnorm_args(op_args):
