@@ -1,8 +1,9 @@
 """Core constructors record an inference graph for the compiler.
 
-Build operators inside ``with Graph() as graph``. TensorShape declares dimensions;
+Build model graphs inside ``with Graph() as graph``. TensorShape declares dimensions;
 Shape(x) represents them as a tensor. Early compiler passes infer shapes and
 dtypes before optimization. The runtime executes the compiled program.
+Compiler passes can create nodes outside tracing and edit the same regions.
 
 Loop and branch callbacks build regions once and return tuples of tensors.
 For example::

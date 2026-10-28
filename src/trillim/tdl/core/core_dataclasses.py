@@ -35,7 +35,7 @@ class CacheSpec:
     axis: int | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Region:
     parameters: TensorTuple
     outputs: TensorTuple
