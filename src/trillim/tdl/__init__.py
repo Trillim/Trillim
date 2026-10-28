@@ -83,6 +83,7 @@ from .math import (
     TopK,
 )
 from .moe import GptOssMoE, MoE
+from .multiturn import ReusePrefix
 from .norm import (
     AdaptiveLayerNorm,
     BatchNorm,
@@ -171,6 +172,7 @@ __all__ = [
     "ReluSquared",
     "Reshape",
     "Resize",
+    "ReusePrefix",
     "Rotary",
     "RotaryFromAngles",
     "Sample",
