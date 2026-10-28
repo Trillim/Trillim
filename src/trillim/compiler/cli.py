@@ -27,7 +27,12 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
         help="bind a checkpoint name to a path; repeat for additional checkpoints",
     )
     arguments = parser.parse_args(args, namespace=CompileArguments())
+    checkpoints: dict[str, Path] = {}
+    for name, path in arguments.checkpoints:
+        if name in checkpoints:
+            parser.error(f"duplicate checkpoint name: {name}")
+        checkpoints[name] = path
     return CompileRequest(
         tdl_path=arguments.tdl_path,
-        checkpoints=dict(arguments.checkpoints),
+        checkpoints=checkpoints,
     )
