@@ -4,6 +4,8 @@ from argparse import ArgumentParser, ArgumentTypeError
 from collections.abc import Sequence
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .compiler_dataclasses import CompileArguments
 from .compiler_pydantic_models import CompileRequest
 
@@ -32,7 +34,10 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
         if name in checkpoints:
             parser.error(f"duplicate checkpoint name: {name}")
         checkpoints[name] = path
-    return CompileRequest(
-        tdl_path=arguments.tdl_path,
-        checkpoints=checkpoints,
-    )
+    try:
+        return CompileRequest(
+            tdl_path=arguments.tdl_path,
+            checkpoints=checkpoints,
+        )
+    except ValidationError as error:
+        parser.error(error.errors()[0]["msg"])
