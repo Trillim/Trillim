@@ -13,7 +13,7 @@ from .operator import Operator
 from .tensor import Tensor
 
 
-def Construct[**P, R: (Tensor, tuple[Tensor, ...])](
+def Construct[**P, R: Tensor | tuple[Tensor, ...]](
     function: Callable[P, R],
 ) -> Callable[P, R]:
     """Record a named operation with a complete, recursively lowerable body.

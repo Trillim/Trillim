@@ -26,7 +26,7 @@ from .types import DType
 
 
 class Weight(BaseModel):
-    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+    model_config = ConfigDict(validate_assignment=True, extra="forbid", strict=True)
 
     root: str
     shape: Shape | None = None
@@ -74,7 +74,7 @@ class ConstructArgs(OperatorArgs):
 
 
 class Model(RootModel[str]):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, strict=True)
 
     @field_validator("root")
     @classmethod
