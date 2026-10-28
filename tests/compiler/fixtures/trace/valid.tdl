@@ -1,0 +1,5 @@
+from trillim.tdl import *
+
+with Graph() as graph:
+    x = Input(name="x", shape=(2,), dtype="fp32")
+    Output(Add(x, 1), name="y")

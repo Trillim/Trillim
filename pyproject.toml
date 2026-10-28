@@ -49,7 +49,7 @@ dev = [
 lint = "ruff check ."
 fmt = "ruff format ."
 test = "pytest ."
-check = "task lint && mypy --strict src"
+check = "task lint && mypy --strict src tests && task test"
 clean = "rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache .mypy_cache"
 licenses = "uvx --from pip-licenses pip-licenses --python=.venv/bin/python --from=mixed --format=plain-vertical --with-license-file --with-notice-file --no-license-path --output-file THIRD_PARTY_LICENSES"
 build = "uv build"
