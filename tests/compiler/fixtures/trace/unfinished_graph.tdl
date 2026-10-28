@@ -1,0 +1,3 @@
+from trillim.tdl import *
+
+graph = Graph()
