@@ -1,8 +1,8 @@
 """Core constructors record an inference graph for the compiler.
 
-Build operators inside ``with Graph() as graph``. Use TensorShape for declared
-dimensions and Shape(x) for runtime dimensions. Shape/dtype inference and
-execution belong to the compiler and runtime, respectively.
+Build operators inside ``with Graph() as graph``. TensorShape declares dimensions;
+Shape(x) represents them as a tensor. Early compiler passes infer shapes and
+dtypes before optimization. The runtime executes the compiled program.
 
 Loop and branch callbacks build regions once and return tuples of tensors.
 For example::
