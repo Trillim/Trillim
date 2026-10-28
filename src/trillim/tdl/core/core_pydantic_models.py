@@ -44,7 +44,7 @@ class Weight(BaseModel):
             raise ValueError("model names must contain only letters")
 
         if not separator or not tensor_name:
-            raise ValueError("weight must name one exact tensor as Model.tensor_name")
+            raise ValueError("weight must name one logical tensor as Model.tensor_name")
 
         return value
 
