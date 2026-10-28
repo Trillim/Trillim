@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from graphlib import TopologicalSorter
 
 from ...tdl.core.core_dataclasses import Region
+from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
 from ...tdl.core.operator import Operator
 
 
@@ -26,3 +27,12 @@ def walk(region: Region) -> Iterator[tuple[Region, Operator]]:
         for body in operator.regions:
             yield from walk(body)
         yield region, operator
+
+
+def collect_checkpoints(region: Region) -> tuple[str, ...]:
+    checkpoints: dict[str, None] = {}
+    for _, operator in walk(region):
+        args = operator.args
+        if isinstance(args, ConstantArgs) and isinstance(args.value, Weight):
+            checkpoints[args.value.model_name] = None
+    return tuple(checkpoints)

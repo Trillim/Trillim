@@ -7,7 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from trillim.compiler.passes.walk import walk
+from trillim.compiler.passes.walk import collect_checkpoints, walk
 from trillim.tdl import (
     Add,
     Cache,
@@ -17,10 +17,13 @@ from trillim.tdl import (
     Graph,
     If,
     Input,
+    Linear,
+    Model,
     Mul,
     Output,
     Sub,
     Tensor,
+    Weight,
     While,
 )
 
@@ -168,3 +171,56 @@ def test_dependency_cycles(self_cycle: bool) -> None:
 
     with pytest.raises(CycleError):
         list(walk(graph.region))
+
+
+def test_no_weight_references() -> None:
+    with Graph() as graph:
+        Output(Constant(1), name="value")
+
+    assert graph.region is not None
+    assert collect_checkpoints(graph.region) == ()
+
+
+def test_base_and_adapter_checkpoints() -> None:
+    base = Model("base")
+    adapter = Model("adapter")
+    with Graph() as graph:
+        x = Input(name="x", shape=(1, 2), dtype="fp32")
+        main = Linear(x, base["linear.weight"], bias=base["linear.bias"])
+        down = Linear(x, adapter["down.weight"], bias=adapter["down.bias"])
+        delta = Linear(down, adapter["up.weight"], bias=adapter["up.bias"])
+        Output(Add(main, delta), name="y")
+
+    assert graph.region is not None
+    assert collect_checkpoints(graph.region) == ("base", "adapter")
+
+
+def test_checkpoints_in_nested_branches() -> None:
+    base, left, right = Model("base"), Model("left"), Model("right")
+    with Graph() as graph:
+        result = While(
+            (Constant(base["initial"]),),
+            condition=lambda _state: Constant(False),
+            body=lambda state: If(
+                Constant(True),
+                then_branch=lambda: (Add(state[0], Constant(left["bias"])),),
+                else_branch=lambda: (Add(state[0], Constant(right["bias"])),),
+            ),
+        )[0]
+        Output(result, name="result")
+
+    assert graph.region is not None
+    assert collect_checkpoints(graph.region) == ("base", "left", "right")
+
+
+def test_unused_argument_metadata_is_not_a_weight_reference() -> None:
+    @Construct
+    def identity(x: Tensor, _weight: Weight) -> Tensor:
+        return x
+
+    unused = Model("unused")
+    with Graph() as graph:
+        Output(identity(Constant(1), unused["weight"]), name="value")
+
+    assert graph.region is not None
+    assert collect_checkpoints(graph.region) == ()
