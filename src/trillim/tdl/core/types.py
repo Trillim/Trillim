@@ -23,6 +23,7 @@ DType = Literal[
     "dubgrp_int6",
     "grp_binary",
     "grp_ternary",
+    "mxfp4",
 ]
 
 
