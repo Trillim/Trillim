@@ -1,37 +1,108 @@
 from __future__ import annotations
 
-from typing import Literal
-
-from .operator import _create_operator, _validate_variant
-from .tdl_pydantic_models import (
-    batchnorm_args,
-    groupnorm_args,
-    layernorm_args,
-    op_args,
-    rmsnorm_args,
-)
-from .tensor import Tensor
-
-NormOp = Literal["layernorm", "rmsnorm", "batchnorm", "groupnorm"]
-NormArgs = layernorm_args | rmsnorm_args | batchnorm_args | groupnorm_args
-
-_NORM_ARGS: dict[str, type[op_args]] = {
-    "layernorm": layernorm_args,
-    "rmsnorm": rmsnorm_args,
-    "batchnorm": batchnorm_args,
-    "groupnorm": groupnorm_args,
-}
+from .core import Add, Construct, Div, Mul, Reshape, Sqrt, Sub, Tensor
+from .math import Dim, Mean, Sum, Value, _dims, _tensor
 
 
-def Norm(*, op: NormOp, args: NormArgs) -> Tensor:
-    _validate_variant(
-        family="Norm",
-        op=op,
-        args=args,
-        registry=_NORM_ARGS,
+def _affine(x: Tensor, weight: Value | None, bias: Value | None) -> Tensor:
+    if weight is not None:
+        x = Mul(x, _tensor(weight))
+    return x if bias is None else Add(x, _tensor(bias))
+
+
+@Construct
+def LayerNorm(
+    x: Tensor,
+    *,
+    weight: Value | None = None,
+    bias: Value | None = None,
+    axes: tuple[int, ...] = (-1,),
+    eps: float = 1e-5,
+) -> Tensor:
+    centered = Sub(x, Mean(x, axes=axes, keepdims=True))
+    variance = Mean(Mul(centered, centered), axes=axes, keepdims=True)
+    return _affine(Div(centered, Sqrt(Add(variance, eps))), weight, bias)
+
+
+@Construct
+def RMSNorm(
+    x: Tensor,
+    *,
+    weight: Value | None = None,
+    eps: float = 1e-6,
+    weight_offset: float = 0.0,
+) -> Tensor:
+    result = Div(x, Sqrt(Add(Mean(Mul(x, x), axes=(-1,), keepdims=True), eps)))
+    return (
+        result if weight is None else Mul(result, Add(_tensor(weight), weight_offset))
     )
-    return _create_operator(
-        family="norm",
-        op=op,
-        args=args,
+
+
+@Construct
+def L2Norm(x: Tensor, *, axis: int = -1, eps: float = 1e-6) -> Tensor:
+    return Div(x, Sqrt(Add(Sum(Mul(x, x), axes=(axis,), keepdims=True), eps)))
+
+
+@Construct
+def BatchNorm(
+    x: Tensor,
+    *,
+    running_mean: Value,
+    running_var: Value,
+    weight: Value | None = None,
+    bias: Value | None = None,
+    eps: float = 1e-5,
+    rank: int,
+) -> Tensor:
+    """Channel-first inference normalization of one input using saved statistics."""
+    shape = (-1, *((1,) * (rank - 1)))
+    mean = Reshape(_tensor(running_mean), shape)
+    var = Reshape(_tensor(running_var), shape)
+    result = Div(Sub(x, mean), Sqrt(Add(var, eps)))
+    if weight is not None:
+        result = Mul(result, Reshape(_tensor(weight), shape))
+    if bias is not None:
+        result = Add(result, Reshape(_tensor(bias), shape))
+    return result
+
+
+@Construct
+def GroupNorm(
+    x: Tensor,
+    *,
+    groups: int,
+    weight: Value | None = None,
+    bias: Value | None = None,
+    eps: float = 1e-5,
+    rank: int,
+) -> Tensor:
+    if groups <= 0:
+        raise ValueError("groups must be positive")
+    dims = _dims(x, rank)
+    grouped = Reshape(x, (groups, -1))
+    result = Reshape(LayerNorm(grouped, eps=eps), dims)
+    shape = (-1, *((1,) * (rank - 1)))
+    if weight is not None:
+        result = Mul(result, Reshape(_tensor(weight), shape))
+    return result if bias is None else Add(result, Reshape(_tensor(bias), shape))
+
+
+@Construct
+def VarianceNorm(
+    x: Tensor, *, weight: Value, correction: int = 1, eps: float = 1e-5
+) -> Tensor:
+    """Scale by variance without subtracting the mean, as PocketTTS's flow head does."""
+
+    centered = Sub(x, Mean(x, axes=(-1,), keepdims=True))
+    variance = Div(
+        Sum(Mul(centered, centered), axes=(-1,), keepdims=True),
+        Sub(Dim(x, -1), correction),
     )
+    return Mul(Div(x, Sqrt(Add(variance, eps))), _tensor(weight))
+
+
+@Construct
+def AdaptiveLayerNorm(
+    x: Tensor, *, shift: Tensor, scale: Tensor, eps: float = 1e-6
+) -> Tensor:
+    return Add(Mul(LayerNorm(x, eps=eps), Add(scale, 1)), shift)

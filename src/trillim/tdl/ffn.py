@@ -1,28 +1,30 @@
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Callable
 
-from .operator import _create_operator, _validate_variant
-from .tdl_pydantic_models import ffn_args, op_args
-from .tensor import Tensor
-
-FFNOp = Literal["ffn"]
-FFNArgs = ffn_args
-
-_FFN_ARGS: dict[str, type[op_args]] = {
-    "ffn": ffn_args,
-}
+from .activation import Silu
+from .core import Construct, Mul, Tensor
+from .linear import Linear
+from .math import Value
 
 
-def FFN(*, op: FFNOp, args: FFNArgs) -> Tensor:
-    _validate_variant(
-        family="FFN",
-        op=op,
-        args=args,
-        registry=_FFN_ARGS,
-    )
-    return _create_operator(
-        family="ffn",
-        op=op,
-        args=args,
-    )
+@Construct
+def FFN(
+    x: Tensor,
+    *,
+    up: Value,
+    down: Value,
+    gate: Value | None = None,
+    up_bias: Value | None = None,
+    down_bias: Value | None = None,
+    gate_bias: Value | None = None,
+    activation: Callable[[Tensor], Tensor] = Silu,
+) -> Tensor:
+    if gate is None and gate_bias is not None:
+        raise ValueError("gate bias requires a gate projection")
+    hidden = Linear(x, up, bias=up_bias)
+    if gate is None:
+        hidden = activation(hidden)
+    else:
+        hidden = Mul(hidden, activation(Linear(x, gate, bias=gate_bias)))
+    return Linear(hidden, down, bias=down_bias)
