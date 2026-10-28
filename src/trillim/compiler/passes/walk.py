@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from graphlib import TopologicalSorter
+from pathlib import Path
 
 from ...tdl.core.core_dataclasses import Region
 from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
@@ -29,10 +30,18 @@ def walk(region: Region) -> Iterator[tuple[Region, Operator]]:
         yield region, operator
 
 
-def collect_checkpoints(region: Region) -> tuple[str, ...]:
+def collect_checkpoints(
+    region: Region, bindings: Mapping[str, Path]
+) -> tuple[str, ...]:
+    """Collect names with path bindings already validated by CompileRequest."""
     checkpoints: dict[str, None] = {}
     for _, operator in walk(region):
         args = operator.args
         if isinstance(args, ConstantArgs) and isinstance(args.value, Weight):
-            checkpoints[args.value.model_name] = None
+            name = args.value.model_name
+            if name not in bindings:
+                raise ValueError(
+                    f"missing checkpoint binding: --checkpoint {name}=PATH"
+                )
+            checkpoints[name] = None
     return tuple(checkpoints)

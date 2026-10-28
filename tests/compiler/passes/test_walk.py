@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from graphlib import CycleError
+from pathlib import Path
 
 import pytest
 from hypothesis import given
@@ -178,10 +179,11 @@ def test_no_weight_references() -> None:
         Output(Constant(1), name="value")
 
     assert graph.region is not None
-    assert collect_checkpoints(graph.region) == ()
+    assert collect_checkpoints(graph.region, {}) == ()
 
 
-def test_base_and_adapter_checkpoints() -> None:
+@pytest.mark.parametrize("missing", [None, "base", "adapter"])
+def test_base_and_adapter_checkpoints(tmp_path: Path, missing: str | None) -> None:
     base = Model("base")
     adapter = Model("adapter")
     with Graph() as graph:
@@ -192,10 +194,15 @@ def test_base_and_adapter_checkpoints() -> None:
         Output(Add(main, delta), name="y")
 
     assert graph.region is not None
-    assert collect_checkpoints(graph.region) == ("base", "adapter")
+    bindings = {name: tmp_path for name in ("base", "adapter") if name != missing}
+    if missing is None:
+        assert collect_checkpoints(graph.region, bindings) == ("base", "adapter")
+    else:
+        with pytest.raises(ValueError, match=missing):
+            collect_checkpoints(graph.region, bindings)
 
 
-def test_checkpoints_in_nested_branches() -> None:
+def test_checkpoints_in_nested_branches(tmp_path: Path) -> None:
     base, left, right = Model("base"), Model("left"), Model("right")
     with Graph() as graph:
         result = While(
@@ -210,7 +217,8 @@ def test_checkpoints_in_nested_branches() -> None:
         Output(result, name="result")
 
     assert graph.region is not None
-    assert collect_checkpoints(graph.region) == ("base", "left", "right")
+    bindings = {name: tmp_path for name in ("base", "left", "right")}
+    assert collect_checkpoints(graph.region, bindings) == ("base", "left", "right")
 
 
 def test_unused_argument_metadata_is_not_a_weight_reference() -> None:
@@ -223,4 +231,4 @@ def test_unused_argument_metadata_is_not_a_weight_reference() -> None:
         Output(identity(Constant(1), unused["weight"]), name="value")
 
     assert graph.region is not None
-    assert collect_checkpoints(graph.region) == ()
+    assert collect_checkpoints(graph.region, {}) == ()
