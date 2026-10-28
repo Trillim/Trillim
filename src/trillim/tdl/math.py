@@ -46,6 +46,12 @@ def _dims(x: Tensor, rank: int) -> tuple[Tensor, ...]:
     return tuple(Dim(x, axis) for axis in range(rank))
 
 
+def _axis(axis: int, rank: int) -> int:
+    if rank <= 0 or not -rank <= axis < rank:
+        raise ValueError("axis is out of range for the tensor rank")
+    return axis % rank
+
+
 @Construct
 def FullLike(x: Tensor, *, shape: Dimensions | None = None, fill: Scalar = 0) -> Tensor:
     """Allocate a filled tensor with X's dtype, including before dtype inference."""
@@ -138,7 +144,7 @@ def Take(
     x: Tensor, indices: Tensor, *, axis: int = 0, rank: int = 1, index_rank: int = 1
 ) -> Tensor:
     """Gather one axis; indices replace that axis with their own dimensions."""
-    axis %= rank
+    axis = _axis(axis, rank)
     others = tuple(i for i in range(rank) if i != axis)
     front = Permute(x, (axis, *others))
     coordinates = Reshape(indices, (*_dims(indices, index_rank), 1))
@@ -164,6 +170,7 @@ def Slice(
     """Positive-stride slicing with clamped bounds; negative bounds count backwards."""
     if step <= 0:
         raise ValueError("Slice requires a positive step")
+    axis = _axis(axis, rank)
     size = Dim(x, axis)
     begin = Constant(start) if isinstance(start, int) else start
     end = size if stop is None else Constant(stop) if isinstance(stop, int) else stop
@@ -178,7 +185,7 @@ def Slice(
 def Concat(tensors: tuple[Tensor, ...], *, axis: int, rank: int) -> Tensor:
     if not tensors:
         raise ValueError("Concat requires at least one tensor")
-    axis %= rank
+    axis = _axis(axis, rank)
     order = (axis, *(i for i in range(rank) if i != axis))
     inverse = tuple(order.index(i) for i in range(rank))
     fronts = tuple(Permute(x, order) for x in tensors)
@@ -198,7 +205,7 @@ def Concat(tensors: tuple[Tensor, ...], *, axis: int, rank: int) -> Tensor:
 
 @Construct
 def Stack(tensors: tuple[Tensor, ...], *, axis: int = 0, rank: int) -> Tensor:
-    axis %= rank + 1
+    axis = _axis(axis, rank + 1)
     expanded = tuple(
         Reshape(x, (*_dims(x, rank)[:axis], 1, *_dims(x, rank)[axis:])) for x in tensors
     )
@@ -210,7 +217,7 @@ def Argmax(
     x: Tensor, *, axis: int = -1, rank: int, mask: Tensor | None = None
 ) -> Tensor:
     """Choose the lowest active index on ties; empty domains return int64's maximum."""
-    axis %= rank
+    axis = _axis(axis, rank)
     shape: list[int | Tensor] = [1] * rank
     shape[axis] = Dim(x, axis)
     indices = Broadcast(Reshape(Iota(Dim(x, axis)), tuple(shape)), Shape(x))
@@ -250,7 +257,9 @@ def TopK(x: Tensor, *, k: int | Tensor, rank: int) -> tuple[Tensor, Tensor]:
     values = FullLike(x, shape=shape)
     indices = Broadcast(Constant(0), shape)
     available = Broadcast(Constant(True), Shape(x))
-    vocab = Iota(Dim(x, -1))
+    width = Dim(x, -1)
+    flat_x = Reshape(x, (-1,))
+    vocab = Iota(width)
     positions = Iota(count)
 
     def step(state: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -258,7 +267,11 @@ def TopK(x: Tensor, *, k: int | Tensor, rank: int) -> tuple[Tensor, Tensor]:
         index = Argmax(x, rank=rank, mask=remaining)
         index = Reshape(index, (*_dims(x, rank)[:-1], 1))
         match = Compare(vocab, index, predicate="eq")
-        value = Sum(Select(match, x, 0), axes=(-1,), keepdims=True)
+        flat_index = Reshape(index, (-1,))
+        coordinates = Add(Mul(Iota(Dim(flat_index, 0)), width), flat_index)
+        value = Reshape(
+            Gather(flat_x, indices=Reshape(coordinates, (-1, 1))), Shape(index)
+        )
         remaining = Select(match, False, remaining)
         output = Select(Compare(positions, i, predicate="eq"), value, output)
         selected = Select(Compare(positions, i, predicate="eq"), index, selected)
