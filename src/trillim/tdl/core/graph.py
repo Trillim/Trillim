@@ -25,6 +25,7 @@ class Graph:
 
     Serving-time batching must preserve these logical inputs, outputs and cache
     histories. Otherwise-unused state updates remain part of the program.
+    After tracing, compiler passes edit the region directly.
     """
 
     def __init__(self) -> None:
@@ -44,7 +45,7 @@ class Graph:
                 "graphs cannot be nested; compose tensor functions instead"
             )
         if self._sealed:
-            raise ValueError("a completed graph cannot be reopened")
+            raise ValueError("a completed graph cannot be retraced")
         if self._tokens is not None:
             raise ValueError("this graph is already being constructed")
         self._tokens = (_current_graph.set(self), _current_scope.set(self._root))
@@ -72,14 +73,14 @@ class Graph:
 def _get_graph() -> Graph:
     graph = _current_graph.get()
     if graph is None:
-        raise RuntimeError("core operators must be constructed inside a Graph context")
+        raise RuntimeError("this operation requires an active Graph tracing context")
     return graph
 
 
 def _get_scope() -> _Scope:
     scope = _current_scope.get()
     if scope is None:
-        raise RuntimeError("core operators must be constructed inside a Graph context")
+        raise RuntimeError("this operation requires an active Graph tracing context")
     return scope
 
 
@@ -91,6 +92,43 @@ def _validate_tensor(tensor: Tensor) -> None:
             return
         scope = scope.parent
     raise ValueError("tensor belongs to another graph or an inaccessible region")
+
+
+def _record_cache_access(operator: Operator, cache: CacheSpec, *, write: bool) -> None:
+    graph = _get_graph()
+    scope = _get_scope()
+    declaration = graph._cache_declarations.get(cache)
+    if declaration is None or graph.caches.get(cache.name) is not cache:
+        raise ValueError("cache belongs to another graph")
+    previous = scope.cache_accesses.get(cache, declaration)
+    operator.dependencies = tuple(dict.fromkeys((*operator.dependencies, previous)))
+    scope.cache_accesses[cache] = operator
+    if write:
+        scope.writes[cache] = None
+    else:
+        scope.reads[cache] = None
+
+
+def _record_operator(operator: Operator) -> None:
+    graph = _current_graph.get()
+    if graph is None:
+        return
+    scope = _get_scope()
+    for tensor in operator.inputs:
+        _validate_tensor(tensor)
+    for tensor in operator.outputs:
+        graph._tensor_scopes[tensor] = scope
+    scope.operators.append(operator)
+    reads = dict.fromkeys(
+        cache for region in operator.regions for cache in region.reads
+    )
+    writes = dict.fromkeys(
+        cache for region in operator.regions for cache in region.writes
+    )
+    for cache in dict.fromkeys((*reads, *writes)):
+        _record_cache_access(operator, cache, write=cache in writes)
+        if cache in reads:
+            scope.reads[cache] = None
 
 
 def _finish_region(scope: _Scope, outputs: TensorTuple) -> Region:

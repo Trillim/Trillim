@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .core_dataclasses import CacheMode, CacheSpec, Scalar, Shape
 from .core_pydantic_models import CacheArgs, CacheAssignArgs, CacheReadArgs
-from .graph import _get_graph, _get_scope
+from .graph import _get_graph, _get_scope, _record_cache_access
 from .operator import Operator
 from .tensor import Tensor
 from .types import DType
@@ -55,7 +55,7 @@ class Cache:
             CacheReadArgs(cache=self.spec),
             outputs=((shape, self.spec.dtype),),
         )
-        operator._access_cache(self.spec, write=False)
+        _record_cache_access(operator, self.spec, write=False)
         return operator.outputs[0]
 
     def assign(self, value: Tensor) -> None:
@@ -70,7 +70,7 @@ class Cache:
             CacheAssignArgs(cache=self.spec, value=value, action="assign"),
             outputs=(),
         )
-        operator._access_cache(self.spec, write=True)
+        _record_cache_access(operator, self.spec, write=True)
 
     def append(self, value: Tensor) -> None:
         """Append with compiler-inserted storage conversion; sliding evicts on overflow."""
@@ -81,4 +81,4 @@ class Cache:
             CacheAssignArgs(cache=self.spec, value=value, action="append"),
             outputs=(),
         )
-        operator._access_cache(self.spec, write=True)
+        _record_cache_access(operator, self.spec, write=True)
