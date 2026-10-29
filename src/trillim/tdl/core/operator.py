@@ -24,28 +24,32 @@ class Operator:
         self.args = args
         self.regions = regions
         self.dependencies: tuple[Operator, ...] = ()
-        inputs: dict[Tensor, None] = {}
-
-        def collect(value: object) -> None:
-            if isinstance(value, Tensor):
-                inputs[value] = None
-            elif isinstance(value, BaseModel):
-                for item in vars(value).values():
-                    collect(item)
-            elif isinstance(value, (tuple, list)):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    collect(item)
-
-        collect(args)
-        for region in regions:
-            collect(region.captures)
-        self.inputs = tuple(inputs)
+        self.inputs = _inputs(args, regions)
         self.outputs = tuple(
             Tensor(producer=self, shape=shape, dtype=dtype) for shape, dtype in outputs
         )
         _record_operator(self)
-        for tensor in inputs:
+        for tensor in self.inputs:
             tensor.consumers.append(self)
+
+
+def _inputs(args: OperatorArgs, regions: tuple[Region, ...]) -> tuple[Tensor, ...]:
+    inputs: dict[Tensor, None] = {}
+
+    def collect(value: object) -> None:
+        if isinstance(value, Tensor):
+            inputs[value] = None
+        elif isinstance(value, BaseModel):
+            for item in vars(value).values():
+                collect(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    collect(args)
+    for region in regions:
+        collect(region.captures)
+    return tuple(inputs)
