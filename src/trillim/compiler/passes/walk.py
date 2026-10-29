@@ -9,22 +9,27 @@ from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
 from ...tdl.core.operator import Operator
 
 
+def predecessors(operator: Operator) -> Iterator[Operator]:
+    for value in operator.inputs:
+        if value.producer is not None:
+            yield value.producer
+    yield from operator.dependencies
+
+
+def ordered_operators(region: Region) -> Iterator[Operator]:
+    local = set(region.operators)
+    dependencies = {
+        operator: [
+            dependency for dependency in predecessors(operator) if dependency in local
+        ]
+        for operator in region.operators
+    }
+    yield from TopologicalSorter(dependencies).static_order()
+
+
 def walk(region: Region) -> Iterator[tuple[Region, Operator]]:
     """Visit dependencies and nested bodies before their operators, retaining scope."""
-    local = set(region.operators)
-    dependencies: dict[Operator, list[Operator]] = {}
-    for operator in region.operators:
-        predecessors = [
-            value.producer
-            for value in operator.inputs
-            if value.producer is not None and value.producer in local
-        ]
-        predecessors.extend(
-            dependency for dependency in operator.dependencies if dependency in local
-        )
-        dependencies[operator] = predecessors
-
-    for operator in TopologicalSorter(dependencies).static_order():
+    for operator in ordered_operators(region):
         for body in operator.regions:
             yield from walk(body)
         yield region, operator
