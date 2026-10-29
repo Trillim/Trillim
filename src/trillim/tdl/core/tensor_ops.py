@@ -23,7 +23,7 @@ from .core_pydantic_models import (
 from .graph import _get_graph, _get_scope
 from .operator import Operator
 from .tensor import Tensor
-from .types import DType, validate_dtype
+from .types import DType
 
 
 def Input(
@@ -55,32 +55,13 @@ def Output(x: Tensor, *, name: str) -> None:
 def Constant(
     value: Scalar | NDArray[np.generic] | Weight, *, dtype: DType | None = None
 ) -> Tensor:
-    shape: TensorShape | None
-    if isinstance(value, Weight):
-        shape = value.shape
-        dtype = dtype if dtype is not None else value.dtype
-    elif isinstance(value, np.ndarray):
+    if isinstance(value, np.ndarray):
         if value.dtype.kind not in "biuf":
             raise ValueError("constant arrays must contain booleans, integers or reals")
         value = value.copy()
         value.setflags(write=False)
-        shape = TensorShape(value.shape)
-        if dtype is None:
-            name = {"float16": "fp16", "float32": "fp32"}.get(
-                value.dtype.name, value.dtype.name
-            )
-            dtype = validate_dtype(name)
-    else:
-        shape = TensorShape(())
-        if dtype is None:
-            if isinstance(value, bool):
-                dtype = "bool"
-            elif isinstance(value, int):
-                dtype = "int64"
-            else:
-                dtype = "fp32"
     args = ConstantArgs(value=value, dtype=dtype)
-    return Operator("constant", args, outputs=((shape, dtype),)).outputs[0]
+    return Operator("constant", args, outputs=((None, dtype),)).outputs[0]
 
 
 def Shape(x: Tensor) -> Tensor:
