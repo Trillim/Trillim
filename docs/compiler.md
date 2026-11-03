@@ -1,0 +1,35 @@
+# Compiler
+
+`python -m trillim compile MODEL.tdl --checkpoint checkpoint=PATH --bound tokens=4096 --output build/model --backend avx2`
+
+- Repeat `--checkpoint NAME=PATH` for additional checkpoints or adapters.
+- `--bound NAME=DIM,DIM` supplies maximum dimensions for a dynamic input.
+- `--value-bound NAME=MIN,MAX` bounds integer input values used in sizes, loops, or indexing.
+- `--dtype NAME=DTYPE` chooses logical storage or input dtypes; other dtypes propagate through the graph.
+- `--depth none` selects kernels immediately; `low`, `medium`, and `high` benchmark through 64, 4096, and 32768 tokens respectively.
+- `--threads`, `--search-seconds`, `--beam-width`, and `--memory-budget` control benchmarking and selection.
+
+The compiler edits the traced TDL graph directly. It validates checkpoint references, infers shapes and dtypes, simplifies computations, matches kernel TDL, selects a covering, schedules work, and assigns shared memory. Compilation publishes a complete directory with one atomic rename. An existing output directory is preserved; Ctrl+C removes the unfinished directory and stops active benchmark workers.
+
+# Executable format 1
+
+`executable.json` is a compact single-line JSON object. All paths are relative to its directory.
+
+- `inputs` and `outputs` map public names to tensor buffers.
+- `buffers` describe dtype, shape, strides, capacity, and storage. Storage is an arena span, caller input, weight, constant, cache, or another tensor's view.
+- `arena_size` covers intermediate outputs and temporary workspace; their live intervals determine reuse. `cache_size` covers persistent state.
+- `caches` describe fixed capacities, initial values, update policies, and offsets. Append overflow is an error; sliding caches retain their newest values.
+- `kernels` contain library paths, symbols, parameter layouts, alignment, and required hardware and software features.
+- `program` contains native calls, views, guards, branches, loops, reductions, and explicit cache accesses. Guards execute where their referenced values exist.
+- `expressions` stores shared shape calculations once; `{"expr": "e0"}` refers to a table entry. Each workload plan has its own expression table.
+- `workloads` contain measured samples, mean, median, variance, reference comparisons, and reasons for skipped measurements. `plans` may provide different kernel coverings for workload ranges; each plan supplies its buffer layout and program.
+
+Shapes and parameters use integer expressions. `scalar` reads a tensor using its declared dtype; `dimension` reads a tensor's captured actual shape; `cache_length` reads current cache metadata. Other expressions combine these values using arithmetic or broadcasting rules. Every actual dimension must fit its declared maximum. Non-finite metadata floats use `{"float": "-inf"}`, `{"float": "inf"}`, or `{"float": "nan"}`; tensor constants remain binary.
+
+An `if` executes its chosen branch and its native result-copy calls. A `while` initializes its output bank, copies that bank to condition/body parameters, and copies body results back after each iteration. `shape_from` captures a destination's actual shape before a transfer. Distinct live banks make these transfers safe when a loop swaps carried values.
+
+A generic `reduce` iterates retained coordinates and reduced coordinates, initializes scalar accumulators, executes its pure reducer program, and stores each result. Its native transfer kernel handles element decoding and strided reads; mathematical reducers remain ordinary kernel calls. Common reductions use fused kernels instead.
+
+A cache read captures its dimensions immediately. `snapshot: true` requires independent values; a direct cache binding is permitted only when the compiler proves those values remain unchanged for their lifetime. `metadata_only` cache writes commit a preceding direct kernel write without copying it again. Capacity guards precede direct append writes.
+
+The bundle also contains `weights.bin`, `constants.bin`, and the selected backend's library. Weight encoding is described in [compiler_weights.md](compiler_weights.md), and native execution in [kernel_standard.md](kernel_standard.md).
