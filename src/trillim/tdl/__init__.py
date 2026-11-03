@@ -61,7 +61,7 @@ from .core import (
 )
 from .embedding import Embedding, InterpolatedEmbedding
 from .ffn import FFN
-from .linear import Linear
+from .linear import BitLinear, Linear
 from .math import (
     Abs,
     Argmax,
@@ -109,6 +109,7 @@ __all__ = [
     "Attention",
     "AxialRotary",
     "BatchNorm",
+    "BitLinear",
     "Broadcast",
     "Cache",
     "Cast",

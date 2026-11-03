@@ -1,7 +1,24 @@
 from __future__ import annotations
 
-from .core import Add, Construct, Matmul, Permute, Tensor
-from .math import Value, _tensor
+from .core import (
+    Add,
+    Cast,
+    Compare,
+    Constant,
+    Construct,
+    Div,
+    Matmul,
+    Mod,
+    Mul,
+    Permute,
+    Reshape,
+    Scatter,
+    Select,
+    Shape,
+    Sub,
+    Tensor,
+)
+from .math import Abs, Clip, Dim, Max, Maximum, Value, _tensor
 
 
 @Construct
@@ -12,7 +29,34 @@ def Linear(
     bias: Value | None = None,
 ) -> Tensor:
     """Apply [out, in] logical weights and optional bias."""
-    output = Matmul(x, Permute(_tensor(weight), (1, 0)))
+    matrix = _tensor(weight)
+    shape = Shape(x)
+    shape = Scatter(
+        shape,
+        indices=Reshape(Sub(Dim(shape, 0), 1), (1, 1)),
+        values=Reshape(Dim(matrix, 0), (1,)),
+    )
+    output = Matmul(Reshape(x, (-1, Dim(x, -1))), Permute(matrix, (1, 0)))
+    output = Reshape(output, shape)
     if bias is not None:
         output = Add(output, _tensor(bias))
     return output
+
+
+@Construct
+def BitLinear(x: Tensor, weight: Value) -> Tensor:
+    """Apply BitNet's nearest-even activation quantization before a projection."""
+    scale = Div(Constant(127.0), Maximum(Max(Abs(x), axes=(-1,), keepdims=True), 1e-5))
+    scaled = Mul(x, scale)
+    magnitude = Abs(scaled)
+    integer = Cast(magnitude, "int64")
+    fraction = Sub(magnitude, Cast(integer, "fp32"))
+    increment = Select(
+        Compare(fraction, 0.5, predicate="eq"),
+        Compare(Mod(integer, 2), 1, predicate="eq"),
+        Compare(fraction, 0.5, predicate="gt"),
+    )
+    rounded = Add(integer, Cast(increment, "int64"))
+    signed = Select(Compare(scaled, 0.0, predicate="lt"), Mul(rounded, -1), rounded)
+    quantized = Div(Cast(Clip(signed, -128, 127), "fp32"), scale)
+    return Linear(quantized, weight)
