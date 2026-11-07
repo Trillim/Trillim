@@ -83,6 +83,5 @@ class Requirements:
 
 @dataclass(slots=True)
 class PackedParameters:
-    value: object
     address: int
     owners: list[object]

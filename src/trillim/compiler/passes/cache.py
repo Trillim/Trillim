@@ -11,10 +11,10 @@ from ...tdl.core.core_pydantic_models import (
 )
 from ...tdl.core.graph import Graph
 from ...tdl.core.operator import Operator
-from ...tdl.core.types import DType
 from ..artifacts.artifact_dataclasses import Layout
 from ..artifacts.expressions import byte_size
 from ..compiler_dataclasses import ShapeExpression
+from ..dtype import QUANTIZED_DTYPES
 from ..kernels.bindings import (
     broadcast_strides,
     contiguous_strides,
@@ -24,21 +24,6 @@ from ..kernels.bindings import (
 from .infer import constant, expression
 from .passes_dataclasses import Selection
 from .walk import walk
-
-_NATIVE: set[DType] = {
-    "bool",
-    "int8",
-    "uint8",
-    "int16",
-    "uint16",
-    "int32",
-    "uint32",
-    "int64",
-    "uint64",
-    "fp16",
-    "bf16",
-    "fp32",
-}
 
 
 def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
@@ -86,7 +71,7 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
             continue
         cache = args.cache
         buffer = layout.buffers[operator.outputs[0]]
-        if cache.mode == "sliding" or cache.dtype not in _NATIVE:
+        if cache.mode == "sliding" or cache.dtype in QUANTIZED_DTYPES:
             continue
         if any(
             layout.positions[write][0] >= buffer.first
@@ -149,7 +134,7 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
         args = operator.args
         if (
             not isinstance(args, CacheAssignArgs)
-            or args.cache.dtype not in _NATIVE
+            or args.cache.dtype in QUANTIZED_DTYPES
             or args.cache.mode == "sliding"
         ):
             continue

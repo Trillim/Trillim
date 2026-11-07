@@ -73,7 +73,6 @@ class Kernel:
     capabilities: Capabilities
     bind: Callable[[KernelBindingContext], dict[str, ParameterValue]]
     library: Path
-    tdl: str
     physical_inputs: tuple[str, ...] | None = None
 
 
