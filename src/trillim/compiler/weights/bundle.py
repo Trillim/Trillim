@@ -119,12 +119,12 @@ def _effective(
             ).astype(np.uint8)
             codes = (packed >> ((row // quarter) * 2)) & 3
             if np.any(codes == 3):
-                raise ValueError(f"invalid BitNet packed code3: {entry.identity}")
+                raise ValueError(f"invalid BitNet packed code 3: {entry.identity}")
             result[offset : offset + length] = (codes.astype(np.float32) - 1) * scale[1]
             offset += length
         return result
     if start % 32 or count % 32:
-        raise ValueError("MXFP4 import slices must align to groups of32")
+        raise ValueError("MXFP4 import slices must align to groups of 32")
     blocks, scales = entry.components
     group_start, groups = start // 32, count // 32
     packed = (
@@ -230,7 +230,7 @@ def _write_entry(
                     ).astype(np.float32)
                     if not np.isfinite(scan).all():
                         raise ValueError(
-                            "rowINT8 quantization requires finite FP32 values"
+                            "row_int8 quantization requires finite FP32 values"
                         )
                     row_maximum = max(row_maximum, np.abs(scan).max())
             multiplier = np.float32(127) / row_maximum

@@ -147,7 +147,9 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
             position = end
         if start + position != state.st_size:
             raise ValueError(f"unreferenced safetensors bytes: {path}")
-    if not tensors or weight_map and set(tensors) != set(weight_map):
+    if not tensors:
+        raise ValueError(f"checkpoint contains no tensors: {location}")
+    if weight_map and set(tensors) != set(weight_map):
         raise ValueError("safetensors shard index contains missing tensors")
     aliases = {
         key: value
