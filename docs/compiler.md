@@ -1,13 +1,19 @@
 # Compiler
 
-`python -m trillim compile MODEL.tdl --checkpoint checkpoint=PATH --bound tokens=4096 --output build/model --backend avx2`
+`trillim compile MODEL.tdl CHECKPOINT_PATH`
 
-- Repeat `--checkpoint NAME=PATH` for additional checkpoints or adapters.
-- `--bound NAME=DIM,DIM` supplies maximum dimensions for a dynamic input.
-- `--value-bound NAME=MIN,MAX` bounds integer input values used in sizes, loops, or indexing.
-- `--dtype NAME=DTYPE` chooses logical storage or input dtypes; other dtypes propagate through the graph.
-- `--depth none` selects kernels immediately; `low`, `medium`, and `high` benchmark through 64, 4096, and 32768 tokens respectively.
-- `--threads`, `--search-seconds`, `--beam-width`, and `--memory-budget` control benchmarking and selection.
+The compiler detects the host backend and writes to `~/.trillim/compiled/<model_name>`. For a checkpoint directory, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. Without a checkpoint, the TDL filename supplies the name.
+
+- `--output PATH` chooses another destination.
+- `--backend scalar|x86|neon` overrides host detection. Kernels declare their hardware features separately, such as AVX2, AVX512, VNNI, or NEON dotprod.
+- `--depth none` picks a direct kernel plan with available backend specializations, without benchmarking.
+- `--depth low` compares kernels for the operations in that plan at 1, 8, and 64 tokens.
+- `--depth high` also compares fusion choices and extends workloads through 512, 4096, and 32768 tokens.
+- `--threads N` overrides the detected CPU thread count.
+- `--max-input-size N` sets the maximum length of each variable input dimension, defaulting to 4096. Fixed dimensions and input values are unaffected; cache capacities remain defined in TDL.
+- Repeat `--checkpoint NAME=PATH` to bind additional checkpoints or adapters; a positional path binds the sole remaining checkpoint.
+
+The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compiler computes scratch and cache requirements without a user-supplied memory budget. Benchmark preparation has an internal memory limit, and individual benchmark workers have a timeout.
 
 The compiler edits the traced TDL graph directly. It validates checkpoint references, infers shapes and dtypes, simplifies computations, matches kernel TDL, selects a covering, schedules work, and assigns shared memory. Compilation publishes a complete directory with one atomic rename. An existing output directory is preserved; Ctrl+C removes the unfinished directory and stops active benchmark workers.
 

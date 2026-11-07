@@ -228,7 +228,6 @@ def allocate(
     weights: WeightIndex,
     manifest: WeightManifest,
     *,
-    memory_budget: int,
     transfer_kernel: Kernel | None = None,
 ) -> Layout:
     if graph.region is None:
@@ -422,9 +421,5 @@ def allocate(
         )
         layout.cache_size = align(layout.cache_size, 64) + byte_size(cache.dtype, shape)
     layout.cache_size = align(layout.cache_size, 64)
-    if layout.arena_size + layout.cache_size > memory_budget:
-        raise ValueError(
-            f"model requires {layout.arena_size + layout.cache_size} writable bytes; budget is {memory_budget}"
-        )
     layout.constants = bytes(constants)
     return layout

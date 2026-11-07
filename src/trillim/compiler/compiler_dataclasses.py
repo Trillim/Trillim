@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -21,16 +20,12 @@ if TYPE_CHECKING:
 class CompileArguments(Namespace):
     tdl_path: Path = field(init=False)
     checkpoints: list[tuple[str, Path]] = field(default_factory=list)
-    backend: str = "scalar"
-    output: Path = Path("build/model")
-    bounds: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
-    dtypes: list[tuple[str, str]] = field(default_factory=list)
+    checkpoint_path: Path | None = None
+    backend: str | None = None
+    output: Path | None = None
     depth: str = "none"
-    threads: int = 1
-    memory_budget: int = 8 * 1024**3
-    beam_width: int = 4
-    search_seconds: float = 10
-    value_bounds: list[tuple[str, tuple[int, int]]] = field(default_factory=list)
+    threads: int | None = None
+    max_input_size: int = 4096
 
 
 @dataclass(slots=True)
@@ -160,9 +155,7 @@ class Inference:
 @dataclass(slots=True)
 class InferenceState:
     graph: Graph
-    bounds: Mapping[str, tuple[int, ...]]
-    dtypes: Mapping[str, DType]
-    value_bounds: Mapping[str, tuple[int, int]]
+    max_input_size: int | None
     result: Inference = field(default_factory=Inference)
     constraint_keys: set[ShapeConstraint] = field(default_factory=set)
     operators: list[Operator] = field(default_factory=list)

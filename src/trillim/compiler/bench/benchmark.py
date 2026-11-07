@@ -27,13 +27,13 @@ from .bench_dataclasses import (
 )
 
 _ROOT = Path(__file__).resolve().parents[4]
+MAX_BYTES = 512 * 1024**2
 
 
 def representative_tokens(level: BenchmarkLevel) -> tuple[int, ...]:
     return {
         "none": (),
         "low": (1, 8, 64),
-        "medium": (1, 8, 64, 512, 4096),
         "high": (1, 8, 64, 512, 4096, 32768),
     }[level]
 
@@ -289,7 +289,7 @@ def benchmark(
     *,
     golden: Invocation | None = None,
     timeout: float = 10.0,
-    max_bytes: int = 512 * 1024**2,
+    max_bytes: int = MAX_BYTES,
 ) -> BenchmarkResult:
     harness = _harness()
     context = mp.get_context("spawn")
