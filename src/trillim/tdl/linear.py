@@ -49,14 +49,14 @@ def BitLinear(x: Tensor, weight: Value) -> Tensor:
     scale = Div(Constant(127.0), Maximum(Max(Abs(x), axes=(-1,), keepdims=True), 1e-5))
     scaled = Mul(x, scale)
     magnitude = Abs(scaled)
-    integer = Cast(magnitude, "int64")
+    integer = Cast(magnitude, "int8")
     fraction = Sub(magnitude, Cast(integer, "fp32"))
     increment = Select(
         Compare(fraction, 0.5, predicate="eq"),
         Compare(Mod(integer, 2), 1, predicate="eq"),
         Compare(fraction, 0.5, predicate="gt"),
     )
-    rounded = Add(integer, Cast(increment, "int64"))
+    rounded = Add(integer, Cast(increment, "int8"))
     signed = Select(Compare(scaled, 0.0, predicate="lt"), Mul(rounded, -1), rounded)
     quantized = Cast(Clip(signed, -128, 127), "int8")
     return Div(Linear(quantized, weight), scale)
