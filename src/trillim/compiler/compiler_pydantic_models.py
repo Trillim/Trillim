@@ -8,6 +8,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..tdl.core.types import DType
+from .kernels.build import host_backend
+from .kernels.kernel_dataclasses import Backend
 
 
 class CompileRequest(BaseModel):
@@ -16,7 +18,7 @@ class CompileRequest(BaseModel):
     tdl_path: Path
     checkpoints: dict[str, Path] = Field(default_factory=dict)
     output: Path = Path("build/model")
-    backend: Literal["scalar", "avx2"] = "scalar"
+    backend: Backend = Field(default_factory=host_backend)
     bounds: dict[str, tuple[int, ...]] = Field(default_factory=dict)
     value_bounds: dict[str, tuple[int, int]] = Field(default_factory=dict)
     dtypes: dict[str, DType] = Field(default_factory=dict)

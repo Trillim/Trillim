@@ -19,7 +19,7 @@ from .native import NativeCapabilities, read_schema
 _LIBRARIES: dict[Path, c.CDLL] = {}
 
 
-def discover(backends: tuple[Backend, ...] = ("scalar", "avx2")) -> tuple[Kernel, ...]:
+def discover(backends: tuple[Backend, ...] = ("scalar",)) -> tuple[Kernel, ...]:
     result: list[Kernel] = []
     for backend in backends:
         artifact = build(backend)

@@ -63,8 +63,8 @@ def compile_model(
         schedule(graph, inference)
         report("Building and matching kernels")
         backends: tuple[Backend, ...] = (
-            ("scalar", "avx2")
-            if request.backend == "avx2" and request.depth != "none"
+            ("scalar", request.backend)
+            if request.backend != "scalar" and request.depth != "none"
             else (request.backend,)
         )
         kernels = discover(backends)

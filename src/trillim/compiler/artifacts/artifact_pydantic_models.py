@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from ...tdl.core.types import DType
+from ..kernels.kernel_dataclasses import Backend
 
 
 class BufferRecord(BaseModel):
@@ -39,7 +40,7 @@ class ExecutableManifest(BaseModel):
     version: Literal[1] = 1
     abi_version: Literal[1] = 1
     endian: Literal["little"] = "little"
-    backend: Literal["scalar", "avx2"]
+    backend: Backend
     threads: int = Field(ge=1)
     arena_size: int = Field(ge=0)
     cache_size: int = Field(ge=0)

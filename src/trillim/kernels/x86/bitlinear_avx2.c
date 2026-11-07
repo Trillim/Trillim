@@ -295,7 +295,7 @@ AVX2 static TrillimStatus project(void *task_context, size_t task_index, size_t 
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_bitlinear(
+TRILLIM_KERNEL TrillimStatus trillim_x86_bitlinear_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -342,18 +342,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_bitlinear(
         context->thread_pool->context, token_tiles * column_tiles, project, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_bitlinear_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_bitlinear_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import avx2_bitlinear as bind\n"
            "def pattern(x: Tensor, weight: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (BitLinear(x, weight),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_bitlinear_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_bitlinear_avx2_parameters(void) {
     return &parameter_schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_bitlinear_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_bitlinear_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

@@ -1,7 +1,7 @@
 #define TRILLIM_ATTENTION_AVX2
 #include "attention.h"
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_attention(
+TRILLIM_KERNEL TrillimStatus trillim_x86_attention_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -14,18 +14,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_attention(
     return context->thread_pool->run(context->thread_pool->context, p->heads * tiles, trillim_attention_task, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_attention_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_attention_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import attention as bind\n"
            "def pattern(q: Tensor, k: Tensor, v: Tensor, *, causal: bool = True, scale = None, window = None) -> tuple[Tensor, ...]:\n"
            "    return (Attention(q, k, v, causal=causal, scale=scale, window=window),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_attention_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_attention_avx2_parameters(void) {
     return trillim_attention_schema();
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_attention_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_attention_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

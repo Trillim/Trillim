@@ -1,6 +1,6 @@
 #include "rotary_avx2.h"
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_rotary(
+TRILLIM_KERNEL TrillimStatus trillim_x86_rotary_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -13,18 +13,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_rotary(
     return context->thread_pool->run(context->thread_pool->context, p->heads * p->tokens, trillim_rotary_task_avx2, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_rotary_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_rotary_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import avx2_rotary as bind\n"
            "def pattern(x: Tensor, positions: Tensor, *, dim: int, theta: float = 10000.0, interleaved: bool = False, amplitude: float = 1.0) -> tuple[Tensor, ...]:\n"
            "    return (Rotary(x, positions, dim=dim, theta=theta, interleaved=interleaved, amplitude=amplitude),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_rotary_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_rotary_avx2_parameters(void) {
     return trillim_rotary_schema();
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_rotary_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_rotary_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

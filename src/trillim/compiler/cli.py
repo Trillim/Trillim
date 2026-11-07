@@ -54,7 +54,7 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
     parser = ArgumentParser(prog="trillim compile")
     parser.add_argument("tdl_path", type=Path)
     parser.add_argument("--output", type=Path, default=Path("build/model"))
-    parser.add_argument("--backend", choices=("scalar", "avx2"), default="scalar")
+    parser.add_argument("--backend", choices=("scalar", "x86", "neon"), default="scalar")
     parser.add_argument(
         "--bound", dest="bounds", action="append", type=_shape, default=[]
     )
