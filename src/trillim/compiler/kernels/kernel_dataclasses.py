@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ...dtype import DType
 from ...tdl.core.core_dataclasses import TensorTuple
+from ...tdl.core.types import DType
 from ..compiler_dataclasses import ShapeExpression
 
 Backend = Literal["scalar", "avx2"]

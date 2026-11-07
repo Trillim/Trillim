@@ -5,7 +5,6 @@ from collections.abc import Iterable
 
 import numpy as np
 
-from ...dtype import encode
 from ...tdl.core.core_dataclasses import Region
 from ...tdl.core.core_pydantic_models import (
     BroadcastArgs,
@@ -25,6 +24,7 @@ from ..artifacts.artifact_dataclasses import Buffer, Layout, Workspace
 from ..artifacts.expressions import align, byte_size, parameter_references, references
 from ..artifacts.parameters import requirements
 from ..compiler_dataclasses import Inference, ShapeExpression
+from ..dtype import encode
 from ..kernels.bindings import (
     broadcast_strides,
     contiguous_strides,

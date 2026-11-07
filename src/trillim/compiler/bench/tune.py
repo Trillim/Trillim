@@ -16,7 +16,6 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
-from ... import dtype as codec
 from ...tdl.core.core_pydantic_models import (
     BinaryArgs,
     BroadcastArgs,
@@ -32,6 +31,7 @@ from ...tdl.core.core_pydantic_models import (
 )
 from ...tdl.core.operator import Operator
 from ...tdl.core.tensor import Tensor
+from .. import dtype as codec
 from ..artifacts.artifact_dataclasses import JSON
 from ..artifacts.expressions import number
 from ..artifacts.parameters import requirements

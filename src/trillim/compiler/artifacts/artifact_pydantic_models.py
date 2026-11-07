@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from ...dtype import DType
+from ...tdl.core.types import DType
 
 
 class BufferRecord(BaseModel):

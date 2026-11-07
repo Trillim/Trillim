@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
-from ...dtype import DType
+from ...tdl.core.types import DType
 from .weights_dataclasses import Checkpoint, SourceDType, WeightSource
 from .weights_pydantic_models import CheckpointConfig, SafetensorsIndex, TensorHeader
 

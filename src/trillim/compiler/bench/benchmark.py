@@ -13,8 +13,8 @@ from statistics import mean, median, pvariance
 
 import numpy as np
 
-from ...dtype import decode
 from ..artifacts.parameters import pack, requirements
+from ..dtype import decode
 from ..kernels.build import _run
 from ..kernels.native import read_schema
 from .bench_dataclasses import (

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from ...dtype import DType
+from ...tdl.core.types import DType
 
 if TYPE_CHECKING:
     from ...tdl.core.tensor import Tensor

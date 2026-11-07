@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ...dtype import DType
+from ...tdl.core.types import DType
 from .weights_dataclasses import SourceDType
 
 Nonnegative = Annotated[int, Field(ge=0, strict=True)]

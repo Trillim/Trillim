@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...dtype import DType
 from ...tdl.core.operator import Operator
 from ...tdl.core.tensor import Tensor
+from ...tdl.core.types import DType
 from ..compiler_dataclasses import Inference, ShapeExpression
 from ..kernels.kernel_dataclasses import Kernel, ParameterValue, TensorBinding
 

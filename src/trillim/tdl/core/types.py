@@ -1,5 +1,33 @@
 from __future__ import annotations
 
-from ...dtype import DType, validate_dtype
+from typing import Literal, cast, get_args
 
-__all__ = ["DType", "validate_dtype"]
+DType = Literal[
+    "bool",
+    "int8",
+    "uint8",
+    "int16",
+    "uint16",
+    "int32",
+    "uint32",
+    "int64",
+    "uint64",
+    "fp16",
+    "bf16",
+    "fp32",
+    "row_int8",
+    "mat_ternary",
+    "grp_int8",
+    "grp_int4",
+    "grp_int5",
+    "dubgrp_int6",
+    "grp_binary",
+    "grp_ternary",
+    "mxfp4",
+]
+
+
+def validate_dtype(value: str) -> DType:
+    if value not in get_args(DType):
+        raise ValueError(f'unsupported dtype "{value}"')
+    return cast(DType, value)

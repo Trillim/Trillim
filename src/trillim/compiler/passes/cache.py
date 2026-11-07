@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 
-from ...dtype import DType
 from ...tdl.core.core_pydantic_models import (
     BroadcastArgs,
     CacheAssignArgs,
@@ -12,6 +11,7 @@ from ...tdl.core.core_pydantic_models import (
 )
 from ...tdl.core.graph import Graph
 from ...tdl.core.operator import Operator
+from ...tdl.core.types import DType
 from ..artifacts.artifact_dataclasses import Layout
 from ..artifacts.expressions import byte_size
 from ..compiler_dataclasses import ShapeExpression
