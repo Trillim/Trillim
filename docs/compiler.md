@@ -1,8 +1,8 @@
 # Compiler
 
-`trillim compile MODEL.tdl CHECKPOINT_PATH`
+`trillim compile MODEL.tdl model=/path/to/model adapter=/path/to/adapter`
 
-The compiler detects the host backend and writes to `~/.trillim/compiled/<model_name>`. For a checkpoint directory, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. Without a checkpoint, the TDL filename supplies the name.
+The compiler detects the host backend and writes to `~/.trillim/compiled/<model_name>`. With one checkpoint, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. With multiple checkpoints or no checkpoints, the TDL filename supplies the name.
 
 - `--output PATH` chooses another destination.
 - `--backend scalar|x86|neon` overrides host detection. Kernels declare their hardware features separately, such as AVX2, AVX512, VNNI, or NEON dotprod.
@@ -11,7 +11,7 @@ The compiler detects the host backend and writes to `~/.trillim/compiled/<model_
 - `--depth high` also compares fusion choices and extends workloads through 512, 4096, and 32768 tokens.
 - `--threads N` overrides the detected CPU thread count.
 - `--max-input-size N` sets the maximum length of each variable input dimension, defaulting to 4096. Fixed dimensions and input values are unaffected; cache capacities remain defined in TDL.
-- Repeat `--checkpoint NAME=PATH` to bind additional checkpoints or adapters; a positional path binds the sole remaining checkpoint.
+Each `NAME=PATH` must match a TDL `Model("NAME")` declaration. Checkpoint paths must exist, be files or directories, and be accessible; these checks run during argument validation before tracing TDL or creating output.
 
 The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compiler computes scratch and cache requirements without a user-supplied memory budget. Benchmark preparation has an internal memory limit, and individual benchmark workers have a timeout.
 

@@ -4,7 +4,7 @@ import os
 import stat
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .bench.bench_dataclasses import BenchmarkLevel
 from .kernels.build import host_backend
@@ -16,19 +16,16 @@ class CompileRequest(BaseModel):
 
     tdl_path: Path
     checkpoints: dict[str, Path] = Field(default_factory=dict)
-    checkpoint_path: Path | None = None
     output: Path | None = None
     backend: Backend = Field(default_factory=host_backend)
     max_input_size: int = Field(default=4096, gt=0)
     depth: BenchmarkLevel = "none"
     threads: int = Field(default_factory=lambda: os.cpu_count() or 1, ge=1)
 
-    @model_validator(mode="after")
-    def validate_checkpoints(self) -> CompileRequest:
-        paths = tuple(self.checkpoints.items())
-        if self.checkpoint_path is not None:
-            paths += (("positional", self.checkpoint_path),)
-        for name, path in paths:
+    @field_validator("checkpoints")
+    @classmethod
+    def validate_checkpoints(cls, value: dict[str, Path]) -> dict[str, Path]:
+        for name, path in value.items():
             try:
                 mode = path.stat().st_mode
             except OSError as error:
@@ -43,4 +40,4 @@ class CompileRequest(BaseModel):
                 )
             if not os.access(path, permissions):
                 raise ValueError(f"checkpoint {name!r} is not accessible: {path}")
-        return self
+        return value

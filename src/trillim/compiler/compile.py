@@ -28,12 +28,9 @@ from .weights import resolve_weights, write_weights
 def compile_model(
     request: CompileRequest, *, progress: Callable[[str], None] | None = None
 ) -> ExecutableManifest:
-    checkpoint = request.checkpoint_path
-    if checkpoint is None and len(request.checkpoints) == 1:
-        checkpoint = next(iter(request.checkpoints.values()))
     model_name = request.tdl_path.stem
-    if checkpoint is not None:
-        checkpoint = checkpoint.resolve()
+    if len(request.checkpoints) == 1:
+        checkpoint = next(iter(request.checkpoints.values())).resolve()
         model_name = checkpoint.parent.name if checkpoint.is_file() else checkpoint.name
     output = (
         request.output or Path.home() / ".trillim/compiled" / model_name
@@ -53,16 +50,8 @@ def compile_model(
         validate(graph)
         report("Resolving checkpoint tensors")
         assert graph.region is not None
-        checkpoints = dict(request.checkpoints)
-        if request.checkpoint_path is not None:
-            missing = set(collect_checkpoints(graph.region)) - checkpoints.keys()
-            if len(missing) != 1:
-                raise ValueError(
-                    "the positional path needs one unbound checkpoint; use --checkpoint NAME=PATH for multiple checkpoints"
-                )
-            checkpoints[missing.pop()] = request.checkpoint_path
-        collect_checkpoints(graph.region, checkpoints)
-        weights = resolve_weights(graph, checkpoints)
+        collect_checkpoints(graph.region, request.checkpoints)
+        weights = resolve_weights(graph, request.checkpoints)
         report("Inferring shapes and dtypes")
         inference = infer(
             graph,

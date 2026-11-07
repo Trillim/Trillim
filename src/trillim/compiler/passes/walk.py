@@ -36,17 +36,15 @@ def walk(region: Region) -> Iterator[tuple[Region, Operator]]:
 
 
 def collect_checkpoints(
-    region: Region, bindings: Mapping[str, Path] | None = None
+    region: Region, bindings: Mapping[str, Path]
 ) -> tuple[str, ...]:
-    """Collect checkpoint names, optionally checking their path bindings."""
+    """Collect checkpoint names and check their path bindings."""
     checkpoints: dict[str, None] = {}
     for _, operator in walk(region):
         args = operator.args
         if isinstance(args, ConstantArgs) and isinstance(args.value, Weight):
             name = args.value.model_name
-            if bindings is not None and name not in bindings:
-                raise ValueError(
-                    f"missing checkpoint binding: --checkpoint {name}=PATH"
-                )
+            if name not in bindings:
+                raise ValueError(f"missing checkpoint binding: {name}=PATH")
             checkpoints[name] = None
     return tuple(checkpoints)

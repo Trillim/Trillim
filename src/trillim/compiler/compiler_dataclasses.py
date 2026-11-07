@@ -19,8 +19,7 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class CompileArguments(Namespace):
     tdl_path: Path = field(init=False)
-    checkpoints: list[tuple[str, Path]] = field(default_factory=list)
-    checkpoint_path: Path | None = None
+    checkpoints: list[tuple[str, Path]] = field(init=False)
     backend: str | None = None
     output: Path | None = None
     depth: str = "none"
