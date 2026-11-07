@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from ..weights.weights_dataclasses import WeightIndex
     from ..weights.weights_pydantic_models import WeightManifest
 
-BenchmarkLevel = Literal["none", "low", "medium", "high"]
+BenchmarkLevel = Literal["none", "low", "high"]
 ConcreteParameter = int | float | tuple[int | float, ...]
 
 
@@ -85,7 +85,6 @@ class TuningState:
     manifest: WeightManifest
     bundle: Path
     request: CompileRequest
-    deadline: float
     rng: np.random.Generator
     dimensions: dict[Hashable, int] = field(default_factory=dict)
     views: frozenset[Operator] = frozenset()

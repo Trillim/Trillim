@@ -4,13 +4,13 @@
 
 The compiler weight API is:
 
-- `resolve_weights(graph, checkpoints, *, dtypes=None) -> WeightIndex`
+- `resolve_weights(graph, checkpoints) -> WeightIndex`
 - `write_weights(index, destination, required_representations=None) -> WeightManifest`
 - `read_manifest(bundle) -> WeightManifest`
 
 `checkpoints` maps TDL model names to a safetensors file, shard index, or checkpoint directory. Resolution validates tensor extents and indexed shard membership, then binds concrete shapes and logical dtypes to weight constants. Identities include the checkpoint name, so equal tensor names in different checkpoints remain distinct.
 
-An exact `Model.tensor_name` CLI dtype override wins over an explicit `Weight.dtype`, then a constant's dtype. A checkpoint-name override supplies the default for floating matrix weights. Native integer tensors and nonmatrix parameters keep their source dtype unless overridden by exact name.
+A TDL weight's explicit dtype takes precedence over its constant's dtype. Otherwise, resolution preserves the checkpoint tensor's logical dtype, including imported quantized formats.
 
 Tied tensors declared by checkpoint metadata or `tie_word_embeddings` share an identity. If both copies are stored, their shapes, dtypes and source bytes must agree. Each requested dtype or packing is a separate representation. Requests for the same identity, dtype and packing share one payload span.
 

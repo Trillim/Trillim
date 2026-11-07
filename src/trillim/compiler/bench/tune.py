@@ -10,7 +10,6 @@ from collections.abc import Hashable
 from math import isfinite, prod
 from pathlib import Path
 from statistics import mean, median, pvariance
-from time import monotonic
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,7 +22,6 @@ from ...tdl.core.core_pydantic_models import (
     ConstantArgs,
     ConstructArgs,
     GatherArgs,
-    InputArgs,
     PermuteArgs,
     ReshapeArgs,
     ScatterArgs,
@@ -49,7 +47,7 @@ from .bench_dataclasses import (
     Tuning,
     TuningState,
 )
-from .benchmark import benchmark, representative_tokens
+from .benchmark import MAX_BYTES, benchmark, representative_tokens
 
 
 def _bounded(value: ShapeExpression, point: int) -> int:
@@ -282,7 +280,7 @@ def _fixture(
     base = _base(tensor)
     shape = _shape(base, point, state)
     estimated = sum(size for _, size in codec.payload_sections(dtype, shape))
-    if max(estimated, required) * 3 > state.request.memory_budget:
+    if max(estimated, required) * 3 > MAX_BYTES:
         raise ValueError("benchmark input preparation exceeds the memory budget")
     info = state.inference.tensors[base]
     producer = base.producer
@@ -314,10 +312,6 @@ def _fixture(
                 0 if dtype.startswith("uint") else -3, lower if lower is not None else 0
             )
             high = min(127, upper if upper is not None else 127)
-            if producer is not None and isinstance(producer.args, InputArgs):
-                interval = state.request.value_bounds.get(producer.args.name)
-                if interval is not None:
-                    low, high = interval
             if (
                 isinstance(candidate.anchor.args, BinaryArgs)
                 and candidate.anchor.op in {"floor_div", "mod"}
@@ -363,10 +357,7 @@ def _invocation(
     comparison_bytes = sum(
         prod(_shape(tensor, point, state)) * 64 for tensor in candidate.outputs
     )
-    if (
-        sum(footprint.inputs) * 3 + footprint.scratch * 2 + comparison_bytes
-        > state.request.memory_budget
-    ):
+    if sum(footprint.inputs) * 3 + footprint.scratch * 2 + comparison_bytes > MAX_BYTES:
         raise ValueError(
             "benchmark native footprint exceeds the preparation/reference memory budget"
         )
@@ -659,14 +650,12 @@ def tune(
     points = representative_tokens(request.depth)
     if not points:
         return result
-    started = monotonic()
     state = TuningState(
         inference,
         weights,
         manifest,
         bundle.resolve(),
         request,
-        started + request.search_seconds,
         np.random.default_rng(0),
         views=frozenset(matches.views),
     )
@@ -679,14 +668,11 @@ def tune(
     aggregated: dict[Operator, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    budget_skipped = 0
     groups = sorted(
         enumerate(matches.candidates.items()),
         key=lambda item: _priority(item[1][1], state),
         reverse=True,
     )
-    planning_seconds = monotonic() - started
-    state.deadline = monotonic() + request.search_seconds
     for operator_index, (operator, candidates) in groups:
         ordered = sorted(
             candidates, key=lambda value: -len(value.kernel.capabilities.hardware)
@@ -730,9 +716,6 @@ def tune(
                         cache_source = "persistent"
                         if profile is not None:
                             cache[key] = profile
-                    if profile is None and monotonic() >= state.deadline:
-                        budget_skipped += 1
-                        continue
                     record_key = key, point
                     record = records.get(record_key)
                     if record is None:
@@ -767,16 +750,10 @@ def tune(
                             and reference is not None
                         ):
                             golden, _ = _invocation(reference, point, state, fixtures)
-                        remaining = state.deadline - monotonic()
-                        if remaining <= 0:
-                            raise TimeoutError(
-                                "compiler tuning time budget exhausted during fixture preparation"
-                            )
                         profile = benchmark(
                             invocation,
                             golden=golden,
-                            timeout=remaining,
-                            max_bytes=request.memory_budget,
+                            max_bytes=MAX_BYTES,
                         )
                         cache[key] = profile
                         _save_profile(key, profile)
@@ -888,19 +865,6 @@ def tune(
                     OverflowError,
                     TimeoutError,
                 ) as error:
-                    if (
-                        isinstance(error, TimeoutError)
-                        and monotonic() >= state.deadline
-                    ):
-                        budget_skipped += 1
-                        if (
-                            record_key is not None
-                            and record is not None
-                            and record.get("status") is None
-                        ):
-                            records.pop(record_key, None)
-                            result.workloads.remove(record)
-                        continue
                     fallback: Hashable = (
                         candidate.kernel.name,
                         tuple(
@@ -934,16 +898,6 @@ def tune(
                             records[failed_key] = record
                             result.workloads.append(record)
                         record.update(status="skipped", reason=str(error))
-    if budget_skipped:
-        result.workloads.append(
-            {
-                "status": "budget_exhausted",
-                "skipped_calls": budget_skipped,
-                "budget_seconds": request.search_seconds,
-                "planning_seconds": planning_seconds,
-                "elapsed_seconds": monotonic() - started,
-            }
-        )
     result.costs = {
         operator: {name: mean(samples) for name, samples in values.items()}
         for operator, values in aggregated.items()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterator, Mapping
-from time import monotonic
 
 from ...tdl.core.core_dataclasses import Region
 from ...tdl.core.core_pydantic_models import (
@@ -111,27 +110,18 @@ def select(
     graph: Graph,
     matches: MatchSet,
     *,
-    beam_width: int = 4,
-    search_seconds: float = 10.0,
     fast: bool = False,
     costs: CostModel | None = None,
 ) -> Selection:
     """Cover outer results before their implementations, retaining a complete fallback."""
     if graph.region is None:
         raise ValueError("cannot select kernels for an incomplete graph")
-    if beam_width < 1 or not math.isfinite(search_seconds) or search_seconds < 0:
-        raise ValueError(
-            "kernel search requires a positive beam width and finite time budget"
-        )
     operators = tuple(_anchors(graph.region))
     best = _greedy(operators, matches, costs)
-    if fast or beam_width == 1 or search_seconds == 0:
+    if fast:
         return best
-    deadline = monotonic() + search_seconds
     states = [Selection()]
     for operator in operators:
-        if monotonic() >= deadline:
-            return best
         following: list[Selection] = []
         for state in states:
             if operator in state.covered:
@@ -156,5 +146,5 @@ def select(
                 -len(state.covered),
                 tuple(candidate.kernel.name for candidate in state.calls.values()),
             ),
-        )[:beam_width]
+        )[:4]
     return min((best, *states), key=lambda state: (state.cost, len(state.calls)))

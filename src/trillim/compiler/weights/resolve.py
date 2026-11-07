@@ -6,7 +6,6 @@ from pathlib import Path
 from ...tdl.core.core_dataclasses import Shape
 from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
 from ...tdl.core.graph import Graph
-from ...tdl.core.types import DType
 from ..passes.walk import walk
 from .reader import LOGICAL_DTYPES, load_checkpoint
 from .weights_dataclasses import Checkpoint, WeightBinding, WeightEntry, WeightIndex
@@ -120,13 +119,10 @@ def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
 def resolve_weights(
     graph: Graph,
     checkpoints: Mapping[str, Path],
-    *,
-    dtypes: Mapping[str, DType] | None = None,
 ) -> WeightIndex:
     """Bind checkpoint-qualified logical identities before shape inference."""
     if graph.region is None:
         raise ValueError("weight resolution requires a completed graph")
-    overrides = dtypes or {}
     index = WeightIndex()
     identities: dict[str, WeightEntry] = {}
     for _, operator in walk(graph.region):
@@ -153,25 +149,7 @@ def resolve_weights(
             raise ValueError(
                 f"declared weight shape disagrees with checkpoint: {weight.root}"
             )
-        target = overrides.get(weight.root) or weight.dtype or args.dtype
-        if (
-            target is None
-            and len(source.shape) >= 2
-            and source.dtype
-            not in (
-                "bool",
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-                "int64",
-                "uint64",
-            )
-        ):
-            target = overrides.get(weight.model_name)
-        target = target or source.dtype
+        target = weight.dtype or args.dtype or source.dtype
         weight.shape = Shape(source.shape)
         operator.args = args.model_copy(update={"dtype": target})
         for tensor in operator.outputs:

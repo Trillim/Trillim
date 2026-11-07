@@ -5,7 +5,6 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from time import monotonic
 
 from .artifacts.artifact_pydantic_models import ExecutableManifest, WorkloadPlan
 from .bench.tune import tune
@@ -22,13 +21,23 @@ from .passes.select import select
 from .passes.trace import trace
 from .passes.validate import validate
 from .passes.verify import verify
+from .passes.walk import collect_checkpoints
 from .weights import resolve_weights, write_weights
 
 
 def compile_model(
     request: CompileRequest, *, progress: Callable[[str], None] | None = None
 ) -> ExecutableManifest:
-    output = request.output.resolve()
+    checkpoint = request.checkpoint_path
+    if checkpoint is None and len(request.checkpoints) == 1:
+        checkpoint = next(iter(request.checkpoints.values()))
+    model_name = request.tdl_path.stem
+    if checkpoint is not None:
+        checkpoint = checkpoint.resolve()
+        model_name = checkpoint.parent.name if checkpoint.is_file() else checkpoint.name
+    output = (
+        request.output or Path.home() / ".trillim/compiled" / model_name
+    ).resolve()
     if output.exists():
         raise FileExistsError(f"output directory already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -43,21 +52,27 @@ def compile_model(
         graph = trace(request)
         validate(graph)
         report("Resolving checkpoint tensors")
-        weights = resolve_weights(graph, request.checkpoints, dtypes=request.dtypes)
+        assert graph.region is not None
+        checkpoints = dict(request.checkpoints)
+        if request.checkpoint_path is not None:
+            missing = set(collect_checkpoints(graph.region)) - checkpoints.keys()
+            if len(missing) != 1:
+                raise ValueError(
+                    "the positional path needs one unbound checkpoint; use --checkpoint NAME=PATH for multiple checkpoints"
+                )
+            checkpoints[missing.pop()] = request.checkpoint_path
+        collect_checkpoints(graph.region, checkpoints)
+        weights = resolve_weights(graph, checkpoints)
         report("Inferring shapes and dtypes")
         inference = infer(
             graph,
-            bounds=request.bounds,
-            value_bounds=request.value_bounds,
-            dtypes=request.dtypes,
+            max_input_size=request.max_input_size,
         )
         report("Simplifying the graph")
         if optimize(graph, inference):
             inference = infer(
                 graph,
-                bounds=request.bounds,
-                value_bounds=request.value_bounds,
-                dtypes=request.dtypes,
+                max_input_size=request.max_input_size,
             )
         validate(graph)
         schedule(graph, inference)
@@ -83,33 +98,50 @@ def compile_model(
         selection = select(
             graph,
             matches,
-            beam_width=request.beam_width,
-            search_seconds=request.search_seconds,
             fast=True,
         )
+        if request.depth == "low":
+            all_matches = replace(
+                all_matches,
+                candidates={
+                    operator: tuple(
+                        candidate
+                        for candidate in candidates
+                        if candidate.covered == selection.calls[operator].covered
+                    )
+                    for operator, candidates in all_matches.candidates.items()
+                    if operator in selection.calls
+                },
+            )
+            matches = replace(
+                matches,
+                candidates={
+                    operator: tuple(
+                        candidate
+                        for candidate in candidates
+                        if candidate.kernel.backend == request.backend
+                    )
+                    for operator, candidates in all_matches.candidates.items()
+                },
+            )
         report("Writing model weights")
         manifest = write_weights(weights, temporary / "weights.bin")
         if request.depth != "none":
             report("Benchmarking representative kernel workloads")
-        deadline = monotonic() + request.search_seconds
-        tuning_request = request.model_copy(
-            update={"search_seconds": request.search_seconds * 0.8}
-        )
         tuning = tune(
             all_matches,
             inference,
             weights,
             manifest,
             temporary / "weights.bin",
-            tuning_request,
+            request,
         )
         if tuning.costs:
             selection = select(
                 graph,
                 matches,
-                beam_width=request.beam_width,
-                search_seconds=max(0.0, deadline - monotonic()),
                 costs=tuning.costs,
+                fast=request.depth != "high",
             )
         report("Allocating intermediate and cache memory")
         layout = allocate(
@@ -118,7 +150,6 @@ def compile_model(
             selection,
             weights,
             manifest,
-            memory_budget=request.memory_budget,
             transfer_kernel=next(
                 (
                     kernel
@@ -153,9 +184,8 @@ def compile_model(
             chosen = select(
                 graph,
                 matches,
-                beam_width=request.beam_width,
-                search_seconds=max(0.0, deadline - monotonic()),
                 costs=costs,
+                fast=request.depth != "high",
             )
             fingerprint = tuple(
                 (id(operator), call.kernel.name)
@@ -168,7 +198,6 @@ def compile_model(
                     chosen,
                     weights,
                     manifest,
-                    memory_budget=request.memory_budget,
                     transfer_kernel=layout.transfer_kernel,
                 )
                 variant = emit(graph, variant_layout, chosen, request, temporary)

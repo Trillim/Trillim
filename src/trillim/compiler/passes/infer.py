@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from functools import reduce
 from itertools import zip_longest
 from typing import cast
@@ -621,44 +620,26 @@ def _join_range(
 
 
 def _input(state: InferenceState, operator: Operator, args: InputArgs) -> None:
-    upper = state.bounds.get(args.name)
-    if upper is not None and (
-        len(upper) != len(args.shape.dimensions) or any(value < 0 for value in upper)
-    ):
-        raise ValueError(f"input {args.name!r} bounds must match its rank")
     tensor = operator.outputs[0]
-    shape = []
-    for axis, dimension in enumerate(args.shape.dimensions):
-        limit = upper[axis] if upper is not None else dimension
-        if dimension is not None:
-            if limit is not None and dimension > limit:
-                raise ValueError(
-                    f"input {args.name!r} fixed dimension exceeds its bound"
-                )
-            shape.append(constant(dimension))
-        else:
-            shape.append(
-                ShapeExpression(
-                    "dimension", tensor=tensor, axis=axis, minimum=0, maximum=limit
-                )
-            )
-    dtype = state.dtypes.get(args.name, args.dtype)
-    interval = state.value_bounds.get(args.name)
-    limits = _type_range(dtype)
-    if (
-        interval is not None
-        and limits is not None
-        and (interval[0] < limits[0] or interval[1] > limits[1])
-    ):
-        raise ValueError(f"input {args.name!r} value bounds exceed its dtype")
-    operator.args = args.model_copy(update={"dtype": dtype})
-    _store(state, tensor, tuple(shape), dtype, value_range=interval)
+    shape = tuple(
+        constant(dimension)
+        if dimension is not None
+        else ShapeExpression(
+            "dimension",
+            tensor=tensor,
+            axis=axis,
+            minimum=0,
+            maximum=state.max_input_size,
+        )
+        for axis, dimension in enumerate(args.shape.dimensions)
+    )
+    _store(state, tensor, shape, args.dtype)
 
 
 def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> None:
     value = args.value
     if isinstance(value, Weight):
-        dtype = state.dtypes.get(value.root, args.dtype or value.dtype)
+        dtype = args.dtype or value.dtype
         shape = (
             None
             if value.shape is None
@@ -772,7 +753,6 @@ def _ordinary(
             operator.outputs[0],
             shape,
             args.cache.dtype,
-            value_range=state.value_bounds.get(args.cache.name),
         )
         return
     output = operator.outputs[0]
@@ -1756,19 +1736,14 @@ def _region(state: InferenceState, region: Region, convert: bool) -> None:
 def infer(
     graph: Graph,
     *,
-    bounds: Mapping[str, tuple[int, ...]] | None = None,
-    dtypes: Mapping[str, DType] | None = None,
-    value_bounds: Mapping[str, tuple[int, int]] | None = None,
+    max_input_size: int | None = None,
 ) -> Inference:
     """Infer logical tensor facts and insert promotions on the existing graph."""
     if graph.region is None:
         raise ValueError("graph must be completed before inference")
-    state = InferenceState(graph, bounds or {}, dtypes or {}, value_bounds or {})
-    unknown = set(state.bounds) - set(graph.inputs)
-    if unknown:
-        raise ValueError(f"shape bounds name unknown inputs: {sorted(unknown)}")
-    if any(low > high for low, high in state.value_bounds.values()):
-        raise ValueError("value bounds require minimum <= maximum")
+    if max_input_size is not None and max_input_size <= 0:
+        raise ValueError("maximum input size must be positive")
+    state = InferenceState(graph, max_input_size)
     _region(state, graph.region, True)
     rebuild(graph)
     return state.result
