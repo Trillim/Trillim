@@ -1,6 +1,6 @@
 # Compiler weights, version 1
 
-`trillim.dtype` defines the public logical dtypes and their canonical encodings. Its encoder and decoder registries contain a function for each dtype. Native integer values retain their NumPy dtype through encoding and decoding, including INT64 and UINT64. BF16 and quantized formats decode to FP32. Backend-specific layouts belong to the compiler.
+`trillim.tdl.core` defines logical dtypes; `trillim.compiler.dtype` implements their canonical encodings. Its encoder and decoder registries contain a function for each dtype. Native integer values retain their NumPy dtype through encoding and decoding, including INT64 and UINT64. BF16 and quantized formats decode to FP32. Backend-specific layouts belong to the compiler.
 
 The compiler weight API is:
 
@@ -26,7 +26,7 @@ The header length includes its trailing spaces. `data_start` is the absolute sta
 
 The header contains `format="trillim.weights"`, `version=1`, `endian="little"`, `data_start`, and an `entries` mapping. Entries record their name, logical reference, dtype, shape, layout, byte extent, representation aliases, import method, and source provenance. Provenance includes the checkpoint-qualified tensor name, original file extent, source dtype/shape, and SHA256 of the source tensor bytes.
 
-`canonical` payloads store value bytes first, followed by their scale sections. Grouped INT5 adds high bits after its BF16 scales. Grouped INT6 then adds high bits and signed subscales. Matrix ternary stores one FP32 gamma after its values. MXFP4 stores E8M0 scales after its packed values. `trillim.dtype.payload_sections` returns the section names and byte lengths. Internal sections have no alignment padding; readers must handle unaligned scales.
+`canonical` payloads store value bytes first, followed by their scale sections. Grouped INT5 adds high bits after its BF16 scales. Grouped INT6 then adds high bits and signed subscales. Matrix ternary stores one FP32 gamma after its values. MXFP4 stores E8M0 scales after its packed values. `trillim.compiler.dtype.payload_sections` returns the section names and byte lengths. Internal sections have no alignment padding; readers must handle unaligned scales.
 
 The writer streams bounded row or column chunks into each section's final position. It does not concatenate independently encoded chunks, which would interleave value and scale sections incorrectly. It writes a temporary file and replaces the destination after completion.
 

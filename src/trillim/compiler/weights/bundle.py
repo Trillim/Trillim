@@ -10,8 +10,8 @@ from typing import BinaryIO
 import numpy as np
 from numpy.typing import NDArray
 
-from ... import dtype as codec
-from ...dtype import DType
+from ...tdl.core.types import DType
+from .. import dtype as codec
 from .reader import CHUNK_BYTES, read_values, unchanged
 from .weights_dataclasses import WeightEntry, WeightIndex, WeightRequest, WeightSource
 from .weights_pydantic_models import SourceProvenance, WeightManifest, WeightRecord

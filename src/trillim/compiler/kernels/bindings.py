@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import get_args
 
-from ...dtype import DType
+from ...tdl.core.types import DType
 from ..compiler_dataclasses import ShapeExpression
 from ..passes.infer import constant, expression
 from .kernel_dataclasses import KernelBindingContext, ParameterValue, TensorBinding

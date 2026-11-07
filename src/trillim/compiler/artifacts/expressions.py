@@ -109,7 +109,8 @@ def serialize(
 
 
 def byte_size(dtype: str, shape: tuple[int, ...]) -> int:
-    from ...dtype import payload_sections, validate_dtype
+    from ...tdl.core.types import validate_dtype
+    from ..dtype import payload_sections
 
     if any(dimension < 0 for dimension in shape):
         raise ValueError("tensor capacity cannot be negative")

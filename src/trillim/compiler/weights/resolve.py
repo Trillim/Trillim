@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-from ...dtype import DType
 from ...tdl.core.core_dataclasses import Shape
 from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
 from ...tdl.core.graph import Graph
+from ...tdl.core.types import DType
 from ..passes.walk import walk
 from .reader import LOGICAL_DTYPES, load_checkpoint
 from .weights_dataclasses import Checkpoint, WeightBinding, WeightEntry, WeightIndex
