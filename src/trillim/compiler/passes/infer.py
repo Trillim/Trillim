@@ -47,6 +47,7 @@ from ..compiler_dataclasses import (
     ShapePredicate,
     TensorInfo,
 )
+from ..dtype import QUANTIZED_DTYPES
 from .rewrite import rebuild
 from .walk import ordered_operators
 
@@ -208,17 +209,6 @@ def expression(op: ShapeOperation, *args: ShapeExpression) -> ShapeExpression:
 
 
 _FLOATS = {"fp16", "bf16", "fp32"}
-_QUANTIZED = {
-    "row_int8",
-    "mat_ternary",
-    "grp_int8",
-    "grp_int4",
-    "grp_int5",
-    "dubgrp_int6",
-    "grp_binary",
-    "grp_ternary",
-    "mxfp4",
-}
 _INTEGERS = {"int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"}
 
 
@@ -227,7 +217,7 @@ def _integer(dtype: DType | None) -> bool:
 
 
 def _promote(left: DType, right: DType, *, numeric: bool = True) -> DType:
-    if left in _QUANTIZED or right in _QUANTIZED:
+    if left in QUANTIZED_DTYPES or right in QUANTIZED_DTYPES:
         return "fp32"
     if left == right:
         return "int64" if numeric and left == "bool" else left
@@ -268,7 +258,7 @@ def _binary_dtype(
 ) -> DType:
     if isinstance(right, Tensor):
         return _promote(left, _dtype(state, right), numeric=numeric)
-    if left in _QUANTIZED:
+    if left in QUANTIZED_DTYPES:
         return "fp32"
     if left in _FLOATS:
         return left

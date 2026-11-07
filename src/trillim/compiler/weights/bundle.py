@@ -16,17 +16,6 @@ from .reader import CHUNK_BYTES, read_values, unchanged
 from .weights_dataclasses import WeightEntry, WeightIndex, WeightRequest, WeightSource
 from .weights_pydantic_models import SourceProvenance, WeightManifest, WeightRecord
 
-_GROUPS: dict[DType, int] = {
-    "mat_ternary": 128,
-    "grp_binary": 128,
-    "grp_ternary": 128,
-    "grp_int4": 32,
-    "grp_int5": 32,
-    "grp_int8": 32,
-    "dubgrp_int6": 256,
-    "mxfp4": 32,
-}
-
 
 def _matrix(shape: tuple[int, ...]) -> tuple[int, int]:
     return (shape[0], math.prod(shape[1:])) if len(shape) > 1 else (1, math.prod(shape))
@@ -143,7 +132,9 @@ def _chunks(entry: WeightEntry, target: DType) -> Iterator[tuple[int, int, int, 
     if rows == 0 or columns == 0:
         return
     limit = CHUNK_BYTES // 8
-    alignment = math.lcm(_GROUPS.get(target, 1), 32 if entry.method == "mxfp4" else 1)
+    alignment = math.lcm(
+        codec.GROUP_SIZES.get(target, 1), 32 if entry.method == "mxfp4" else 1
+    )
     if columns <= limit:
         batch = max(1, limit // columns)
         for row in range(0, rows, batch):

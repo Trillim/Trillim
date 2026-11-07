@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 from ...tdl.core.tensor import Tensor
 from ..compiler_dataclasses import ShapeExpression
+from ..dtype import payload_sections
 from ..kernels.kernel_dataclasses import ParameterValue
 from .artifact_dataclasses import JSON, Expressions
 
@@ -109,12 +110,7 @@ def serialize(
 
 
 def byte_size(dtype: str, shape: tuple[int, ...]) -> int:
-    from ...tdl.core.types import validate_dtype
-    from ..dtype import payload_sections
-
-    if any(dimension < 0 for dimension in shape):
-        raise ValueError("tensor capacity cannot be negative")
-    return sum(size for _, size in payload_sections(validate_dtype(dtype), shape))
+    return sum(size for _, size in payload_sections(dtype, shape))
 
 
 def align(value: int, alignment: int) -> int:

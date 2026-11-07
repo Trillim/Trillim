@@ -75,7 +75,7 @@ Encoded = tuple[NDArray[np.uint8], DType]
 Encoder = Callable[[NDArray[np.generic]], Encoded]
 Decoder = Callable[[NDArray[np.uint8], int, int], NDArray[np.generic]]
 
-_NATIVE: dict[DType, np.dtype[np.generic]] = {
+NATIVE_DTYPES: dict[DType, np.dtype[np.generic]] = {
     "bool": np.dtype("bool"),
     "int8": np.dtype("int8"),
     "uint8": np.dtype("uint8"),
@@ -89,7 +89,8 @@ _NATIVE: dict[DType, np.dtype[np.generic]] = {
     "fp32": np.dtype("float32"),
 }
 
-_GROUP_SIZE: dict[DType, int] = {
+GROUP_SIZES: dict[DType, int] = {
+    "mat_ternary": 128,
     "grp_int8": 32,
     "grp_int4": 32,
     "grp_int5": 32,
@@ -98,6 +99,8 @@ _GROUP_SIZE: dict[DType, int] = {
     "grp_ternary": 128,
     "mxfp4": 32,
 }
+
+QUANTIZED_DTYPES: frozenset[DType] = frozenset({"row_int8", *GROUP_SIZES})
 
 _MXFP4_MAGNITUDES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
 _MXFP4_VALUES = np.concatenate((_MXFP4_MAGNITUDES, -_MXFP4_MAGNITUDES))
@@ -213,7 +216,7 @@ def _matrix_shape(
     shape: tuple[int, ...], transpose: bool, groups: int
 ) -> tuple[int, int]:
     if any(dimension < 0 for dimension in shape):
-        raise ValueError("codec requires nonnegative tensor dimensions")
+        raise ValueError("tensor dimensions cannot be negative")
     if groups <= 0:
         raise ValueError("groups must be positive")
 
@@ -257,7 +260,7 @@ def _from_rows(
 
 
 def encode_native(target: DType, tensor: NDArray[np.generic]) -> Encoded:
-    return _pack(target, tensor.astype(_NATIVE[target]))
+    return _pack(target, tensor.astype(NATIVE_DTYPES[target]))
 
 
 def encode_bf16(tensor: NDArray[np.generic]) -> Encoded:
@@ -375,8 +378,8 @@ def payload_sections(
 ) -> tuple[tuple[str, int], ...]:
     target = validate_dtype(dtype)
     rows, columns = _matrix_shape(shape, transpose, groups)
-    if target in _NATIVE:
-        return (("values", rows * columns * _NATIVE[target].itemsize),)
+    if target in NATIVE_DTYPES:
+        return (("values", rows * columns * NATIVE_DTYPES[target].itemsize),)
     if target == "bf16":
         return (("values", rows * columns * 2),)
     if rows == 0 or columns == 0:
@@ -385,7 +388,7 @@ def payload_sections(
         return (("values", rows * columns), ("scales", rows * 2))
     if target == "mat_ternary":
         return (("values", rows * ((columns + 127) // 128) * 32), ("scale", 4))
-    size = _GROUP_SIZE[target]
+    size = GROUP_SIZES[target]
     count = rows * ((columns + size - 1) // size)
     widths = {
         "mxfp4": 16,
@@ -410,7 +413,7 @@ def payload_sections(
 def decode_native(
     target: DType, payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
-    native = _NATIVE[target]
+    native = NATIVE_DTYPES[target]
     (values,) = _split(payload, (rows * columns * native.itemsize,))
     return _view(values, native, (rows, columns))
 
@@ -463,7 +466,7 @@ def decode_mxfp4(
 def _group_parts(
     payload: NDArray[np.uint8], dtype: DType, rows: int, columns: int
 ) -> tuple[tuple[NDArray[np.uint8], ...], NDArray[np.float32], int]:
-    count = (columns + _GROUP_SIZE[dtype] - 1) // _GROUP_SIZE[dtype]
+    count = (columns + GROUP_SIZES[dtype] - 1) // GROUP_SIZES[dtype]
     parts = _split(
         payload, tuple(length for _, length in payload_sections(dtype, (rows, columns)))
     )
@@ -549,7 +552,7 @@ def decode_grp_int5(
 
 
 ENCODERS: dict[DType, Encoder] = {
-    name: partial(encode_native, name) for name in _NATIVE
+    name: partial(encode_native, name) for name in NATIVE_DTYPES
 }
 ENCODERS.update(
     {
@@ -566,7 +569,7 @@ ENCODERS.update(
     }
 )
 DECODERS: dict[DType, Decoder] = {
-    name: partial(decode_native, name) for name in _NATIVE
+    name: partial(decode_native, name) for name in NATIVE_DTYPES
 }
 DECODERS.update(
     {
@@ -592,7 +595,7 @@ def encode(
     source = _to_rows(np.asarray(tensor), transpose, groups)
     if source.dtype.kind not in "biuf":
         raise TypeError("encode requires real numeric or boolean values")
-    if target not in _NATIVE and target != "bf16":
+    if target not in NATIVE_DTYPES and target != "bf16":
         if source.size == 0:
             raise ValueError("packed dtypes require nonempty tensor dimensions")
         with np.errstate(over="ignore"):

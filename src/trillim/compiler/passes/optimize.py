@@ -37,24 +37,13 @@ from ...tdl.core.operator import Operator
 from ...tdl.core.tensor import Tensor
 from ...tdl.core.types import DType
 from ..compiler_dataclasses import Inference, OptimizationState, TensorInfo
+from ..dtype import QUANTIZED_DTYPES, decode, encode
 from .rewrite import rebuild, replace_arguments, replace_tensors
 from .walk import ordered_operators, walk
 
 _LIMIT = 65536
 _UNHASHABLE = object()
-_NATIVE_WEIGHT_TYPES = {
-    "bf16",
-    "fp16",
-    "row_int8",
-    "mat_ternary",
-    "grp_int8",
-    "grp_int4",
-    "grp_int5",
-    "dubgrp_int6",
-    "grp_binary",
-    "grp_ternary",
-    "mxfp4",
-}
+_FUSED_WEIGHT_DTYPES = QUANTIZED_DTYPES | {"bf16", "fp16"}
 
 
 def _effective_dtype(tensor: Tensor, state: OptimizationState) -> DType | None:
@@ -106,12 +95,10 @@ def _matrix_uses(
         elif isinstance(args, MatmulArgs):
             other = args.b if args.a is tensor else args.a
             other_dtype = _effective_dtype(other, state)
-            if consumer.outputs[
-                0
-            ].dtype != "fp32" or other_dtype not in _NATIVE_WEIGHT_TYPES - {
-                "bf16",
-                "fp16",
-            } | {"fp32"}:
+            if (
+                consumer.outputs[0].dtype != "fp32"
+                or other_dtype not in QUANTIZED_DTYPES | {"fp32"}
+            ):
                 return False
         elif consumer.op != "shape":
             return False
@@ -125,7 +112,7 @@ def _weight_casts(graph: Graph, state: OptimizationState) -> None:
         if (
             isinstance(args, CastArgs)
             and args.dtype == "fp32"
-            and args.x.dtype in _NATIVE_WEIGHT_TYPES
+            and args.x.dtype in _FUSED_WEIGHT_DTYPES
             and _weight_source(args.x)
             and _matrix_uses(operator.outputs[0], state, set())
         ):
@@ -136,31 +123,9 @@ def _weight_casts(graph: Graph, state: OptimizationState) -> None:
 def _convert(
     value: NDArray[np.generic], dtype: DType | None
 ) -> NDArray[np.generic] | None:
-    if dtype is None:
+    if dtype is None or dtype in QUANTIZED_DTYPES:
         return None
-    if dtype == "bf16":
-        source = np.asarray(value, dtype=np.float32)
-        bits = source.view(np.uint32)
-        rounded = (
-            (bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)
-        ).view(np.float32)
-        return np.where(np.isnan(source), source, rounded)
-    name = {"fp16": "float16", "fp32": "float32"}.get(dtype, dtype)
-    if dtype not in {
-        "bool",
-        "fp16",
-        "fp32",
-        "int8",
-        "uint8",
-        "int16",
-        "uint16",
-        "int32",
-        "uint32",
-        "int64",
-        "uint64",
-    }:
-        return None
-    return value.astype(np.dtype[np.generic](name), copy=False)
+    return decode(encode(value, dtype), value.shape)
 
 
 def _shape(tensor: Tensor, state: OptimizationState) -> tuple[int, ...] | None:
@@ -430,20 +395,7 @@ def _weight_view(
             weight_producer is not None
             and isinstance(weight_producer.args, ConstantArgs)
             and isinstance(weight_producer.args.value, Weight)
-            and args.x.dtype
-            in {
-                "bf16",
-                "fp16",
-                "row_int8",
-                "mat_ternary",
-                "grp_int8",
-                "grp_int4",
-                "grp_int5",
-                "dubgrp_int6",
-                "grp_binary",
-                "grp_ternary",
-                "mxfp4",
-            }
+            and args.x.dtype in _FUSED_WEIGHT_DTYPES
         ):
             return args.x, ()
     if isinstance(args, (ReshapeArgs, PermuteArgs, BroadcastArgs)):
