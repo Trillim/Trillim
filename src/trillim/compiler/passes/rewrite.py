@@ -63,63 +63,10 @@ def _tensor(value: Tensor, replacements: Mapping[Tensor, Tensor]) -> Tensor:
     return result
 
 
-def replace_tensor(graph: Graph, old: Tensor, new: Tensor) -> None:
-    """Replace uses, including captures and public outputs, on the existing graph."""
-    if graph.region is None:
-        raise ValueError("graph must be completed before rewriting")
-    if old is new:
-        return
-    _replace(graph.region, {old: new})
-    rebuild(graph)
-
-
 def replace_tensors(graph: Graph, replacements: Mapping[Tensor, Tensor]) -> None:
     if graph.region is None:
         raise ValueError("graph must be completed before rewriting")
     _replace(graph.region, replacements)
-    rebuild(graph)
-
-
-def replace_operator(
-    graph: Graph,
-    old: Operator,
-    replacements: tuple[Operator, ...],
-    *,
-    outputs: tuple[Tensor, ...] | None = None,
-) -> None:
-    if graph.region is None:
-        raise ValueError("graph must be completed before rewriting")
-    results = (
-        outputs
-        if outputs is not None
-        else replacements[-1].outputs
-        if replacements
-        else ()
-    )
-    if len(results) != len(old.outputs):
-        raise ValueError("operator replacement must preserve output arity")
-
-    def edit(region: Region) -> bool:
-        for index, operator in enumerate(region.operators):
-            if operator is old:
-                for replacement in replacements:
-                    replacement.dependencies = tuple(
-                        dict.fromkeys((*old.dependencies, *replacement.dependencies))
-                    )
-                region.operators = (
-                    *region.operators[:index],
-                    *replacements,
-                    *region.operators[index + 1 :],
-                )
-                return True
-            for body in operator.regions:
-                if edit(body):
-                    return True
-        return False
-
-    if not edit(graph.region):
-        raise ValueError("operator does not belong to this graph")
-    _replace(graph.region, dict(zip(old.outputs, results, strict=True)))
     rebuild(graph)
 
 
