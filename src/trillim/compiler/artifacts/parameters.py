@@ -61,7 +61,7 @@ def pack(
                 raise ValueError(f"expected scalar parameter: {item.name}")
             argument = _checked_scalar(item.type, argument, item.name)
             setattr(value, item.name, argument)
-    return PackedParameters(value, c.addressof(value), owners)
+    return PackedParameters(c.addressof(value), owners)
 
 
 def requirements(

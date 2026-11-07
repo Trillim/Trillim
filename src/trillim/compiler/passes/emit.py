@@ -24,7 +24,7 @@ from ..artifacts import transfers
 from ..artifacts.artifact_dataclasses import JSON, Expressions, Layout
 from ..artifacts.artifact_pydantic_models import ExecutableManifest
 from ..artifacts.expressions import align, byte_size, number, references, serialize
-from ..compiler_dataclasses import ShapeConstraint
+from ..compiler_dataclasses import ShapeConstraint, ShapeExpression
 from ..compiler_pydantic_models import CompileRequest
 from ..kernels.kernel_dataclasses import ParameterValue
 from .passes_dataclasses import Selection
@@ -33,8 +33,6 @@ from .passes_dataclasses import Selection
 def _parameter(
     value: ParameterValue, names: dict[Tensor, str], expressions: Expressions
 ) -> JSON:
-    from ..compiler_dataclasses import ShapeExpression
-
     if isinstance(value, ShapeExpression):
         return serialize(value, names, expressions)
     if isinstance(value, tuple):

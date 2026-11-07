@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ...tdl.core.core_dataclasses import Region
 from ...tdl.core.graph import Graph
 from ...tdl.core.operator import Operator
 from ...tdl.core.tensor import Tensor
@@ -32,7 +31,6 @@ class KernelPattern:
 @dataclass(slots=True)
 class MatchSet:
     candidates: dict[Operator, tuple[KernelMatch, ...]] = field(default_factory=dict)
-    owners: dict[Operator, Region] = field(default_factory=dict)
     views: set[Operator] = field(default_factory=set)
     rejections: dict[Operator, dict[str, str]] = field(default_factory=dict)
 

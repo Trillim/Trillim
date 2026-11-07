@@ -23,7 +23,7 @@ from ...tdl.core.core_pydantic_models import (
 )
 from ...tdl.core.operator import Operator
 from ...tdl.core.tensor import Tensor
-from ..artifacts.expressions import bound, byte_size
+from ..artifacts.expressions import bound, byte_size, parameter_references
 from ..artifacts.parameters import requirements
 from ..compiler_dataclasses import Inference, ShapeConstraint, ShapeExpression
 from ..kernels.bindings import (
@@ -425,24 +425,6 @@ def _tensor_arguments(value: object, name: str) -> dict[str, Tensor]:
     return {}
 
 
-def _references(value: object) -> set[Tensor]:
-    result: set[Tensor] = set()
-    visited: set[ShapeExpression] = set()
-    pending = [value]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, ShapeExpression):
-            if item in visited:
-                continue
-            visited.add(item)
-            if item.tensor is not None:
-                result.add(item.tensor)
-            pending.extend(item.args)
-        elif isinstance(item, tuple):
-            pending.extend(item)
-    return result
-
-
 def _safe_boundary(tensor: Tensor, internals: set[Operator]) -> bool:
     producer = tensor.producer
     if producer not in internals:
@@ -470,8 +452,7 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
     for constraint in inference.constraints:
         constraints.setdefault(constraint.operator, []).append(constraint)
     cache: dict[tuple[int, object], KernelPattern | None] = {}
-    for region, operator in walk(graph.region):
-        result.owners[operator] = region
+    for _, operator in walk(graph.region):
         if isinstance(operator.args, (PermuteArgs, BroadcastArgs)):
             result.views.add(operator)
         elif isinstance(operator.args, ReshapeArgs):
@@ -561,12 +542,13 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                 )
                 parameters = kernel.bind(context)
                 references = set().union(
-                    *(_references(value) for value in parameters.values())
+                    *(parameter_references(value) for value in parameters.values())
                 )
                 for owner in (*covered, None):
                     for constraint in constraints.get(owner, ()):
                         references.update(
-                            _references(constraint.left) | _references(constraint.right)
+                            parameter_references(constraint.left)
+                            | parameter_references(constraint.right)
                         )
                 eliminated = {
                     value

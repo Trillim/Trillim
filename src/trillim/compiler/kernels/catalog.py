@@ -23,7 +23,10 @@ def discover(backends: tuple[Backend, ...] = ("scalar", "avx2")) -> tuple[Kernel
     result: list[Kernel] = []
     for backend in backends:
         artifact = build(backend)
-        library = _LIBRARIES.setdefault(artifact.library, c.CDLL(str(artifact.library)))
+        library = _LIBRARIES.get(artifact.library)
+        if library is None:
+            library = c.CDLL(str(artifact.library))
+            _LIBRARIES[artifact.library] = library
         for name in artifact.symbols:
             capability_function = getattr(library, f"{name}_capabilities")
             capability_function.argtypes, capability_function.restype = (
@@ -70,7 +73,6 @@ def discover(backends: tuple[Backend, ...] = ("scalar", "avx2")) -> tuple[Kernel
                     ),
                     binder,
                     artifact.library,
-                    tdl,
                     cast(tuple[str, ...] | None, physical),
                 )
             )

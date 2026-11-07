@@ -173,7 +173,7 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
                 if embedding in tensors:
                     aliases[head] = embedding
                     break
-    return Checkpoint(name, directory, config, tensors, aliases)
+    return Checkpoint(name, config, tensors, aliases)
 
 
 def unchanged(source: WeightSource) -> None:

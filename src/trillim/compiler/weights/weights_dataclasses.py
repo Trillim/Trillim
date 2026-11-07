@@ -32,7 +32,6 @@ class WeightSource:
 @dataclass(slots=True)
 class Checkpoint:
     name: str
-    path: Path
     config: CheckpointConfig
     tensors: dict[str, WeightSource]
     aliases: dict[str, str] = field(default_factory=dict)
