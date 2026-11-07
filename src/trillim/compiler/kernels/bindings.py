@@ -545,7 +545,7 @@ def avx2_bitlinear(context: KernelBindingContext) -> dict[str, ParameterValue]:
     result = bitlinear(context)
     width = context.inputs["x"].shape[-1]
     if width.op != "const" or width.value is None or width.value % 128:
-        raise ValueError("AVX2 BitLinear requires a fixed width divisible by128")
+        raise ValueError("AVX2 BitLinear requires a fixed width divisible by 128")
     return result
 
 

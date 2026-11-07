@@ -20,7 +20,7 @@ def _checkpoint(value: str) -> tuple[str, Path]:
 def _shape(value: str) -> tuple[str, tuple[int, ...]]:
     name, separator, dimensions = value.partition("=")
     try:
-        shape = tuple(int(item) for item in dimensions.split(",") if item)
+        shape = tuple(int(item) for item in dimensions.split(",")) if dimensions else ()
     except ValueError as error:
         raise ArgumentTypeError(
             "expected NAME=DIM,DIM with integer dimensions"
@@ -38,13 +38,15 @@ def _dtype(value: str) -> tuple[str, str]:
 
 
 def _value_bound(value: str) -> tuple[str, tuple[int, int]]:
-    name, text = _dtype(value)
+    name, separator, text = value.partition("=")
     try:
         bounds = tuple(int(item) for item in text.split(","))
     except ValueError as error:
         raise ArgumentTypeError("expected NAME=MIN,MAX") from error
-    if len(bounds) != 2 or bounds[0] > bounds[1]:
+    if not separator or not name or len(bounds) != 2:
         raise ArgumentTypeError("expected NAME=MIN,MAX")
+    if bounds[0] > bounds[1]:
+        raise ArgumentTypeError("expected NAME=MIN,MAX with MIN <= MAX")
     return name, (bounds[0], bounds[1])
 
 
@@ -105,4 +107,6 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
             }
         )
     except ValidationError as error:
-        parser.error(error.errors()[0]["msg"])
+        detail = error.errors()[0]
+        field = ".".join(str(item) for item in detail["loc"])
+        parser.error(f"{field}: {detail['msg']}")
