@@ -45,7 +45,7 @@ def Linear(
 
 @Construct
 def BitLinear(x: Tensor, weight: Value) -> Tensor:
-    """Apply BitNet's nearest-even activation quantization before a projection."""
+    """Project nearest-even INT8 activation codes and rescale the output to FP32."""
     scale = Div(Constant(127.0), Maximum(Max(Abs(x), axes=(-1,), keepdims=True), 1e-5))
     scaled = Mul(x, scale)
     magnitude = Abs(scaled)
@@ -58,5 +58,5 @@ def BitLinear(x: Tensor, weight: Value) -> Tensor:
     )
     rounded = Add(integer, Cast(increment, "int64"))
     signed = Select(Compare(scaled, 0.0, predicate="lt"), Mul(rounded, -1), rounded)
-    quantized = Div(Cast(Clip(signed, -128, 127), "fp32"), scale)
-    return Linear(quantized, weight)
+    quantized = Cast(Clip(signed, -128, 127), "int8")
+    return Div(Linear(quantized, weight), scale)
