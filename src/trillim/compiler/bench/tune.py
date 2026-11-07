@@ -526,6 +526,7 @@ def _code_key() -> str:
         directory / "native.c",
         directory / "native.h",
         directory.parent / "artifacts/parameters.py",
+        directory.parent / "dtype.py",
         directory.parent / "kernels/bindings.py",
     ]
     digest = hashlib.sha256()
@@ -798,11 +799,9 @@ def tune(
                                 libraries,
                             )
                             keys[reference_signature, None] = reference_key
+                            assert golden is not None
                             footprint = requirements(
-                                reference.kernel.parameter_schema,
-                                golden.parameters
-                                if golden is not None
-                                else _parameters(reference, point, state),
+                                reference.kernel.parameter_schema, golden.parameters
                             )
                             size = (
                                 sum(
@@ -813,8 +812,6 @@ def tune(
                                 )
                                 + sum(footprint.outputs)
                                 + footprint.scratch
-                                if golden is not None
-                                else 0
                             )
                             samples = profile.reference_samples
                             scalar_profile = BenchmarkResult(
