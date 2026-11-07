@@ -20,7 +20,13 @@ def _checkpoint(value: str) -> tuple[str, Path]:
 def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
     parser = ArgumentParser(prog="trillim compile")
     parser.add_argument("tdl_path", type=Path)
-    parser.add_argument("checkpoint_path", type=Path, nargs="?")
+    parser.add_argument(
+        "checkpoints",
+        type=_checkpoint,
+        nargs="*",
+        metavar="NAME=PATH",
+        help="bind each TDL checkpoint name to its weights file or directory",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--backend", choices=("scalar", "x86", "neon"))
     parser.add_argument("--depth", choices=("none", "low", "high"), default="none")
@@ -31,15 +37,7 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
         default=4096,
         help="maximum length of each variable input dimension (default: 4096)",
     )
-    parser.add_argument(
-        "--checkpoint",
-        dest="checkpoints",
-        action="append",
-        type=_checkpoint,
-        metavar="NAME=PATH",
-        help="bind a checkpoint name to a path; repeat for additional checkpoints",
-    )
-    arguments = parser.parse_args(args, namespace=CompileArguments())
+    arguments = parser.parse_intermixed_args(args, namespace=CompileArguments())
     checkpoints: dict[str, Path] = {}
     for name, path in arguments.checkpoints:
         if name in checkpoints:
@@ -48,7 +46,6 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
     values: dict[str, object] = {
         "tdl_path": arguments.tdl_path,
         "checkpoints": checkpoints,
-        "checkpoint_path": arguments.checkpoint_path,
         "output": arguments.output,
         "depth": arguments.depth,
         "max_input_size": arguments.max_input_size,
