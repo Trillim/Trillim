@@ -688,7 +688,9 @@ def tune(
     planning_seconds = monotonic() - started
     state.deadline = monotonic() + request.search_seconds
     for operator_index, (operator, candidates) in groups:
-        ordered = sorted(candidates, key=lambda value: value.kernel.backend != "avx2")
+        ordered = sorted(
+            candidates, key=lambda value: -len(value.kernel.capabilities.hardware)
+        )
         for point in points:
             costs = result.per_workload.setdefault(point, {})
             for candidate in ordered:

@@ -53,7 +53,7 @@ TRILLIM_AVX2 static TrillimStatus linear_task(void *opaque, size_t index, size_t
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_linear(
+TRILLIM_KERNEL TrillimStatus trillim_x86_linear_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -67,18 +67,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_linear(
     return context->thread_pool->run(context->thread_pool->context, p->batches * p->m * tiles, linear_task, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_linear_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_linear_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import avx2_linear as bind\n"
            "def pattern(x: Tensor, weight: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Linear(x, weight),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_linear_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_linear_avx2_parameters(void) {
     return trillim_matmul_schema();
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_linear_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_linear_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

@@ -48,7 +48,7 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_rmsnorm(
+TRILLIM_KERNEL TrillimStatus trillim_x86_rmsnorm_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -61,18 +61,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_rmsnorm(
     return context->thread_pool->run(context->thread_pool->context, p->rows, normalize, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_rmsnorm_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_rmsnorm_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import avx2_rmsnorm as bind\n"
            "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0) -> tuple[Tensor, ...]:\n"
            "    return (RMSNorm(x, weight=weight, eps=eps, weight_offset=weight_offset),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_rmsnorm_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_rmsnorm_avx2_parameters(void) {
     return trillim_rms_schema(true);
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_rmsnorm_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_rmsnorm_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

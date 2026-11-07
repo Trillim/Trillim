@@ -10,7 +10,7 @@ from ...tdl.core.core_dataclasses import TensorTuple
 from ...tdl.core.types import DType
 from ..compiler_dataclasses import ShapeExpression
 
-Backend = Literal["scalar", "avx2"]
+Backend = Literal["scalar", "x86", "neon"]
 ParameterValue = (
     int | float | ShapeExpression | tuple[int | float | ShapeExpression, ...]
 )

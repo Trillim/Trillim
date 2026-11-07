@@ -1,6 +1,6 @@
 #include "activation_avx2.h"
 
-TRILLIM_KERNEL TrillimStatus trillim_avx2_relu_squared_mul(
+TRILLIM_KERNEL TrillimStatus trillim_x86_relu_squared_mul_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -15,18 +15,18 @@ TRILLIM_KERNEL TrillimStatus trillim_avx2_relu_squared_mul(
         p->count / 1024 + (p->count % 1024 != 0), trillim_activation_task_avx2, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_avx2_relu_squared_mul_tdl(void) {
+TRILLIM_KERNEL const char *trillim_x86_relu_squared_mul_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import activation as bind\n"
            "def pattern(a: Tensor, b: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Mul(ReluSquared(a), b),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_avx2_relu_squared_mul_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_relu_squared_mul_avx2_parameters(void) {
     return trillim_activation_schema();
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_avx2_relu_squared_mul_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "avx2", "avx2", "m"};
+TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_relu_squared_mul_avx2_capabilities(void) {
+    static const TrillimCapabilities capabilities = {1, "x86", "avx2", "m"};
     return &capabilities;
 }

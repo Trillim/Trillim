@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import signal
 import subprocess
 import tempfile
@@ -30,10 +31,25 @@ def _run(command: list[str]) -> None:
         raise
 
 
+def host_backend() -> Backend:
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64", "i386", "i686"}:
+        return "x86"
+    if machine in {"aarch64", "arm64", "armv7l", "armv8l"}:
+        return "neon"
+    return "scalar"
+
+
 def build(backend: Backend) -> BuildArtifact:
+    if backend != "scalar" and backend != host_backend():
+        raise ValueError(
+            f"cannot build {backend} kernels on a {platform.machine()} host"
+        )
     kernel_root = _ROOT / "src/trillim/kernels"
     sources = sorted((kernel_root / backend).glob("*.c"))
-    fallback = sorted((kernel_root / "scalar").glob("*.c")) if backend == "avx2" else []
+    fallback = (
+        sorted((kernel_root / "scalar").glob("*.c")) if backend != "scalar" else []
+    )
     if not sources and not fallback:
         raise ValueError(f"no kernels for backend {backend}")
     headers = sorted(kernel_root.rglob("*.h"))
@@ -49,7 +65,7 @@ def build(backend: Backend) -> BuildArtifact:
     directory = parent / digest.hexdigest()[:16]
     library = directory / "kernels.so"
     symbols = [f"trillim_{backend}_{source.stem}" for source in sources]
-    symbols.extend(f"trillim_avx2_scalar_{source.stem}" for source in fallback)
+    symbols.extend(f"trillim_{backend}_scalar_{source.stem}" for source in fallback)
     if library.exists():
         return BuildArtifact(backend, library, tuple(symbols), directory / "backend.o")
     parent.mkdir(parents=True, exist_ok=True)
@@ -63,8 +79,8 @@ def build(backend: Backend) -> BuildArtifact:
                 target = generated / source.name
                 target.write_text(
                     source.read_text()
-                    .replace("trillim_scalar_", "trillim_avx2_scalar_")
-                    .replace('"scalar"', '"avx2"')
+                    .replace("trillim_scalar_", f"trillim_{backend}_scalar_")
+                    .replace('"scalar"', f'"{backend}"')
                 )
                 compiled_sources.append(target)
         objects: list[Path] = []
