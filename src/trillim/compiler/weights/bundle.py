@@ -263,19 +263,6 @@ def _write_entry(
         raise RuntimeError(f"canonical section lengths disagree: {entry.identity}")
 
 
-def _requests(index: WeightIndex) -> list[WeightRequest]:
-    targets: dict[str, set[DType]] = {}
-    for binding in index.bindings.values():
-        targets.setdefault(binding.logical, set()).add(binding.dtype)
-    return [
-        WeightRequest(
-            logical, dtype, name=logical if len(dtypes) == 1 else f"{logical}@{dtype}"
-        )
-        for logical, dtypes in targets.items()
-        for dtype in sorted(dtypes)
-    ]
-
-
 def write_weights(
     index: WeightIndex,
     destination: Path,
@@ -283,18 +270,26 @@ def write_weights(
 ) -> WeightManifest:
     """Stream canonical weights into one version1 JSON-header binary bundle."""
     destination = destination.resolve()
-    requests = (
-        list(required_representations)
-        if required_representations is not None
-        else _requests(index)
-    )
+    if required_representations is None:
+        targets: dict[str, set[DType]] = {}
+        for binding in index.bindings.values():
+            targets.setdefault(binding.logical, set()).add(binding.dtype)
+        required_representations = [
+            WeightRequest(
+                logical,
+                dtype,
+                name=logical if len(dtypes) == 1 else f"{logical}@{dtype}",
+            )
+            for logical, dtypes in targets.items()
+            for dtype in sorted(dtypes)
+        ]
     records: dict[str, WeightRecord] = {}
     work: dict[tuple[str, DType, str], tuple[WeightEntry, WeightRequest, int]] = {}
     fingerprints: dict[WeightSource, SourceProvenance] = {}
     offsets: dict[tuple[str, DType, str], int] = {}
     names_by_key: dict[tuple[str, DType, str], list[str]] = {}
     total = 0
-    for request in requests:
+    for request in required_representations:
         if request.packing != "canonical":
             raise ValueError(f"unsupported backend weight packing: {request.packing}")
         entry = index.sources[request.logical]

@@ -8,14 +8,17 @@ from pathlib import Path
 from time import monotonic
 
 from .artifacts.artifact_pydantic_models import ExecutableManifest, WorkloadPlan
+from .bench.tune import tune
 from .compiler_pydantic_models import CompileRequest
-from .kernels import discover
+from .kernels.catalog import discover
 from .kernels.kernel_dataclasses import Backend
 from .passes.allocate import allocate
 from .passes.emit import emit
 from .passes.infer import infer
 from .passes.match import match
+from .passes.optimize import optimize
 from .passes.schedule import schedule
+from .passes.select import select
 from .passes.trace import trace
 from .passes.validate import validate
 from .passes.verify import verify
@@ -25,9 +28,6 @@ from .weights import resolve_weights, write_weights
 def compile_model(
     request: CompileRequest, *, progress: Callable[[str], None] | None = None
 ) -> ExecutableManifest:
-    from .passes.optimize import optimize
-    from .passes.select import select
-
     output = request.output.resolve()
     if output.exists():
         raise FileExistsError(f"output directory already exists: {output}")
@@ -89,8 +89,6 @@ def compile_model(
         )
         report("Writing model weights")
         manifest = write_weights(weights, temporary / "weights.bin")
-        from .bench.tune import tune
-
         if request.depth != "none":
             report("Benchmarking representative kernel workloads")
         deadline = monotonic() + request.search_seconds

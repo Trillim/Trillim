@@ -10,20 +10,6 @@ from .artifact_dataclasses import PackedParameters, Requirements
 from .expressions import bound
 
 
-def maximum_parameters(
-    parameters: Mapping[str, ParameterValue],
-) -> dict[str, int | float | tuple[int | float, ...]]:
-    def scalar(value: float | ShapeExpression) -> int | float:
-        return bound(value) if isinstance(value, ShapeExpression) else value
-
-    return {
-        name: tuple(scalar(item) for item in value)
-        if isinstance(value, tuple)
-        else scalar(value)
-        for name, value in parameters.items()
-    }
-
-
 def _checked_scalar(kind: str, value: float, name: str) -> int | float:
     if kind == "float":
         return float(value)
@@ -81,7 +67,18 @@ def pack(
 def requirements(
     schema: ParameterSchema, parameters: Mapping[str, ParameterValue]
 ) -> Requirements:
-    packed = pack(schema, maximum_parameters(parameters))
+    def scalar(value: float | ShapeExpression) -> int | float:
+        return bound(value) if isinstance(value, ShapeExpression) else value
+
+    packed = pack(
+        schema,
+        {
+            name: tuple(scalar(item) for item in value)
+            if isinstance(value, tuple)
+            else scalar(value)
+            for name, value in parameters.items()
+        },
+    )
     inputs = (c.c_size_t * schema.input_count)()
     outputs = (c.c_size_t * schema.output_count)()
     scratch = c.c_size_t()

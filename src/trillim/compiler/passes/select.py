@@ -82,14 +82,6 @@ def _choices(
     )
 
 
-def _extend(state: Selection, candidate: KernelMatch, cost: float) -> Selection:
-    return Selection(
-        {**state.calls, candidate.anchor: candidate},
-        state.covered | candidate.covered,
-        state.cost + cost,
-    )
-
-
 def _greedy(
     operators: tuple[Operator, ...], matches: MatchSet, costs: CostModel | None
 ) -> Selection:
@@ -146,7 +138,11 @@ def select(
                 following.append(state)
                 continue
             following.extend(
-                _extend(state, candidate, cost)
+                Selection(
+                    {**state.calls, candidate.anchor: candidate},
+                    state.covered | candidate.covered,
+                    state.cost + cost,
+                )
                 for candidate, cost in _choices(operator, matches, state, costs)
             )
             if operator in matches.views or isinstance(operator.args, _INTRINSICS):
