@@ -9,7 +9,6 @@ typedef struct TrillimBenchContext TrillimBenchContext;
 typedef struct {
     _Alignas(64) atomic_size_t generation;
     TrillimStatus status;
-    atomic_size_t completed;
     TrillimBenchContext *backend;
     pthread_t thread;
     size_t index;

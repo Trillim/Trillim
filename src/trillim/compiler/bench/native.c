@@ -60,17 +60,10 @@ static TrillimStatus execute_tasks(
         }
         status = task(task_context, index, worker->index);
         ++completed;
-        if (completed == 1) {
-            /* Expose initial progress; batch the remaining statistics. */
-            atomic_fetch_add_explicit(&worker->completed, 1, memory_order_relaxed);
-        }
         if (status != TRILLIM_OK) {
             atomic_store_explicit(&backend->cancelled, true, memory_order_relaxed);
             break;
         }
-    }
-    if (completed > 1) {
-        atomic_fetch_add_explicit(&worker->completed, completed - 1, memory_order_relaxed);
     }
     return status == TRILLIM_OK || status == TRILLIM_CANCELLED ? status : TRILLIM_ERROR;
 }
@@ -114,7 +107,7 @@ static void *worker_main(void *context) {
         void *task_context = backend->task_context;
         size_t task_count = backend->task_count;
         worker->status = execute_tasks(worker, task, task_context, task_count, true);
-        /* The acknowledgement publishes both status and completed callback writes. */
+        /* Publish task status and output writes before acknowledging this dispatch. */
         atomic_store_explicit(&worker->generation, generation, memory_order_release);
     }
     return NULL;
@@ -215,7 +208,6 @@ TrillimBenchContext *trillim_bench_create(size_t worker_count) {
         worker->backend = backend;
         worker->index = index;
         atomic_init(&worker->generation, 0);
-        atomic_init(&worker->completed, 0);
         if (index != 0 && pthread_create(&worker->thread, NULL, worker_main, worker) != 0) {
             backend->pool.worker_count = index;
             trillim_bench_destroy(backend);
@@ -239,7 +231,6 @@ void trillim_bench_destroy(TrillimBenchContext *backend) {
     pthread_mutex_destroy(&backend->mutex);
     free(backend);
 }
-
 
 void trillim_bench_cancel(TrillimBenchContext *context) {
     atomic_store_explicit(&context->cancelled, true, memory_order_relaxed);

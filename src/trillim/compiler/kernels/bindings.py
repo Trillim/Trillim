@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import get_args
 
+from ...tdl.core.tensor import Tensor
 from ...tdl.core.types import DType
 from ..compiler_dataclasses import ShapeExpression
 from ..passes.infer import constant, expression
@@ -194,15 +195,11 @@ def _reduction(
     }
 
 
-def sum(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def reduction(context: KernelBindingContext) -> dict[str, ParameterValue]:
     axes = context.attrs["axes"]
     if not isinstance(axes, tuple) or not all(isinstance(axis, int) for axis in axes):
-        raise TypeError("sum axes must be an integer tuple")
+        raise TypeError("reduction axes must be an integer tuple")
     return _reduction(context, axes)
-
-
-def max(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    return sum(context)
 
 
 def argmax(context: KernelBindingContext) -> dict[str, ParameterValue]:
@@ -246,10 +243,6 @@ def select(context: KernelBindingContext) -> dict[str, ParameterValue]:
     return result
 
 
-def reshape(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    return cast(context)
-
-
 def permute(context: KernelBindingContext) -> dict[str, ParameterValue]:
     result = cast(context)
     axes = context.attrs["axes"]
@@ -289,8 +282,6 @@ def shape(context: KernelBindingContext) -> dict[str, ParameterValue]:
 def _scalar_parameter(
     value: object, binding: TensorBinding | None = None
 ) -> int | ShapeExpression:
-    from ...tdl.core.tensor import Tensor
-
     if isinstance(value, (int, ShapeExpression)):
         return value
     if isinstance(value, Tensor):

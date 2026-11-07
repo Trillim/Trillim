@@ -97,7 +97,6 @@ def _invoke(
     library = c.CDLL(str(invocation.library))
     schema = read_schema(library, invocation.kernel)
     packed = pack(schema, invocation.parameters)
-    owners: list[object] = [packed]
     footprint = requirements(schema, invocation.parameters)
     input_sizes = footprint.inputs
     output_sizes = footprint.outputs
@@ -148,7 +147,6 @@ def _invoke(
             inputs.append(allocation)
     outputs = [_allocation(size) for size in output_sizes]
     scratch = _allocation(scratch_size)
-    owners.extend([*inputs, *outputs, scratch])
     harness_library = c.CDLL(str(harness))
     create = harness_library.trillim_bench_create
     create.argtypes, create.restype = [c.c_size_t], c.c_void_p
@@ -269,7 +267,14 @@ def _worker(
             normalized_error,
             reference_samples,
         )
-    except (ValueError, TypeError, RuntimeError, OSError) as error:
+    except (
+        ValueError,
+        TypeError,
+        RuntimeError,
+        OSError,
+        MemoryError,
+        OverflowError,
+    ) as error:
         result = BenchmarkFailure(str(error))
     try:
         connection.send(result)
