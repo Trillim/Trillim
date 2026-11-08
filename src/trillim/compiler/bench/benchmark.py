@@ -13,9 +13,10 @@ from statistics import mean, median, pvariance
 
 import numpy as np
 
+from ... import _VERSION_ROOT
 from ..artifacts.parameters import _pack, _requirements
 from ..dtype import _decode
-from ..kernels.build import _run
+from ..kernels.build import _KERNEL_ROOT, _run
 from ..kernels.native import _read_schema
 from .bench_dataclasses import (
     _BenchmarkFailure,
@@ -26,7 +27,6 @@ from .bench_dataclasses import (
     _NativeAllocation,
 )
 
-_ROOT = Path(__file__).resolve().parents[4]
 _MAX_BYTES = 512 * 1024**2
 
 
@@ -40,7 +40,7 @@ def _representative_tokens(level: _BenchmarkLevel) -> tuple[int, ...]:
 
 def _harness() -> Path:
     source = Path(__file__).with_name("native.c")
-    header = _ROOT / "src/trillim/kernels/common.h"
+    header = _KERNEL_ROOT / "common.h"
     compiler = os.environ.get("CC", "cc")
     flags = (
         "-O2",
@@ -63,7 +63,7 @@ def _harness() -> Path:
         + source.with_suffix(".h").read_bytes()
         + header.read_bytes()
     ).hexdigest()[:16]
-    destination = _ROOT / "build/kernelbench" / digest / "native.so"
+    destination = _VERSION_ROOT / "bench" / digest / "native.so"
     if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(

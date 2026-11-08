@@ -8,9 +8,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ... import _VERSION_ROOT
 from .kernel_dataclasses import _Backend, _BuildArtifact
 
-_ROOT = Path(__file__).resolve().parents[4]
+_KERNEL_ROOT = Path(__file__).resolve().parents[2] / "kernels"
 _FLAGS = ("-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-fPIC")
 
 
@@ -45,7 +46,7 @@ def _build(backend: _Backend) -> _BuildArtifact:
         raise ValueError(
             f"cannot build {backend} kernels on a {platform.machine()} host"
         )
-    kernel_root = _ROOT / "src/trillim/kernels"
+    kernel_root = _KERNEL_ROOT
     sources = sorted((kernel_root / backend).glob("*.c"))
     fallback = (
         sorted((kernel_root / "scalar").glob("*.c")) if backend != "scalar" else []
@@ -61,7 +62,7 @@ def _build(backend: _Backend) -> _BuildArtifact:
     for source in (*sources, *fallback, *headers):
         digest.update(str(source.relative_to(kernel_root)).encode())
         digest.update(source.read_bytes())
-    parent = _ROOT / "build/kernels" / backend
+    parent = _VERSION_ROOT / "kernels" / backend
     directory = parent / digest.hexdigest()[:16]
     library = directory / "kernels.so"
     symbols = [f"trillim_{backend}_{source.stem}" for source in sources]

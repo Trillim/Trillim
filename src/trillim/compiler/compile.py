@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
+from .. import _VERSION_ROOT
 from .artifacts.artifact_pydantic_models import _ExecutableManifest, _WorkloadPlan
 from .bench.tune import _tune
 from .compiler_pydantic_models import _CompileRequest
@@ -33,9 +34,7 @@ def _compile_model(
     if len(request.checkpoints) == 1:
         checkpoint = next(iter(request.checkpoints.values())).resolve()
         model_name = checkpoint.parent.name if checkpoint.is_file() else checkpoint.name
-    output = (
-        request.output or Path.home() / ".trillim/compiled" / model_name
-    ).resolve()
+    output = (request.output or _VERSION_ROOT / "compiled" / model_name).resolve()
     if output.exists():
         raise FileExistsError(f"output directory already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)

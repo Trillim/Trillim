@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import os as _os
 import sys as _sys
+from pathlib import Path as _Path
+
+_VERSION_ROOT = (
+    _Path(_os.environ.get("TRILLIM_HOME", "~/.trillim")).expanduser().resolve()
+    / "1.0.0"
+)
 
 
 def _main() -> None:
