@@ -2,6 +2,8 @@
 
 Each backend builds its kernel sources into one `backend.o` and one loadable library under `$TRILLIM_HOME/1.0.0/kernels/<backend>/<build-hash>/`. `TRILLIM_HOME` defaults to `~/.trillim`. A backend has no dependency on another backend's library.
 
+`common.h` is the sole shared kernel header. It contains the ABI, native dtype access and basic indexing utilities. Each kernel lives in one `.c` file with its own parameter structs, static helpers and four exported functions; it includes no other project files.
+
 A kernel exports four functions:
 
 - The execution function accepts output pointers, input pointers, scratch, its parameter struct, and a borrowed execution context, in that order.

@@ -1,14 +1,97 @@
-#include "bitlinear_avx2.h"
-
+#include "common.h"
 #include <float.h>
 #include <immintrin.h>
+#include <math.h>
 #include <string.h>
 
 #define AVX2 __attribute__((target("avx2")))
 #define DECODE_OUTPUTS_PER_TASK 128
 #define ACTIVATION_METADATA_BYTES 32
 
+static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
+    size_t itemsize = trillim_itemsize(dtype);
+    if (columns != 0 && rows > SIZE_MAX / columns) {
+        return false;
+    }
+    size_t count = rows * columns;
+    if (itemsize != 0) {
+        if (count > SIZE_MAX / itemsize) {
+            return false;
+        }
+        *bytes = count * itemsize;
+        return true;
+    }
+    if (dtype == TRILLIM_ROW_INT8) {
+        if (rows > (SIZE_MAX - count) / 2) {
+            return false;
+        }
+        *bytes = count + rows * 2;
+        return true;
+    }
+    size_t group;
+    size_t record;
+    switch (dtype) {
+    case TRILLIM_MAT_TERNARY: group = 128; record = 32; break;
+    case TRILLIM_GRP_INT8: group = 32; record = 34; break;
+    case TRILLIM_GRP_INT4: group = 32; record = 18; break;
+    case TRILLIM_GRP_INT5: group = 32; record = 22; break;
+    case TRILLIM_DUBGRP_INT6: group = 256; record = 210; break;
+    case TRILLIM_GRP_BINARY: group = 128; record = 18; break;
+    case TRILLIM_GRP_TERNARY: group = 128; record = 34; break;
+    case TRILLIM_MXFP4: group = 32; record = 17; break;
+    default: return false;
+    }
+    size_t groups = columns / group + (columns % group != 0);
+    if (rows != 0 && groups > SIZE_MAX / record / rows) {
+        return false;
+    }
+    *bytes = rows * groups * record;
+    if (dtype == TRILLIM_MAT_TERNARY) {
+        if (*bytes > SIZE_MAX - sizeof(float)) {
+            return false;
+        }
+        *bytes += sizeof(float);
+    }
+    return true;
+}
 
+typedef struct {
+    size_t tokens;
+    size_t width;
+    size_t outputs;
+} TrillimBitLinearParameters;
+
+static inline TrillimStatus trillim_bitlinear_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
+    const TrillimBitLinearParameters *p = (const TrillimBitLinearParameters *)parameters;
+    inputs[0] = 0;
+    inputs[1] = 0;
+    outputs[0] = 0;
+    *scratch = 0;
+    if (p->tokens == 0 || p->outputs == 0) {
+        return TRILLIM_OK;
+    }
+    if (p->width == 0 || p->width > INT64_MAX / 127 || p->width > SIZE_MAX - 8 ||
+        p->tokens > SIZE_MAX / sizeof(float) / p->width || p->tokens > SIZE_MAX / sizeof(float) / p->outputs ||
+        p->tokens > SIZE_MAX / (p->width + 8) ||
+        !trillim_payload_size(p->outputs, p->width, TRILLIM_MAT_TERNARY, &inputs[1])) {
+        return TRILLIM_ERROR;
+    }
+    inputs[0] = p->tokens * p->width * sizeof(float);
+    outputs[0] = p->tokens * p->outputs * sizeof(float);
+    *scratch = p->tokens * (p->width + 8);
+    return TRILLIM_OK;
+}
+
+typedef struct {
+    float *output;
+    const float *input;
+    const uint8_t *weight;
+    float gamma;
+    uint8_t *scratch;
+    const TrillimBitLinearParameters *params;
+    const TrillimKernelContext *context;
+    size_t decode_columns;
+} TrillimAvx2BitLinearTask;
 
 static const TrillimParameter parameter_fields[] = {
     {"tokens", "size_t", offsetof(TrillimBitLinearParameters, tokens), NULL},
@@ -34,7 +117,9 @@ static TrillimStatus requirements(
 }
 
 static const size_t input_alignments[] = {4, 1};
+
 static const size_t output_alignments[] = {4};
+
 static const TrillimParameterSchema parameter_schema = {
     sizeof(TrillimBitLinearParameters), TRILLIM_ALIGNOF(TrillimBitLinearParameters),
     sizeof(parameter_fields) / sizeof(parameter_fields[0]), parameter_fields,

@@ -1,4 +1,64 @@
-#include "selection.h"
+#include "common.h"
+#include <math.h>
+#include <string.h>
+
+typedef struct {
+    size_t count;
+    size_t rank;
+    const size_t *shape;
+    const size_t *a_strides;
+    const size_t *b_strides;
+    uint32_t dtype;
+} TrillimBinaryParameters;
+
+static inline TrillimStatus trillim_binary_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
+    const TrillimBinaryParameters *p = (const TrillimBinaryParameters *)parameters;
+    size_t bytes = trillim_itemsize(p->dtype), a, b;
+    inputs[0] = 0;
+    inputs[1] = 0;
+    outputs[0] = 0;
+    *scratch = 0;
+    if (bytes == 0 || !trillim_span(p->rank, p->shape, p->a_strides, &a) || !trillim_span(p->rank, p->shape, p->b_strides, &b)) {
+        return TRILLIM_ERROR;
+    }
+    size_t elements = 1;
+    for (size_t i = 0;i<p->rank;++i) {
+        if (p->shape[i] != 0 && elements>SIZE_MAX/p->shape[i]) {
+            return TRILLIM_ERROR;
+        }
+        elements *= p->shape[i];
+    }
+    if (elements != p->count) {
+        return TRILLIM_ERROR;
+    }
+    if (p->count == 0) {
+        return TRILLIM_OK;
+    }
+    if (a > SIZE_MAX/bytes || b > SIZE_MAX/bytes || p->count > SIZE_MAX/bytes) {
+        return TRILLIM_ERROR;
+    }
+    inputs[0] = a*bytes;
+    inputs[1] = b*bytes;
+    outputs[0] = p->count*bytes;
+    return TRILLIM_OK;
+}
+
+typedef struct {
+    size_t count;
+    size_t rank;
+    const size_t *shape;
+    const size_t *a_strides;
+    const size_t *b_strides;
+    uint32_t dtype;
+    const size_t *condition_strides;
+} TrillimSelectParameters;
+
+typedef struct {
+    void *output;
+    const void *const *inputs;
+    const void *parameters;
+    const TrillimKernelContext *context;
+} TrillimSelectionTask;
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const TrillimSelectParameters *p = (const TrillimSelectParameters *)parameters;
