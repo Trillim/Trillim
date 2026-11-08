@@ -1,4 +1,55 @@
-#include "activation.h"
+#include "common.h"
+#include <math.h>
+
+typedef struct { size_t count; } TrillimActivationParameters;
+
+typedef struct {
+    float *output;
+    const float *gate;
+    const float *up;
+    const TrillimActivationParameters *parameters;
+    const TrillimKernelContext *context;
+    bool silu;
+} TrillimActivationTask;
+
+static inline TrillimStatus trillim_activation_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
+    const TrillimActivationParameters *p = (const TrillimActivationParameters *)parameters;
+    inputs[0] = 0;
+    inputs[1] = 0;
+    outputs[0] = 0;
+    *scratch = 0;
+    if (p->count > SIZE_MAX / sizeof(float)) {
+        return TRILLIM_ERROR;
+    }
+    inputs[0] = p->count * sizeof(float);
+    inputs[1] = inputs[0];
+    outputs[0] = inputs[0];
+    return TRILLIM_OK;
+}
+
+static inline TrillimStatus trillim_activation_task(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimActivationTask *task = (const TrillimActivationTask *)opaque;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t begin = tile * 1024;
+    size_t end = task->parameters->count - begin < 1024 ? task->parameters->count : begin + 1024;
+    for (size_t i = begin; i < end; ++i) {
+        float gate = task->gate[i];
+        float value;
+        if (task->silu) {
+            float e = expf(-fabsf(gate));
+            float sigmoid = gate >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
+            value = gate * sigmoid;
+        } else {
+            value = gate >= 0.0f ? gate : 0.0f;
+            value *= value;
+        }
+        task->output[i] = value * task->up[i];
+    }
+    return TRILLIM_OK;
+}
 
 TRILLIM_KERNEL TrillimStatus trillim_scalar_relu_squared_mul(
     void *const *outputs, const void *const *inputs, void *scratch,
@@ -23,7 +74,14 @@ TRILLIM_KERNEL const char *trillim_scalar_relu_squared_mul_tdl(void) {
 }
 
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_relu_squared_mul_parameters(void) {
-    return trillim_activation_schema();
+    static const TrillimParameter fields[] = {{"count", "size_t", offsetof(TrillimActivationParameters, count), NULL}};
+    static const size_t inputs[] = {4, 4};
+    static const size_t outputs[] = {4};
+    static const TrillimParameterSchema schema = {
+        sizeof(TrillimActivationParameters), TRILLIM_ALIGNOF(TrillimActivationParameters),
+        1, fields, 2, 1, trillim_activation_requirements, NULL, inputs, outputs, 1
+    };
+    return &schema;
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_relu_squared_mul_capabilities(void) {

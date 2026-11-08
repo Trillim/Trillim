@@ -1,4 +1,19 @@
-#include "generation.h"
+#include "common.h"
+#include <math.h>
+#include <string.h>
+
+typedef struct {
+    size_t count;
+    int64_t start;
+    int64_t step;
+    uint32_t dtype;
+} TrillimIotaParameters;
+
+typedef struct {
+    void *output;
+    const void *parameters;
+    const TrillimKernelContext *context;
+} TrillimGenerationTask;
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     (void)inputs;
