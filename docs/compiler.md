@@ -2,6 +2,8 @@
 
 `trillim compile MODEL.tdl model=/path/to/model adapter=/path/to/adapter`
 
+The supported Python API is `trillim.tdl` and `trillim.tdl.core` for model authoring. Compilation is exposed through the command above; compiler functions, types and helpers are private.
+
 The compiler detects the host backend and writes to `~/.trillim/compiled/<model_name>`. With one checkpoint, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. With multiple checkpoints or no checkpoints, the TDL filename supplies the name.
 
 - `--output PATH` chooses another destination.

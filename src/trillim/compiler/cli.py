@@ -6,8 +6,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .compiler_dataclasses import CompileArguments
-from .compiler_pydantic_models import CompileRequest
+from .compiler_dataclasses import _CompileArguments
+from .compiler_pydantic_models import _CompileRequest
 
 
 def _checkpoint(value: str) -> tuple[str, Path]:
@@ -17,7 +17,7 @@ def _checkpoint(value: str) -> tuple[str, Path]:
     return name, Path(path)
 
 
-def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
+def _parse_args(args: Sequence[str] | None = None) -> _CompileRequest:
     parser = ArgumentParser(prog="trillim compile")
     parser.add_argument("tdl_path", type=Path)
     parser.add_argument(
@@ -37,7 +37,7 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
         default=4096,
         help="maximum length of each variable input dimension (default: 4096)",
     )
-    arguments = parser.parse_intermixed_args(args, namespace=CompileArguments())
+    arguments = parser.parse_intermixed_args(args, namespace=_CompileArguments())
     checkpoints: dict[str, Path] = {}
     for name, path in arguments.checkpoints:
         if name in checkpoints:
@@ -55,7 +55,7 @@ def parse_args(args: Sequence[str] | None = None) -> CompileRequest:
     if arguments.threads is not None:
         values["threads"] = arguments.threads
     try:
-        return CompileRequest.model_validate(values)
+        return _CompileRequest.model_validate(values)
     except ValidationError as error:
         detail = error.errors()[0]
         field = ".".join(str(item) for item in detail["loc"])

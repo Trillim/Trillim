@@ -6,25 +6,25 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .bench.bench_dataclasses import BenchmarkLevel
-from .kernels.build import host_backend
-from .kernels.kernel_dataclasses import Backend
+from .bench.bench_dataclasses import _BenchmarkLevel
+from .kernels.build import _host_backend
+from .kernels.kernel_dataclasses import _Backend
 
 
-class CompileRequest(BaseModel):
+class _CompileRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     tdl_path: Path
     checkpoints: dict[str, Path] = Field(default_factory=dict)
     output: Path | None = None
-    backend: Backend = Field(default_factory=host_backend)
+    backend: _Backend = Field(default_factory=_host_backend)
     max_input_size: int = Field(default=4096, gt=0)
-    depth: BenchmarkLevel = "none"
+    depth: _BenchmarkLevel = "none"
     threads: int = Field(default_factory=lambda: os.cpu_count() or 1, ge=1)
 
     @field_validator("checkpoints")
     @classmethod
-    def validate_checkpoints(cls, value: dict[str, Path]) -> dict[str, Path]:
+    def _validate_checkpoints(cls, value: dict[str, Path]) -> dict[str, Path]:
         for name, path in value.items():
             try:
                 mode = path.stat().st_mode

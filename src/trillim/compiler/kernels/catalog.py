@@ -5,24 +5,24 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from ...tdl.core.core_dataclasses import TensorTuple
-from .build import build
+from ...tdl.core.core_dataclasses import _TensorTuple
+from .build import _build
 from .kernel_dataclasses import (
-    Backend,
-    Capabilities,
-    Kernel,
-    KernelBindingContext,
-    ParameterValue,
+    _Backend,
+    _Capabilities,
+    _Kernel,
+    _KernelBindingContext,
+    _ParameterValue,
 )
-from .native import NativeCapabilities, read_schema
+from .native import _NativeCapabilities, _read_schema
 
 _LIBRARIES: dict[Path, c.CDLL] = {}
 
 
-def discover(backends: tuple[Backend, ...] = ("scalar",)) -> tuple[Kernel, ...]:
-    result: list[Kernel] = []
+def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ...]:
+    result: list[_Kernel] = []
     for backend in backends:
-        artifact = build(backend)
+        artifact = _build(backend)
         library = _LIBRARIES.get(artifact.library)
         if library is None:
             library = c.CDLL(str(artifact.library))
@@ -31,22 +31,22 @@ def discover(backends: tuple[Backend, ...] = ("scalar",)) -> tuple[Kernel, ...]:
             capability_function = getattr(library, f"{name}_capabilities")
             capability_function.argtypes, capability_function.restype = (
                 [],
-                c.POINTER(NativeCapabilities),
+                c.POINTER(_NativeCapabilities),
             )
             capabilities = cast(
-                "c._Pointer[NativeCapabilities]", capability_function()
+                "c._Pointer[_NativeCapabilities]", capability_function()
             ).contents
             if capabilities.abi_version != 1:
                 raise ValueError(f"{name}: incompatible kernel ABI")
-            schema = read_schema(library, name)
+            schema = _read_schema(library, name)
             tdl_function = getattr(library, f"{name}_tdl")
             tdl_function.argtypes, tdl_function.restype = [], c.c_char_p
             tdl = cast(bytes, tdl_function()).decode()
             namespace: dict[str, object] = {}
             exec(compile(tdl, f"<{name}>", "exec"), namespace)  # noqa: S102 - trusted kernel metadata
-            pattern = cast(Callable[..., TensorTuple], namespace["pattern"])
+            pattern = cast(Callable[..., _TensorTuple], namespace["pattern"])
             binder = cast(
-                Callable[[KernelBindingContext], dict[str, ParameterValue]],
+                Callable[[_KernelBindingContext], dict[str, _ParameterValue]],
                 namespace["bind"],
             )
             if not callable(pattern) or not callable(binder):
@@ -60,12 +60,12 @@ def discover(backends: tuple[Backend, ...] = ("scalar",)) -> tuple[Kernel, ...]:
                     f"{name}: physical_inputs must be a tuple of input names"
                 )
             result.append(
-                Kernel(
+                _Kernel(
                     name,
                     backend,
                     pattern,
                     schema,
-                    Capabilities(
+                    _Capabilities(
                         1,
                         capabilities.backend.decode(),
                         tuple(capabilities.hardware.decode().split()),

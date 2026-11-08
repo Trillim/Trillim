@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .core_dataclasses import Shape, TensorTuple
-from .core_pydantic_models import IfArgs, ReduceArgs, WhileArgs
+from .core_dataclasses import Shape, _TensorTuple
+from .core_pydantic_models import _IfArgs, _ReduceArgs, _WhileArgs
 from .graph import _build_region
-from .operator import Operator
+from .operator import _Operator
 from .tensor import Tensor
 
 
@@ -19,24 +19,24 @@ def _validate_condition(condition: Tensor) -> None:
 def If(
     condition: Tensor,
     *,
-    then_branch: Callable[[], TensorTuple],
-    else_branch: Callable[[], TensorTuple],
-) -> TensorTuple:
+    then_branch: Callable[[], _TensorTuple],
+    else_branch: Callable[[], _TensorTuple],
+) -> _TensorTuple:
     """Build both branches; execute only the selected branch at runtime."""
-    args = IfArgs(condition=condition)
+    args = _IfArgs(condition=condition)
     _validate_condition(args.condition)
 
-    def build_then(parameters: TensorTuple) -> TensorTuple:
+    def build_then(parameters: _TensorTuple) -> _TensorTuple:
         return then_branch()
 
-    def build_else(parameters: TensorTuple) -> TensorTuple:
+    def build_else(parameters: _TensorTuple) -> _TensorTuple:
         return else_branch()
 
     then_region = _build_region((), build_then)
     else_region = _build_region((), build_else)
     if len(then_region.outputs) != len(else_region.outputs):
         raise ValueError("If branches must return the same number of tensors")
-    return Operator(
+    return _Operator(
         "if",
         args,
         outputs=tuple((None, None) for _ in then_region.outputs),
@@ -45,11 +45,11 @@ def If(
 
 
 def While(
-    initial: TensorTuple,
+    initial: _TensorTuple,
     *,
-    condition: Callable[[TensorTuple], Tensor],
-    body: Callable[[TensorTuple], TensorTuple],
-) -> TensorTuple:
+    condition: Callable[[_TensorTuple], Tensor],
+    body: Callable[[_TensorTuple], _TensorTuple],
+) -> _TensorTuple:
     """Carry tensors through a loop; condition and body are traced once.
 
     The condition executes before every iteration, including the final check.
@@ -58,7 +58,7 @@ def While(
     for numeric promotion. The body preserves carried arity, dtype and rank;
     dimension sizes may change within compiler-supported bounds.
     """
-    args = WhileArgs(initial=initial)
+    args = _WhileArgs(initial=initial)
     condition_parameters = tuple(
         Tensor(shape=value.shape, _parameter=True) for value in args.initial
     )
@@ -66,7 +66,7 @@ def While(
         Tensor(shape=value.shape, _parameter=True) for value in args.initial
     )
 
-    def build_condition(parameters: TensorTuple) -> TensorTuple:
+    def build_condition(parameters: _TensorTuple) -> _TensorTuple:
         return (condition(parameters),)
 
     condition_region = _build_region(condition_parameters, build_condition)
@@ -76,7 +76,7 @@ def While(
     body_region = _build_region(body_parameters, body)
     if len(body_region.outputs) != len(args.initial):
         raise ValueError("While body must preserve the number of carried tensors")
-    return Operator(
+    return _Operator(
         "while",
         args,
         outputs=tuple((None, None) for _ in args.initial),
@@ -85,13 +85,13 @@ def While(
 
 
 def Reduce(
-    values: TensorTuple,
+    values: _TensorTuple,
     *,
-    initial: TensorTuple,
+    initial: _TensorTuple,
     axes: tuple[int, ...],
-    reducer: Callable[[TensorTuple, TensorTuple], TensorTuple],
+    reducer: Callable[[_TensorTuple, _TensorTuple], _TensorTuple],
     keepdims: bool = False,
-) -> TensorTuple:
+) -> _TensorTuple:
     """Reduce corresponding elements using a pure, associative scalar graph.
 
     The reducer receives accumulator and element tuples and returns the next
@@ -100,7 +100,7 @@ def Reduce(
     Initial values are scalars and are returned in the accumulator dtype for
     empty domains. Tuple accumulators support value/index tie-breaking.
     """
-    args = ReduceArgs(values=values, initial=initial, axes=axes, keepdims=keepdims)
+    args = _ReduceArgs(values=values, initial=initial, axes=axes, keepdims=keepdims)
     for value in args.initial:
         if value.shape is not None and value.shape.dimensions != ():
             raise ValueError("reduction initial values must be scalar")
@@ -111,7 +111,7 @@ def Reduce(
     )
     count = len(accumulators)
 
-    def build(parameters: TensorTuple) -> TensorTuple:
+    def build(parameters: _TensorTuple) -> _TensorTuple:
         return reducer(parameters[:count], parameters[count:])
 
     region = _build_region((*accumulators, *elements), build)
@@ -121,7 +121,7 @@ def Reduce(
         )
     if len(region.outputs) != count:
         raise ValueError("reducer must preserve accumulator arity")
-    return Operator(
+    return _Operator(
         "reduce",
         args,
         outputs=tuple((None, None) for _ in args.initial),

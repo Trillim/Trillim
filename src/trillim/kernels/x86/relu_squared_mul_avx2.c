@@ -17,7 +17,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_relu_squared_mul_avx2(
 
 TRILLIM_KERNEL const char *trillim_x86_relu_squared_mul_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import activation as bind\n"
+           "from trillim.compiler.kernels.bindings import _activation as bind\n"
            "def pattern(a: Tensor, b: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Mul(ReluSquared(a), b),)\n";
 }

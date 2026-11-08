@@ -25,7 +25,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_bitlinear(
 
 TRILLIM_KERNEL const char *trillim_scalar_bitlinear_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import bitlinear as bind\n"
+           "from trillim.compiler.kernels.bindings import _bitlinear as bind\n"
            "def pattern(x: Tensor, weight: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (BitLinear(x, weight),)\n";
 }

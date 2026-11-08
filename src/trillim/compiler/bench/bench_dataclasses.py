@@ -10,42 +10,42 @@ from ...tdl.core.types import DType
 if TYPE_CHECKING:
     import numpy as np
 
-    from ...tdl.core.operator import Operator
-    from ..artifacts.artifact_dataclasses import JSON
-    from ..compiler_dataclasses import Inference
-    from ..compiler_pydantic_models import CompileRequest
-    from ..weights.weights_dataclasses import WeightIndex
-    from ..weights.weights_pydantic_models import WeightManifest
+    from ...tdl.core.operator import _Operator
+    from ..artifacts.artifact_dataclasses import _JSON
+    from ..compiler_dataclasses import _Inference
+    from ..compiler_pydantic_models import _CompileRequest
+    from ..weights.weights_dataclasses import _WeightIndex
+    from ..weights.weights_pydantic_models import _WeightManifest
 
-BenchmarkLevel = Literal["none", "low", "high"]
-ConcreteParameter = int | float | tuple[int | float, ...]
+_BenchmarkLevel = Literal["none", "low", "high"]
+_ConcreteParameter = int | float | tuple[int | float, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkOutput:
+class _BenchmarkOutput:
     dtype: DType
     shape: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkInput:
+class _BenchmarkInput:
     path: Path
     offset: int
     size: int
 
 
 @dataclass(frozen=True, slots=True)
-class Invocation:
+class _Invocation:
     library: Path
     kernel: str
-    parameters: dict[str, ConcreteParameter]
-    inputs: tuple[bytes | BenchmarkInput, ...]
-    outputs: tuple[BenchmarkOutput, ...]
+    parameters: dict[str, _ConcreteParameter]
+    inputs: tuple[bytes | _BenchmarkInput, ...]
+    outputs: tuple[_BenchmarkOutput, ...]
     threads: int = 1
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkResult:
+class _BenchmarkResult:
     samples: tuple[float, ...]
     mean: float
     median: float
@@ -58,33 +58,33 @@ class BenchmarkResult:
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkFailure:
+class _BenchmarkFailure:
     message: str
 
 
 @dataclass(slots=True)
-class NativeAllocation:
+class _NativeAllocation:
     owner: object
     address: int
     size: int
 
 
 @dataclass(slots=True)
-class Tuning:
-    costs: dict[Operator, dict[str, float]] = field(default_factory=dict)
-    workloads: list[dict[str, JSON]] = field(default_factory=list)
-    per_workload: dict[int, dict[Operator, dict[str, float]]] = field(
+class _Tuning:
+    costs: dict[_Operator, dict[str, float]] = field(default_factory=dict)
+    workloads: list[dict[str, _JSON]] = field(default_factory=list)
+    per_workload: dict[int, dict[_Operator, dict[str, float]]] = field(
         default_factory=dict
     )
 
 
 @dataclass(slots=True)
-class TuningState:
-    inference: Inference
-    weights: WeightIndex
-    manifest: WeightManifest
+class _TuningState:
+    inference: _Inference
+    weights: _WeightIndex
+    manifest: _WeightManifest
     bundle: Path
-    request: CompileRequest
+    request: _CompileRequest
     rng: np.random.Generator
     dimensions: dict[Hashable, int] = field(default_factory=dict)
-    views: frozenset[Operator] = frozenset()
+    views: frozenset[_Operator] = frozenset()

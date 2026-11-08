@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_rmsnorm(
 
 TRILLIM_KERNEL const char *trillim_scalar_rmsnorm_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import rmsnorm as bind\n"
+           "from trillim.compiler.kernels.bindings import _rmsnorm as bind\n"
            "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0) -> tuple[Tensor, ...]:\n"
            "    return (RMSNorm(x, weight=weight, weight_offset=weight_offset, eps=eps),)\n";
 }

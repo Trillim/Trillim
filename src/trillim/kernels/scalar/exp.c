@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_exp(
 
 TRILLIM_KERNEL const char *trillim_scalar_exp_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import unary as bind\n"
+           "from trillim.compiler.kernels.bindings import _unary as bind\n"
            "def pattern(x: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Exp(x),)\n";
 }

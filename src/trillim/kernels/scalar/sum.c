@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_sum(
 
 TRILLIM_KERNEL const char *trillim_scalar_sum_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import reduction as bind\n"
+           "from trillim.compiler.kernels.bindings import _bind_reduction as bind\n"
            "def pattern(x: Tensor, *, axes: tuple[int, ...], keepdims: bool = False) -> tuple[Tensor, ...]:\n"
            "    return (Sum(x, axes=axes, keepdims=keepdims),)\n";
 }

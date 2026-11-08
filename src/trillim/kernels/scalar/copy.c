@@ -9,7 +9,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_copy(
 
 TRILLIM_KERNEL const char *trillim_scalar_copy_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import cast as bind\n"
+           "from trillim.compiler.kernels.bindings import _cast as bind\n"
            "def pattern(x: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (x,)\n";
 }

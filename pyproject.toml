@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.scripts]
-trillim = "trillim:main"
+trillim = "trillim:_main"
 
 [project.urls]
 Repository = "https://github.com/Trillim/Trillim"

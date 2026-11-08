@@ -63,7 +63,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_rmsnorm_avx2(
 
 TRILLIM_KERNEL const char *trillim_x86_rmsnorm_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import avx2_rmsnorm as bind\n"
+           "from trillim.compiler.kernels.bindings import _avx2_rmsnorm as bind\n"
            "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0) -> tuple[Tensor, ...]:\n"
            "    return (RMSNorm(x, weight=weight, eps=eps, weight_offset=weight_offset),)\n";
 }

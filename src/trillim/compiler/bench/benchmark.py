@@ -13,24 +13,24 @@ from statistics import mean, median, pvariance
 
 import numpy as np
 
-from ..artifacts.parameters import pack, requirements
-from ..dtype import decode
+from ..artifacts.parameters import _pack, _requirements
+from ..dtype import _decode
 from ..kernels.build import _run
-from ..kernels.native import read_schema
+from ..kernels.native import _read_schema
 from .bench_dataclasses import (
-    BenchmarkFailure,
-    BenchmarkInput,
-    BenchmarkLevel,
-    BenchmarkResult,
-    Invocation,
-    NativeAllocation,
+    _BenchmarkFailure,
+    _BenchmarkInput,
+    _BenchmarkLevel,
+    _BenchmarkResult,
+    _Invocation,
+    _NativeAllocation,
 )
 
 _ROOT = Path(__file__).resolve().parents[4]
-MAX_BYTES = 512 * 1024**2
+_MAX_BYTES = 512 * 1024**2
 
 
-def representative_tokens(level: BenchmarkLevel) -> tuple[int, ...]:
+def _representative_tokens(level: _BenchmarkLevel) -> tuple[int, ...]:
     return {
         "none": (),
         "low": (1, 8, 64),
@@ -85,25 +85,25 @@ def _harness() -> Path:
     return destination
 
 
-def _allocation(size: int, alignment: int = 64) -> NativeAllocation:
+def _allocation(size: int, alignment: int = 64) -> _NativeAllocation:
     owner = c.create_string_buffer(size + alignment)
     address = (c.addressof(owner) + alignment - 1) // alignment * alignment
-    return NativeAllocation(owner, address, size)
+    return _NativeAllocation(owner, address, size)
 
 
 def _invoke(
-    invocation: Invocation, harness: Path, max_bytes: int
+    invocation: _Invocation, harness: Path, max_bytes: int
 ) -> tuple[tuple[float, ...], tuple[bytes, ...], int]:
     library = c.CDLL(str(invocation.library))
-    schema = read_schema(library, invocation.kernel)
-    packed = pack(schema, invocation.parameters)
-    footprint = requirements(schema, invocation.parameters)
+    schema = _read_schema(library, invocation.kernel)
+    packed = _pack(schema, invocation.parameters)
+    footprint = _requirements(schema, invocation.parameters)
     input_sizes = footprint.inputs
     output_sizes = footprint.outputs
     scratch_size = footprint.scratch
     total = (
         sum(
-            item.size if isinstance(item, BenchmarkInput) else len(item)
+            item.size if isinstance(item, _BenchmarkInput) else len(item)
             for item in invocation.inputs
         )
         + sum(output_sizes)
@@ -116,10 +116,10 @@ def _invoke(
         or len(invocation.outputs) != schema.output_count
     ):
         raise ValueError("benchmark binding count mismatch")
-    inputs: list[NativeAllocation] = []
+    inputs: list[_NativeAllocation] = []
     mappings: dict[Path, mmap.mmap] = {}
     for payload, size in zip(invocation.inputs, input_sizes, strict=True):
-        if isinstance(payload, BenchmarkInput):
+        if isinstance(payload, _BenchmarkInput):
             if payload.offset < 0 or payload.size < size:
                 raise ValueError(
                     "benchmark file binding is smaller than its required span"
@@ -137,7 +137,7 @@ def _invoke(
                 mapping, dtype=np.uint8, count=payload.size, offset=payload.offset
             )
             inputs.append(
-                NativeAllocation((mapping, view), view.ctypes.data, payload.size)
+                _NativeAllocation((mapping, view), view.ctypes.data, payload.size)
             )
         else:
             if len(payload) < size:
@@ -196,8 +196,8 @@ def _invoke(
 
 def _worker(
     connection: Connection,
-    invocation: Invocation,
-    golden: Invocation | None,
+    invocation: _Invocation,
+    golden: _Invocation | None,
     harness: Path,
     max_bytes: int,
 ) -> None:
@@ -212,11 +212,11 @@ def _worker(
             for actual_bytes, expected_bytes, metadata in zip(
                 outputs, expected, invocation.outputs, strict=True
             ):
-                actual = decode(
+                actual = _decode(
                     (np.frombuffer(actual_bytes, dtype=np.uint8), metadata.dtype),
                     metadata.shape,
                 )
-                reference = decode(
+                reference = _decode(
                     (np.frombuffer(expected_bytes, dtype=np.uint8), metadata.dtype),
                     metadata.shape,
                 )
@@ -256,7 +256,7 @@ def _worker(
                         )
                         maximum_error = max(maximum_error, error)
                         normalized_error = max(normalized_error, error / scale)
-        result: BenchmarkResult | BenchmarkFailure = BenchmarkResult(
+        result: _BenchmarkResult | _BenchmarkFailure = _BenchmarkResult(
             samples,
             mean(samples),
             median(samples),
@@ -275,7 +275,7 @@ def _worker(
         MemoryError,
         OverflowError,
     ) as error:
-        result = BenchmarkFailure(str(error))
+        result = _BenchmarkFailure(str(error))
     try:
         connection.send(result)
     except (BrokenPipeError, EOFError):
@@ -284,13 +284,13 @@ def _worker(
         connection.close()
 
 
-def benchmark(
-    invocation: Invocation,
+def _benchmark(
+    invocation: _Invocation,
     *,
-    golden: Invocation | None = None,
+    golden: _Invocation | None = None,
     timeout: float = 10.0,
-    max_bytes: int = MAX_BYTES,
-) -> BenchmarkResult:
+    max_bytes: int = _MAX_BYTES,
+) -> _BenchmarkResult:
     harness = _harness()
     context = mp.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
@@ -303,9 +303,9 @@ def benchmark(
         if not parent.poll(timeout):
             raise TimeoutError(f"kernel benchmark exceeded {timeout:g} seconds")
         result = parent.recv()
-        if not isinstance(result, (BenchmarkResult, BenchmarkFailure)):
+        if not isinstance(result, (_BenchmarkResult, _BenchmarkFailure)):
             raise TypeError("invalid native benchmark result")
-        if isinstance(result, BenchmarkFailure):
+        if isinstance(result, _BenchmarkFailure):
             raise RuntimeError(result.message)  # noqa: TRY004 - reports a worker failure
         return result
     finally:

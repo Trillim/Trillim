@@ -9,7 +9,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_permute(
 
 TRILLIM_KERNEL const char *trillim_scalar_permute_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import permute as bind\n"
+           "from trillim.compiler.kernels.bindings import _permute as bind\n"
            "def pattern(x: Tensor, *, axes: tuple[int, ...]) -> tuple[Tensor, ...]:\n"
            "    return (Permute(x, axes),)\n";
 }

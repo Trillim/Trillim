@@ -5,19 +5,19 @@ from collections.abc import Callable
 from .activation import Silu
 from .core import Construct, Mul, Tensor
 from .linear import Linear
-from .math import Value
+from .math import _Value
 
 
 @Construct
 def FFN(
     x: Tensor,
     *,
-    up: Value,
-    down: Value,
-    gate: Value | None = None,
-    up_bias: Value | None = None,
-    down_bias: Value | None = None,
-    gate_bias: Value | None = None,
+    up: _Value,
+    down: _Value,
+    gate: _Value | None = None,
+    up_bias: _Value | None = None,
+    down_bias: _Value | None = None,
+    gate_bias: _Value | None = None,
     activation: Callable[[Tensor], Tensor] = Silu,
 ) -> Tensor:
     if gate is None and gate_bias is not None:

@@ -56,7 +56,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_random(
 
 TRILLIM_KERNEL const char *trillim_scalar_random_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import random as bind\n"
+           "from trillim.compiler.kernels.bindings import _random as bind\n"
            "physical_inputs = ()\n"
            "def pattern(*, shape, seed, offset = 0, distribution = \"uniform\", dtype = \"fp32\") -> tuple[Tensor, ...]:\n"
            "    return (Random(shape, seed=seed, offset=offset, distribution=distribution, dtype=dtype),)\n";

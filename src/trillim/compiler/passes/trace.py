@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from ...tdl.core import Graph
-from ..compiler_pydantic_models import CompileRequest
+from ..compiler_pydantic_models import _CompileRequest
 
 
-def trace(request: CompileRequest) -> Graph:
+def _trace(request: _CompileRequest) -> Graph:
     filename = str(request.tdl_path)
     namespace: dict[str, object] = {"__name__": "__tdl__", "__file__": filename}
     try:
@@ -18,7 +18,7 @@ def trace(request: CompileRequest) -> Graph:
     graph = namespace.get("graph")
     if not isinstance(graph, Graph):
         raise TypeError(f"{filename}: TDL file must define 'graph' as a Graph")
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError(
             f"{filename}: TDL graph must be completed using its context manager"
         )

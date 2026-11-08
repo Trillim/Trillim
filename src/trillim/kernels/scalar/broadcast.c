@@ -9,7 +9,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_broadcast(
 
 TRILLIM_KERNEL const char *trillim_scalar_broadcast_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import broadcast as bind\n"
+           "from trillim.compiler.kernels.bindings import _broadcast as bind\n"
            "physical_inputs = ('x',)\n"
            "def pattern(x: Tensor, *, shape) -> tuple[Tensor, ...]:\n"
            "    return (Broadcast(x, shape),)\n";

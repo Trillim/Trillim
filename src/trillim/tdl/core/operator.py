@@ -2,38 +2,38 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from .core_dataclasses import Region, Shape
-from .core_pydantic_models import OperatorArgs
+from .core_dataclasses import Shape, _Region
+from .core_pydantic_models import _OperatorArgs
 from .graph import _record_operator
 from .tensor import Tensor
 from .types import DType
 
 
-class Operator:
+class _Operator:
     """Create a node and its tensor links; record it when tracing is active."""
 
     def __init__(
         self,
         op: str,
-        args: OperatorArgs,
+        args: _OperatorArgs,
         *,
         outputs: tuple[tuple[Shape | None, DType | None], ...] = ((None, None),),
-        regions: tuple[Region, ...] = (),
+        regions: tuple[_Region, ...] = (),
     ) -> None:
         self.op = op
         self.args = args
         self.regions = regions
-        self.dependencies: tuple[Operator, ...] = ()
+        self.dependencies: tuple[_Operator, ...] = ()
         self.inputs = _inputs(args, regions)
         self.outputs = tuple(
-            Tensor(producer=self, shape=shape, dtype=dtype) for shape, dtype in outputs
+            Tensor(_producer=self, shape=shape, dtype=dtype) for shape, dtype in outputs
         )
         _record_operator(self)
         for tensor in self.inputs:
-            tensor.consumers.append(self)
+            tensor._consumers.append(self)
 
 
-def _inputs(args: OperatorArgs, regions: tuple[Region, ...]) -> tuple[Tensor, ...]:
+def _inputs(args: _OperatorArgs, regions: tuple[_Region, ...]) -> tuple[Tensor, ...]:
     inputs: dict[Tensor, None] = {}
 
     def collect(value: object) -> None:

@@ -5,23 +5,23 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from .core_dataclasses import Dimensions, Scalar
 from .core_dataclasses import Shape as TensorShape
+from .core_dataclasses import _Dimensions, _Scalar
 from .core_pydantic_models import (
-    BroadcastArgs,
-    ConstantArgs,
-    GatherArgs,
-    InputArgs,
-    IotaArgs,
-    OutputArgs,
-    PermuteArgs,
-    ReshapeArgs,
-    ScatterArgs,
-    UnaryArgs,
     Weight,
+    _BroadcastArgs,
+    _ConstantArgs,
+    _GatherArgs,
+    _InputArgs,
+    _IotaArgs,
+    _OutputArgs,
+    _PermuteArgs,
+    _ReshapeArgs,
+    _ScatterArgs,
+    _UnaryArgs,
 )
 from .graph import _get_graph, _get_scope
-from .operator import Operator
+from .operator import _Operator
 from .tensor import Tensor
 from .types import DType
 
@@ -30,43 +30,43 @@ def Input(
     *, name: str, shape: TensorShape | tuple[int | None, ...], dtype: DType
 ) -> Tensor:
     shape = shape if isinstance(shape, TensorShape) else TensorShape(shape)
-    args = InputArgs(name=name, shape=shape, dtype=dtype)
+    args = _InputArgs(name=name, shape=shape, dtype=dtype)
     graph = _get_graph()
     if _get_scope() is not graph._root:
         raise ValueError("inputs must be declared in the outer graph")
-    if name in graph.inputs:
+    if name in graph._inputs:
         raise ValueError(f'duplicate input name "{name}"')
-    tensor = Operator("input", args, outputs=((shape, dtype),)).outputs[0]
-    graph.inputs[name] = tensor
+    tensor = _Operator("input", args, outputs=((shape, dtype),)).outputs[0]
+    graph._inputs[name] = tensor
     return tensor
 
 
 def Output(x: Tensor, *, name: str) -> None:
-    args = OutputArgs(x=x, name=name)
+    args = _OutputArgs(x=x, name=name)
     graph = _get_graph()
     if _get_scope() is not graph._root:
         raise ValueError("outputs must be declared in the outer graph")
-    if name in graph.outputs:
+    if name in graph._outputs:
         raise ValueError(f'duplicate output name "{name}"')
-    Operator("output", args, outputs=())
-    graph.outputs[name] = x
+    _Operator("output", args, outputs=())
+    graph._outputs[name] = x
 
 
 def Constant(
-    value: Scalar | NDArray[np.generic] | Weight, *, dtype: DType | None = None
+    value: _Scalar | NDArray[np.generic] | Weight, *, dtype: DType | None = None
 ) -> Tensor:
     if isinstance(value, np.ndarray):
         if value.dtype.kind not in "biuf":
             raise ValueError("constant arrays must contain booleans, integers or reals")
         value = value.copy()
         value.setflags(write=False)
-    args = ConstantArgs(value=value, dtype=dtype)
-    return Operator("constant", args, outputs=((None, dtype),)).outputs[0]
+    args = _ConstantArgs(value=value, dtype=dtype)
+    return _Operator("constant", args, outputs=((None, dtype),)).outputs[0]
 
 
 def Shape(x: Tensor) -> Tensor:
     """Return the runtime dimensions as a rank-one int64 tensor."""
-    return Operator("shape", UnaryArgs(x=x), outputs=((None, "int64"),)).outputs[0]
+    return _Operator("shape", _UnaryArgs(x=x), outputs=((None, "int64"),)).outputs[0]
 
 
 def Iota(
@@ -77,24 +77,24 @@ def Iota(
     dtype: Literal["int32", "int64"] = "int64",
 ) -> Tensor:
     """Generate indices in the half-open range [start, stop) with a fixed step."""
-    return Operator(
+    return _Operator(
         "iota",
-        IotaArgs(stop=stop, start=start, step=step, dtype=dtype),
+        _IotaArgs(stop=stop, start=start, step=step, dtype=dtype),
         outputs=((None, dtype),),
     ).outputs[0]
 
 
-def Reshape(x: Tensor, shape: Dimensions) -> Tensor:
-    return Operator("reshape", ReshapeArgs(x=x, shape=shape)).outputs[0]
+def Reshape(x: Tensor, shape: _Dimensions) -> Tensor:
+    return _Operator("reshape", _ReshapeArgs(x=x, shape=shape)).outputs[0]
 
 
 def Permute(x: Tensor, axes: tuple[int, ...]) -> Tensor:
-    return Operator("permute", PermuteArgs(x=x, axes=axes)).outputs[0]
+    return _Operator("permute", _PermuteArgs(x=x, axes=axes)).outputs[0]
 
 
-def Broadcast(x: Tensor, shape: Dimensions) -> Tensor:
+def Broadcast(x: Tensor, shape: _Dimensions) -> Tensor:
     """Broadcast with trailing-axis alignment; insert axes with Reshape first."""
-    return Operator("broadcast", BroadcastArgs(x=x, shape=shape)).outputs[0]
+    return _Operator("broadcast", _BroadcastArgs(x=x, shape=shape)).outputs[0]
 
 
 def Gather(
@@ -102,15 +102,15 @@ def Gather(
     *,
     indices: Tensor,
     mask: Tensor | None = None,
-    fill: Scalar = 0,
+    fill: _Scalar = 0,
 ) -> Tensor:
     """Index leading axes with [..., K] coordinates and retain trailing slice axes.
 
     A false mask entry yields fill without accessing its coordinates. Active
     coordinates must be in bounds; negative coordinates are invalid.
     """
-    return Operator(
-        "gather", GatherArgs(x=x, indices=indices, mask=mask, fill=fill)
+    return _Operator(
+        "gather", _GatherArgs(x=x, indices=indices, mask=mask, fill=fill)
     ).outputs[0]
 
 
@@ -129,7 +129,7 @@ def Scatter(
     The compiler promotes X and values to a common result dtype. Persistent
     cache storage conversion belongs to a subsequent cache write.
     """
-    return Operator(
+    return _Operator(
         "scatter",
-        ScatterArgs(x=x, indices=indices, values=values, mode=mode, mask=mask),
+        _ScatterArgs(x=x, indices=indices, values=values, mode=mode, mask=mask),
     ).outputs[0]

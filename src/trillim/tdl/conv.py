@@ -34,10 +34,10 @@ from .math import (
     Maximum,
     Stack,
     Take,
-    Value,
     _dims,
     _tensor,
     _tuple,
+    _Value,
 )
 
 
@@ -105,10 +105,10 @@ def _windows(
 @Construct
 def Conv(
     x: Tensor,
-    weight: Value,
+    weight: _Value,
     *,
     kernel: tuple[int, ...],
-    bias: Value | None = None,
+    bias: _Value | None = None,
     stride: int | tuple[int, ...] = 1,
     padding: int | tuple[int, ...] = 0,
     dilation: int | tuple[int, ...] = 1,
@@ -145,10 +145,10 @@ def Conv(
 @Construct
 def ConvTranspose(
     x: Tensor,
-    weight: Value,
+    weight: _Value,
     *,
     kernel: tuple[int, ...],
-    bias: Value | None = None,
+    bias: _Value | None = None,
     stride: int | tuple[int, ...] = 1,
     padding: int | tuple[int, ...] = 0,
     dilation: int | tuple[int, ...] = 1,

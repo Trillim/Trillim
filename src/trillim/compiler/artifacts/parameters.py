@@ -3,17 +3,17 @@ from __future__ import annotations
 import ctypes as c
 from collections.abc import Mapping
 
-from ..compiler_dataclasses import ShapeExpression
-from ..kernels.kernel_dataclasses import ParameterSchema, ParameterValue
-from ..kernels.native import NATIVE_TYPES
-from .artifact_dataclasses import PackedParameters, Requirements
-from .expressions import bound
+from ..compiler_dataclasses import _ShapeExpression
+from ..kernels.kernel_dataclasses import _ParameterSchema, _ParameterValue
+from ..kernels.native import _NATIVE_TYPES
+from .artifact_dataclasses import _PackedParameters, _Requirements
+from .expressions import _bound
 
 
 def _checked_scalar(kind: str, value: float, name: str) -> int | float:
     if kind == "float":
         return float(value)
-    native = NATIVE_TYPES[kind]
+    native = _NATIVE_TYPES[kind]
     bits = c.sizeof(native) * 8
     unsigned = kind.startswith("u") or kind == "size_t"
     minimum, maximum = (
@@ -24,17 +24,17 @@ def _checked_scalar(kind: str, value: float, name: str) -> int | float:
     return value
 
 
-def pack(
-    schema: ParameterSchema,
+def _pack(
+    schema: _ParameterSchema,
     parameters: Mapping[str, int | float | tuple[int | float, ...]],
-) -> PackedParameters:
+) -> _PackedParameters:
     value = schema.native_type()
     owners: list[object] = [value]
     if set(parameters) != {item.name for item in schema.fields}:
         raise ValueError("kernel parameter fields do not match the native schema")
     for item in schema.fields:
         argument = parameters[item.name]
-        native = NATIVE_TYPES[item.type]
+        native = _NATIVE_TYPES[item.type]
         if item.length is not None:
             if (
                 not isinstance(argument, tuple)
@@ -61,16 +61,16 @@ def pack(
                 raise ValueError(f"expected scalar parameter: {item.name}")
             argument = _checked_scalar(item.type, argument, item.name)
             setattr(value, item.name, argument)
-    return PackedParameters(c.addressof(value), owners)
+    return _PackedParameters(c.addressof(value), owners)
 
 
-def requirements(
-    schema: ParameterSchema, parameters: Mapping[str, ParameterValue]
-) -> Requirements:
-    def scalar(value: float | ShapeExpression) -> int | float:
-        return bound(value) if isinstance(value, ShapeExpression) else value
+def _requirements(
+    schema: _ParameterSchema, parameters: Mapping[str, _ParameterValue]
+) -> _Requirements:
+    def scalar(value: float | _ShapeExpression) -> int | float:
+        return _bound(value) if isinstance(value, _ShapeExpression) else value
 
-    packed = pack(
+    packed = _pack(
         schema,
         {
             name: tuple(scalar(item) for item in value)
@@ -92,4 +92,4 @@ def requirements(
     status = function(packed.address, inputs, outputs, c.byref(scratch))
     if status:
         raise ValueError(f"kernel rejected bounded parameters (status {status})")
-    return Requirements(tuple(inputs), tuple(outputs), scratch.value)
+    return _Requirements(tuple(inputs), tuple(outputs), scratch.value)

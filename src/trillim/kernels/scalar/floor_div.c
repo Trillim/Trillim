@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_floor_div(
 
 TRILLIM_KERNEL const char *trillim_scalar_floor_div_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import binary as bind\n"
+           "from trillim.compiler.kernels.bindings import _binary as bind\n"
            "def pattern(a: Tensor, b: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (FloorDiv(a, b),)\n";
 }

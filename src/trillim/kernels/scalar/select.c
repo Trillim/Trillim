@@ -45,7 +45,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_select(
 
 TRILLIM_KERNEL const char *trillim_scalar_select_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import select as bind\n"
+           "from trillim.compiler.kernels.bindings import _select as bind\n"
            "physical_inputs = ('condition', 'when_true', 'when_false')\n"
            "def pattern(condition: Tensor, when_true: Tensor, when_false: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Select(condition, when_true, when_false),)\n";

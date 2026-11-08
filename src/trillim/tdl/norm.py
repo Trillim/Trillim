@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from .core import Add, Construct, Div, Mul, Reshape, Sqrt, Sub, Tensor
-from .math import Dim, Mean, Sum, Value, _dims, _tensor
+from .math import Dim, Mean, Sum, _dims, _tensor, _Value
 
 
-def _affine(x: Tensor, weight: Value | None, bias: Value | None) -> Tensor:
+def _affine(x: Tensor, weight: _Value | None, bias: _Value | None) -> Tensor:
     if weight is not None:
         x = Mul(x, _tensor(weight))
     return x if bias is None else Add(x, _tensor(bias))
@@ -14,8 +14,8 @@ def _affine(x: Tensor, weight: Value | None, bias: Value | None) -> Tensor:
 def LayerNorm(
     x: Tensor,
     *,
-    weight: Value | None = None,
-    bias: Value | None = None,
+    weight: _Value | None = None,
+    bias: _Value | None = None,
     axes: tuple[int, ...] = (-1,),
     eps: float = 1e-5,
 ) -> Tensor:
@@ -28,7 +28,7 @@ def LayerNorm(
 def RMSNorm(
     x: Tensor,
     *,
-    weight: Value | None = None,
+    weight: _Value | None = None,
     eps: float = 1e-6,
     weight_offset: float = 0.0,
 ) -> Tensor:
@@ -47,10 +47,10 @@ def L2Norm(x: Tensor, *, axis: int = -1, eps: float = 1e-6) -> Tensor:
 def BatchNorm(
     x: Tensor,
     *,
-    running_mean: Value,
-    running_var: Value,
-    weight: Value | None = None,
-    bias: Value | None = None,
+    running_mean: _Value,
+    running_var: _Value,
+    weight: _Value | None = None,
+    bias: _Value | None = None,
     eps: float = 1e-5,
     rank: int,
 ) -> Tensor:
@@ -71,8 +71,8 @@ def GroupNorm(
     x: Tensor,
     *,
     groups: int,
-    weight: Value | None = None,
-    bias: Value | None = None,
+    weight: _Value | None = None,
+    bias: _Value | None = None,
     eps: float = 1e-5,
     rank: int,
 ) -> Tensor:
@@ -89,7 +89,7 @@ def GroupNorm(
 
 @Construct
 def VarianceNorm(
-    x: Tensor, *, weight: Value, correction: int = 1, eps: float = 1e-5
+    x: Tensor, *, weight: _Value, correction: int = 1, eps: float = 1e-5
 ) -> Tensor:
     """Scale by variance without subtracting the mean, as PocketTTS's flow head does."""
 

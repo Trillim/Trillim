@@ -17,7 +17,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_silu_mul(
 
 TRILLIM_KERNEL const char *trillim_scalar_silu_mul_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import activation as bind\n"
+           "from trillim.compiler.kernels.bindings import _activation as bind\n"
            "def pattern(a: Tensor, b: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Mul(Silu(a), b),)\n";
 }

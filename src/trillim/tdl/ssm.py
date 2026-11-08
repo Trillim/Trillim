@@ -19,17 +19,17 @@ from .core import (
     While,
 )
 from .linear import Linear
-from .math import Concat, Dim, FullLike, Slice, Sum, Take, Value
+from .math import Concat, Dim, FullLike, Slice, Sum, Take, _Value
 
 
 @Construct
 def CausalConv(
     x: Tensor,
-    weight: Value,
+    weight: _Value,
     *,
     kernel: int,
     state: Cache,
-    bias: Value | None = None,
+    bias: _Value | None = None,
     groups: int = 1,
 ) -> Tensor:
     """Streaming depthwise or grouped convolution; X [T,C], history [C,K-1]."""
@@ -138,10 +138,10 @@ def LSTMCell(
     hidden: Tensor,
     cell: Tensor,
     *,
-    input_weight: Value,
-    recurrent_weight: Value,
-    input_bias: Value | None = None,
-    recurrent_bias: Value | None = None,
+    input_weight: _Value,
+    recurrent_weight: _Value,
+    input_bias: _Value | None = None,
+    recurrent_bias: _Value | None = None,
 ) -> tuple[Tensor, Tensor]:
     """One inference step with PyTorch/ONNX gate order input, forget, candidate, output."""
 

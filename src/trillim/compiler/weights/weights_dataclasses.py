@@ -8,20 +8,20 @@ from ...tdl.core.types import DType
 
 if TYPE_CHECKING:
     from ...tdl.core.tensor import Tensor
-    from .weights_pydantic_models import CheckpointConfig
+    from .weights_pydantic_models import _CheckpointConfig
 
-SourceDType = Literal[
+_SourceDType = Literal[
     "BOOL", "I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F16", "BF16", "F32"
 ]
-ImportMethod = Literal["native", "bitnet_absmean", "bitnet_packed", "mxfp4"]
+_ImportMethod = Literal["native", "bitnet_absmean", "bitnet_packed", "mxfp4"]
 
 
 @dataclass(frozen=True, slots=True)
-class WeightSource:
+class _WeightSource:
     checkpoint: str
     tensor: str
     path: Path
-    dtype: SourceDType
+    dtype: _SourceDType
     shape: tuple[int, ...]
     offset: int
     size: int
@@ -30,42 +30,42 @@ class WeightSource:
 
 
 @dataclass(slots=True)
-class Checkpoint:
+class _Checkpoint:
     name: str
-    config: CheckpointConfig
-    tensors: dict[str, WeightSource]
+    config: _CheckpointConfig
+    tensors: dict[str, _WeightSource]
     aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class WeightEntry:
+class _WeightEntry:
     identity: str
     shape: tuple[int, ...]
     dtype: DType
-    source: WeightSource
-    method: ImportMethod = "native"
-    components: tuple[WeightSource, ...] = ()
+    source: _WeightSource
+    method: _ImportMethod = "native"
+    components: tuple[_WeightSource, ...] = ()
     aliases: tuple[str, ...] = ()
-    tied_sources: tuple[WeightSource, ...] = ()
+    tied_sources: tuple[_WeightSource, ...] = ()
     linear_class: str = ""
 
 
 @dataclass(frozen=True, slots=True)
-class WeightBinding:
+class _WeightBinding:
     logical: str
-    source: WeightEntry
+    source: _WeightEntry
     dtype: DType
 
 
 @dataclass(slots=True)
-class WeightIndex:
-    sources: dict[str, WeightEntry] = field(default_factory=dict)
-    bindings: dict[Tensor, WeightBinding] = field(default_factory=dict)
-    checkpoints: dict[str, Checkpoint] = field(default_factory=dict)
+class _WeightIndex:
+    sources: dict[str, _WeightEntry] = field(default_factory=dict)
+    bindings: dict[Tensor, _WeightBinding] = field(default_factory=dict)
+    checkpoints: dict[str, _Checkpoint] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class WeightRequest:
+class _WeightRequest:
     logical: str
     dtype: DType
     packing: str = "canonical"

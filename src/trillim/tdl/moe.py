@@ -27,9 +27,9 @@ from .math import (
     Softmax,
     Sum,
     TopK,
-    Value,
     _dims,
     _tensor,
+    _Value,
 )
 
 
@@ -37,8 +37,8 @@ from .math import (
 def MoE(
     x: Tensor,
     *,
-    router: Value,
-    router_bias: Value | None = None,
+    router: _Value,
+    router_bias: _Value | None = None,
     experts: tuple[Callable[[Tensor], Tensor], ...],
     top_k: int,
     scoring: Literal["softmax", "sigmoid"] = "softmax",
@@ -71,12 +71,12 @@ def MoE(
 def GptOssMoE(
     x: Tensor,
     *,
-    router: Value,
-    router_bias: Value | None = None,
-    gate_up: Value,
-    down: Value,
-    gate_up_bias: Value,
-    down_bias: Value,
+    router: _Value,
+    router_bias: _Value | None = None,
+    gate_up: _Value,
+    down: _Value,
+    gate_up_bias: _Value,
+    down_bias: _Value,
     top_k: int,
     limit: float = 7.0,
 ) -> Tensor:

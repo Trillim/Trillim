@@ -8,7 +8,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from trillim.compiler.passes.walk import collect_checkpoints, walk
+from trillim.compiler.passes.walk import _collect_checkpoints, _walk
 from trillim.tdl import (
     Add,
     Cache,
@@ -41,22 +41,22 @@ def test_shuffled_dependency_order(permutation: Sequence[int]) -> None:
             Output(Add(left, right), name="y")
             Constant(99)
 
-        region = graph.region
+        region = graph._region
         assert region is not None
         original = region.operators
         assert len(original) == len(permutation)
         region.operators = tuple(original[index] for index in permutation)
 
-        entries = list(walk(region))
+        entries = list(_walk(region))
         positions = {operator: index for index, (_, operator) in enumerate(entries)}
         assert set(positions) == set(original)
         assert len(entries) == len(original)
         assert all(owner is region for owner, _ in entries)
-        assert entries == list(walk(region))
+        assert entries == list(_walk(region))
         for operator in original:
             for value in operator.inputs:
-                if value.producer is not None:
-                    assert positions[value.producer] < positions[operator]
+                if value._producer is not None:
+                    assert positions[value._producer] < positions[operator]
         labels = {operator: index for index, operator in enumerate(original)}
         orders.append(tuple(labels[operator] for _, operator in entries))
 
@@ -67,8 +67,8 @@ def test_empty_region() -> None:
     with Graph() as graph:
         pass
 
-    assert graph.region is not None
-    assert list(walk(graph.region)) == []
+    assert graph._region is not None
+    assert list(_walk(graph._region)) == []
 
 
 def test_cache_effect_order() -> None:
@@ -80,7 +80,7 @@ def test_cache_effect_order() -> None:
         state.assign(Constant(2.0))
         Output(snapshot, name="snapshot")
 
-    region = graph.region
+    region = graph._region
     assert region is not None
     effects = tuple(
         operator
@@ -89,7 +89,7 @@ def test_cache_effect_order() -> None:
     )
     region.operators = tuple(reversed(region.operators))
 
-    entries = list(walk(region))
+    entries = list(_walk(region))
 
     assert tuple(operator for _, operator in entries if operator in effects) == effects
     assert len(entries) == len(region.operators)
@@ -117,7 +117,7 @@ def test_nested_regions_and_captures() -> None:
         )[0]
         Output(result, name="y")
 
-    region = graph.region
+    region = graph._region
     assert region is not None
     input_op, loop_op, output_op = region.operators
     condition, body_region = loop_op.regions
@@ -137,7 +137,7 @@ def test_nested_regions_and_captures() -> None:
         (region, loop_op),
         (region, output_op),
     ]
-    entries = list(walk(region))
+    entries = list(_walk(region))
 
     assert entries == expected
     for (owner, _), (expected_owner, _) in zip(entries, expected, strict=True):
@@ -153,11 +153,11 @@ def test_nested_cache_dependency_stays_in_parent_region() -> None:
             else_branch=lambda: (Constant(0.0),),
         )[0]
 
-    assert graph.region is not None
-    assert result.producer is not None
-    body = result.producer.regions[0]
+    assert graph._region is not None
+    assert result._producer is not None
+    body = result._producer.regions[0]
 
-    assert list(walk(body)) == [(body, body.operators[0])]
+    assert list(_walk(body)) == [(body, body.operators[0])]
 
 
 @pytest.mark.parametrize("self_cycle", [True, False], ids=["self", "two-node"])
@@ -166,20 +166,20 @@ def test_dependency_cycles(self_cycle: bool) -> None:
         x = Constant(1)
         Add(x, 1)
 
-    assert graph.region is not None
-    first, second = graph.region.operators
+    assert graph._region is not None
+    first, second = graph._region.operators
     first.dependencies = (first,) if self_cycle else (second,)
 
     with pytest.raises(CycleError):
-        list(walk(graph.region))
+        list(_walk(graph._region))
 
 
 def test_no_weight_references() -> None:
     with Graph() as graph:
         Output(Constant(1), name="value")
 
-    assert graph.region is not None
-    assert collect_checkpoints(graph.region, {}) == ()
+    assert graph._region is not None
+    assert _collect_checkpoints(graph._region, {}) == ()
 
 
 @pytest.mark.parametrize("missing", [None, "base", "adapter"])
@@ -193,13 +193,13 @@ def test_base_and_adapter_checkpoints(tmp_path: Path, missing: str | None) -> No
         delta = Linear(down, adapter["up.weight"], bias=adapter["up.bias"])
         Output(Add(main, delta), name="y")
 
-    assert graph.region is not None
+    assert graph._region is not None
     bindings = {name: tmp_path for name in ("base", "adapter") if name != missing}
     if missing is None:
-        assert collect_checkpoints(graph.region, bindings) == ("base", "adapter")
+        assert _collect_checkpoints(graph._region, bindings) == ("base", "adapter")
     else:
         with pytest.raises(ValueError, match=missing):
-            collect_checkpoints(graph.region, bindings)
+            _collect_checkpoints(graph._region, bindings)
 
 
 def test_checkpoints_in_nested_branches(tmp_path: Path) -> None:
@@ -216,9 +216,9 @@ def test_checkpoints_in_nested_branches(tmp_path: Path) -> None:
         )[0]
         Output(result, name="result")
 
-    assert graph.region is not None
+    assert graph._region is not None
     bindings = {name: tmp_path for name in ("base", "left", "right")}
-    assert collect_checkpoints(graph.region, bindings) == ("base", "left", "right")
+    assert _collect_checkpoints(graph._region, bindings) == ("base", "left", "right")
 
 
 def test_unused_argument_metadata_is_not_a_weight_reference() -> None:
@@ -230,5 +230,5 @@ def test_unused_argument_metadata_is_not_a_weight_reference() -> None:
     with Graph() as graph:
         Output(identity(Constant(1), unused["weight"]), name="value")
 
-    assert graph.region is not None
-    assert collect_checkpoints(graph.region, {}) == ()
+    assert graph._region is not None
+    assert _collect_checkpoints(graph._region, {}) == ()

@@ -38,7 +38,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_compare(
 
 TRILLIM_KERNEL const char *trillim_scalar_compare_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import compare as bind\n"
+           "from trillim.compiler.kernels.bindings import _compare as bind\n"
            "def pattern(a: Tensor, b: Tensor, *, predicate: str) -> tuple[Tensor, ...]:\n"
            "    return (Compare(a, b, predicate=predicate),)\n";
 }

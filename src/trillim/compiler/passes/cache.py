@@ -3,44 +3,44 @@ from __future__ import annotations
 import math
 
 from ...tdl.core.core_pydantic_models import (
-    BroadcastArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
-    PermuteArgs,
-    ReshapeArgs,
+    _BroadcastArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
+    _PermuteArgs,
+    _ReshapeArgs,
 )
 from ...tdl.core.graph import Graph
-from ...tdl.core.operator import Operator
-from ..artifacts.artifact_dataclasses import Layout
-from ..artifacts.expressions import byte_size
-from ..compiler_dataclasses import ShapeExpression
-from ..dtype import QUANTIZED_DTYPES
+from ...tdl.core.operator import _Operator
+from ..artifacts.artifact_dataclasses import _Layout
+from ..artifacts.expressions import _byte_size
+from ..compiler_dataclasses import _ShapeExpression
+from ..dtype import _QUANTIZED_DTYPES
 from ..kernels.bindings import (
-    broadcast_strides,
-    contiguous_strides,
-    product,
-    reshape_strides,
+    _broadcast_strides,
+    _contiguous_strides,
+    _product,
+    _reshape_strides,
 )
-from .infer import constant, expression
-from .passes_dataclasses import Selection
-from .walk import walk
+from .infer import _constant_expression, _expression
+from .passes_dataclasses import _Selection
+from .walk import _walk
 
 
-def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
+def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
     """Use persistent storage directly only when snapshot and alias safety are proved."""
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError("graph is not complete")
     operators = [
-        operator for _, operator in walk(graph.region) if operator in layout.positions
+        operator for _, operator in _walk(graph._region) if operator in layout.positions
     ]
-    writes: dict[str, list[Operator]] = {}
+    writes: dict[str, list[_Operator]] = {}
     for operator in operators:
-        if isinstance(operator.args, CacheAssignArgs):
+        if isinstance(operator.args, _CacheAssignArgs):
             writes.setdefault(operator.args.cache.name, []).append(operator)
-    loop_ends: dict[Operator, list[tuple[int, int, set[str]]]] = {}
+    loop_ends: dict[_Operator, list[tuple[int, int, set[str]]]] = {}
 
     def scopes(
-        region_operators: tuple[Operator, ...],
+        region_operators: tuple[_Operator, ...],
         enclosing: list[tuple[int, int, set[str]]],
     ) -> None:
         for operator in region_operators:
@@ -63,15 +63,15 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
             for body in operator.regions:
                 scopes(body.operators, nested)
 
-    scopes(graph.region.operators, [])
+    scopes(graph._region.operators, [])
     by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
     for operator in operators:
         args = operator.args
-        if not isinstance(args, CacheReadArgs) or isinstance(args, CacheAssignArgs):
+        if not isinstance(args, _CacheReadArgs) or isinstance(args, _CacheAssignArgs):
             continue
         cache = args.cache
         buffer = layout.buffers[operator.outputs[0]]
-        if cache.mode == "sliding" or cache.dtype in QUANTIZED_DTYPES:
+        if cache.mode == "sliding" or cache.dtype in _QUANTIZED_DTYPES:
             continue
         if any(
             layout.positions[write][0] >= buffer.first
@@ -85,29 +85,29 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
         ):
             continue
         shape = tuple(
-            constant(dimension)
+            _constant_expression(dimension)
             for dimension in cache.shape.dimensions
             if dimension is not None
         )
-        changed = {buffer.name: contiguous_strides(shape)}
+        changed = {buffer.name: _contiguous_strides(shape)}
         compatible = True
-        for _, view in walk(graph.region):
+        for _, view in _walk(graph._region):
             for output in view.outputs:
                 alias = layout.buffers[output]
                 if alias.storage != "alias" or alias.source not in changed:
                     continue
                 original = by_name[alias.source]
                 strides = changed[alias.source]
-                if isinstance(view.args, ReshapeArgs):
-                    reshaped = reshape_strides(original.shape, strides, alias.shape)
+                if isinstance(view.args, _ReshapeArgs):
+                    reshaped = _reshape_strides(original.shape, strides, alias.shape)
                     if reshaped is None:
                         compatible = False
                         break
                     strides = reshaped
-                elif isinstance(view.args, PermuteArgs):
+                elif isinstance(view.args, _PermuteArgs):
                     strides = tuple(strides[axis] for axis in view.args.axes)
-                elif isinstance(view.args, BroadcastArgs):
-                    strides = broadcast_strides(original.shape, alias.shape, strides)
+                elif isinstance(view.args, _BroadcastArgs):
+                    strides = _broadcast_strides(original.shape, alias.shape, strides)
                 changed[alias.name] = strides
             if not compatible:
                 break
@@ -115,9 +115,9 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
             continue
         buffer.storage, buffer.source = "cache", cache.name
         storage_shape = (
-            (shape[0], product(shape[1:]))
+            (shape[0], _product(shape[1:]))
             if len(shape) > 1
-            else (constant(1), product(shape))
+            else (_constant_expression(1), _product(shape))
         )
         for name, strides in changed.items():
             by_name[name].strides = strides
@@ -133,15 +133,15 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
     for operator in operators:
         args = operator.args
         if (
-            not isinstance(args, CacheAssignArgs)
-            or args.cache.dtype in QUANTIZED_DTYPES
+            not isinstance(args, _CacheAssignArgs)
+            or args.cache.dtype in _QUANTIZED_DTYPES
             or args.cache.mode == "sliding"
         ):
             continue
         source = args.value
-        producer = source.producer
+        producer = source._producer
         call = selection.calls.get(producer) if producer is not None else None
-        if call is None or source.consumers != [operator]:
+        if call is None or source._consumers != [operator]:
             continue
         buffer = layout.buffers[source]
         if buffer.storage != "arena" or buffer.dtype != args.cache.dtype:
@@ -170,7 +170,7 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
             alignment = call.kernel.parameter_schema.output_alignments[slot]
             if (
                 alignment > 64
-                or byte_size(args.cache.dtype, capacity_shape[axis + 1 :]) % alignment
+                or _byte_size(args.cache.dtype, capacity_shape[axis + 1 :]) % alignment
             ):
                 continue
         if any(
@@ -188,8 +188,8 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
         ):
             continue
         if any(
-            isinstance(other.args, CacheReadArgs)
-            and not isinstance(other.args, CacheAssignArgs)
+            isinstance(other.args, _CacheReadArgs)
+            and not isinstance(other.args, _CacheAssignArgs)
             and other.args.cache.name == args.cache.name
             and start <= layout.positions[other][0] < stop
             for other in operators
@@ -205,15 +205,17 @@ def bind_caches(graph: Graph, layout: Layout, selection: Selection) -> None:
         if args.action == "append":
             assert axis is not None
             capacity = capacity_shape[axis]
-            length = ShapeExpression(
+            length = _ShapeExpression(
                 "cache_length", cache=args.cache.name, minimum=0, maximum=capacity
             )
-            buffer.byte_offset = expression(
+            buffer.byte_offset = _expression(
                 "mul",
                 length,
-                constant(byte_size(args.cache.dtype, capacity_shape[axis + 1 :])),
+                _constant_expression(
+                    _byte_size(args.cache.dtype, capacity_shape[axis + 1 :])
+                ),
             )
             layout.cache_guards.setdefault(call.anchor, []).append(
-                (expression("add", length, buffer.shape[axis]), capacity)
+                (_expression("add", length, buffer.shape[axis]), capacity)
             )
         layout.direct_writes.add(operator)

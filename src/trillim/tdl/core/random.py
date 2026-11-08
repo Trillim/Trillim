@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from .core_dataclasses import Dimensions
-from .core_pydantic_models import RandomArgs
-from .operator import Operator
+from .core_dataclasses import _Dimensions
+from .core_pydantic_models import _RandomArgs
+from .operator import _Operator
 from .tensor import Tensor
 
 
 def Random(
-    shape: Dimensions,
+    shape: _Dimensions,
     *,
     seed: int | Tensor,
     offset: int | Tensor = 0,
@@ -23,7 +23,7 @@ def Random(
     Advance it in repeated calls to obtain fresh draws. Backend algorithms need
     not generate identical samples across different backends or dtypes.
     """
-    args = RandomArgs(
+    args = _RandomArgs(
         shape=shape, seed=seed, offset=offset, distribution=distribution, dtype=dtype
     )
-    return Operator("random", args, outputs=((None, dtype),)).outputs[0]
+    return _Operator("random", args, outputs=((None, dtype),)).outputs[0]

@@ -13,13 +13,13 @@ from .core import (
     Sub,
     Tensor,
 )
-from .math import Clip, Take, Value, _dims, _tensor
+from .math import Clip, Take, _dims, _tensor, _Value
 
 
 @Construct
 def Embedding(
     tokens: Tensor,
-    weight: Value,
+    weight: _Value,
     *,
     token_rank: int = 1,
     padding_idx: int | None = None,
@@ -38,7 +38,7 @@ def Embedding(
 
 @Construct
 def InterpolatedEmbedding(
-    positions: Tensor, weight: Value, *, grid_size: int
+    positions: Tensor, weight: _Value, *, grid_size: int
 ) -> Tensor:
     """Bilinear learned square-grid positions. Coordinates [N,2] are in grid units."""
 

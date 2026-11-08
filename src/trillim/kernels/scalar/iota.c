@@ -44,7 +44,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_iota(
 
 TRILLIM_KERNEL const char *trillim_scalar_iota_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import iota as bind\n"
+           "from trillim.compiler.kernels.bindings import _iota as bind\n"
            "physical_inputs = ()\n"
            "def pattern(stop: Tensor, *, start = 0, step: int = 1, dtype = \"int64\") -> tuple[Tensor, ...]:\n"
            "    return (Iota(stop, start=start, step=step, dtype=dtype),)\n";

@@ -18,15 +18,15 @@ from .core import (
     Sub,
     Tensor,
 )
-from .math import Abs, Clip, Dim, Max, Maximum, Value, _tensor
+from .math import Abs, Clip, Dim, Max, Maximum, _tensor, _Value
 
 
 @Construct
 def Linear(
     x: Tensor,
-    weight: Value,
+    weight: _Value,
     *,
-    bias: Value | None = None,
+    bias: _Value | None = None,
 ) -> Tensor:
     """Apply [out, in] logical weights and optional bias."""
     matrix = _tensor(weight)
@@ -44,7 +44,7 @@ def Linear(
 
 
 @Construct
-def BitLinear(x: Tensor, weight: Value) -> Tensor:
+def BitLinear(x: Tensor, weight: _Value) -> Tensor:
     """Project nearest-even INT8 activation codes and rescale the output to FP32."""
     scale = Div(Constant(127.0), Maximum(Max(Abs(x), axes=(-1,), keepdims=True), 1e-5))
     scaled = Mul(x, scale)

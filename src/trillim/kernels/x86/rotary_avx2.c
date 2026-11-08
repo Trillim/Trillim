@@ -15,7 +15,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_rotary_avx2(
 
 TRILLIM_KERNEL const char *trillim_x86_rotary_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import avx2_rotary as bind\n"
+           "from trillim.compiler.kernels.bindings import _avx2_rotary as bind\n"
            "def pattern(x: Tensor, positions: Tensor, *, dim: int, theta: float = 10000.0, interleaved: bool = False, amplitude: float = 1.0) -> tuple[Tensor, ...]:\n"
            "    return (Rotary(x, positions, dim=dim, theta=theta, interleaved=interleaved, amplitude=amplitude),)\n";
 }

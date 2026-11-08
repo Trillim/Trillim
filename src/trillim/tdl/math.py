@@ -24,12 +24,12 @@ from .core import (
     Weight,
     While,
 )
-from .core.core_dataclasses import Dimensions, Scalar
+from .core.core_dataclasses import _Dimensions, _Scalar
 
-Value = Tensor | Weight
+_Value = Tensor | Weight
 
 
-def _tensor(value: Value) -> Tensor:
+def _tensor(value: _Value) -> Tensor:
     return Constant(value) if isinstance(value, Weight) else value
 
 
@@ -53,7 +53,9 @@ def _axis(axis: int, rank: int) -> int:
 
 
 @Construct
-def FullLike(x: Tensor, *, shape: Dimensions | None = None, fill: Scalar = 0) -> Tensor:
+def FullLike(
+    x: Tensor, *, shape: _Dimensions | None = None, fill: _Scalar = 0
+) -> Tensor:
     """Allocate a filled tensor with X's dtype, including before dtype inference."""
     scalar = Gather(
         Reshape(x, (-1,)),
@@ -65,17 +67,17 @@ def FullLike(x: Tensor, *, shape: Dimensions | None = None, fill: Scalar = 0) ->
 
 
 @Construct
-def Maximum(a: Tensor, b: Tensor | Scalar) -> Tensor:
+def Maximum(a: Tensor, b: Tensor | _Scalar) -> Tensor:
     return Select(Compare(a, b, predicate="ge"), a, b)
 
 
 @Construct
-def Minimum(a: Tensor, b: Tensor | Scalar) -> Tensor:
+def Minimum(a: Tensor, b: Tensor | _Scalar) -> Tensor:
     return Select(Compare(a, b, predicate="le"), a, b)
 
 
 @Construct
-def Clip(x: Tensor, low: Tensor | Scalar, high: Tensor | Scalar) -> Tensor:
+def Clip(x: Tensor, low: Tensor | _Scalar, high: Tensor | _Scalar) -> Tensor:
     return Minimum(Maximum(x, low), high)
 
 
@@ -317,7 +319,9 @@ def _tuple(value: int | Sequence[int], dimensions: int) -> tuple[int, ...]:
 
 
 @Construct
-def Pad(x: Tensor, *, padding: tuple[tuple[int, int], ...], fill: Scalar = 0) -> Tensor:
+def Pad(
+    x: Tensor, *, padding: tuple[tuple[int, int], ...], fill: _Scalar = 0
+) -> Tensor:
     """Constant padding; each pair gives before/after widths for one axis."""
     result = x
     rank = len(padding)

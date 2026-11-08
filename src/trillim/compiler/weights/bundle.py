@@ -11,30 +11,35 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ...tdl.core.types import DType
-from .. import dtype as codec
-from .reader import CHUNK_BYTES, read_values, unchanged
-from .weights_dataclasses import WeightEntry, WeightIndex, WeightRequest, WeightSource
-from .weights_pydantic_models import SourceProvenance, WeightManifest, WeightRecord
+from .. import dtype as _codec
+from .reader import _CHUNK_BYTES, _read_values, _unchanged
+from .weights_dataclasses import (
+    _WeightEntry,
+    _WeightIndex,
+    _WeightRequest,
+    _WeightSource,
+)
+from .weights_pydantic_models import _SourceProvenance, _WeightManifest, _WeightRecord
 
 
 def _matrix(shape: tuple[int, ...]) -> tuple[int, int]:
     return (shape[0], math.prod(shape[1:])) if len(shape) > 1 else (1, math.prod(shape))
 
 
-def _provenance(source: WeightSource) -> SourceProvenance:
-    unchanged(source)
+def _provenance(source: _WeightSource) -> _SourceProvenance:
+    _unchanged(source)
     digest = hashlib.sha256()
     with source.path.open("rb") as file:
         file.seek(source.offset)
         remaining = source.size
         while remaining:
-            data = file.read(min(remaining, CHUNK_BYTES))
+            data = file.read(min(remaining, _CHUNK_BYTES))
             if not data:
                 raise ValueError(f"truncated checkpoint tensor: {source.tensor}")
             digest.update(data)
             remaining -= len(data)
-    unchanged(source)
-    return SourceProvenance(
+    _unchanged(source)
+    return _SourceProvenance(
         checkpoint=source.checkpoint,
         tensor=source.tensor,
         file=str(source.path),
@@ -46,20 +51,20 @@ def _provenance(source: WeightSource) -> SourceProvenance:
     )
 
 
-def _bitnet_scale(entry: WeightEntry) -> tuple[np.float32, np.float32]:
+def _bitnet_scale(entry: _WeightEntry) -> tuple[np.float32, np.float32]:
     if entry.method == "bitnet_packed":
         scale_source = entry.components[0]
         if math.prod(scale_source.shape) != 1:
             raise ValueError(f"BitNet weight_scale must be scalar: {entry.identity}")
-        scale = np.float32(read_values(scale_source, 0, 1)[0])
+        scale = np.float32(_read_values(scale_source, 0, 1)[0])
         gamma = np.float32(1) / scale if entry.linear_class == "bitlinear" else scale
         inverse = np.float32(1) / gamma
     else:
         count = math.prod(entry.shape)
         total = np.float64(0)
-        for start in range(0, count, CHUNK_BYTES // 4):
-            values = read_values(
-                entry.source, start, min(CHUNK_BYTES // 4, count - start)
+        for start in range(0, count, _CHUNK_BYTES // 4):
+            values = _read_values(
+                entry.source, start, min(_CHUNK_BYTES // 4, count - start)
             ).astype(np.float32)
             if not np.isfinite(values).all():
                 raise ValueError(f"nonfinite BitNet latent weights: {entry.identity}")
@@ -71,8 +76,8 @@ def _bitnet_scale(entry: WeightEntry) -> tuple[np.float32, np.float32]:
         gamma = np.float32(1) / inverse
         if entry.source.dtype == "BF16":
             gamma = np.float32(
-                codec.decode(
-                    codec.encode(np.array([gamma], dtype=np.float32), "bf16"), (1,)
+                _codec._decode(
+                    _codec._encode(np.array([gamma], dtype=np.float32), "bf16"), (1,)
                 )[0]
             )
         elif entry.source.dtype == "F16":
@@ -83,16 +88,16 @@ def _bitnet_scale(entry: WeightEntry) -> tuple[np.float32, np.float32]:
 
 
 def _effective(
-    entry: WeightEntry,
+    entry: _WeightEntry,
     start: int,
     count: int,
     scale: tuple[np.float32, np.float32] | None,
 ) -> NDArray[np.generic]:
     if entry.method == "native":
-        return read_values(entry.source, start, count)
+        return _read_values(entry.source, start, count)
     if entry.method == "bitnet_absmean":
         assert scale is not None
-        values = read_values(entry.source, start, count).astype(np.float32)
+        values = _read_values(entry.source, start, count).astype(np.float32)
         return np.clip(np.rint(values * scale[0]), -1, 1).astype(np.float32) * scale[1]
     if entry.method == "bitnet_packed":
         assert scale is not None
@@ -103,7 +108,7 @@ def _effective(
         while offset < count:
             row, column = divmod(start + offset, columns)
             length = min(count - offset, columns - column)
-            packed = read_values(
+            packed = _read_values(
                 entry.source, (row % quarter) * columns + column, length
             ).astype(np.uint8)
             codes = (packed >> ((row // quarter) * 2)) & 3
@@ -117,23 +122,25 @@ def _effective(
     blocks, scales = entry.components
     group_start, groups = start // 32, count // 32
     packed = (
-        read_values(blocks, group_start * 16, groups * 16)
+        _read_values(blocks, group_start * 16, groups * 16)
         .astype(np.uint8)
         .reshape(1, groups, 16)
     )
     exponents = (
-        read_values(scales, group_start, groups).astype(np.uint8).reshape(1, groups)
+        _read_values(scales, group_start, groups).astype(np.uint8).reshape(1, groups)
     )
-    return codec.decode(codec.import_mxfp4(packed, exponents), (1, count)).reshape(-1)
+    return _codec._decode(_codec._import_mxfp4(packed, exponents), (1, count)).reshape(
+        -1
+    )
 
 
-def _chunks(entry: WeightEntry, target: DType) -> Iterator[tuple[int, int, int, int]]:
+def _chunks(entry: _WeightEntry, target: DType) -> Iterator[tuple[int, int, int, int]]:
     rows, columns = _matrix(entry.shape)
     if rows == 0 or columns == 0:
         return
-    limit = CHUNK_BYTES // 8
+    limit = _CHUNK_BYTES // 8
     alignment = math.lcm(
-        codec.GROUP_SIZES.get(target, 1), 32 if entry.method == "mxfp4" else 1
+        _codec._GROUP_SIZES.get(target, 1), 32 if entry.method == "mxfp4" else 1
     )
     if columns <= limit:
         batch = max(1, limit // columns)
@@ -146,29 +153,29 @@ def _chunks(entry: WeightEntry, target: DType) -> Iterator[tuple[int, int, int, 
                 yield row, 1, column, min(step, columns - column)
 
 
-def _raw_copy(output: BinaryIO, offset: int, source: WeightSource) -> None:
-    unchanged(source)
+def _raw_copy(output: BinaryIO, offset: int, source: _WeightSource) -> None:
+    _unchanged(source)
     output.seek(offset)
     with source.path.open("rb") as file:
         file.seek(source.offset)
         remaining = source.size
         while remaining:
-            data = file.read(min(remaining, CHUNK_BYTES))
+            data = file.read(min(remaining, _CHUNK_BYTES))
             if not data:
                 raise ValueError(f"truncated checkpoint tensor: {source.tensor}")
             output.write(data)
             remaining -= len(data)
-    unchanged(source)
+    _unchanged(source)
 
 
 def _write_entry(
     output: BinaryIO,
     start: int,
-    entry: WeightEntry,
+    entry: _WeightEntry,
     target: DType,
     scale: tuple[np.float32, np.float32] | None,
 ) -> None:
-    sections = codec.payload_sections(target, entry.shape)
+    sections = _codec._payload_sections(target, entry.shape)
     positions = []
     cursor = start
     for _, size in sections:
@@ -207,16 +214,16 @@ def _write_entry(
                 else np.zeros(values.shape, dtype=np.float32)
             )
             quantized = np.clip(np.rint(normalized), -1, 1).astype(np.int8)
-            encoded = codec.import_mat_ternary(quantized, gamma)[0]
+            encoded = _codec._import_mat_ternary(quantized, gamma)[0]
             parts = (encoded[:-4],)
-        elif target == "row_int8" and columns > CHUNK_BYTES // 8:
+        elif target == "row_int8" and columns > _CHUNK_BYTES // 8:
             if column == 0:
                 row_maximum = np.float32(1e-5)
-                for begin in range(0, columns, CHUNK_BYTES // 8):
+                for begin in range(0, columns, _CHUNK_BYTES // 8):
                     scan = _effective(
                         entry,
                         row * columns + begin,
-                        min(CHUNK_BYTES // 8, columns - begin),
+                        min(_CHUNK_BYTES // 8, columns - begin),
                         scale,
                     ).astype(np.float32)
                     if not np.isfinite(scan).all():
@@ -232,14 +239,14 @@ def _write_entry(
             if column + count == columns:
                 parts = (
                     *parts,
-                    codec.encode(
+                    _codec._encode(
                         np.array([row_maximum / np.float32(127)], dtype=np.float32),
                         "bf16",
                     )[0],
                 )
         else:
-            encoded = codec.encode(values, target)[0]
-            sizes = codec.payload_sections(target, values.shape)
+            encoded = _codec._encode(values, target)[0]
+            sizes = _codec._payload_sections(target, values.shape)
             splits = np.cumsum([size for _, size in sizes[:-1]])
             parts = tuple(np.split(encoded, splits))
         for index, part in enumerate(parts):
@@ -254,11 +261,11 @@ def _write_entry(
         raise RuntimeError(f"canonical section lengths disagree: {entry.identity}")
 
 
-def write_weights(
-    index: WeightIndex,
+def _write_weights(
+    index: _WeightIndex,
     destination: Path,
-    required_representations: Sequence[WeightRequest] | None = None,
-) -> WeightManifest:
+    required_representations: Sequence[_WeightRequest] | None = None,
+) -> _WeightManifest:
     """Stream canonical weights into one version1 JSON-header binary bundle."""
     destination = destination.resolve()
     if required_representations is None:
@@ -266,7 +273,7 @@ def write_weights(
         for binding in index.bindings.values():
             targets.setdefault(binding.logical, set()).add(binding.dtype)
         required_representations = [
-            WeightRequest(
+            _WeightRequest(
                 logical,
                 dtype,
                 name=logical if len(dtypes) == 1 else f"{logical}@{dtype}",
@@ -274,9 +281,9 @@ def write_weights(
             for logical, dtypes in targets.items()
             for dtype in sorted(dtypes)
         ]
-    records: dict[str, WeightRecord] = {}
-    work: dict[tuple[str, DType, str], tuple[WeightEntry, WeightRequest, int]] = {}
-    fingerprints: dict[WeightSource, SourceProvenance] = {}
+    records: dict[str, _WeightRecord] = {}
+    work: dict[tuple[str, DType, str], tuple[_WeightEntry, _WeightRequest, int]] = {}
+    fingerprints: dict[_WeightSource, _SourceProvenance] = {}
     offsets: dict[tuple[str, DType, str], int] = {}
     names_by_key: dict[tuple[str, DType, str], list[str]] = {}
     total = 0
@@ -290,7 +297,7 @@ def write_weights(
             raise ValueError(f"duplicate weight representation name: {name}")
         names_by_key.setdefault(key, []).append(name)
         size = sum(
-            length for _, length in codec.payload_sections(request.dtype, entry.shape)
+            length for _, length in _codec._payload_sections(request.dtype, entry.shape)
         )
         if key not in offsets:
             total = (total + 63) // 64 * 64
@@ -308,7 +315,7 @@ def write_weights(
                 raise ValueError(
                     f"tied checkpoint weights have different values: {entry.identity}"
                 )
-        records[name] = WeightRecord(
+        records[name] = _WeightRecord(
             name=name,
             logical=request.logical,
             dtype=request.dtype,
@@ -328,7 +335,7 @@ def write_weights(
             records[name] = records[name].model_copy(
                 update={"aliases": [alias for alias in names if alias != name]}
             )
-    manifest = WeightManifest(data_start=8, entries=records)
+    manifest = _WeightManifest(data_start=8, entries=records)
     while True:
         header = manifest.model_dump_json().encode()
         start = (8 + len(header) + 63) // 64 * 64
@@ -341,7 +348,7 @@ def write_weights(
         raise ValueError("weight bundle destination overlaps a checkpoint source")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with temporary.open("w+b", buffering=CHUNK_BYTES) as output:
+        with temporary.open("w+b", buffering=_CHUNK_BYTES) as output:
             output.write(struct.pack("<Q", manifest.data_start - 8))
             output.write(header)
             output.write(b" " * (manifest.data_start - 8 - len(header)))
@@ -361,14 +368,14 @@ def write_weights(
                     scales.get(entry.identity),
                 )
             for source in fingerprints:
-                unchanged(source)
+                _unchanged(source)
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
     return manifest
 
 
-def read_manifest(bundle: Path) -> WeightManifest:
+def _read_manifest(bundle: Path) -> _WeightManifest:
     with bundle.open("rb") as file:
         prefix = file.read(8)
         if len(prefix) != 8:
@@ -376,7 +383,7 @@ def read_manifest(bundle: Path) -> WeightManifest:
         length = struct.unpack("<Q", prefix)[0]
         if length > min(100_000_000, bundle.stat().st_size - 8):
             raise ValueError("invalid weight bundle header length")
-        manifest = WeightManifest.model_validate_json(file.read(length))
+        manifest = _WeightManifest.model_validate_json(file.read(length))
     if manifest.data_start != 8 + length or manifest.data_start % 64:
         raise ValueError("weight bundle data_start disagrees with header")
     size = bundle.stat().st_size - manifest.data_start
@@ -385,7 +392,7 @@ def read_manifest(bundle: Path) -> WeightManifest:
             raise ValueError(f"invalid weight bundle entry: {name}")
         expected = sum(
             length
-            for _, length in codec.payload_sections(entry.dtype, tuple(entry.shape))
+            for _, length in _codec._payload_sections(entry.dtype, tuple(entry.shape))
         )
         if entry.layout != "canonical" or entry.size != expected:
             raise ValueError(f"invalid weight bundle representation: {name}")
@@ -399,7 +406,7 @@ def read_manifest(bundle: Path) -> WeightManifest:
                 other.layout,
             ) != (entry.offset, entry.size, entry.dtype, entry.shape, entry.layout):
                 raise ValueError(f"invalid weight bundle alias: {name} -> {alias}")
-    spans: dict[tuple[int, int], WeightRecord] = {}
+    spans: dict[tuple[int, int], _WeightRecord] = {}
     for entry in manifest.entries.values():
         if entry.size == 0:
             continue

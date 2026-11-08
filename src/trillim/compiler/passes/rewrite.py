@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from ...tdl.core.core_dataclasses import CacheSpec, Region, _Scope
+from ...tdl.core.core_dataclasses import _CacheSpec, _Region, _Scope
 from ...tdl.core.core_pydantic_models import (
-    CacheArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
-    InputArgs,
-    OperatorArgs,
-    OutputArgs,
+    _CacheArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
+    _InputArgs,
+    _OperatorArgs,
+    _OutputArgs,
 )
 from ...tdl.core.graph import Graph
-from ...tdl.core.operator import Operator, _inputs
+from ...tdl.core.operator import _inputs, _Operator
 from ...tdl.core.tensor import Tensor
-from .walk import ordered_operators, predecessors
+from .walk import _ordered_operators, _predecessors
 
 
 def _value(value: object, replacements: Mapping[Tensor, Tensor]) -> object:
@@ -26,7 +26,7 @@ def _value(value: object, replacements: Mapping[Tensor, Tensor]) -> object:
             visited.add(value)
             value = replacements[value]
         return value
-    if isinstance(value, OperatorArgs):
+    if isinstance(value, _OperatorArgs):
         return value.model_copy(
             update={
                 name: _value(item, replacements) for name, item in vars(value).items()
@@ -41,17 +41,17 @@ def _value(value: object, replacements: Mapping[Tensor, Tensor]) -> object:
     return value
 
 
-def replace_arguments(
-    args: OperatorArgs, replacements: Mapping[Tensor, Tensor]
-) -> OperatorArgs:
+def _replace_arguments(
+    args: _OperatorArgs, replacements: Mapping[Tensor, Tensor]
+) -> _OperatorArgs:
     result = _value(args, replacements)
-    assert isinstance(result, OperatorArgs)
+    assert isinstance(result, _OperatorArgs)
     return result
 
 
-def _replace(region: Region, replacements: Mapping[Tensor, Tensor]) -> None:
+def _replace(region: _Region, replacements: Mapping[Tensor, Tensor]) -> None:
     for operator in region.operators:
-        operator.args = replace_arguments(operator.args, replacements)
+        operator.args = _replace_arguments(operator.args, replacements)
         for body in operator.regions:
             _replace(body, replacements)
     region.outputs = tuple(_tensor(value, replacements) for value in region.outputs)
@@ -63,19 +63,21 @@ def _tensor(value: Tensor, replacements: Mapping[Tensor, Tensor]) -> Tensor:
     return result
 
 
-def replace_tensors(graph: Graph, replacements: Mapping[Tensor, Tensor]) -> None:
-    if graph.region is None:
+def _replace_tensors(graph: Graph, replacements: Mapping[Tensor, Tensor]) -> None:
+    if graph._region is None:
         raise ValueError("graph must be completed before rewriting")
-    _replace(graph.region, replacements)
-    rebuild(graph)
+    _replace(graph._region, replacements)
+    _rebuild(graph)
 
 
-def _summarize(region: Region, tensors: set[Tensor], operators: set[Operator]) -> None:
+def _summarize(
+    region: _Region, tensors: set[Tensor], operators: set[_Operator]
+) -> None:
     tensors.update(region.parameters)
     tensors.update(region.outputs)
     tensors.update(region.captures)
-    reads: dict[CacheSpec, None] = {}
-    writes: dict[CacheSpec, None] = {}
+    reads: dict[_CacheSpec, None] = {}
+    writes: dict[_CacheSpec, None] = {}
     for operator in region.operators:
         operators.add(operator)
         tensors.update(operator.inputs)
@@ -85,14 +87,14 @@ def _summarize(region: Region, tensors: set[Tensor], operators: set[Operator]) -
             reads.update(dict.fromkeys(body.reads))
             writes.update(dict.fromkeys(body.writes))
         args = operator.args
-        if isinstance(args, CacheAssignArgs):
+        if isinstance(args, _CacheAssignArgs):
             writes[args.cache] = None
-        elif isinstance(args, CacheReadArgs):
+        elif isinstance(args, _CacheReadArgs):
             reads[args.cache] = None
         operator.inputs = _inputs(args, operator.regions)
         tensors.update(operator.inputs)
         for output in operator.outputs:
-            output.producer = operator
+            output._producer = operator
     local = set(region.parameters)
     local.update(output for operator in region.operators for output in operator.outputs)
     captures = dict.fromkeys(
@@ -109,11 +111,11 @@ def _summarize(region: Region, tensors: set[Tensor], operators: set[Operator]) -
 
 
 def _dependencies(
-    dependencies: tuple[Operator, ...], live: set[Operator], visible: set[Operator]
-) -> tuple[Operator, ...]:
-    result: dict[Operator, None] = {}
+    dependencies: tuple[_Operator, ...], live: set[_Operator], visible: set[_Operator]
+) -> tuple[_Operator, ...]:
+    result: dict[_Operator, None] = {}
     pending = list(dependencies)
-    visited: set[Operator] = set()
+    visited: set[_Operator] = set()
     while pending:
         operator = pending.pop()
         if operator in visited:
@@ -124,22 +126,22 @@ def _dependencies(
                 raise ValueError("rewritten dependency lies outside its region scope")
             result[operator] = None
         else:
-            pending.extend(predecessors(operator))
+            pending.extend(_predecessors(operator))
     return tuple(result)
 
 
 def _order(
     graph: Graph,
-    region: Region,
+    region: _Region,
     parent: _Scope | None,
-    outer: set[Operator],
-    live: set[Operator],
+    outer: set[_Operator],
+    live: set[_Operator],
 ) -> _Scope:
     # Removed snapshot barriers can still connect surviving cache effects.
     allowed = outer | set(region.operators)
     for operator in region.operators:
         operator.dependencies = _dependencies(operator.dependencies, live, allowed)
-    region.operators = tuple(ordered_operators(region))
+    region.operators = tuple(_ordered_operators(region))
     scope = _Scope(
         parent=parent, parameters=region.parameters, operators=list(region.operators)
     )
@@ -157,9 +159,9 @@ def _order(
             cache for body in operator.regions for cache in body.writes
         )
         args = operator.args
-        if isinstance(args, CacheAssignArgs):
+        if isinstance(args, _CacheAssignArgs):
             writes[args.cache] = None
-        elif isinstance(args, CacheReadArgs):
+        elif isinstance(args, _CacheReadArgs):
             reads[args.cache] = None
         for cache in dict.fromkeys((*reads, *writes)):
             previous = scope.cache_accesses.get(cache, graph._cache_declarations[cache])
@@ -171,33 +173,33 @@ def _order(
         for body in operator.regions:
             _order(graph, body, scope, visible, live)
         for value in operator.inputs:
-            value.consumers.append(operator)
+            value._consumers.append(operator)
         for output in operator.outputs:
             graph._tensor_scopes[output] = scope
         visible.add(operator)
     return scope
 
 
-def rebuild(graph: Graph) -> None:
+def _rebuild(graph: Graph) -> None:
     """Recompute graph links, region captures and ordered cache effects after edits."""
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError("graph must be completed before rewriting")
     tensors = set(graph._tensor_scopes)
-    operators: set[Operator] = set()
-    _summarize(graph.region, tensors, operators)
+    operators: set[_Operator] = set()
+    _summarize(graph._region, tensors, operators)
     for tensor in tensors:
-        tensor.consumers.clear()
-    graph.inputs = {}
-    graph.outputs = {}
+        tensor._consumers.clear()
+    graph._inputs = {}
+    graph._outputs = {}
     graph._cache_declarations = {}
-    for operator in graph.region.operators:
+    for operator in graph._region.operators:
         args = operator.args
-        if isinstance(args, InputArgs):
-            graph.inputs[args.name] = operator.outputs[0]
-        elif isinstance(args, OutputArgs):
-            graph.outputs[args.name] = args.x
-        elif isinstance(args, CacheArgs):
-            graph._cache_declarations[graph.caches[args.name]] = operator
-    graph.region.outputs = tuple(graph.outputs.values())
+        if isinstance(args, _InputArgs):
+            graph._inputs[args.name] = operator.outputs[0]
+        elif isinstance(args, _OutputArgs):
+            graph._outputs[args.name] = args.x
+        elif isinstance(args, _CacheArgs):
+            graph._cache_declarations[graph._caches[args.name]] = operator
+    graph._region.outputs = tuple(graph._outputs.values())
     graph._tensor_scopes = {}
-    graph._root = _order(graph, graph.region, None, set(), operators)
+    graph._root = _order(graph, graph._region, None, set(), operators)
