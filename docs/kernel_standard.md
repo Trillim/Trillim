@@ -9,9 +9,11 @@ A kernel exports four functions:
 - The execution function accepts output pointers, input pointers, scratch, its parameter struct, and a borrowed execution context, in that order.
 - `_tdl()` returns Python TDL defining `pattern(...)` and a parameter `bind(context)` function; matching uses the computation rather than node names.
 - `_parameters()` describes the native struct's field types and offsets, pointer counts, alignment, required buffer sizes, scratch size, and permitted aliases.
-- `_capabilities()` declares ABI version 1, the backend, required hardware features, and required software libraries.
+- `_capabilities()` returns ABI version 1 and one `uint64_t` mask of required capabilities. The library's location identifies the backend.
 
-The compiler validates capabilities before invoking feature-dependent code. Metadata exports must be safe on the baseline CPU.
+`common.h` defines the capability flags. Bits 0–31 describe backend-specific hardware features; bits 32–63 describe software libraries. X86 flags include AVX2, AVX512 variants, AVX-VNNI, AVX512-VNNI and FMA. NEON flags cover NEON and dotprod. LIBM and BLAS use the same software bits across backends, so portable kernels retain their requirements when included in another backend.
+
+The compiler builds one available-capabilities mask per backend and accepts a kernel when `(required & available) == required`. Missing or unknown bits make a kernel unavailable. Metadata exports must be safe on the baseline CPU. The executable records the required mask and readable feature names.
 
 These four native exports define the kernel API. The Python helpers used by built-in parameter binders are compiler-private.
 

@@ -5,6 +5,22 @@
 #include <stdint.h>
 #include <string.h>
 #define TRILLIM_KERNEL_ABI_VERSION 1
+
+#define TRILLIM_CAP_X86_AVX2 (UINT64_C(1) << 0)
+#define TRILLIM_CAP_X86_AVX512F (UINT64_C(1) << 1)
+#define TRILLIM_CAP_X86_AVX512BW (UINT64_C(1) << 2)
+#define TRILLIM_CAP_X86_AVX512DQ (UINT64_C(1) << 3)
+#define TRILLIM_CAP_X86_AVX512VL (UINT64_C(1) << 4)
+#define TRILLIM_CAP_X86_AVX_VNNI (UINT64_C(1) << 5)
+#define TRILLIM_CAP_X86_AVX512_VNNI (UINT64_C(1) << 6)
+#define TRILLIM_CAP_X86_FMA (UINT64_C(1) << 7)
+
+#define TRILLIM_CAP_NEON (UINT64_C(1) << 0)
+#define TRILLIM_CAP_NEON_DOTPROD (UINT64_C(1) << 1)
+
+#define TRILLIM_CAP_LIBM (UINT64_C(1) << 32)
+#define TRILLIM_CAP_BLAS (UINT64_C(1) << 33)
+
 #ifdef __cplusplus
 #define TRILLIM_KERNEL extern "C"
 #define TRILLIM_ALIGNOF(type) alignof(type)
@@ -36,9 +52,7 @@ typedef struct {
 } TrillimParameterSchema;
 typedef struct {
     uint32_t abi_version;
-    const char *backend;
-    const char *hardware;
-    const char *software;
+    uint64_t required;
 } TrillimCapabilities;
 typedef TrillimStatus (*TrillimTask)(void *, size_t, size_t);
 typedef struct {

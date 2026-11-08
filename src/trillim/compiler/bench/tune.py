@@ -512,7 +512,7 @@ def _tune(
     )
     for operator_index, (operator, candidates) in groups:
         ordered = sorted(
-            candidates, key=lambda value: -len(value.kernel.capabilities.hardware)
+            candidates, key=lambda value: -value.kernel.capabilities.bit_count()
         )
         for point in points:
             costs = result.per_workload.setdefault(point, {})

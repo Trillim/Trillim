@@ -74,8 +74,7 @@ def _choices(
         key=lambda item: (
             item[1] / len(item[0].covered),
             -len(item[0].covered),
-            -len(item[0].kernel.capabilities.hardware),
-            -len(item[0].kernel.capabilities.software),
+            -item[0].kernel.capabilities.bit_count(),
             item[0].kernel.name,
         ),
     )

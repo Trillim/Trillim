@@ -57,20 +57,12 @@ class _ParameterSchema:
 
 
 @dataclass(frozen=True, slots=True)
-class _Capabilities:
-    abi_version: int
-    backend: str
-    hardware: tuple[str, ...]
-    software: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _Kernel:
     name: str
     backend: _Backend
     pattern: Callable[..., _TensorTuple]
     parameter_schema: _ParameterSchema
-    capabilities: _Capabilities
+    capabilities: int
     bind: Callable[[_KernelBindingContext], dict[str, _ParameterValue]]
     library: Path
     physical_inputs: tuple[str, ...] | None = None

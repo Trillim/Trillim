@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import inspect
-from pathlib import Path
 from typing import get_args
 
 import numpy as np
@@ -32,6 +29,7 @@ from ..kernels.bindings import (
     _reshape_strides,
     _storage_shape,
 )
+from ..kernels.catalog import _available_capabilities
 from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
 from .infer import _infer
 from .optimize import _optimize
@@ -197,31 +195,6 @@ def _equivalent(
     if not isinstance(t.args, _ConstantArgs):
         covered.add(t)
     pairs.add(pair)
-    return True
-
-
-def _available(kernel: _Kernel) -> bool:
-    if kernel.capabilities.abi_version != 1:
-        return False
-    features: set[str] = set()
-    cpuinfo = Path("/proc/cpuinfo")
-    if cpuinfo.exists():
-        for line in cpuinfo.read_text().splitlines():
-            if line.startswith(("flags", "Features")):
-                features.update(line.partition(":")[2].split())
-    if any(
-        feature.replace("-", "_") not in features
-        for feature in kernel.capabilities.hardware
-    ):
-        return False
-    for software in kernel.capabilities.software:
-        library = ctypes.util.find_library(software)
-        if library is None:
-            return False
-        try:
-            ctypes.CDLL(library)
-        except OSError:
-            return False
     return True
 
 
@@ -451,7 +424,15 @@ def _match(
         raise ValueError("cannot match an incomplete graph")
     result = _MatchSet()
     state = _MatchingState(inference)
-    eligible = tuple(kernel for kernel in kernels if _available(kernel))
+    available = {
+        backend: _available_capabilities(backend)
+        for backend in {kernel.backend for kernel in kernels}
+    }
+    eligible = tuple(
+        kernel
+        for kernel in kernels
+        if kernel.capabilities & available[kernel.backend] == kernel.capabilities
+    )
     signatures = {id(kernel): _signature(kernel) for kernel in eligible}
     constraints: dict[_Operator | None, list[_ShapeConstraint]] = {}
     for constraint in inference.constraints:
