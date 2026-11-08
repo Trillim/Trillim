@@ -4,7 +4,9 @@
 
 The supported Python API is `trillim.tdl` and `trillim.tdl.core` for model authoring. Compilation is exposed through the command above; compiler functions, types and helpers are private.
 
-The compiler detects the host backend and writes to `~/.trillim/compiled/<model_name>`. With one checkpoint, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. With multiple checkpoints or no checkpoints, the TDL filename supplies the name.
+Generated files use `$TRILLIM_HOME/1.0.0/`, where `TRILLIM_HOME` defaults to `~/.trillim`. Only version 1.0.0 is read. `kernels/` holds backend builds, `bench/` holds the native benchmark helper, and `compiled/` holds model bundles. Benchmark timings are reused only within the current compilation; the executable records the measurements used for selection.
+
+The compiler detects the host backend and writes to `~/.trillim/1.0.0/compiled/<model_name>` by default. With one checkpoint, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. With multiple checkpoints or no checkpoints, the TDL filename supplies the name.
 
 - `--output PATH` chooses another destination.
 - `--backend scalar|x86|neon` overrides host detection. Kernels declare their hardware features separately, such as AVX2, AVX512, VNNI, or NEON dotprod.

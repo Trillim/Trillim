@@ -1,6 +1,6 @@
 # Kernel ABI 1
 
-Each backend builds its kernel sources into one `backend.o` and one loadable library under `build/kernels/`. A backend has no dependency on another backend's library.
+Each backend builds its kernel sources into one `backend.o` and one loadable library under `$TRILLIM_HOME/1.0.0/kernels/<backend>/<build-hash>/`. `TRILLIM_HOME` defaults to `~/.trillim`. A backend has no dependency on another backend's library.
 
 A kernel exports four functions:
 

@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import platform
-import tempfile
 from collections import defaultdict
 from collections.abc import Hashable
 from math import isfinite, prod
@@ -13,7 +8,6 @@ from statistics import mean, median, pvariance
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import TypeAdapter
 
 from ...tdl.core.core_pydantic_models import (
     Weight,
@@ -31,7 +25,6 @@ from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
 from .. import dtype as _codec
 from ..artifacts.artifact_dataclasses import _JSON
-from ..artifacts.expressions import _number
 from ..artifacts.parameters import _requirements
 from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..compiler_pydantic_models import _CompileRequest
@@ -474,162 +467,6 @@ def _priority(
     )
 
 
-_RESULT = TypeAdapter(_BenchmarkResult)
-_PROFILE_ROOT = Path(__file__).resolve().parents[4] / "build/kernelbench/profiles"
-
-
-def _cpu_key() -> str:
-    try:
-        lines = Path("/proc/cpuinfo").read_text().splitlines()
-    except OSError:
-        lines = [platform.processor()]
-    fields = sorted(
-        {
-            line.strip()
-            for line in lines
-            if line.partition(":")[0].strip()
-            in {
-                "vendor_id",
-                "model name",
-                "cpu family",
-                "model",
-                "stepping",
-                "flags",
-                "Features",
-                "CPU implementer",
-                "CPU part",
-            }
-        }
-    )
-    try:
-        affinity = sorted(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        affinity = list(range(os.cpu_count() or 1))
-    return json.dumps(
-        [platform.machine(), platform.release(), fields, affinity],
-        separators=(",", ":"),
-    )
-
-
-def _code_key() -> str:
-    directory = Path(__file__).resolve().parent
-    sources = [
-        Path(__file__),
-        directory / "benchmark.py",
-        directory / "bench_dataclasses.py",
-        directory / "native.c",
-        directory / "native.h",
-        directory.parent / "artifacts/parameters.py",
-        directory.parent / "dtype.py",
-        directory.parent / "kernels/bindings.py",
-    ]
-    digest = hashlib.sha256()
-    for source in sources:
-        digest.update(source.read_bytes())
-    return digest.hexdigest()
-
-
-def _json_key(value: object) -> _JSON:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (int, float)):
-        return _number(value)
-    if value is None or isinstance(value, str):
-        return value
-    if isinstance(value, tuple):
-        return [_json_key(item) for item in value]
-    raise TypeError("unsupported native profile signature value")
-
-
-def _profile_key(
-    candidate: _KernelMatch,
-    reference: _KernelMatch | None,
-    signature: Hashable,
-    state: _TuningState,
-    cpu: str,
-    code: str,
-    libraries: dict[Path, str],
-) -> str:
-    for kernel in (
-        (candidate.kernel,)
-        if reference is None
-        else (candidate.kernel, reference.kernel)
-    ):
-        if kernel.library not in libraries:
-            libraries[kernel.library] = hashlib.sha256(
-                kernel.library.read_bytes()
-            ).hexdigest()
-    description = {
-        "version": 1,
-        "cpu": cpu,
-        "threads": state.request.threads,
-        "code": code,
-        "library": libraries[candidate.kernel.library],
-        "reference": None
-        if reference is None
-        else [reference.kernel.name, libraries[reference.kernel.library]],
-        "signature": _json_key(signature),
-    }
-    return hashlib.sha256(
-        json.dumps(
-            description, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-    ).hexdigest()
-
-
-def _load_profile(key: str) -> _BenchmarkResult | None:
-    try:
-        profile = _RESULT.validate_json((_PROFILE_ROOT / f"{key}.json").read_bytes())
-        if (
-            len(profile.samples) != 3
-            or any(
-                not isfinite(value) or value < 0
-                for value in (
-                    *profile.samples,
-                    profile.mean,
-                    profile.median,
-                    profile.variance,
-                    profile.maximum_error,
-                    profile.normalized_error,
-                )
-            )
-            or profile.allocated_bytes < 0
-        ):
-            return None
-        return profile
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _save_profile(key: str, profile: _BenchmarkResult) -> None:
-    if not all(
-        isfinite(value)
-        for value in (
-            *profile.samples,
-            profile.mean,
-            profile.median,
-            profile.variance,
-            profile.maximum_error,
-            profile.normalized_error,
-        )
-    ):
-        return
-    temporary: Path | None = None
-    try:
-        _PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=_PROFILE_ROOT, prefix=".profile-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(_RESULT.dump_json(profile))
-        temporary.replace(_PROFILE_ROOT / f"{key}.json")
-    except OSError:
-        pass
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
 def _increment(record: dict[str, _JSON], operator: int) -> None:
     uses = record["uses"]
     assert isinstance(uses, int)
@@ -662,10 +499,7 @@ def _tune(
         np.random.default_rng(0),
         views=frozenset(matches.views),
     )
-    cpu, code = _cpu_key(), _code_key()
-    libraries: dict[Path, str] = {}
-    keys: dict[tuple[Hashable, str | None], str] = {}
-    cache: dict[str, _BenchmarkResult] = {}
+    cache: dict[Hashable, _BenchmarkResult] = {}
     records: dict[tuple[Hashable, int], dict[str, _JSON]] = {}
     rejected: set[tuple[_Operator, str]] = set()
     aggregated: dict[_Operator, dict[str, list[float]]] = defaultdict(
@@ -693,32 +527,15 @@ def _tune(
                             "no equivalent scalar candidate is available for numerical validation"
                         )
                     signature = _signature(candidate, point, state)
-                    cache_identity = (
+                    key = (
                         signature,
-                        reference.kernel.name
+                        (reference.kernel.library, reference.kernel.name)
                         if candidate.kernel.backend != "scalar"
                         and reference is not None
                         else None,
                     )
-                    key = keys.get(cache_identity)
-                    if key is None:
-                        key = _profile_key(
-                            candidate,
-                            reference if candidate.kernel.backend != "scalar" else None,
-                            signature,
-                            state,
-                            cpu,
-                            code,
-                            libraries,
-                        )
-                        keys[cache_identity] = key
                     profile = cache.get(key)
                     cache_source = "memory"
-                    if profile is None:
-                        profile = _load_profile(key)
-                        cache_source = "persistent"
-                        if profile is not None:
-                            cache[key] = profile
                     record_key = key, point
                     record = records.get(record_key)
                     if record is None:
@@ -732,7 +549,6 @@ def _tune(
                             "kernel": candidate.kernel.name,
                             "backend": candidate.kernel.backend,
                             "threads": request.threads,
-                            "profile_key": key,
                             "parameters": {
                                 name: list(value) if isinstance(value, tuple) else value
                                 for name, value in parameters.items()
@@ -759,7 +575,6 @@ def _tune(
                             max_bytes=_MAX_BYTES,
                         )
                         cache[key] = profile
-                        _save_profile(key, profile)
                         cache_source = "measured"
                         inputs: list[_JSON] = [
                             description for description in descriptions
@@ -771,16 +586,7 @@ def _tune(
                             and len(profile.reference_samples) == 3
                         ):
                             reference_signature = _signature(reference, point, state)
-                            reference_key = _profile_key(
-                                reference,
-                                None,
-                                reference_signature,
-                                state,
-                                cpu,
-                                code,
-                                libraries,
-                            )
-                            keys[reference_signature, None] = reference_key
+                            reference_key = reference_signature, None
                             assert golden is not None
                             footprint = _requirements(
                                 reference.kernel.parameter_schema, golden.parameters
@@ -806,7 +612,6 @@ def _tune(
                                 size,
                             )
                             cache[reference_key] = scalar_profile
-                            _save_profile(reference_key, scalar_profile)
                     if not profile.correct:
                         rejected.add((operator, candidate.kernel.name))
                         costs.setdefault(operator, {})[candidate.kernel.name] = float(
