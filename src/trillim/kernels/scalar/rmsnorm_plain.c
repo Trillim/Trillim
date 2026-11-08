@@ -274,6 +274,6 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rmsnorm_plain_parame
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_rmsnorm_plain_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "scalar", "", "m"};
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
     return &capabilities;
 }

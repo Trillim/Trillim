@@ -27,6 +27,7 @@ from ..artifacts.expressions import _align, _byte_size, _number, _references, _s
 from ..compiler_dataclasses import _ShapeConstraint, _ShapeExpression
 from ..compiler_pydantic_models import _CompileRequest
 from ..kernels.kernel_dataclasses import _ParameterValue
+from ..kernels.native import _CAPABILITY_FLAGS
 from .passes_dataclasses import _Selection
 
 
@@ -289,8 +290,12 @@ def _emit(
             "input_alignments": list(schema.input_alignments),
             "output_alignments": list(schema.output_alignments),
             "scratch_alignment": schema.scratch_alignment,
-            "hardware": list(kernel.capabilities.hardware),
-            "software": list(kernel.capabilities.software),
+            "capabilities": kernel.capabilities,
+            "features": [
+                name
+                for name, flag in _CAPABILITY_FLAGS[kernel.backend].items()
+                if kernel.capabilities & flag
+            ],
         }
     cache_offset = 0
     caches: dict[str, _JSON] = {}

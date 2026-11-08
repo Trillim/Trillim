@@ -29,7 +29,7 @@ The compiler edits the traced TDL graph directly. It validates checkpoint refere
 - `buffers` describe dtype, shape, strides, capacity, and storage. Storage is an arena span, caller input, weight, constant, cache, or another tensor's view.
 - `arena_size` covers intermediate outputs and temporary workspace; their live intervals determine reuse. `cache_size` covers persistent state.
 - `caches` describe fixed capacities, initial values, update policies, and offsets. Append overflow is an error; sliding caches retain their newest values.
-- `kernels` contain library paths, symbols, parameter layouts, alignment, and required hardware and software features.
+- `kernels` contain library paths, symbols, parameter layouts, alignment, and a required capability bitmask with readable feature names.
 - `program` contains native calls, views, guards, branches, loops, reductions, and explicit cache accesses. Guards execute where their referenced values exist.
 - `expressions` stores shared shape calculations once; `{"expr": "e0"}` refers to a table entry. Each workload plan has its own expression table.
 - `workloads` contain measured samples, mean, median, variance, reference comparisons, and reasons for skipped measurements. `plans` may provide different kernel coverings for workload ranges; each plan supplies its buffer layout and program.

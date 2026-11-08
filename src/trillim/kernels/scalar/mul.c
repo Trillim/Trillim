@@ -115,6 +115,6 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_mul_parameters(void)
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_mul_capabilities(void) {
-    static const TrillimCapabilities capabilities = {1, "scalar", "", ""};
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, 0};
     return &capabilities;
 }

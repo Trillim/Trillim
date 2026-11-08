@@ -3,7 +3,28 @@ from __future__ import annotations
 import ctypes as c
 from typing import cast
 
-from .kernel_dataclasses import _ParameterField, _ParameterSchema
+from .kernel_dataclasses import _Backend, _ParameterField, _ParameterSchema
+
+_SOFTWARE_CAPABILITIES = {"m": 1 << 32, "blas": 1 << 33}
+_CAPABILITY_FLAGS: dict[_Backend, dict[str, int]] = {
+    "scalar": {**_SOFTWARE_CAPABILITIES},
+    "x86": {
+        **_SOFTWARE_CAPABILITIES,
+        "avx2": 1 << 0,
+        "avx512f": 1 << 1,
+        "avx512bw": 1 << 2,
+        "avx512dq": 1 << 3,
+        "avx512vl": 1 << 4,
+        "avx_vnni": 1 << 5,
+        "avx512_vnni": 1 << 6,
+        "fma": 1 << 7,
+    },
+    "neon": {
+        **_SOFTWARE_CAPABILITIES,
+        "neon": 1 << 0,
+        "dotprod": 1 << 1,
+    },
+}
 
 
 class _NativeParameter(c.Structure):
@@ -34,9 +55,7 @@ class _NativeSchema(c.Structure):
 class _NativeCapabilities(c.Structure):
     _fields_ = [
         ("abi_version", c.c_uint32),
-        ("backend", c.c_char_p),
-        ("hardware", c.c_char_p),
-        ("software", c.c_char_p),
+        ("required", c.c_uint64),
     ]
 
 

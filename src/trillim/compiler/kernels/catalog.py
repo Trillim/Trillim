@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes as c
+import ctypes.util
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -9,14 +10,43 @@ from ...tdl.core.core_dataclasses import _TensorTuple
 from .build import _build
 from .kernel_dataclasses import (
     _Backend,
-    _Capabilities,
     _Kernel,
     _KernelBindingContext,
     _ParameterValue,
 )
-from .native import _NativeCapabilities, _read_schema
+from .native import (
+    _CAPABILITY_FLAGS,
+    _SOFTWARE_CAPABILITIES,
+    _NativeCapabilities,
+    _read_schema,
+)
 
 _LIBRARIES: dict[Path, c.CDLL] = {}
+
+
+def _available_capabilities(backend: _Backend) -> int:
+    features: set[str] = set()
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith(("flags", "Features")):
+                features.update(line.partition(":")[2].split())
+    except OSError:
+        pass
+    aliases = {"neon": "asimd", "dotprod": "asimddp"}
+    available = 0
+    for name, flag in _CAPABILITY_FLAGS[backend].items():
+        if name in _SOFTWARE_CAPABILITIES:
+            library = ctypes.util.find_library(name)
+            if library is None:
+                continue
+            try:
+                c.CDLL(library)
+            except OSError:
+                continue
+            available |= flag
+        elif name in features or aliases.get(name) in features:
+            available |= flag
+    return available
 
 
 def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ...]:
@@ -65,12 +95,7 @@ def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ..
                     backend,
                     pattern,
                     schema,
-                    _Capabilities(
-                        1,
-                        capabilities.backend.decode(),
-                        tuple(capabilities.hardware.decode().split()),
-                        tuple(capabilities.software.decode().split()),
-                    ),
+                    int(capabilities.required),
                     binder,
                     artifact.library,
                     cast(tuple[str, ...] | None, physical),

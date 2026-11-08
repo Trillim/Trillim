@@ -79,9 +79,9 @@ def _build(backend: _Backend) -> _BuildArtifact:
             for source in fallback:
                 target = generated / source.name
                 target.write_text(
-                    source.read_text()
-                    .replace("trillim_scalar_", f"trillim_{backend}_scalar_")
-                    .replace('"scalar"', f'"{backend}"')
+                    source.read_text().replace(
+                        "trillim_scalar_", f"trillim_{backend}_scalar_"
+                    )
                 )
                 compiled_sources.append(target)
         objects: list[Path] = []
