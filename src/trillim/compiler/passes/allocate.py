@@ -5,45 +5,50 @@ from collections.abc import Iterable
 
 import numpy as np
 
-from ...tdl.core.core_dataclasses import Region
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
-    BroadcastArgs,
-    ConstantArgs,
-    ConstructArgs,
-    InputArgs,
-    PermuteArgs,
-    ReduceArgs,
-    ReshapeArgs,
     Weight,
-    WhileArgs,
+    _BroadcastArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _InputArgs,
+    _PermuteArgs,
+    _ReduceArgs,
+    _ReshapeArgs,
+    _WhileArgs,
 )
 from ...tdl.core.graph import Graph
 from ...tdl.core.tensor import Tensor
-from ..artifacts import transfers
-from ..artifacts.artifact_dataclasses import Buffer, Layout, Workspace
-from ..artifacts.expressions import align, byte_size, parameter_references, references
-from ..artifacts.parameters import requirements
-from ..compiler_dataclasses import Inference, ShapeExpression
-from ..dtype import encode
-from ..kernels.bindings import (
-    broadcast_strides,
-    contiguous_strides,
-    product,
-    reshape_strides,
+from ..artifacts import transfers as _transfers
+from ..artifacts.artifact_dataclasses import _Buffer, _Layout, _Workspace
+from ..artifacts.expressions import (
+    _align,
+    _byte_size,
+    _parameter_references,
+    _references,
 )
-from ..kernels.kernel_dataclasses import Kernel, KernelBindingContext, TensorBinding
-from ..weights.weights_dataclasses import WeightIndex
-from ..weights.weights_pydantic_models import WeightManifest
-from .cache import bind_caches
-from .infer import constant
-from .passes_dataclasses import Selection
-from .walk import walk
+from ..artifacts.parameters import _requirements
+from ..compiler_dataclasses import _Inference, _ShapeExpression
+from ..dtype import _encode
+from ..kernels.bindings import (
+    _broadcast_strides,
+    _contiguous_strides,
+    _product,
+    _reshape_strides,
+)
+from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
+from ..weights.weights_dataclasses import _WeightIndex
+from ..weights.weights_pydantic_models import _WeightManifest
+from .cache import _bind_caches
+from .infer import _constant_expression
+from .passes_dataclasses import _Selection
+from .walk import _walk
 
 
 def _schedule(
-    region: Region,
-    selection: Selection,
-    layout: Layout,
+    region: _Region,
+    selection: _Selection,
+    layout: _Layout,
     live: set[Tensor],
     clock: list[int],
 ) -> None:
@@ -66,14 +71,16 @@ def _schedule(
         touch(call.bindings.values() if call else operator.inputs, start)
         if call is not None:
             for parameter in call.parameters.values():
-                touch(parameter_references(parameter), start)
+                touch(_parameter_references(parameter), start)
         for constraint in layout.inference.constraints:
             if (
                 constraint.operator is operator
                 or call is not None
                 and constraint.operator in call.covered
             ):
-                touch(references(constraint.left) | references(constraint.right), start)
+                touch(
+                    _references(constraint.left) | _references(constraint.right), start
+                )
         if call is None:
             for body in operator.regions:
                 _schedule(body, selection, layout, live, clock)
@@ -83,22 +90,22 @@ def _schedule(
         if (
             operator.regions
             and call is None
-            and not isinstance(operator.args, ConstructArgs)
+            and not isinstance(operator.args, _ConstructArgs)
         ):
             touch(operator.outputs, stop)
         for body in operator.regions if call is None else ():
             touch(body.outputs, stop)
             # Captures must survive every iteration, even after their final textual use.
             touch(body.captures, stop)
-            if isinstance(operator.args, (WhileArgs, ReduceArgs)):
+            if isinstance(operator.args, (_WhileArgs, _ReduceArgs)):
                 touch(body.parameters, stop)
         layout.positions[operator] = start, stop
     touch(region.outputs, clock[0])
 
 
-def _arena(items: list[Buffer | Workspace]) -> int:
+def _arena(items: list[_Buffer | _Workspace]) -> int:
     pending = sorted(items, key=lambda item: (item.first, -item.size))
-    active: list[Buffer | Workspace] = []
+    active: list[_Buffer | _Workspace] = []
     free: list[tuple[int, int]] = []
     size = 0
     for item in pending:
@@ -115,9 +122,9 @@ def _arena(items: list[Buffer | Workspace]) -> int:
                 merged.append((offset, length))
         free = merged
         candidates = [
-            (length - item.size, index, align(offset, item.alignment))
+            (length - item.size, index, _align(offset, item.alignment))
             for index, (offset, length) in enumerate(free)
-            if align(offset, item.alignment) + item.size <= offset + length
+            if _align(offset, item.alignment) + item.size <= offset + length
         ]
         if candidates:
             _, index, begin = min(candidates)
@@ -128,19 +135,19 @@ def _arena(items: list[Buffer | Workspace]) -> int:
                 free.append((begin + item.size, offset + length - begin - item.size))
             item.offset = begin
         else:
-            item.offset = align(size, item.alignment)
+            item.offset = _align(size, item.alignment)
             size = item.offset + item.size
         active.append(item)
-    return align(size, 64)
+    return _align(size, 64)
 
 
-def _views(region: Region, selection: Selection, layout: Layout) -> None:
-    for _, operator in walk(region):
+def _views(region: _Region, selection: _Selection, layout: _Layout) -> None:
+    for _, operator in _walk(region):
         if operator in selection.calls:
             continue
         args = operator.args
         source: Tensor | None = None
-        if isinstance(args, ConstructArgs):
+        if isinstance(args, _ConstructArgs):
             pairs = zip(operator.outputs, operator.regions[0].outputs, strict=True)
             for output, body_output in pairs:
                 result, original = layout.buffers[output], layout.buffers[body_output]
@@ -151,40 +158,40 @@ def _views(region: Region, selection: Selection, layout: Layout) -> None:
                     original.size,
                 )
             continue
-        if isinstance(args, (PermuteArgs, BroadcastArgs, ReshapeArgs)):
+        if isinstance(args, (_PermuteArgs, _BroadcastArgs, _ReshapeArgs)):
             source = args.x
         if source is None:
             continue
         result, original = layout.buffers[operator.outputs[0]], layout.buffers[source]
         reshaped = (
-            reshape_strides(original.shape, original.strides, result.shape)
-            if isinstance(args, ReshapeArgs)
+            _reshape_strides(original.shape, original.strides, result.shape)
+            if isinstance(args, _ReshapeArgs)
             else None
         )
-        if isinstance(args, ReshapeArgs) and reshaped is None:
+        if isinstance(args, _ReshapeArgs) and reshaped is None:
             result.storage, result.source = "arena", None
-            result.strides = contiguous_strides(result.shape)
+            result.strides = _contiguous_strides(result.shape)
             result.storage_shape = (
-                (result.shape[0], product(result.shape[1:]))
+                (result.shape[0], _product(result.shape[1:]))
                 if len(result.shape) > 1
-                else (constant(1), product(result.shape))
+                else (_constant_expression(1), _product(result.shape))
             )
-            result.size = byte_size(result.dtype, result.maximum_shape)
+            result.size = _byte_size(result.dtype, result.maximum_shape)
             continue
         result.storage, result.source = "alias", original.name
         result.size, result.storage_shape = original.size, original.storage_shape
-        if isinstance(args, PermuteArgs):
+        if isinstance(args, _PermuteArgs):
             result.strides = tuple(original.strides[index] for index in args.axes)
-        elif isinstance(args, ReshapeArgs):
+        elif isinstance(args, _ReshapeArgs):
             assert reshaped is not None
             result.strides = reshaped
-        elif isinstance(args, BroadcastArgs):
-            result.strides = broadcast_strides(
+        elif isinstance(args, _BroadcastArgs):
+            result.strides = _broadcast_strides(
                 original.shape, result.shape, original.strides
             )
 
 
-def _lifetimes(layout: Layout, live: set[Tensor]) -> None:
+def _lifetimes(layout: _Layout, live: set[Tensor]) -> None:
     by_name = {buffer.name: tensor for tensor, buffer in layout.buffers.items()}
     dependencies: dict[Tensor, set[Tensor]] = {}
     for tensor, buffer in layout.buffers.items():
@@ -195,7 +202,7 @@ def _lifetimes(layout: Layout, live: set[Tensor]) -> None:
         )
         related: set[Tensor] = set()
         for value in values:
-            related.update(references(value))
+            related.update(_references(value))
         if buffer.storage == "alias":
             if buffer.source is None or buffer.source not in by_name:
                 raise ValueError("view has no backing storage")
@@ -221,20 +228,20 @@ def _lifetimes(layout: Layout, live: set[Tensor]) -> None:
                     queued.add(dependency)
 
 
-def allocate(
+def _allocate(
     graph: Graph,
-    inference: Inference,
-    selection: Selection,
-    weights: WeightIndex,
-    manifest: WeightManifest,
+    inference: _Inference,
+    selection: _Selection,
+    weights: _WeightIndex,
+    manifest: _WeightManifest,
     *,
-    transfer_kernel: Kernel | None = None,
-) -> Layout:
-    if graph.region is None:
+    transfer_kernel: _Kernel | None = None,
+) -> _Layout:
+    if graph._region is None:
         raise ValueError("graph is not complete")
-    layout = Layout(inference, transfer_kernel=transfer_kernel)
+    layout = _Layout(inference, transfer_kernel=transfer_kernel)
     tensors: dict[Tensor, None] = {}
-    for region, operator in walk(graph.region):
+    for region, operator in _walk(graph._region):
         tensors.update(dict.fromkeys(region.parameters))
         tensors.update(dict.fromkeys(operator.outputs))
     constants = bytearray()
@@ -250,13 +257,13 @@ def allocate(
         maximum = tuple(
             int(dimension) for dimension in info.maximum_shape if dimension is not None
         )
-        buffer = Buffer(
+        buffer = _Buffer(
             f"t{index}",
             info.dtype,
             info.shape,
             maximum,
-            contiguous_strides(info.shape),
-            size=byte_size(info.dtype, maximum),
+            _contiguous_strides(info.shape),
+            size=_byte_size(info.dtype, maximum),
             first=2**63 - 1,
             values=info.values,
         )
@@ -268,23 +275,23 @@ def allocate(
             lower, upper = inference.value_ranges.get(tensor, (None, None))
             if lower is not None and upper is not None:
                 buffer.values = (
-                    ShapeExpression(
+                    _ShapeExpression(
                         "scalar", tensor=tensor, minimum=lower, maximum=upper
                     ),
                 )
         buffer.storage_shape = (
-            (info.shape[0], product(info.shape[1:]))
+            (info.shape[0], _product(info.shape[1:]))
             if len(info.shape) > 1
-            else (constant(1), product(info.shape))
+            else (_constant_expression(1), _product(info.shape))
         )
         layout.buffers[tensor] = buffer
-        producer = tensor.producer
+        producer = tensor._producer
         if producer is None:
             continue
         args = producer.args
-        if isinstance(args, InputArgs):
+        if isinstance(args, _InputArgs):
             buffer.storage, buffer.source = "input", args.name
-        elif isinstance(args, ConstantArgs):
+        elif isinstance(args, _ConstantArgs):
             if isinstance(args.value, Weight):
                 binding = weights.bindings[tensor]
                 entry = next(
@@ -308,33 +315,33 @@ def allocate(
                 )
             else:
                 buffer.storage = "constant"
-                buffer.offset = align(len(constants), 64)
+                buffer.offset = _align(len(constants), 64)
                 constants.extend(bytes(buffer.offset - len(constants)))
-                payload = encode(np.asarray(args.value), info.dtype)[0].tobytes()
+                payload = _encode(np.asarray(args.value), info.dtype)[0].tobytes()
                 buffer.size = len(payload)
                 constants.extend(payload)
-    _views(graph.region, selection, layout)
+    _views(graph._region, selection, layout)
     live: set[Tensor] = set()
-    _schedule(graph.region, selection, layout, live, [0])
+    _schedule(graph._region, selection, layout, live, [0])
     _lifetimes(layout, live)
-    bind_caches(graph, layout, selection)
-    _views(graph.region, selection, layout)
+    _bind_caches(graph, layout, selection)
+    _views(graph._region, selection, layout)
     _lifetimes(layout, live)
     for operator, call in selection.calls.items():
-        context = KernelBindingContext(
+        context = _KernelBindingContext(
             {
-                name: layout.buffers[tensor].binding()
+                name: layout.buffers[tensor]._binding()
                 for name, tensor in call.bindings.items()
             },
-            tuple(layout.buffers[tensor].binding() for tensor in call.outputs),
+            tuple(layout.buffers[tensor]._binding() for tensor in call.outputs),
             dict(vars(operator.args)),
         )
-        if isinstance(operator.args, ConstructArgs):
-            context = KernelBindingContext(
+        if isinstance(operator.args, _ConstructArgs):
+            context = _KernelBindingContext(
                 context.inputs, context.outputs, operator.args.arguments
             )
         parameters = call.kernel.bind(context)
-        required = requirements(call.kernel.parameter_schema, parameters)
+        required = _requirements(call.kernel.parameter_schema, parameters)
         for tensor, size in zip(call.inputs, required.inputs, strict=True):
             if size > layout.buffers[tensor].size:
                 raise ValueError(
@@ -345,7 +352,7 @@ def allocate(
             buffer.size = max(buffer.size, size)
         layout.parameters[operator] = parameters
         for parameter in parameters.values():
-            for tensor in parameter_references(parameter):
+            for tensor in _parameter_references(parameter):
                 if tensor not in layout.buffers:
                     raise ValueError("kernel parameter references an eliminated tensor")
                 live.add(tensor)
@@ -353,7 +360,7 @@ def allocate(
                 buffer.first = min(buffer.first, layout.positions[operator][0])
                 buffer.last = max(buffer.last, layout.positions[operator][1])
         start, stop = layout.positions[operator]
-        layout.scratch[operator] = Workspace(
+        layout.scratch[operator] = _Workspace(
             0,
             required.scratch,
             call.kernel.parameter_schema.scratch_alignment,
@@ -361,43 +368,43 @@ def allocate(
             stop,
         )
     if transfer_kernel is not None:
-        for _, operator in walk(graph.region):
+        for _, operator in _walk(graph._region):
             if (
                 operator not in layout.positions
                 or operator in selection.calls
                 or not operator.regions
-                or isinstance(operator.args, ConstructArgs)
+                or isinstance(operator.args, _ConstructArgs)
             ):
                 continue
             scratch = 0
-            for phase in transfers.pairs(operator).values():
+            for phase in _transfers._pairs(operator).values():
                 for source, destination in phase:
-                    required = requirements(
+                    required = _requirements(
                         transfer_kernel.parameter_schema,
-                        transfers.parameters(layout, source, destination),
+                        _transfers._parameters(layout, source, destination),
                     )
                     scratch = max(scratch, required.scratch)
-            if isinstance(operator.args, ReduceArgs):
+            if isinstance(operator.args, _ReduceArgs):
                 for source in (*operator.args.values, *operator.args.initial):
-                    copy_source = layout.buffers[source].binding()
-                    scalar = TensorBinding((), (), copy_source.dtype)
-                    sliced = TensorBinding(
+                    copy_source = layout.buffers[source]._binding()
+                    scalar = _TensorBinding((), (), copy_source.dtype)
+                    sliced = _TensorBinding(
                         (),
                         (),
                         copy_source.dtype,
                         storage_shape=copy_source.storage_shape,
                     )
                     parameters = transfer_kernel.bind(
-                        KernelBindingContext({"x": sliced}, (scalar,), {})
+                        _KernelBindingContext({"x": sliced}, (scalar,), {})
                     )
                     scratch = max(
                         scratch,
-                        requirements(
+                        _requirements(
                             transfer_kernel.parameter_schema, parameters
                         ).scratch,
                     )
             first, last = layout.positions[operator]
-            layout.transfer_scratch[operator] = Workspace(
+            layout.transfer_scratch[operator] = _Workspace(
                 0,
                 scratch,
                 transfer_kernel.parameter_schema.scratch_alignment,
@@ -405,7 +412,7 @@ def allocate(
                 last,
             )
     _lifetimes(layout, live)
-    items: list[Buffer | Workspace] = [
+    items: list[_Buffer | _Workspace] = [
         buffer
         for buffer in layout.buffers.values()
         if buffer.storage == "arena" and buffer.last >= buffer.first
@@ -415,11 +422,13 @@ def allocate(
         workspace for workspace in layout.transfer_scratch.values() if workspace.size
     )
     layout.arena_size = _arena(items)
-    for cache in graph.caches.values():
+    for cache in graph._caches.values():
         shape = tuple(
             dimension for dimension in cache.shape.dimensions if dimension is not None
         )
-        layout.cache_size = align(layout.cache_size, 64) + byte_size(cache.dtype, shape)
-    layout.cache_size = align(layout.cache_size, 64)
+        layout.cache_size = _align(layout.cache_size, 64) + _byte_size(
+            cache.dtype, shape
+        )
+    layout.cache_size = _align(layout.cache_size, 64)
     layout.constants = bytes(constants)
     return layout

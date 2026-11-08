@@ -69,7 +69,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_linear_avx2(
 
 TRILLIM_KERNEL const char *trillim_x86_linear_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import avx2_linear as bind\n"
+           "from trillim.compiler.kernels.bindings import _avx2_linear as bind\n"
            "def pattern(x: Tensor, weight: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Linear(x, weight),)\n";
 }

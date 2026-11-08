@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_argmax(
 
 TRILLIM_KERNEL const char *trillim_scalar_argmax_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import argmax as bind\n"
+           "from trillim.compiler.kernels.bindings import _argmax as bind\n"
            "def pattern(x: Tensor, *, axis: int = -1, rank: int) -> tuple[Tensor, ...]:\n"
            "    return (Argmax(x, axis=axis, rank=rank),)\n";
 }

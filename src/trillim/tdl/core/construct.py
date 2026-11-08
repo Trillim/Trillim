@@ -7,9 +7,9 @@ from typing import cast
 
 from pydantic import ConfigDict, validate_call
 
-from .core_pydantic_models import ConstructArgs
+from .core_pydantic_models import _ConstructArgs
 from .graph import _build_region
-from .operator import Operator
+from .operator import _Operator
 from .tensor import Tensor
 
 
@@ -42,9 +42,9 @@ def Construct[**P, R: Tensor | tuple[Tensor, ...]](
         bound = parameters.bind(*args, **kwargs)
         bound.apply_defaults()
         region = _build_region((), body)
-        operator = Operator(
+        operator = _Operator(
             f"{function.__module__}.{function.__qualname__}",
-            ConstructArgs(arguments=dict(bound.arguments)),
+            _ConstructArgs(arguments=dict(bound.arguments)),
             outputs=tuple((value.shape, value.dtype) for value in region.outputs),
             regions=(region,),
         )

@@ -11,10 +11,10 @@ from numpy.typing import NDArray
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
 from ...tdl.core.types import DType
-from .weights_dataclasses import Checkpoint, SourceDType, WeightSource
-from .weights_pydantic_models import CheckpointConfig, SafetensorsIndex, TensorHeader
+from .weights_dataclasses import _Checkpoint, _SourceDType, _WeightSource
+from .weights_pydantic_models import _CheckpointConfig, _SafetensorsIndex, _TensorHeader
 
-SOURCE_DTYPES: dict[SourceDType, str] = {
+_SOURCE_DTYPES: dict[_SourceDType, str] = {
     "BOOL": "?",
     "I8": "i1",
     "U8": "u1",
@@ -28,7 +28,7 @@ SOURCE_DTYPES: dict[SourceDType, str] = {
     "BF16": "<u2",
     "F32": "<f4",
 }
-LOGICAL_DTYPES: dict[SourceDType, DType] = {
+_LOGICAL_DTYPES: dict[_SourceDType, DType] = {
     "BOOL": "bool",
     "I8": "int8",
     "U8": "uint8",
@@ -44,7 +44,7 @@ LOGICAL_DTYPES: dict[SourceDType, DType] = {
 }
 _OBJECT = TypeAdapter(dict[str, JsonValue], config=ConfigDict(strict=True))
 _METADATA = TypeAdapter(dict[str, str], config=ConfigDict(strict=True))
-CHUNK_BYTES = 8 * 1024**2
+_CHUNK_BYTES = 8 * 1024**2
 
 
 def _unique(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -56,19 +56,19 @@ def _unique(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
     return result
 
 
-def json_object(data: bytes) -> dict[str, JsonValue]:
+def _json_object(data: bytes) -> dict[str, JsonValue]:
     parsed = json.loads(data, object_pairs_hook=_unique)
     return _OBJECT.validate_python(parsed)
 
 
-def load_checkpoint(name: str, location: Path) -> Checkpoint:
+def _load_checkpoint(name: str, location: Path) -> _Checkpoint:
     location = location.absolute()
     directory = location if location.is_dir() else location.parent
     config_path = directory / "config.json"
     config = (
-        CheckpointConfig.model_validate(json_object(config_path.read_bytes()))
+        _CheckpointConfig.model_validate(_json_object(config_path.read_bytes()))
         if config_path.is_file()
-        else CheckpointConfig()
+        else _CheckpointConfig()
     )
     index_path = (
         location
@@ -79,8 +79,8 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
     if location.is_file() and location.suffix == ".safetensors":
         paths = [location]
     elif index_path.is_file():
-        weight_map = SafetensorsIndex.model_validate(
-            json_object(index_path.read_bytes())
+        weight_map = _SafetensorsIndex.model_validate(
+            _json_object(index_path.read_bytes())
         ).weight_map
         shard_names = sorted(set(weight_map.values()))
         if any(Path(shard).name != shard for shard in shard_names):
@@ -94,7 +94,7 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
             raise ValueError(
                 f"checkpoint needs one safetensors file or an explicit shard index: {location}"
             )
-    tensors: dict[str, WeightSource] = {}
+    tensors: dict[str, _WeightSource] = {}
     metadata: dict[str, str] = {}
     for path in paths:
         state = path.stat()
@@ -105,7 +105,7 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
             header_size = struct.unpack("<Q", prefix)[0]
             if header_size < 2 or header_size > min(100_000_000, state.st_size - 8):
                 raise ValueError(f"invalid safetensors header length: {path}")
-            header = json_object(source.read(header_size))
+            header = _json_object(source.read(header_size))
         start = 8 + header_size
         ranges = []
         for tensor_name, value in header.items():
@@ -115,10 +115,10 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
                         raise ValueError(f"conflicting checkpoint metadata: {key}")
                     metadata[key] = item
                 continue
-            info = TensorHeader.model_validate(value)
+            info = _TensorHeader.model_validate(value)
             begin, end = info.data_offsets
             expected = (
-                math.prod(info.shape) * np.dtype(SOURCE_DTYPES[info.dtype]).itemsize
+                math.prod(info.shape) * np.dtype(_SOURCE_DTYPES[info.dtype]).itemsize
             )
             if begin > end or end - begin != expected or start + end > state.st_size:
                 raise ValueError(f"invalid safetensors extent: {tensor_name}")
@@ -127,7 +127,7 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
             if weight_map and weight_map.get(tensor_name) != path.name:
                 raise ValueError(f"shard index disagrees with tensor: {tensor_name}")
             ranges.append((begin, end))
-            tensors[tensor_name] = WeightSource(
+            tensors[tensor_name] = _WeightSource(
                 name,
                 tensor_name,
                 path.resolve(),
@@ -173,21 +173,21 @@ def load_checkpoint(name: str, location: Path) -> Checkpoint:
                 if embedding in tensors:
                     aliases[head] = embedding
                     break
-    return Checkpoint(name, config, tensors, aliases)
+    return _Checkpoint(name, config, tensors, aliases)
 
 
-def unchanged(source: WeightSource) -> None:
+def _unchanged(source: _WeightSource) -> None:
     state = source.path.stat()
     if state.st_size != source.file_size or state.st_mtime_ns != source.modified_ns:
         raise ValueError(f"checkpoint changed while compiling: {source.path}")
 
 
-def read_values(source: WeightSource, start: int, count: int) -> NDArray[np.generic]:
+def _read_values(source: _WeightSource, start: int, count: int) -> NDArray[np.generic]:
     length = math.prod(source.shape)
     if start < 0 or count < 0 or start + count > length:
         raise ValueError(f"checkpoint slice exceeds tensor: {source.tensor}")
-    unchanged(source)
-    dtype = np.dtype(SOURCE_DTYPES[source.dtype])
+    _unchanged(source)
+    dtype = np.dtype(_SOURCE_DTYPES[source.dtype])
     with source.path.open("rb") as file:
         file.seek(source.offset + start * dtype.itemsize)
         data = file.read(count * dtype.itemsize)

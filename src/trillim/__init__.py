@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import sys
+import sys as _sys
 
 
-def main() -> None:
-    from .compiler import compile_model
-    from .compiler.cli import parse_args
+def _main() -> None:
+    from .compiler.cli import _parse_args
+    from .compiler.compile import _compile_model
 
-    arguments = sys.argv[1:]
+    arguments = _sys.argv[1:]
     if arguments and arguments[0] == "compile":
         arguments = arguments[1:]
     try:
-        compile_model(parse_args(arguments), progress=print)
+        _compile_model(_parse_args(arguments), progress=print)
     except KeyboardInterrupt:
-        print("Compilation cancelled.", file=sys.stderr)
+        print("Compilation cancelled.", file=_sys.stderr)
         raise SystemExit(130) from None

@@ -27,7 +27,7 @@ DType = Literal[
 ]
 
 
-def validate_dtype(value: str) -> DType:
+def _validate_dtype(value: str) -> DType:
     if value not in get_args(DType):
         raise ValueError(f'unsupported dtype "{value}"')
     return cast(DType, value)

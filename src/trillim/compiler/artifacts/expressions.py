@@ -4,21 +4,21 @@ import math
 from collections.abc import Mapping
 
 from ...tdl.core.tensor import Tensor
-from ..compiler_dataclasses import ShapeExpression
-from ..dtype import payload_sections
-from ..kernels.kernel_dataclasses import ParameterValue
-from .artifact_dataclasses import JSON, Expressions
+from ..compiler_dataclasses import _ShapeExpression
+from ..dtype import _payload_sections
+from ..kernels.kernel_dataclasses import _ParameterValue
+from .artifact_dataclasses import _JSON, _Expressions
 
 
-def number(value: float) -> JSON:
+def _number(value: float) -> _JSON:
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": str(value)}
     return value
 
 
-def references(value: ShapeExpression) -> set[Tensor]:
+def _references(value: _ShapeExpression) -> set[Tensor]:
     pending = [value]
-    visited: set[ShapeExpression] = set()
+    visited: set[_ShapeExpression] = set()
     result: set[Tensor] = set()
     while pending:
         current = pending.pop()
@@ -31,15 +31,15 @@ def references(value: ShapeExpression) -> set[Tensor]:
     return result
 
 
-def parameter_references(value: ParameterValue) -> set[Tensor]:
-    if isinstance(value, ShapeExpression):
-        return references(value)
+def _parameter_references(value: _ParameterValue) -> set[Tensor]:
+    if isinstance(value, _ShapeExpression):
+        return _references(value)
     if isinstance(value, tuple):
-        return set().union(*(parameter_references(item) for item in value))
+        return set().union(*(_parameter_references(item) for item in value))
     return set()
 
 
-def bound(value: ShapeExpression, *, upper: bool = True) -> int:
+def _bound(value: _ShapeExpression, *, upper: bool = True) -> int:
     known = value.maximum if upper else value.minimum
     if known is not None:
         return known
@@ -48,21 +48,23 @@ def bound(value: ShapeExpression, *, upper: bool = True) -> int:
     if value.op in {"scalar", "dimension", "cache_length"}:
         raise ValueError(f"missing finite bound for {value.op}")
     if value.op == "sub":
-        return bound(value.args[0], upper=upper) - bound(value.args[1], upper=not upper)
+        return _bound(value.args[0], upper=upper) - _bound(
+            value.args[1], upper=not upper
+        )
     if value.op == "mul":
         left, right = value.args
         products = [
-            bound(left, upper=x) * bound(right, upper=y)
+            _bound(left, upper=x) * _bound(right, upper=y)
             for x in (False, True)
             for y in (False, True)
         ]
         return max(products) if upper else min(products)
     if value.op == "broadcast_stride":
-        return max(0, bound(value.args[1])) if upper else 0
+        return max(0, _bound(value.args[1])) if upper else 0
     if value.op == "broadcast":
-        values = [bound(item, upper=upper) for item in value.args]
+        values = [_bound(item, upper=upper) for item in value.args]
         return max(values) if upper else min(0, *values)
-    a, b = (bound(item, upper=upper) for item in value.args)
+    a, b = (_bound(item, upper=upper) for item in value.args)
     if value.op == "add":
         return a + b
     if value.op == "min":
@@ -70,28 +72,28 @@ def bound(value: ShapeExpression, *, upper: bool = True) -> int:
     if value.op == "max":
         return max(a, b)
     if value.op == "mod":
-        divisor = bound(value.args[1])
+        divisor = _bound(value.args[1])
         if divisor <= 0:
             raise ValueError("modulo needs a positive bounded divisor")
         return divisor - 1 if upper else 0
     if value.op in {"floor_div", "ceil_div"}:
-        divisor = bound(value.args[1], upper=not upper)
+        divisor = _bound(value.args[1], upper=not upper)
         if divisor <= 0:
             raise ValueError("shape division needs a positive divisor")
         return a // divisor if value.op == "floor_div" else -(-a // divisor)
     raise ValueError(f"unsupported shape expression: {value.op}")
 
 
-def serialize(
-    value: ShapeExpression, names: Mapping[Tensor, str], expressions: Expressions
-) -> JSON:
+def _serialize(
+    value: _ShapeExpression, names: Mapping[Tensor, str], expressions: _Expressions
+) -> _JSON:
     if value.op == "const":
         assert value.value is not None
         return value.value
     if value.tensor is not None:
         if value.tensor not in names:
             raise ValueError("shape expression references an eliminated tensor")
-        result: dict[str, JSON] = {"op": value.op, "tensor": names[value.tensor]}
+        result: dict[str, _JSON] = {"op": value.op, "tensor": names[value.tensor]}
         if value.axis is not None:
             result["axis"] = value.axis
         return result
@@ -104,16 +106,16 @@ def serialize(
     expressions.names[value] = name
     expressions.nodes[name] = {
         "op": value.op,
-        "args": [serialize(item, names, expressions) for item in value.args],
+        "args": [_serialize(item, names, expressions) for item in value.args],
     }
     return {"expr": name}
 
 
-def byte_size(dtype: str, shape: tuple[int, ...]) -> int:
-    return sum(size for _, size in payload_sections(dtype, shape))
+def _byte_size(dtype: str, shape: tuple[int, ...]) -> int:
+    return sum(size for _, size in _payload_sections(dtype, shape))
 
 
-def align(value: int, alignment: int) -> int:
+def _align(value: int, alignment: int) -> int:
     if alignment < 1 or alignment & (alignment - 1):
         raise ValueError("alignment must be a positive power of two")
     return (value + alignment - 1) // alignment * alignment

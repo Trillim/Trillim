@@ -14,12 +14,12 @@ from pydantic import (
 )
 
 from .core_dataclasses import (
-    CacheMode,
-    CacheSpec,
-    Dimensions,
-    Scalar,
     Shape,
-    TensorTuple,
+    _CacheMode,
+    _CacheSpec,
+    _Dimensions,
+    _Scalar,
+    _TensorTuple,
 )
 from .tensor import Tensor
 from .types import DType
@@ -37,7 +37,7 @@ class Weight(BaseModel):
 
     @field_validator("root")
     @classmethod
-    def validate_reference(cls, value: str) -> str:
+    def _validate_reference(cls, value: str) -> str:
         model_name, separator, tensor_name = value.partition(".")
 
         if not model_name.isalpha():
@@ -49,18 +49,18 @@ class Weight(BaseModel):
         return value
 
     @property
-    def model_name(self) -> str:
+    def _model_name(self) -> str:
         return self.root.partition(".")[0]
 
     @property
-    def tensor_name(self) -> str:
+    def _tensor_name(self) -> str:
         return self.root.partition(".")[2]
 
     def __str__(self) -> str:
         return self.root
 
 
-class OperatorArgs(BaseModel):
+class _OperatorArgs(BaseModel):
     model_config = ConfigDict(
         frozen=True,
         extra="forbid",
@@ -69,7 +69,7 @@ class OperatorArgs(BaseModel):
     )
 
 
-class ConstructArgs(OperatorArgs):
+class _ConstructArgs(_OperatorArgs):
     arguments: dict[str, object]
 
 
@@ -78,64 +78,60 @@ class Model(RootModel[str]):
 
     @field_validator("root")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def _validate_name(cls, value: str) -> str:
         if not value.isalpha():
             raise ValueError("model names must contain only letters")
 
         return value
 
-    @property
-    def name(self) -> str:
-        return self.root
-
     def __getitem__(self, tensor_name: str) -> Weight:
-        return Weight(f"{self.name}.{tensor_name}")
+        return Weight(f"{self.root}.{tensor_name}")
 
 
-class UnaryArgs(OperatorArgs):
+class _UnaryArgs(_OperatorArgs):
     x: Tensor
 
 
-class BinaryArgs(OperatorArgs):
+class _BinaryArgs(_OperatorArgs):
     a: Tensor
-    b: Tensor | Scalar
+    b: Tensor | _Scalar
 
 
-class MatmulArgs(OperatorArgs):
+class _MatmulArgs(_OperatorArgs):
     a: Tensor
     b: Tensor
 
 
-class CompareArgs(BinaryArgs):
+class _CompareArgs(_BinaryArgs):
     predicate: Literal["eq", "ne", "lt", "le", "gt", "ge"]
 
 
-class SelectArgs(OperatorArgs):
+class _SelectArgs(_OperatorArgs):
     condition: Tensor
-    when_true: Tensor | Scalar
-    when_false: Tensor | Scalar
+    when_true: Tensor | _Scalar
+    when_false: Tensor | _Scalar
 
 
-class CastArgs(UnaryArgs):
+class _CastArgs(_UnaryArgs):
     dtype: DType
 
 
-class InputArgs(OperatorArgs):
+class _InputArgs(_OperatorArgs):
     name: str = Field(min_length=1)
     shape: Shape
     dtype: DType
 
 
-class OutputArgs(UnaryArgs):
+class _OutputArgs(_UnaryArgs):
     name: str = Field(min_length=1)
 
 
-class ConstantArgs(OperatorArgs):
-    value: Scalar | NDArray[np.generic] | Weight
+class _ConstantArgs(_OperatorArgs):
+    value: _Scalar | NDArray[np.generic] | Weight
     dtype: DType | None = None
 
 
-class IotaArgs(OperatorArgs):
+class _IotaArgs(_OperatorArgs):
     stop: int | Tensor
     start: int | Tensor = 0
     step: int = 1
@@ -143,18 +139,18 @@ class IotaArgs(OperatorArgs):
 
     @field_validator("step")
     @classmethod
-    def validate_step(cls, value: int) -> int:
+    def _validate_step(cls, value: int) -> int:
         if value == 0:
             raise ValueError("iota step cannot be zero")
         return value
 
 
-class ReshapeArgs(UnaryArgs):
-    shape: Dimensions
+class _ReshapeArgs(_UnaryArgs):
+    shape: _Dimensions
 
     @field_validator("shape")
     @classmethod
-    def validate_shape(cls, value: Dimensions) -> Dimensions:
+    def _validate_shape(cls, value: _Dimensions) -> _Dimensions:
         if isinstance(value, tuple):
             fixed = [dimension for dimension in value if isinstance(dimension, int)]
             if fixed.count(-1) > 1 or any(dimension < -1 for dimension in fixed):
@@ -162,23 +158,23 @@ class ReshapeArgs(UnaryArgs):
         return value
 
 
-class PermuteArgs(UnaryArgs):
+class _PermuteArgs(_UnaryArgs):
     axes: tuple[int, ...]
 
     @field_validator("axes")
     @classmethod
-    def validate_axes(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+    def _validate_axes(cls, value: tuple[int, ...]) -> tuple[int, ...]:
         if sorted(value) != list(range(len(value))):
             raise ValueError("axes must be a permutation of 0 through rank - 1")
         return value
 
 
-class BroadcastArgs(UnaryArgs):
-    shape: Dimensions
+class _BroadcastArgs(_UnaryArgs):
+    shape: _Dimensions
 
     @field_validator("shape")
     @classmethod
-    def validate_shape(cls, value: Dimensions) -> Dimensions:
+    def _validate_shape(cls, value: _Dimensions) -> _Dimensions:
         if isinstance(value, tuple) and any(
             isinstance(dimension, int) and dimension < 0 for dimension in value
         ):
@@ -186,27 +182,27 @@ class BroadcastArgs(UnaryArgs):
         return value
 
 
-class GatherArgs(UnaryArgs):
+class _GatherArgs(_UnaryArgs):
     indices: Tensor
     mask: Tensor | None = None
-    fill: Scalar = 0
+    fill: _Scalar = 0
 
 
-class ScatterArgs(UnaryArgs):
+class _ScatterArgs(_UnaryArgs):
     indices: Tensor
     values: Tensor
     mode: Literal["replace", "add"] = "replace"
     mask: Tensor | None = None
 
 
-class ReduceArgs(OperatorArgs):
-    values: TensorTuple = Field(min_length=1)
-    initial: TensorTuple = Field(min_length=1)
+class _ReduceArgs(_OperatorArgs):
+    values: _TensorTuple = Field(min_length=1)
+    initial: _TensorTuple = Field(min_length=1)
     axes: tuple[int, ...]
     keepdims: bool = False
 
     @model_validator(mode="after")
-    def validate_reduction(self) -> ReduceArgs:
+    def _validate_reduction(self) -> _ReduceArgs:
         if len(self.values) != len(self.initial):
             raise ValueError("reduce values and initial values must have equal arity")
         if len(set(self.axes)) != len(self.axes):
@@ -214,23 +210,23 @@ class ReduceArgs(OperatorArgs):
         return self
 
 
-class WhileArgs(OperatorArgs):
-    initial: TensorTuple
+class _WhileArgs(_OperatorArgs):
+    initial: _TensorTuple
 
 
-class IfArgs(OperatorArgs):
+class _IfArgs(_OperatorArgs):
     condition: Tensor
 
 
-class RandomArgs(OperatorArgs):
-    shape: Dimensions
+class _RandomArgs(_OperatorArgs):
+    shape: _Dimensions
     seed: int | Tensor
     offset: int | Tensor = 0
     distribution: Literal["uniform", "normal"] = "uniform"
     dtype: Literal["fp16", "bf16", "fp32"] = "fp32"
 
     @model_validator(mode="after")
-    def validate_random(self) -> RandomArgs:
+    def _validate_random(self) -> _RandomArgs:
         if isinstance(self.seed, int) and not 0 <= self.seed < 2**64:
             raise ValueError("random seed must fit uint64")
         if isinstance(self.offset, int) and self.offset < 0:
@@ -242,16 +238,16 @@ class RandomArgs(OperatorArgs):
         return self
 
 
-class CacheArgs(OperatorArgs):
+class _CacheArgs(_OperatorArgs):
     name: str = Field(min_length=1)
     shape: Shape
     dtype: DType
-    mode: CacheMode = "overwrite"
+    mode: _CacheMode = "overwrite"
     axis: int | None = None
-    initial: Scalar = 0
+    initial: _Scalar = 0
 
     @model_validator(mode="after")
-    def validate_cache(self) -> CacheArgs:
+    def _validate_cache(self) -> _CacheArgs:
         if any(dimension is None for dimension in self.shape.dimensions):
             raise ValueError("cache capacity must have fixed dimensions")
         if self.mode == "overwrite":
@@ -269,10 +265,10 @@ class CacheArgs(OperatorArgs):
         return self
 
 
-class CacheReadArgs(OperatorArgs):
-    cache: CacheSpec
+class _CacheReadArgs(_OperatorArgs):
+    cache: _CacheSpec
 
 
-class CacheAssignArgs(CacheReadArgs):
+class _CacheAssignArgs(_CacheReadArgs):
     value: Tensor
     action: Literal["assign", "append"]

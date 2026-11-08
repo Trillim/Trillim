@@ -3,10 +3,10 @@ from __future__ import annotations
 import ctypes as c
 from typing import cast
 
-from .kernel_dataclasses import ParameterField, ParameterSchema
+from .kernel_dataclasses import _ParameterField, _ParameterSchema
 
 
-class NativeParameter(c.Structure):
+class _NativeParameter(c.Structure):
     _fields_ = [
         ("name", c.c_char_p),
         ("type", c.c_char_p),
@@ -15,12 +15,12 @@ class NativeParameter(c.Structure):
     ]
 
 
-class NativeSchema(c.Structure):
+class _NativeSchema(c.Structure):
     _fields_ = [
         ("size", c.c_size_t),
         ("alignment", c.c_size_t),
         ("field_count", c.c_size_t),
-        ("fields", c.POINTER(NativeParameter)),
+        ("fields", c.POINTER(_NativeParameter)),
         ("input_count", c.c_size_t),
         ("output_count", c.c_size_t),
         ("requirements", c.c_void_p),
@@ -31,7 +31,7 @@ class NativeSchema(c.Structure):
     ]
 
 
-class NativeCapabilities(c.Structure):
+class _NativeCapabilities(c.Structure):
     _fields_ = [
         ("abi_version", c.c_uint32),
         ("backend", c.c_char_p),
@@ -40,7 +40,7 @@ class NativeCapabilities(c.Structure):
     ]
 
 
-NATIVE_TYPES: dict[
+_NATIVE_TYPES: dict[
     str, type[c.c_size_t | c.c_int32 | c.c_uint32 | c.c_int64 | c.c_uint64 | c.c_float]
 ] = {
     "size_t": c.c_size_t,
@@ -52,15 +52,15 @@ NATIVE_TYPES: dict[
 }
 
 
-def read_schema(library: c.CDLL, name: str) -> ParameterSchema:
+def _read_schema(library: c.CDLL, name: str) -> _ParameterSchema:
     native_function = getattr(library, f"{name}_parameters")
     native_function.argtypes, native_function.restype = (
         [],
-        c.POINTER(NativeSchema),
+        c.POINTER(_NativeSchema),
     )
-    native = cast("c._Pointer[NativeSchema]", native_function()).contents
+    native = cast("c._Pointer[_NativeSchema]", native_function()).contents
     fields = tuple(
-        ParameterField(
+        _ParameterField(
             field.name.decode(),
             field.type.decode(),
             field.offset,
@@ -77,7 +77,7 @@ def read_schema(library: c.CDLL, name: str) -> ParameterSchema:
                 "_fields_": [
                     (
                         field.name,
-                        c.c_void_p if field.length else NATIVE_TYPES[field.type],
+                        c.c_void_p if field.length else _NATIVE_TYPES[field.type],
                     )
                     for field in fields
                 ]
@@ -92,7 +92,7 @@ def read_schema(library: c.CDLL, name: str) -> ParameterSchema:
     for field in fields:
         if getattr(native_type, field.name).offset != field.offset:
             raise ValueError(f"{name}: inconsistent field offset")
-    return ParameterSchema(
+    return _ParameterSchema(
         native.size,
         native.alignment,
         fields,

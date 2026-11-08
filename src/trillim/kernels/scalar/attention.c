@@ -15,7 +15,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_attention(
 
 TRILLIM_KERNEL const char *trillim_scalar_attention_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import attention as bind\n"
+           "from trillim.compiler.kernels.bindings import _attention as bind\n"
            "def pattern(q: Tensor, k: Tensor, v: Tensor, *, causal: bool = True, scale = None, window = None) -> tuple[Tensor, ...]:\n"
            "    return (Attention(q, k, v, causal=causal, scale=scale, window=window),)\n";
 }

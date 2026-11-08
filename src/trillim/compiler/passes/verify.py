@@ -6,10 +6,10 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from ..artifacts.artifact_pydantic_models import BufferRecord, ExecutableManifest
-from ..artifacts.expressions import byte_size
-from ..weights.bundle import read_manifest
-from ..weights.weights_pydantic_models import WeightManifest
+from ..artifacts.artifact_pydantic_models import _BufferRecord, _ExecutableManifest
+from ..artifacts.expressions import _byte_size
+from ..weights.bundle import _read_manifest
+from ..weights.weights_pydantic_models import _WeightManifest
 
 
 def _strings(value: JsonValue, label: str) -> list[str]:
@@ -47,7 +47,7 @@ def _references(value: JsonValue, expressions: Mapping[str, JsonValue]) -> set[s
     return result
 
 
-def _expressions(manifest: ExecutableManifest) -> None:
+def _expressions(manifest: _ExecutableManifest) -> None:
     dependencies: dict[str, set[str]] = {}
     for name, expression in manifest.expressions.items():
         pending = [expression]
@@ -69,7 +69,7 @@ def _expressions(manifest: ExecutableManifest) -> None:
 
 def _program(
     program: list[dict[str, JsonValue]],
-    manifest: ExecutableManifest,
+    manifest: _ExecutableManifest,
     available: set[str],
 ) -> set[str]:
     def require(values: list[str]) -> None:
@@ -272,9 +272,9 @@ def _program(
 
 
 def _verify_plan(
-    manifest: ExecutableManifest,
+    manifest: _ExecutableManifest,
     directory: Path,
-    weights: WeightManifest,
+    weights: _WeightManifest,
     constant_size: int,
 ) -> None:
     _expressions(manifest)
@@ -298,7 +298,7 @@ def _verify_plan(
         if buffer.storage == "arena":
             if (
                 buffer.offset + buffer.size > manifest.arena_size
-                or buffer.size < byte_size(buffer.dtype, tuple(buffer.maximum_shape))
+                or buffer.size < _byte_size(buffer.dtype, tuple(buffer.maximum_shape))
             ):
                 raise ValueError(f"tensor span exceeds arena: {name}")
             allocations.append((name, buffer))
@@ -334,7 +334,7 @@ def _verify_plan(
                 backing = manifest.buffers[source]
                 source = backing.source if backing.storage == "alias" else None
     # A sweep over live intervals checks allocation safety without quadratic graph scans.
-    active: list[tuple[str, BufferRecord]] = []
+    active: list[tuple[str, _BufferRecord]] = []
     for name, buffer in sorted(allocations, key=lambda item: item[1].first):
         active = [(other, span) for other, span in active if span.last >= buffer.first]
         for other, span in active:
@@ -365,11 +365,11 @@ def _verify_plan(
         raise ValueError("model output is not produced by the program")
 
 
-def verify(directory: Path) -> ExecutableManifest:
-    manifest = ExecutableManifest.model_validate_json(
+def _verify(directory: Path) -> _ExecutableManifest:
+    manifest = _ExecutableManifest.model_validate_json(
         (directory / "executable.json").read_bytes()
     )
-    weights = read_manifest(directory / manifest.weights)
+    weights = _read_manifest(directory / manifest.weights)
     constant_size = (directory / manifest.constants).stat().st_size
     _verify_plan(manifest, directory, weights, constant_size)
     previous = 0

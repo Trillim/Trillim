@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .kernel_dataclasses import Backend, BuildArtifact
+from .kernel_dataclasses import _Backend, _BuildArtifact
 
 _ROOT = Path(__file__).resolve().parents[4]
 _FLAGS = ("-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-fPIC")
@@ -31,7 +31,7 @@ def _run(command: list[str]) -> None:
         raise
 
 
-def host_backend() -> Backend:
+def _host_backend() -> _Backend:
     machine = platform.machine().lower()
     if machine in {"x86_64", "amd64", "i386", "i686"}:
         return "x86"
@@ -40,8 +40,8 @@ def host_backend() -> Backend:
     return "scalar"
 
 
-def build(backend: Backend) -> BuildArtifact:
-    if backend != "scalar" and backend != host_backend():
+def _build(backend: _Backend) -> _BuildArtifact:
+    if backend != "scalar" and backend != _host_backend():
         raise ValueError(
             f"cannot build {backend} kernels on a {platform.machine()} host"
         )
@@ -67,7 +67,7 @@ def build(backend: Backend) -> BuildArtifact:
     symbols = [f"trillim_{backend}_{source.stem}" for source in sources]
     symbols.extend(f"trillim_{backend}_scalar_{source.stem}" for source in fallback)
     if library.exists():
-        return BuildArtifact(backend, library, tuple(symbols), directory / "backend.o")
+        return _BuildArtifact(backend, library, tuple(symbols), directory / "backend.o")
     parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".build-", dir=parent) as temporary_name:
         temporary = Path(temporary_name)
@@ -116,4 +116,4 @@ def build(backend: Backend) -> BuildArtifact:
         except OSError:
             if not library.exists():
                 raise
-    return BuildArtifact(backend, library, tuple(symbols), directory / "backend.o")
+    return _BuildArtifact(backend, library, tuple(symbols), directory / "backend.o")

@@ -6,56 +6,56 @@ from typing import cast
 
 import numpy as np
 
-from ...tdl.core.core_dataclasses import Dimensions, Region, Scalar, Shape
+from ...tdl.core.core_dataclasses import Shape, _Dimensions, _Region, _Scalar
 from ...tdl.core.core_pydantic_models import (
-    BinaryArgs,
-    BroadcastArgs,
-    CacheArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
-    CastArgs,
-    CompareArgs,
-    ConstantArgs,
-    ConstructArgs,
-    GatherArgs,
-    IfArgs,
-    InputArgs,
-    IotaArgs,
-    MatmulArgs,
-    OutputArgs,
-    PermuteArgs,
-    RandomArgs,
-    ReduceArgs,
-    ReshapeArgs,
-    ScatterArgs,
-    SelectArgs,
-    UnaryArgs,
     Weight,
-    WhileArgs,
+    _BinaryArgs,
+    _BroadcastArgs,
+    _CacheArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
+    _CastArgs,
+    _CompareArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _GatherArgs,
+    _IfArgs,
+    _InputArgs,
+    _IotaArgs,
+    _MatmulArgs,
+    _OutputArgs,
+    _PermuteArgs,
+    _RandomArgs,
+    _ReduceArgs,
+    _ReshapeArgs,
+    _ScatterArgs,
+    _SelectArgs,
+    _UnaryArgs,
+    _WhileArgs,
 )
 from ...tdl.core.graph import Graph
-from ...tdl.core.operator import Operator
+from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
-from ...tdl.core.types import DType, validate_dtype
+from ...tdl.core.types import DType, _validate_dtype
 from ..compiler_dataclasses import (
-    Inference,
-    InferenceState,
-    ShapeConstraint,
-    ShapeExpression,
-    ShapeOperation,
-    ShapePredicate,
-    TensorInfo,
+    _Inference,
+    _InferenceState,
+    _ShapeConstraint,
+    _ShapeExpression,
+    _ShapeOperation,
+    _ShapePredicate,
+    _TensorInfo,
 )
-from ..dtype import QUANTIZED_DTYPES
-from .rewrite import rebuild
-from .walk import ordered_operators
+from ..dtype import _QUANTIZED_DTYPES
+from .rewrite import _rebuild
+from .walk import _ordered_operators
 
 
-def constant(value: int) -> ShapeExpression:
-    return ShapeExpression("const", value=value, minimum=value, maximum=value)
+def _constant_expression(value: int) -> _ShapeExpression:
+    return _ShapeExpression("const", value=value, minimum=value, maximum=value)
 
 
-def expression(op: ShapeOperation, *args: ShapeExpression) -> ShapeExpression:
+def _expression(op: _ShapeOperation, *args: _ShapeExpression) -> _ShapeExpression:
     if len(args) != 2 or op not in {
         "add",
         "sub",
@@ -87,14 +87,14 @@ def expression(op: ShapeOperation, *args: ShapeExpression) -> ShapeExpression:
             "broadcast": lambda: b if a == 1 else a,
             "broadcast_stride": lambda: 0 if a == 1 else b,
         }[op]()
-        return constant(value)
+        return _constant_expression(value)
     if op in {"add", "sub"} and right.op == "const" and right.value == 0:
         return left
     if op == "add" and left.op == "const" and left.value == 0:
         return right
     if op == "mul":
         if left.value == 0 or right.value == 0:
-            return constant(0)
+            return _constant_expression(0)
         if left.op == "const" and left.value == 1:
             return right
         if right.op == "const" and right.value == 1:
@@ -109,7 +109,7 @@ def expression(op: ShapeOperation, *args: ShapeExpression) -> ShapeExpression:
         if left == right:
             return left
     if op == "broadcast_stride" and left.op == "const":
-        return constant(0) if left.value == 1 else right
+        return _constant_expression(0) if left.value == 1 else right
     low: int | None = None
     high: int | None = None
     if op == "add":
@@ -204,7 +204,7 @@ def expression(op: ShapeOperation, *args: ShapeExpression) -> ShapeExpression:
     elif op == "broadcast_stride":
         low = None if right.minimum is None else min(0, right.minimum)
         high = None if right.maximum is None else max(0, right.maximum)
-    return ShapeExpression(op, args, minimum=low, maximum=high)
+    return _ShapeExpression(op, args, minimum=low, maximum=high)
 
 
 _FLOATS = {"fp16", "bf16", "fp32"}
@@ -216,7 +216,7 @@ def _integer(dtype: DType | None) -> bool:
 
 
 def _promote(left: DType, right: DType, *, numeric: bool = True) -> DType:
-    if left in QUANTIZED_DTYPES or right in QUANTIZED_DTYPES:
+    if left in _QUANTIZED_DTYPES or right in _QUANTIZED_DTYPES:
         return "fp32"
     if left == right:
         return "int64" if numeric and left == "bool" else left
@@ -239,10 +239,10 @@ def _promote(left: DType, right: DType, *, numeric: bool = True) -> DType:
         bits *= 2
     if bits > 64:
         raise ValueError("signed and uint64 operands require an explicit common cast")
-    return validate_dtype(("int" if signed else "uint") + str(bits))
+    return _validate_dtype(("int" if signed else "uint") + str(bits))
 
 
-def _literal_dtype(value: Scalar) -> DType:
+def _literal_dtype(value: _Scalar) -> DType:
     return (
         "bool"
         if isinstance(value, bool)
@@ -253,11 +253,15 @@ def _literal_dtype(value: Scalar) -> DType:
 
 
 def _binary_dtype(
-    left: DType, right: Tensor | Scalar, state: InferenceState, *, numeric: bool = True
+    left: DType,
+    right: Tensor | _Scalar,
+    state: _InferenceState,
+    *,
+    numeric: bool = True,
 ) -> DType:
     if isinstance(right, Tensor):
         return _promote(left, _dtype(state, right), numeric=numeric)
-    if left in QUANTIZED_DTYPES:
+    if left in _QUANTIZED_DTYPES:
         return "fp32"
     if left in _FLOATS:
         return left
@@ -271,7 +275,7 @@ def _binary_dtype(
     return left
 
 
-def _dtype(state: InferenceState, tensor: Tensor) -> DType:
+def _dtype(state: _InferenceState, tensor: Tensor) -> DType:
     dtype = state.result.tensors[tensor].dtype
     if dtype is None:
         raise ValueError(
@@ -280,14 +284,14 @@ def _dtype(state: InferenceState, tensor: Tensor) -> DType:
     return dtype
 
 
-def _shape(state: InferenceState, tensor: Tensor) -> tuple[ShapeExpression, ...]:
+def _shape(state: _InferenceState, tensor: Tensor) -> tuple[_ShapeExpression, ...]:
     shape = state.result.tensors[tensor].shape
     if shape is None:
         raise ValueError("tensor rank is unresolved; resolve checkpoint metadata first")
     return shape
 
 
-def _range(state: InferenceState, tensor: Tensor) -> tuple[int | None, int | None]:
+def _range(state: _InferenceState, tensor: Tensor) -> tuple[int | None, int | None]:
     return state.result.value_ranges.get(tensor, (None, None))
 
 
@@ -305,13 +309,13 @@ def _type_range(dtype: DType | None) -> tuple[int, int] | None:
 
 
 def _store(
-    state: InferenceState,
+    state: _InferenceState,
     tensor: Tensor,
-    shape: tuple[ShapeExpression, ...] | None,
+    shape: tuple[_ShapeExpression, ...] | None,
     dtype: DType | None,
-    values: tuple[ShapeExpression, ...] | None = None,
+    values: tuple[_ShapeExpression, ...] | None = None,
     value_range: tuple[int | None, int | None] | None = None,
-) -> TensorInfo:
+) -> _TensorInfo:
     if value_range is None and values:
         lower_bounds = [value.minimum for value in values]
         upper_bounds = [value.maximum for value in values]
@@ -336,7 +340,7 @@ def _store(
                 if value.minimum is not None
                 and value.maximum is not None
                 and limits[0] <= value.minimum <= value.maximum <= limits[1]
-                else ShapeExpression(
+                else _ShapeExpression(
                     "scalar",
                     tensor=tensor,
                     axis=index,
@@ -352,9 +356,11 @@ def _store(
     if shape == () and values is None and _integer(dtype):
         low, high = value_range or (None, None)
         values = (
-            ShapeExpression("scalar", tensor=tensor, axis=0, minimum=low, maximum=high),
+            _ShapeExpression(
+                "scalar", tensor=tensor, axis=0, minimum=low, maximum=high
+            ),
         )
-    info = TensorInfo(
+    info = _TensorInfo(
         shape,
         None if shape is None else tuple(value.maximum for value in shape),
         dtype,
@@ -372,16 +378,16 @@ def _store(
     return info
 
 
-def _copy(state: InferenceState, tensor: Tensor, source: Tensor) -> TensorInfo:
+def _copy(state: _InferenceState, tensor: Tensor, source: Tensor) -> _TensorInfo:
     info = state.result.tensors[source]
     return _store(
         state, tensor, info.shape, info.dtype, info.values, _range(state, source)
     )
 
 
-def _scalar(state: InferenceState, value: int | Tensor) -> ShapeExpression:
+def _scalar(state: _InferenceState, value: int | Tensor) -> _ShapeExpression:
     if isinstance(value, int):
-        return constant(value)
+        return _constant_expression(value)
     info = state.result.tensors[value]
     if info.shape != () or not _integer(info.dtype):
         raise ValueError(
@@ -390,14 +396,14 @@ def _scalar(state: InferenceState, value: int | Tensor) -> ShapeExpression:
     if info.values is not None:
         return info.values[0]
     low, high = _range(state, value)
-    return ShapeExpression("scalar", tensor=value, axis=0, minimum=low, maximum=high)
+    return _ShapeExpression("scalar", tensor=value, axis=0, minimum=low, maximum=high)
 
 
 def _constraint(
-    state: InferenceState,
+    state: _InferenceState,
     predicate: str,
-    left: ShapeExpression,
-    right: ShapeExpression,
+    left: _ShapeExpression,
+    right: _ShapeExpression,
     reason: str,
     convert: bool,
 ) -> None:
@@ -417,8 +423,8 @@ def _constraint(
             raise ValueError(reason)
         return
     if convert:
-        item = ShapeConstraint(
-            predicate=cast(ShapePredicate, predicate),
+        item = _ShapeConstraint(
+            predicate=cast(_ShapePredicate, predicate),
             left=left,
             right=right,
             reason=reason,
@@ -430,30 +436,34 @@ def _constraint(
 
 
 def _broadcast(
-    state: InferenceState,
-    left: tuple[ShapeExpression, ...],
-    right: tuple[ShapeExpression, ...],
+    state: _InferenceState,
+    left: tuple[_ShapeExpression, ...],
+    right: tuple[_ShapeExpression, ...],
     convert: bool,
-) -> tuple[ShapeExpression, ...]:
+) -> tuple[_ShapeExpression, ...]:
     shape = []
-    for a, b in zip_longest(reversed(left), reversed(right), fillvalue=constant(1)):
+    for a, b in zip_longest(
+        reversed(left), reversed(right), fillvalue=_constant_expression(1)
+    ):
         _constraint(
             state, "broadcast", a, b, "incompatible broadcast dimensions", convert
         )
-        shape.append(expression("broadcast", a, b))
+        shape.append(_expression("broadcast", a, b))
     return tuple(reversed(shape))
 
 
-def _product(shape: tuple[ShapeExpression, ...]) -> ShapeExpression:
+def _product(shape: tuple[_ShapeExpression, ...]) -> _ShapeExpression:
     return reduce(
-        lambda left, right: expression("mul", left, right), shape, constant(1)
+        lambda left, right: _expression("mul", left, right),
+        shape,
+        _constant_expression(1),
     )
 
 
 def _reshape_quotient(
-    numerator: ShapeExpression, denominator: ShapeExpression
-) -> ShapeExpression:
-    def factors(value: ShapeExpression) -> list[ShapeExpression]:
+    numerator: _ShapeExpression, denominator: _ShapeExpression
+) -> _ShapeExpression:
+    def factors(value: _ShapeExpression) -> list[_ShapeExpression]:
         if value.op == "mul":
             return [factor for argument in value.args for factor in factors(argument)]
         return [] if value.op == "const" and value.value == 1 else [value]
@@ -465,14 +475,14 @@ def _reshape_quotient(
             remaining.remove(factor)
         else:
             divisors.append(factor)
-    return expression(
+    return _expression(
         "floor_div", _product(tuple(remaining)), _product(tuple(divisors))
     )
 
 
 def _dimensions(
-    state: InferenceState, dimensions: Dimensions
-) -> tuple[ShapeExpression, ...]:
+    state: _InferenceState, dimensions: _Dimensions
+) -> tuple[_ShapeExpression, ...]:
     if isinstance(dimensions, tuple):
         return tuple(_scalar(state, dimension) for dimension in dimensions)
     info = state.result.tensors[dimensions]
@@ -485,7 +495,7 @@ def _dimensions(
         return info.values
     low, high = _range(state, dimensions)
     return tuple(
-        ShapeExpression(
+        _ShapeExpression(
             "scalar", tensor=dimensions, axis=index, minimum=low, maximum=high
         )
         for index in range(length.value)
@@ -493,12 +503,12 @@ def _dimensions(
 
 
 def _cast(
-    state: InferenceState, region: Region, tensor: Tensor, dtype: DType, convert: bool
+    state: _InferenceState, region: _Region, tensor: Tensor, dtype: DType, convert: bool
 ) -> Tensor:
     if _dtype(state, tensor) == dtype or not convert:
         return tensor
-    operator = Operator(
-        "cast", CastArgs(x=tensor, dtype=dtype), outputs=((tensor.shape, dtype),)
+    operator = _Operator(
+        "cast", _CastArgs(x=tensor, dtype=dtype), outputs=((tensor.shape, dtype),)
     )
     region.operators = (*region.operators, operator)
     source = state.result.tensors[tensor]
@@ -510,24 +520,24 @@ def _cast(
 
 
 def _operand(
-    state: InferenceState,
-    region: Region,
-    value: Tensor | Scalar,
+    state: _InferenceState,
+    region: _Region,
+    value: Tensor | _Scalar,
     dtype: DType,
     convert: bool,
-) -> Tensor | Scalar:
+) -> Tensor | _Scalar:
     if isinstance(value, Tensor):
         return _cast(state, region, value, dtype, convert)
     if not convert:
         return value
-    constant_args = ConstantArgs(value=value, dtype=dtype)
-    operator = Operator("constant", constant_args, outputs=((Shape(()), dtype),))
+    constant_args = _ConstantArgs(value=value, dtype=dtype)
+    operator = _Operator("constant", constant_args, outputs=((Shape(()), dtype),))
     region.operators = (*region.operators, operator)
     _constant(state, operator, constant_args)
     return operator.outputs[0]
 
 
-def _condition(state: InferenceState, tensor: Tensor, *, scalar: bool) -> None:
+def _condition(state: _InferenceState, tensor: Tensor, *, scalar: bool) -> None:
     if _dtype(state, tensor) != "bool" or scalar and _shape(state, tensor) != ():
         raise ValueError(
             "conditions require boolean tensors"
@@ -536,16 +546,18 @@ def _condition(state: InferenceState, tensor: Tensor, *, scalar: bool) -> None:
 
 
 def _values(
-    state: InferenceState, value: Tensor | Scalar
-) -> tuple[ShapeExpression, ...] | None:
+    state: _InferenceState, value: Tensor | _Scalar
+) -> tuple[_ShapeExpression, ...] | None:
     if isinstance(value, Tensor):
         return state.result.tensors[value].values
-    return (constant(int(value)),) if isinstance(value, (bool, int)) else None
+    return (
+        (_constant_expression(int(value)),) if isinstance(value, (bool, int)) else None
+    )
 
 
 def _binary_values(
-    state: InferenceState, op: str, left: Tensor, right: Tensor | Scalar
-) -> tuple[ShapeExpression, ...] | None:
+    state: _InferenceState, op: str, left: Tensor, right: Tensor | _Scalar
+) -> tuple[_ShapeExpression, ...] | None:
     a, b = _values(state, left), _values(state, right)
     if a is None or b is None or op not in {"add", "sub", "mul", "floor_div", "mod"}:
         return None
@@ -557,31 +569,31 @@ def _binary_values(
         else:
             return None
     return tuple(
-        expression(cast(ShapeOperation, op), x, y) for x, y in zip(a, b, strict=True)
+        _expression(cast(_ShapeOperation, op), x, y) for x, y in zip(a, b, strict=True)
     )
 
 
 def _numeric_range(
-    state: InferenceState, op: str, left: Tensor, right: Tensor | Scalar
+    state: _InferenceState, op: str, left: Tensor, right: Tensor | _Scalar
 ) -> tuple[int | None, int | None] | None:
     if op not in {"add", "sub", "mul", "floor_div", "mod"}:
         return None
     low, high = _range(state, left)
-    a = ShapeExpression("scalar", tensor=left, minimum=low, maximum=high)
+    a = _ShapeExpression("scalar", tensor=left, minimum=low, maximum=high)
     if isinstance(right, Tensor):
         low, high = _range(state, right)
-        b = ShapeExpression("scalar", tensor=right, minimum=low, maximum=high)
+        b = _ShapeExpression("scalar", tensor=right, minimum=low, maximum=high)
     elif isinstance(right, (int, bool)):
-        b = constant(int(right))
+        b = _constant_expression(int(right))
     else:
         return None
-    result = expression(cast(ShapeOperation, op), a, b)
+    result = _expression(cast(_ShapeOperation, op), a, b)
     return result.minimum, result.maximum
 
 
 def _select_values(
-    state: InferenceState, args: SelectArgs
-) -> tuple[ShapeExpression, ...] | None:
+    state: _InferenceState, args: _SelectArgs
+) -> tuple[_ShapeExpression, ...] | None:
     when_true, when_false = (
         _values(state, args.when_true),
         _values(state, args.when_false),
@@ -589,8 +601,8 @@ def _select_values(
     condition = _values(state, args.condition)
     if condition is not None and len(condition) == 1 and condition[0].op == "const":
         return when_true if condition[0].value else when_false
-    producer = args.condition.producer
-    if producer is not None and isinstance(producer.args, CompareArgs):
+    producer = args.condition._producer
+    if producer is not None and isinstance(producer.args, _CompareArgs):
         compare = producer.args
         a, b = _values(state, compare.a), _values(state, compare.b)
         if (
@@ -603,8 +615,8 @@ def _select_values(
             and len(a) == len(b)
             and compare.predicate in {"ge", "gt", "le", "lt"}
         ):
-            op: ShapeOperation = "max" if compare.predicate in {"ge", "gt"} else "min"
-            return tuple(expression(op, x, y) for x, y in zip(a, b, strict=True))
+            op: _ShapeOperation = "max" if compare.predicate in {"ge", "gt"} else "min"
+            return tuple(_expression(op, x, y) for x, y in zip(a, b, strict=True))
     if when_true is not None and when_true == when_false:
         return when_true
     return None
@@ -619,12 +631,12 @@ def _join_range(
     )
 
 
-def _input(state: InferenceState, operator: Operator, args: InputArgs) -> None:
+def _input(state: _InferenceState, operator: _Operator, args: _InputArgs) -> None:
     tensor = operator.outputs[0]
     shape = tuple(
-        constant(dimension)
+        _constant_expression(dimension)
         if dimension is not None
-        else ShapeExpression(
+        else _ShapeExpression(
             "dimension",
             tensor=tensor,
             axis=axis,
@@ -636,7 +648,7 @@ def _input(state: InferenceState, operator: Operator, args: InputArgs) -> None:
     _store(state, tensor, shape, args.dtype)
 
 
-def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> None:
+def _constant(state: _InferenceState, operator: _Operator, args: _ConstantArgs) -> None:
     value = args.value
     if isinstance(value, Weight):
         dtype = args.dtype or value.dtype
@@ -644,9 +656,9 @@ def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> 
             None
             if value.shape is None
             else tuple(
-                constant(dimension)
+                _constant_expression(dimension)
                 if dimension is not None
-                else ShapeExpression(
+                else _ShapeExpression(
                     "dimension", tensor=operator.outputs[0], axis=axis, minimum=0
                 )
                 for axis, dimension in enumerate(value.shape.dimensions)
@@ -656,18 +668,18 @@ def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> 
         return
     dtype = args.dtype
     if isinstance(value, np.ndarray):
-        shape = tuple(constant(dimension) for dimension in value.shape)
+        shape = tuple(_constant_expression(dimension) for dimension in value.shape)
         if dtype is None:
             dtype = (
                 "fp16"
                 if value.dtype.name == "float16"
                 else "fp32"
                 if value.dtype.kind == "f"
-                else validate_dtype(value.dtype.name)
+                else _validate_dtype(value.dtype.name)
             )
         values = (
             tuple(
-                constant(int(bool(item)) if dtype == "bool" else int(item))
+                _constant_expression(int(bool(item)) if dtype == "bool" else int(item))
                 for item in value.flat
             )
             if _integer(dtype) and value.size <= 4096
@@ -677,7 +689,7 @@ def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> 
         shape = ()
         dtype = dtype or _literal_dtype(value)
         values = (
-            (constant(int(bool(value)) if dtype == "bool" else int(value)),)
+            (_constant_expression(int(bool(value)) if dtype == "bool" else int(value)),)
             if _integer(dtype)
             else None
         )
@@ -695,20 +707,20 @@ def _constant(state: InferenceState, operator: Operator, args: ConstantArgs) -> 
 
 
 def _ordinary(
-    state: InferenceState, region: Region, operator: Operator, convert: bool
+    state: _InferenceState, region: _Region, operator: _Operator, convert: bool
 ) -> None:
     args, op = operator.args, operator.op
-    values: tuple[ShapeExpression, ...] | None
-    shape: tuple[ShapeExpression, ...]
-    if isinstance(args, InputArgs):
+    values: tuple[_ShapeExpression, ...] | None
+    shape: tuple[_ShapeExpression, ...]
+    if isinstance(args, _InputArgs):
         _input(state, operator, args)
         return
-    if isinstance(args, ConstantArgs):
+    if isinstance(args, _ConstantArgs):
         _constant(state, operator, args)
         return
-    if isinstance(args, (CacheArgs, OutputArgs)):
+    if isinstance(args, (_CacheArgs, _OutputArgs)):
         return
-    if isinstance(args, CacheAssignArgs):
+    if isinstance(args, _CacheAssignArgs):
         actual = _shape(state, args.value)
         expected = args.cache.shape.dimensions
         if len(actual) != len(expected):
@@ -724,7 +736,7 @@ def _ordinary(
                 state,
                 predicate,
                 dimension,
-                constant(capacity),
+                _constant_expression(capacity),
                 "cache write exceeds its declared shape",
                 convert,
             )
@@ -734,9 +746,9 @@ def _ordinary(
             }
         )
         return
-    if isinstance(args, CacheReadArgs):
+    if isinstance(args, _CacheReadArgs):
         shape = tuple(
-            ShapeExpression(
+            _ShapeExpression(
                 "dimension",
                 tensor=operator.outputs[0],
                 axis=axis,
@@ -744,7 +756,7 @@ def _ordinary(
                 maximum=dimension,
             )
             if axis == args.cache.axis
-            else constant(dimension)
+            else _constant_expression(dimension)
             for axis, dimension in enumerate(args.cache.shape.dimensions)
             if dimension is not None
         )
@@ -756,7 +768,7 @@ def _ordinary(
         )
         return
     output = operator.outputs[0]
-    if isinstance(args, CompareArgs):
+    if isinstance(args, _CompareArgs):
         dtype = _binary_dtype(_dtype(state, args.a), args.b, state, numeric=False)
         shape = _broadcast(
             state,
@@ -781,7 +793,7 @@ def _ordinary(
             x, y = a[0].value, b[0].value
             assert x is not None and y is not None
             values = (
-                constant(
+                _constant_expression(
                     int(
                         {
                             "eq": x == y,
@@ -795,7 +807,7 @@ def _ordinary(
                 ),
             )
         _store(state, output, shape, "bool", values, (0, 1))
-    elif isinstance(args, BinaryArgs):
+    elif isinstance(args, _BinaryArgs):
         dtype = _binary_dtype(_dtype(state, args.a), args.b, state)
         if op == "div" and dtype not in _FLOATS:
             dtype = "fp32"
@@ -818,7 +830,7 @@ def _ordinary(
             }
         )
         _store(state, output, shape, dtype, values, value_range)
-    elif isinstance(args, CastArgs):
+    elif isinstance(args, _CastArgs):
         cast_info = state.result.tensors[args.x]
         values = (
             cast_info.values
@@ -828,7 +840,7 @@ def _ordinary(
         _store(
             state, output, cast_info.shape, args.dtype, values, _range(state, args.x)
         )
-    elif isinstance(args, SelectArgs):
+    elif isinstance(args, _SelectArgs):
         _condition(state, args.condition, scalar=False)
         dtype_a = (
             _dtype(state, args.when_true)
@@ -885,7 +897,7 @@ def _ordinary(
             values,
             None if values is not None else _join_range(true_range, false_range),
         )
-    elif isinstance(args, MatmulArgs):
+    elif isinstance(args, _MatmulArgs):
         left, right = _shape(state, args.a), _shape(state, args.b)
         if len(left) < 2 or len(right) < 2:
             raise ValueError("matmul requires rank-two or higher tensors")
@@ -904,15 +916,17 @@ def _ordinary(
         )
         dtype = _promote(_dtype(state, args.a), _dtype(state, args.b))
         _store(state, output, shape, dtype)
-    elif isinstance(args, IotaArgs):
+    elif isinstance(args, _IotaArgs):
         start, stop = _scalar(state, args.start), _scalar(state, args.stop)
         delta = (
-            expression("sub", stop, start)
+            _expression("sub", stop, start)
             if args.step > 0
-            else expression("sub", start, stop)
+            else _expression("sub", start, stop)
         )
-        length = expression(
-            "max", constant(0), expression("ceil_div", delta, constant(abs(args.step)))
+        length = _expression(
+            "max",
+            _constant_expression(0),
+            _expression("ceil_div", delta, _constant_expression(abs(args.step))),
         )
         values = None
         if (
@@ -922,7 +936,8 @@ def _ordinary(
         ):
             assert start.value is not None and stop.value is not None
             values = tuple(
-                constant(value) for value in range(start.value, stop.value, args.step)
+                _constant_expression(value)
+                for value in range(start.value, stop.value, args.step)
             )
         limits = (
             (start.minimum, None if stop.maximum is None else stop.maximum - 1)
@@ -930,7 +945,7 @@ def _ordinary(
             else (None if stop.minimum is None else stop.minimum + 1, start.maximum)
         )
         _store(state, output, (length,), args.dtype, values, limits)
-    elif isinstance(args, ReshapeArgs):
+    elif isinstance(args, _ReshapeArgs):
         source = _shape(state, args.x)
         reshape_dimensions = list(_dimensions(state, args.shape))
         inferred = [
@@ -953,7 +968,7 @@ def _ordinary(
                 state,
                 "ge",
                 denominator,
-                constant(1),
+                _constant_expression(1),
                 "reshape inferred dimension has an ambiguous zero divisor",
                 convert,
             )
@@ -971,7 +986,7 @@ def _ordinary(
                 state,
                 "ge",
                 value,
-                constant(0),
+                _constant_expression(0),
                 "reshape dimensions cannot be negative",
                 convert,
             )
@@ -992,7 +1007,7 @@ def _ordinary(
             info.values,
             _range(state, args.x),
         )
-    elif isinstance(args, PermuteArgs):
+    elif isinstance(args, _PermuteArgs):
         source = _shape(state, args.x)
         if len(source) != len(args.axes):
             raise ValueError("permute axes must match tensor rank")
@@ -1006,7 +1021,7 @@ def _ordinary(
             values,
             _range(state, args.x),
         )
-    elif isinstance(args, BroadcastArgs):
+    elif isinstance(args, _BroadcastArgs):
         target = _dimensions(state, args.shape)
         source = _shape(state, args.x)
         if len(source) > len(target):
@@ -1025,7 +1040,7 @@ def _ordinary(
                 state,
                 "ge",
                 expected_dimension,
-                constant(0),
+                _constant_expression(0),
                 "broadcast dimensions cannot be negative",
                 convert,
             )
@@ -1040,7 +1055,7 @@ def _ordinary(
         ):
             values = info.values * count
         _store(state, output, target, info.dtype, values, _range(state, args.x))
-    elif isinstance(args, (GatherArgs, ScatterArgs)):
+    elif isinstance(args, (_GatherArgs, _ScatterArgs)):
         source = _shape(state, args.x)
         indices = _shape(state, args.indices)
         if not indices or indices[-1].op != "const" or indices[-1].value is None:
@@ -1059,7 +1074,7 @@ def _ordinary(
         updates: dict[str, object] = {
             "indices": _cast(state, region, args.indices, "int64", convert)
         }
-        if isinstance(args, GatherArgs):
+        if isinstance(args, _GatherArgs):
             info = state.result.tensors[args.x]
             values = None
             coordinates_values = state.result.tensors[args.indices].values
@@ -1111,7 +1126,7 @@ def _ordinary(
             mask_values = (
                 state.result.tensors[args.mask].values
                 if args.mask is not None
-                else (constant(1),)
+                else (_constant_expression(1),)
             )
             propagated = None
             if (
@@ -1138,7 +1153,7 @@ def _ordinary(
                         replaced[coordinate] = (
                             updated
                             if args.mode == "replace"
-                            else expression("add", replaced[coordinate], updated)
+                            else _expression("add", replaced[coordinate], updated)
                         )
                 else:
                     propagated = tuple(replaced)
@@ -1153,14 +1168,14 @@ def _ordinary(
                 ),
             )
         operator.args = args.model_copy(update=updates)
-    elif isinstance(args, RandomArgs):
+    elif isinstance(args, _RandomArgs):
         shape = _dimensions(state, args.shape)
         for value in shape:
             _constraint(
                 state,
                 "ge",
                 value,
-                constant(0),
+                _constant_expression(0),
                 "random dimensions cannot be negative",
                 convert,
             )
@@ -1170,7 +1185,7 @@ def _ordinary(
                 state,
                 "ge",
                 scalar,
-                constant(0),
+                _constant_expression(0),
                 f"random {name} cannot be negative",
                 convert,
             )
@@ -1178,15 +1193,15 @@ def _ordinary(
                 state,
                 "le",
                 scalar,
-                constant(2**64 - 1),
+                _constant_expression(2**64 - 1),
                 f"random {name} exceeds uint64",
                 convert,
             )
         _store(state, output, shape, args.dtype)
-    elif isinstance(args, UnaryArgs):
+    elif isinstance(args, _UnaryArgs):
         shape = _shape(state, args.x)
         if op == "shape":
-            _store(state, output, (constant(len(shape)),), "int64", shape)
+            _store(state, output, (_constant_expression(len(shape)),), "int64", shape)
         elif op in {"exp", "log", "sqrt", "sin", "cos", "erf"}:
             dtype = _dtype(state, args.x)
             if dtype not in _FLOATS:
@@ -1202,8 +1217,8 @@ def _ordinary(
 
 
 def _joined_shape(
-    state: InferenceState, output: Tensor, left: TensorInfo, right: TensorInfo
-) -> tuple[ShapeExpression, ...]:
+    state: _InferenceState, output: Tensor, left: _TensorInfo, right: _TensorInfo
+) -> tuple[_ShapeExpression, ...]:
     if left.shape is None or right.shape is None or len(left.shape) != len(right.shape):
         raise ValueError("control-flow results must have a stable tensor rank")
     dimensions = []
@@ -1222,7 +1237,7 @@ def _joined_shape(
                 else max(a.maximum, b.maximum)
             )
             dimensions.append(
-                ShapeExpression(
+                _ShapeExpression(
                     "dimension", tensor=output, axis=axis, minimum=low, maximum=high
                 )
             )
@@ -1230,9 +1245,9 @@ def _joined_shape(
 
 
 def _parameter(
-    state: InferenceState,
+    state: _InferenceState,
     tensor: Tensor,
-    info: TensorInfo,
+    info: _TensorInfo,
     dtype: DType,
     value_range: tuple[int | None, int | None],
 ) -> None:
@@ -1242,7 +1257,7 @@ def _parameter(
         else tuple(
             value
             if value.op == "const"
-            else ShapeExpression(
+            else _ShapeExpression(
                 "dimension",
                 tensor=tensor,
                 axis=axis,
@@ -1255,7 +1270,7 @@ def _parameter(
     _store(state, tensor, shape, dtype, value_range=value_range)
 
 
-def _known_bool(state: InferenceState, tensor: Tensor | Scalar) -> bool | None:
+def _known_bool(state: _InferenceState, tensor: Tensor | _Scalar) -> bool | None:
     values = _values(state, tensor)
     if values is not None and len(values) == 1 and values[0].op == "const":
         return bool(values[0].value)
@@ -1263,19 +1278,19 @@ def _known_bool(state: InferenceState, tensor: Tensor | Scalar) -> bool | None:
 
 
 def _comparisons(
-    state: InferenceState, tensor: Tensor, truth: bool = True
-) -> list[tuple[CompareArgs, bool]]:
-    producer = tensor.producer
+    state: _InferenceState, tensor: Tensor, truth: bool = True
+) -> list[tuple[_CompareArgs, bool]]:
+    producer = tensor._producer
     if producer is None:
         return []
     args = producer.args
-    if isinstance(args, ConstructArgs):
+    if isinstance(args, _ConstructArgs):
         return _comparisons(state, producer.regions[0].outputs[0], truth)
-    if isinstance(args, CastArgs) and _dtype(state, args.x) == "bool":
+    if isinstance(args, _CastArgs) and _dtype(state, args.x) == "bool":
         return _comparisons(state, args.x, truth)
-    if isinstance(args, CompareArgs):
+    if isinstance(args, _CompareArgs):
         return [(args, truth)]
-    if isinstance(args, SelectArgs):
+    if isinstance(args, _SelectArgs):
         left, right = (
             _known_bool(state, args.when_true),
             _known_bool(state, args.when_false),
@@ -1292,7 +1307,7 @@ def _comparisons(
 
 
 def _guard_bounds(
-    state: InferenceState, condition: Region
+    state: _InferenceState, condition: _Region
 ) -> dict[int, tuple[int | None, int | None]]:
     parameters = {tensor: index for index, tensor in enumerate(condition.parameters)}
     result: dict[int, tuple[int | None, int | None]] = {}
@@ -1341,7 +1356,7 @@ def _guard_bounds(
     return result
 
 
-def _step(value: ShapeExpression, parameter: Tensor) -> int | None:
+def _step(value: _ShapeExpression, parameter: Tensor) -> int | None:
     if value.op == "scalar" and value.tensor is parameter:
         return 0
     if value.op in {"add", "sub"}:
@@ -1356,8 +1371,8 @@ def _step(value: ShapeExpression, parameter: Tensor) -> int | None:
 
 
 def _iteration_bound(
-    state: InferenceState,
-    operator: Operator,
+    state: _InferenceState,
+    operator: _Operator,
     initial: tuple[Tensor, ...],
     guards: dict[int, tuple[int | None, int | None]],
 ) -> int | None:
@@ -1381,7 +1396,7 @@ def _iteration_bound(
     for _, current in _operators(body):
         args = current.args
         if (
-            isinstance(args, CacheAssignArgs)
+            isinstance(args, _CacheAssignArgs)
             and args.action == "append"
             and args.cache.mode == "append"
         ):
@@ -1394,7 +1409,7 @@ def _iteration_bound(
     return min(candidates) if candidates else None
 
 
-def _operators(region: Region) -> list[tuple[Region, Operator]]:
+def _operators(region: _Region) -> list[tuple[_Region, _Operator]]:
     result = []
     for operator in region.operators:
         result.append((region, operator))
@@ -1404,9 +1419,9 @@ def _operators(region: Region) -> list[tuple[Region, Operator]]:
 
 
 def _reduction_ranges(
-    state: InferenceState,
-    operator: Operator,
-    args: ReduceArgs,
+    state: _InferenceState,
+    operator: _Operator,
+    args: _ReduceArgs,
     ranges: list[tuple[int | None, int | None]],
     unstable: set[int],
 ) -> list[tuple[int | None, int | None]]:
@@ -1427,7 +1442,7 @@ def _reduction_ranges(
                 offset = (
                     right
                     if values[0].op == "add"
-                    else expression("mul", constant(-1), right)
+                    else _expression("mul", _constant_expression(-1), right)
                 )
             elif (
                 values[0].op == "add"
@@ -1456,16 +1471,16 @@ def _reduction_ranges(
 
 
 def _control(
-    state: InferenceState, parent: Region, operator: Operator, convert: bool
+    state: _InferenceState, parent: _Region, operator: _Operator, convert: bool
 ) -> None:
     args = operator.args
-    if isinstance(args, ConstructArgs):
+    if isinstance(args, _ConstructArgs):
         body = operator.regions[0]
         _region(state, body, convert)
         for output, value in zip(operator.outputs, body.outputs, strict=True):
             _copy(state, output, value)
         return
-    if isinstance(args, IfArgs):
+    if isinstance(args, _IfArgs):
         _condition(state, args.condition, scalar=True)
         left, right = operator.regions
         _region(state, left, convert)
@@ -1495,10 +1510,10 @@ def _control(
         if convert:
             left.outputs, right.outputs = tuple(left_outputs), tuple(right_outputs)
         return
-    if not isinstance(args, (WhileArgs, ReduceArgs)):
+    if not isinstance(args, (_WhileArgs, _ReduceArgs)):
         raise TypeError(f"inference has no region rule for {operator.op!r}")
     initial = args.initial
-    if isinstance(args, WhileArgs):
+    if isinstance(args, _WhileArgs):
         condition, body = operator.regions
     else:
         body = operator.regions[0]
@@ -1530,7 +1545,7 @@ def _control(
         | None
     ) = None
     for _ in range(12):
-        if isinstance(args, WhileArgs):
+        if isinstance(args, _WhileArgs):
             for parameter, info, dtype, interval in zip(
                 condition.parameters, infos, dtypes, ranges, strict=True
             ):
@@ -1553,7 +1568,7 @@ def _control(
                 else None
             )
             if (
-                isinstance(args, WhileArgs)
+                isinstance(args, _WhileArgs)
                 and known_iterations is not None
                 and previous_values is not None
                 and len(previous_values) == 1
@@ -1570,7 +1585,7 @@ def _control(
                 low = high
             _parameter(state, parameter, info, dtype, (low, high))
         _region(state, body, False)
-        if isinstance(args, WhileArgs):
+        if isinstance(args, _WhileArgs):
             known_iterations = _iteration_bound(state, operator, initial, guards)
         joined_infos = []
         joined_dtypes = []
@@ -1580,20 +1595,20 @@ def _control(
         ):
             dtype = _promote(_dtype(state, value), _dtype(state, result), numeric=False)
             start, end = state.result.tensors[value], state.result.tensors[result]
-            if isinstance(args, ReduceArgs):
+            if isinstance(args, _ReduceArgs):
                 if end.shape != ():
                     raise ValueError("reducer must return scalar accumulator values")
                 shape = ()
             else:
                 shape = _joined_shape(state, body.parameters[index], start, end)
             joined_infos.append(
-                TensorInfo(shape, tuple(d.maximum for d in shape), dtype)
+                _TensorInfo(shape, tuple(d.maximum for d in shape), dtype)
             )
             joined_dtypes.append(dtype)
             interval = _join_range(_range(state, value), _range(state, result))
             values = state.result.tensors[result].values
             if (
-                isinstance(args, WhileArgs)
+                isinstance(args, _WhileArgs)
                 and known_iterations is not None
                 and values is not None
                 and len(values) == 1
@@ -1629,11 +1644,11 @@ def _control(
         infos, dtypes, ranges = joined_infos, joined_dtypes, joined_ranges
         if (
             current == previous
-            or isinstance(args, ReduceArgs)
+            or isinstance(args, _ReduceArgs)
             and previous is not None
             and current[:2] == previous[:2]
         ):
-            if isinstance(args, ReduceArgs) and previous is not None:
+            if isinstance(args, _ReduceArgs) and previous is not None:
                 unstable_ranges = {
                     index
                     for index, (a, b) in enumerate(
@@ -1647,7 +1662,7 @@ def _control(
         raise ValueError(
             f"{operator.op} carried shapes or values have no proven finite fixed point"
         )
-    if isinstance(args, WhileArgs):
+    if isinstance(args, _WhileArgs):
         iteration_limit = _iteration_bound(state, operator, initial, guards)
         if iteration_limit is not None:
             state.result.loop_iterations[operator] = iteration_limit
@@ -1683,7 +1698,7 @@ def _control(
         if len(axes) != len(args.axes):
             raise ValueError("reduction axes alias after normalization")
         shape = tuple(
-            constant(1) if axis in axes else value
+            _constant_expression(1) if axis in axes else value
             for axis, value in enumerate(source)
             if args.keepdims or axis not in axes
         )
@@ -1702,11 +1717,11 @@ def _control(
     for output, final_shape, dtype, interval in zip(
         operator.outputs, output_shape, dtypes, ranges, strict=True
     ):
-        if isinstance(args, WhileArgs) and final_shape is not None:
+        if isinstance(args, _WhileArgs) and final_shape is not None:
             final_shape = tuple(
                 value
                 if value.op == "const"
-                else ShapeExpression(
+                else _ShapeExpression(
                     "dimension",
                     tensor=output,
                     axis=axis,
@@ -1718,8 +1733,8 @@ def _control(
         _store(state, output, final_shape, dtype, value_range=interval)
 
 
-def _region(state: InferenceState, region: Region, convert: bool) -> None:
-    for operator in tuple(ordered_operators(region)):
+def _region(state: _InferenceState, region: _Region, convert: bool) -> None:
+    for operator in tuple(_ordered_operators(region)):
         state.operators.append(operator)
         try:
             if operator.regions:
@@ -1733,17 +1748,17 @@ def _region(state: InferenceState, region: Region, convert: bool) -> None:
             state.operators.pop()
 
 
-def infer(
+def _infer(
     graph: Graph,
     *,
     max_input_size: int | None = None,
-) -> Inference:
+) -> _Inference:
     """Infer logical tensor facts and insert promotions on the existing graph."""
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError("graph must be completed before inference")
     if max_input_size is not None and max_input_size <= 0:
         raise ValueError("maximum input size must be positive")
-    state = InferenceState(graph, max_input_size)
-    _region(state, graph.region, True)
-    rebuild(graph)
+    state = _InferenceState(graph, max_input_size)
+    _region(state, graph._region, True)
+    _rebuild(graph)
     return state.result

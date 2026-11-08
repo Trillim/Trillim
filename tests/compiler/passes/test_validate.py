@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from trillim.compiler.passes.validate import validate
+from trillim.compiler.passes.validate import _validate
 from trillim.tdl.core import (
     Add,
     Cache,
@@ -19,13 +19,13 @@ from trillim.tdl.core import (
     Tensor,
     While,
 )
-from trillim.tdl.core.core_dataclasses import CacheMode
+from trillim.tdl.core.core_dataclasses import _CacheMode
 from trillim.tdl.core.core_pydantic_models import (
-    BinaryArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
+    _BinaryArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
 )
-from trillim.tdl.core.operator import Operator, _inputs
+from trillim.tdl.core.operator import _inputs, _Operator
 
 
 def test_nested_graph() -> None:
@@ -54,9 +54,9 @@ def test_nested_graph() -> None:
         Output(result, name="result")
         Output(result, name="alias")
 
-    assert graph.region is not None
-    graph.region.operators = tuple(reversed(graph.region.operators))
-    validate(graph)
+    assert graph._region is not None
+    graph._region.operators = tuple(reversed(graph._region.operators))
+    _validate(graph)
 
 
 def test_tuple_reduction() -> None:
@@ -74,17 +74,17 @@ def test_tuple_reduction() -> None:
         Output(results[0], name="sum")
         Output(results[1], name="offset")
 
-    validate(graph)
+    _validate(graph)
 
 
 def test_empty_graph_and_loop() -> None:
     with Graph() as empty:
         pass
-    validate(empty)
+    _validate(empty)
 
     with Graph() as graph:
         While((), condition=lambda _: Constant(False), body=lambda _: ())
-    validate(graph)
+    _validate(graph)
 
 
 @pytest.mark.parametrize(
@@ -108,33 +108,33 @@ def test_tensor_links(fault: str, message: str) -> None:
         y = Add(x, 1)
         Output(y, name="y")
 
-    assert graph.region is not None
-    input_op, add_op, _ = graph.region.operators
+    assert graph._region is not None
+    input_op, add_op, _ = graph._region.operators
     if fault == "producer":
-        y.producer = input_op
+        y._producer = input_op
     elif fault == "missing-consumer":
-        x.consumers.clear()
+        x._consumers.clear()
     elif fault == "duplicate-consumer":
-        x.consumers.append(add_op)
+        x._consumers.append(add_op)
     elif fault == "foreign-consumer":
-        Operator("foreign", BinaryArgs(a=x, b=1))
+        _Operator("foreign", _BinaryArgs(a=x, b=1))
     elif fault == "stale-input":
         add_op.inputs = ()
     elif fault == "duplicate-operator":
-        graph.region.operators += (add_op,)
+        graph._region.operators += (add_op,)
     elif fault == "duplicate-output":
         add_op.outputs = (y, y)
     elif fault == "input-binding":
-        graph.inputs["x"] = y
+        graph._inputs["x"] = y
     elif fault == "output-binding":
-        graph.outputs["y"] = x
+        graph._outputs["y"] = x
     elif fault == "root-result":
-        graph.region.outputs = ()
+        graph._region.outputs = ()
     else:
         raise AssertionError(fault)
 
     with pytest.raises(ValueError, match=message):
-        validate(graph)
+        _validate(graph)
 
 
 @pytest.mark.parametrize("kind", ["if", "while", "reduce", "construct"])
@@ -160,8 +160,8 @@ def test_region_bindings(kind: str, fault: str) -> None:
             y = identity(x)
         Output(y, name="y")
 
-    assert y.producer is not None
-    operator = y.producer
+    assert y._producer is not None
+    operator = y._producer
     region = operator.regions[0]
     if fault == "regions":
         operator.regions = ()
@@ -172,7 +172,7 @@ def test_region_bindings(kind: str, fault: str) -> None:
         region.outputs = ()
 
     with pytest.raises(ValueError, match="regions|region bindings"):
-        validate(graph)
+        _validate(graph)
 
 
 @pytest.mark.parametrize("fault", ["missing", "duplicate", "foreign", "sibling"])
@@ -186,9 +186,9 @@ def test_region_captures(fault: str) -> None:
         )[0]
         Output(y, name="y")
 
-    assert y.producer is not None
-    assert graph.region is not None
-    then, otherwise = y.producer.regions
+    assert y._producer is not None
+    assert graph._region is not None
+    then, otherwise = y._producer.regions
     if fault == "missing":
         then.captures = ()
         message = "captures do not match"
@@ -198,14 +198,14 @@ def test_region_captures(fault: str) -> None:
     else:
         replacement = otherwise.outputs[0] if fault == "sibling" else Constant(0)
         add = then.operators[0]
-        add.args = BinaryArgs(a=replacement, b=1)
+        add.args = _BinaryArgs(a=replacement, b=1)
         add.inputs = (replacement,)
         then.captures = (replacement,)
-        y.producer.inputs += (replacement,)
+        y._producer.inputs += (replacement,)
         message = "captures do not match"
 
     with pytest.raises(ValueError, match=message):
-        validate(graph)
+        _validate(graph)
 
 
 @pytest.mark.parametrize("fault", ["reuse", "recursive", "dependency", "parameter"])
@@ -218,29 +218,29 @@ def test_region_ownership(fault: str) -> None:
             body=lambda values: (Add(values[0], 1),),
         )[0]
 
-    assert graph.region is not None
-    assert y.producer is not None
-    loop = y.producer
+    assert graph._region is not None
+    assert y._producer is not None
+    loop = y._producer
     condition, body = loop.regions
     if fault == "reuse":
         loop.regions = (condition, condition)
         message = "region is reused"
     elif fault == "recursive":
-        loop.regions = (condition, graph.region)
+        loop.regions = (condition, graph._region)
         message = "region is reused"
     elif fault == "dependency":
         body.operators[0].dependencies = (condition.operators[0],)
         message = "dependency outside its scope"
     else:
-        body.parameters[0].producer = loop
+        body.parameters[0]._producer = loop
         message = "parameter cannot have a producer"
 
     with pytest.raises(ValueError, match=message):
-        validate(graph)
+        _validate(graph)
 
 
 @pytest.mark.parametrize("mode", ["overwrite", "append", "sliding"])
-def test_cache_modes(mode: CacheMode) -> None:
+def test_cache_modes(mode: _CacheMode) -> None:
     with Graph() as graph:
         cache = Cache(
             name="state",
@@ -256,7 +256,7 @@ def test_cache_modes(mode: CacheMode) -> None:
         cache.read()
         if mode != "overwrite":
             cache.append(value)
-    validate(graph)
+    _validate(graph)
 
 
 def test_cache_order_through_tensor_flow_and_parallel_reads() -> None:
@@ -266,12 +266,12 @@ def test_cache_order_through_tensor_flow_and_parallel_reads() -> None:
         second = cache.read()
         cache.assign(Add(first, second))
 
-    assert graph.region is not None
-    declaration, read1, read2, _, write = graph.region.operators
+    assert graph._region is not None
+    declaration, read1, read2, _, write = graph._region.operators
     read1.dependencies = (declaration,)
     read2.dependencies = (declaration,)
     write.dependencies = ()
-    validate(graph)
+    _validate(graph)
 
 
 @pytest.mark.parametrize("fault", ["ownership", "declaration", "summary", "order"])
@@ -282,23 +282,23 @@ def test_cache_validation(fault: str) -> None:
         cache.assign(Constant(1.0))
         Output(snapshot, name="snapshot")
 
-    assert graph.region is not None
-    declaration, read, _, write, _ = graph.region.operators
+    assert graph._region is not None
+    declaration, read, _, write, _ = graph._region.operators
     if fault == "ownership":
-        read.args = CacheReadArgs(cache=replace(cache.spec))
+        read.args = _CacheReadArgs(cache=replace(cache._spec))
         message = "belongs to another graph"
     elif fault == "declaration":
-        graph.caches["state"] = replace(cache.spec, dtype="fp16")
+        graph._caches["state"] = replace(cache._spec, dtype="fp16")
         message = "invalid cache declaration"
     elif fault == "summary":
-        graph.region.reads = ()
+        graph._region.reads = ()
         message = "effects do not match"
     else:
         write.dependencies = (declaration,)
         message = "unordered cache effects"
 
     with pytest.raises(ValueError, match=message):
-        validate(graph)
+        _validate(graph)
 
 
 def test_nested_cache_effect_order() -> None:
@@ -312,12 +312,12 @@ def test_nested_cache_effect_order() -> None:
         cache.read()
         reset(cache)
 
-    validate(graph)
-    assert graph.region is not None
-    declaration, _, reset_op = graph.region.operators
+    _validate(graph)
+    assert graph._region is not None
+    declaration, _, reset_op = graph._region.operators
     reset_op.dependencies = (declaration,)
     with pytest.raises(ValueError, match="unordered cache effects"):
-        validate(graph)
+        _validate(graph)
 
 
 @pytest.mark.parametrize("kind", ["while", "reduce"])
@@ -330,31 +330,31 @@ def test_region_effect_restrictions(kind: str) -> None:
         else:
             y = Reduce((x,), initial=(x,), axes=(), reducer=lambda a, _: a)[0]
 
-    assert graph.region is not None
-    assert y.producer is not None
-    operator = y.producer
+    assert graph._region is not None
+    assert y._producer is not None
+    operator = y._producer
     region = operator.regions[0]
-    declaration = graph.region.operators[0]
+    declaration = graph._region.operators[0]
     if kind == "while":
-        effect = Operator(
+        effect = _Operator(
             "cache_assign",
-            CacheAssignArgs(cache=cache.spec, value=x, action="assign"),
+            _CacheAssignArgs(cache=cache._spec, value=x, action="assign"),
             outputs=(),
         )
         region.captures = (x,)
-        region.writes = graph.region.writes = (cache.spec,)
+        region.writes = graph._region.writes = (cache._spec,)
         message = "while condition cannot update caches"
     else:
-        effect = Operator("cache_read", CacheReadArgs(cache=cache.spec))
-        region.reads = graph.region.reads = (cache.spec,)
+        effect = _Operator("cache_read", _CacheReadArgs(cache=cache._spec))
+        region.reads = graph._region.reads = (cache._spec,)
         message = "reduce body cannot access caches"
     effect.dependencies = operator.dependencies = (declaration,)
     region.operators += (effect,)
 
     with pytest.raises(ValueError, match=message):
-        validate(graph)
+        _validate(graph)
 
 
 def test_unfinished_graph() -> None:
     with pytest.raises(ValueError, match="completed"):
-        validate(Graph())
+        _validate(Graph())

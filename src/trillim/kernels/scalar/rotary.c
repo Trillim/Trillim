@@ -15,7 +15,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_rotary(
 
 TRILLIM_KERNEL const char *trillim_scalar_rotary_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import rotary as bind\n"
+           "from trillim.compiler.kernels.bindings import _rotary as bind\n"
            "def pattern(x: Tensor, positions: Tensor, *, dim: int, theta: float = 10000.0, interleaved: bool = False, amplitude: float = 1.0) -> tuple[Tensor, ...]:\n"
            "    return (Rotary(x, positions, dim=dim, theta=theta, interleaved=interleaved, amplitude=amplitude),)\n";
 }

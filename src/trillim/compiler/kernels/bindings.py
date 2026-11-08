@@ -4,131 +4,133 @@ from typing import get_args
 
 from ...tdl.core.tensor import Tensor
 from ...tdl.core.types import DType
-from ..compiler_dataclasses import ShapeExpression
-from ..passes.infer import constant, expression
-from .kernel_dataclasses import KernelBindingContext, ParameterValue, TensorBinding
+from ..compiler_dataclasses import _ShapeExpression
+from ..passes.infer import _constant_expression, _expression
+from .kernel_dataclasses import _KernelBindingContext, _ParameterValue, _TensorBinding
 
-DTYPE_IDS: dict[DType, int] = {
+_DTYPE_IDS: dict[DType, int] = {
     name: index for index, name in enumerate(get_args(DType))
 }
 
 
-def product(shape: tuple[ShapeExpression, ...]) -> ShapeExpression:
-    result = constant(1)
+def _product(shape: tuple[_ShapeExpression, ...]) -> _ShapeExpression:
+    result = _constant_expression(1)
     for dimension in shape:
-        result = expression("mul", result, dimension)
+        result = _expression("mul", result, dimension)
     return result
 
 
-def contiguous_strides(
-    shape: tuple[ShapeExpression, ...],
-) -> tuple[ShapeExpression, ...]:
-    strides: list[ShapeExpression] = []
-    size = constant(1)
+def _contiguous_strides(
+    shape: tuple[_ShapeExpression, ...],
+) -> tuple[_ShapeExpression, ...]:
+    strides: list[_ShapeExpression] = []
+    size = _constant_expression(1)
     for dimension in reversed(shape):
         strides.append(size)
-        size = expression("mul", size, dimension)
+        size = _expression("mul", size, dimension)
     return tuple(reversed(strides))
 
 
-def broadcast_strides(
-    shape: tuple[ShapeExpression, ...],
-    target: tuple[ShapeExpression, ...],
-    strides: tuple[ShapeExpression, ...] | None = None,
-) -> tuple[ShapeExpression, ...]:
+def _broadcast_strides(
+    shape: tuple[_ShapeExpression, ...],
+    target: tuple[_ShapeExpression, ...],
+    strides: tuple[_ShapeExpression, ...] | None = None,
+) -> tuple[_ShapeExpression, ...]:
     if len(shape) > len(target):
         raise ValueError("cannot broadcast to a smaller rank")
-    strides = strides or contiguous_strides(shape)
-    result = [constant(0)] * (len(target) - len(shape))
+    strides = strides or _contiguous_strides(shape)
+    result = [_constant_expression(0)] * (len(target) - len(shape))
     for dimension, stride, output in zip(
         shape, strides, target[len(target) - len(shape) :], strict=True
     ):
         if dimension.op == "const" and dimension.value == 1:
-            result.append(constant(0))
+            result.append(_constant_expression(0))
         elif dimension == output:
             result.append(stride)
         else:
-            result.append(expression("broadcast_stride", dimension, stride))
+            result.append(_expression("broadcast_stride", dimension, stride))
     return tuple(result)
 
 
-def native_dtype(dtype: DType) -> int:
-    result = DTYPE_IDS[dtype]
-    if result > DTYPE_IDS["fp32"]:
+def _native_dtype(dtype: DType) -> int:
+    result = _DTYPE_IDS[dtype]
+    if result > _DTYPE_IDS["fp32"]:
         raise ValueError("kernel requires native tensor storage")
     return result
 
 
-def binary(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _binary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     a, b = context.inputs["a"], context.inputs["b"]
     if a.dtype != output.dtype or b.dtype != output.dtype:
         raise ValueError("binary inputs must have the promoted output dtype")
     return {
-        "count": product(output.shape),
+        "count": _product(output.shape),
         "rank": len(output.shape),
         "shape": output.shape,
-        "a_strides": broadcast_strides(a.shape, output.shape, a.strides),
-        "b_strides": broadcast_strides(b.shape, output.shape, b.strides),
-        "dtype": native_dtype(output.dtype),
+        "a_strides": _broadcast_strides(a.shape, output.shape, a.strides),
+        "b_strides": _broadcast_strides(b.shape, output.shape, b.strides),
+        "dtype": _native_dtype(output.dtype),
     }
 
 
-def unary(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _unary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     source = context.inputs["x"]
     return {
-        "count": product(output.shape),
+        "count": _product(output.shape),
         "rank": len(output.shape),
         "shape": output.shape,
-        "strides": source.strides or contiguous_strides(source.shape),
-        "dtype": native_dtype(output.dtype),
+        "strides": source.strides or _contiguous_strides(source.shape),
+        "dtype": _native_dtype(output.dtype),
     }
 
 
-def storage_shape(binding: TensorBinding) -> tuple[ShapeExpression, ShapeExpression]:
+def _storage_shape(
+    binding: _TensorBinding,
+) -> tuple[_ShapeExpression, _ShapeExpression]:
     if binding.storage_shape is not None:
         return binding.storage_shape
     if len(binding.shape) < 2:
-        return constant(1), product(binding.shape)
-    return binding.shape[0], product(binding.shape[1:])
+        return _constant_expression(1), _product(binding.shape)
+    return binding.shape[0], _product(binding.shape[1:])
 
 
 def _batch_strides(
-    binding: TensorBinding, target: tuple[ShapeExpression, ...]
-) -> tuple[ShapeExpression, ...]:
+    binding: _TensorBinding, target: tuple[_ShapeExpression, ...]
+) -> tuple[_ShapeExpression, ...]:
     shape = binding.shape[:-2]
-    strides = (binding.strides or contiguous_strides(binding.shape))[:-2]
-    result = [constant(0)] * (len(target) - len(shape))
+    strides = (binding.strides or _contiguous_strides(binding.shape))[:-2]
+    result = [_constant_expression(0)] * (len(target) - len(shape))
     for dimension, stride, output in zip(
         shape, strides, target[len(target) - len(shape) :], strict=True
     ):
         if dimension.op == "const" and dimension.value == 1:
-            result.append(constant(0))
+            result.append(_constant_expression(0))
         elif dimension == output:
             result.append(stride)
         else:
-            result.append(expression("broadcast_stride", dimension, stride))
+            result.append(_expression("broadcast_stride", dimension, stride))
     return tuple(result)
 
 
-def matmul(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _matmul(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     a, b = context.inputs["a"], context.inputs["b"]
     output = context.outputs[0]
     if len(a.shape) < 2 or len(b.shape) < 2:
         raise ValueError("matrix multiplication requires rank at least two")
     if (not output.dtype.startswith("fp") and output.dtype != "bf16") and (
-        DTYPE_IDS[a.dtype] >= DTYPE_IDS["fp16"]
-        or DTYPE_IDS[b.dtype] >= DTYPE_IDS["fp16"]
+        _DTYPE_IDS[a.dtype] >= _DTYPE_IDS["fp16"]
+        or _DTYPE_IDS[b.dtype] >= _DTYPE_IDS["fp16"]
     ):
         raise ValueError("floating matrix inputs require a floating output")
     batch = output.shape[:-2]
-    a_strides = a.strides or contiguous_strides(a.shape)
-    b_strides = b.strides or contiguous_strides(b.shape)
-    a_rows, a_columns = storage_shape(a)
-    b_rows, b_columns = storage_shape(b)
+    a_strides = a.strides or _contiguous_strides(a.shape)
+    b_strides = b.strides or _contiguous_strides(b.shape)
+    a_rows, a_columns = _storage_shape(a)
+    b_rows, b_columns = _storage_shape(b)
     return {
-        "batches": product(batch),
+        "batches": _product(batch),
         "m": output.shape[-2],
         "n": output.shape[-1],
         "k": a.shape[-1],
@@ -140,9 +142,9 @@ def matmul(context: KernelBindingContext) -> dict[str, ParameterValue]:
         "a_col_stride": a_strides[-1],
         "b_row_stride": b_strides[-2],
         "b_col_stride": b_strides[-1],
-        "a_dtype": DTYPE_IDS[a.dtype],
-        "b_dtype": DTYPE_IDS[b.dtype],
-        "out_dtype": native_dtype(output.dtype),
+        "a_dtype": _DTYPE_IDS[a.dtype],
+        "b_dtype": _DTYPE_IDS[b.dtype],
+        "out_dtype": _native_dtype(output.dtype),
         "a_storage_rows": a_rows,
         "a_storage_columns": a_columns,
         "b_storage_rows": b_rows,
@@ -150,70 +152,70 @@ def matmul(context: KernelBindingContext) -> dict[str, ParameterValue]:
     }
 
 
-def cast(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _cast(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     output = context.outputs[0]
-    source_rows, source_columns = storage_shape(source)
-    output_rows, output_columns = storage_shape(output)
+    source_rows, source_columns = _storage_shape(source)
+    output_rows, output_columns = _storage_shape(output)
     return {
-        "count": product(output.shape),
+        "count": _product(output.shape),
         "rank": len(source.shape),
         "shape": source.shape,
-        "strides": source.strides or contiguous_strides(source.shape),
+        "strides": source.strides or _contiguous_strides(source.shape),
         "source_offset": 0,
         "source_rows": source_rows,
         "source_columns": source_columns,
         "output_rows": output_rows,
         "output_columns": output_columns,
-        "input_dtype": DTYPE_IDS[source.dtype],
-        "output_dtype": DTYPE_IDS[output.dtype],
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "output_dtype": _DTYPE_IDS[output.dtype],
     }
 
 
 def _reduction(
-    context: KernelBindingContext, axes: tuple[int, ...]
-) -> dict[str, ParameterValue]:
+    context: _KernelBindingContext, axes: tuple[int, ...]
+) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     rank = len(source.shape)
     normalized = tuple(axis % rank for axis in axes)
-    strides = source.strides or contiguous_strides(source.shape)
+    strides = source.strides or _contiguous_strides(source.shape)
     kept = tuple(axis for axis in range(rank) if axis not in normalized)
-    rows, columns = storage_shape(source)
+    rows, columns = _storage_shape(source)
     return {
-        "outputs": product(context.outputs[0].shape),
+        "outputs": _product(context.outputs[0].shape),
         "output_rank": len(kept),
         "reduce_rank": len(normalized),
-        "reduce_count": product(tuple(source.shape[axis] for axis in normalized)),
+        "reduce_count": _product(tuple(source.shape[axis] for axis in normalized)),
         "output_shape": tuple(source.shape[axis] for axis in kept),
         "output_strides": tuple(strides[axis] for axis in kept),
         "reduce_shape": tuple(source.shape[axis] for axis in normalized),
         "reduce_strides": tuple(strides[axis] for axis in normalized),
         "storage_rows": rows,
         "storage_columns": columns,
-        "input_dtype": DTYPE_IDS[source.dtype],
-        "output_dtype": native_dtype(context.outputs[0].dtype),
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "output_dtype": _native_dtype(context.outputs[0].dtype),
     }
 
 
-def reduction(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _bind_reduction(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     axes = context.attrs["axes"]
     if not isinstance(axes, tuple) or not all(isinstance(axis, int) for axis in axes):
         raise TypeError("reduction axes must be an integer tuple")
     return _reduction(context, axes)
 
 
-def argmax(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _argmax(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     axis = context.attrs.get("axis", -1)
     if not isinstance(axis, int):
         raise TypeError("argmax axis must be an integer")
     return _reduction(context, (axis,))
 
 
-def compare(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _compare(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     dtype = context.inputs["a"].dtype
-    promoted = TensorBinding(output.shape, output.maximum_shape, dtype)
-    result = binary(KernelBindingContext(context.inputs, (promoted,), context.attrs))
+    promoted = _TensorBinding(output.shape, output.maximum_shape, dtype)
+    result = _binary(_KernelBindingContext(context.inputs, (promoted,), context.attrs))
     predicate = context.attrs["predicate"]
     if not isinstance(predicate, str) or predicate not in (
         "eq",
@@ -228,28 +230,28 @@ def compare(context: KernelBindingContext) -> dict[str, ParameterValue]:
     return result
 
 
-def select(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = binary(
-        KernelBindingContext(
+def _select(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _binary(
+        _KernelBindingContext(
             {"a": context.inputs["when_true"], "b": context.inputs["when_false"]},
             context.outputs,
             context.attrs,
         )
     )
     condition = context.inputs["condition"]
-    result["condition_strides"] = broadcast_strides(
+    result["condition_strides"] = _broadcast_strides(
         condition.shape, context.outputs[0].shape, condition.strides
     )
     return result
 
 
-def permute(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = cast(context)
+def _permute(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _cast(context)
     axes = context.attrs["axes"]
     if not isinstance(axes, tuple) or not all(isinstance(axis, int) for axis in axes):
         raise TypeError("permute axes must be an integer tuple")
     source = context.inputs["x"]
-    strides = source.strides or contiguous_strides(source.shape)
+    strides = source.strides or _contiguous_strides(source.shape)
     result.update(
         {
             "rank": len(context.outputs[0].shape),
@@ -260,29 +262,29 @@ def permute(context: KernelBindingContext) -> dict[str, ParameterValue]:
     return result
 
 
-def broadcast(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = cast(context)
+def _broadcast(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _cast(context)
     source = context.inputs["x"]
     output = context.outputs[0]
     result.update(
         {
             "rank": len(output.shape),
             "shape": output.shape,
-            "strides": broadcast_strides(source.shape, output.shape, source.strides),
+            "strides": _broadcast_strides(source.shape, output.shape, source.strides),
         }
     )
     return result
 
 
-def shape(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _shape(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     return {"rank": len(source.shape), "shape": source.shape}
 
 
 def _scalar_parameter(
-    value: object, binding: TensorBinding | None = None
-) -> int | ShapeExpression:
-    if isinstance(value, (int, ShapeExpression)):
+    value: object, binding: _TensorBinding | None = None
+) -> int | _ShapeExpression:
+    if isinstance(value, (int, _ShapeExpression)):
         return value
     if isinstance(value, Tensor):
         if (
@@ -297,35 +299,35 @@ def _scalar_parameter(
     raise TypeError("expected an integer or scalar tensor parameter")
 
 
-def iota(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _iota(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return {
-        "count": product(context.outputs[0].shape),
+        "count": _product(context.outputs[0].shape),
         "start": _scalar_parameter(
             context.attrs.get("start", 0), context.inputs.get("start")
         ),
         "step": _scalar_parameter(context.attrs.get("step", 1)),
-        "dtype": native_dtype(context.outputs[0].dtype),
+        "dtype": _native_dtype(context.outputs[0].dtype),
     }
 
 
-def random(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _random(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     distribution = context.attrs.get("distribution", "uniform")
     if distribution not in ("uniform", "normal"):
         raise ValueError("invalid random distribution")
     return {
-        "count": product(context.outputs[0].shape),
+        "count": _product(context.outputs[0].shape),
         "seed": _scalar_parameter(context.attrs["seed"], context.inputs.get("seed")),
         "offset": _scalar_parameter(
             context.attrs.get("offset", 0), context.inputs.get("offset")
         ),
         "distribution": int(distribution == "normal"),
-        "dtype": native_dtype(context.outputs[0].dtype),
+        "dtype": _native_dtype(context.outputs[0].dtype),
     }
 
 
 def _indexing(
-    context: KernelBindingContext, scatter_operation: bool
-) -> dict[str, ParameterValue]:
+    context: _KernelBindingContext, scatter_operation: bool
+) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     indices = context.inputs["indices"]
     output = context.outputs[0]
@@ -334,13 +336,13 @@ def _indexing(
         raise ValueError("indexed coordinate width must be statically known")
     if indices.dtype != "int64":
         raise ValueError("index kernels require promoted int64 coordinates")
-    source_strides = source.strides or contiguous_strides(source.shape)
-    index_strides = indices.strides or contiguous_strides(indices.shape)
+    source_strides = source.strides or _contiguous_strides(source.shape)
+    index_strides = indices.strides or _contiguous_strides(indices.shape)
     index_shape = indices.shape[:-1]
     slice_shape = source.shape[coordinates:]
     target_shape = (*index_shape, *slice_shape)
-    storage_rows, storage_columns = storage_shape(source)
-    output_rows, output_columns = storage_shape(output)
+    storage_rows, storage_columns = _storage_shape(source)
+    output_rows, output_columns = _storage_shape(output)
     mask = context.inputs.get("mask")
     fill = context.attrs.get("fill", 0)
     if not isinstance(fill, (int, float)):
@@ -349,40 +351,40 @@ def _indexing(
     if mode not in ("replace", "add"):
         raise ValueError("invalid scatter mode")
     if scatter_operation:
-        native_dtype(output.dtype)
+        _native_dtype(output.dtype)
     floating = (
         output.dtype in ("fp16", "bf16", "fp32")
-        or DTYPE_IDS[output.dtype] >= DTYPE_IDS["row_int8"]
+        or _DTYPE_IDS[output.dtype] >= _DTYPE_IDS["row_int8"]
     )
     values = context.inputs.get("values")
     return {
-        "count": product(output.shape),
-        "items": product(index_shape),
+        "count": _product(output.shape),
+        "items": _product(index_shape),
         "coordinates": coordinates,
         "index_rank": len(index_shape),
         "slice_rank": len(slice_shape),
-        "slice_size": product(slice_shape),
+        "slice_size": _product(slice_shape),
         "index_shape": index_shape,
         "index_strides": index_strides[:-1],
-        "mask_strides": broadcast_strides(mask.shape, index_shape, mask.strides)
+        "mask_strides": _broadcast_strides(mask.shape, index_shape, mask.strides)
         if mask
-        else (constant(0),) * len(index_shape),
+        else (_constant_expression(0),) * len(index_shape),
         "coordinate_stride": index_strides[-1],
         "indexed_shape": source.shape[:coordinates],
         "indexed_strides": source_strides[:coordinates],
-        "output_indexed_strides": contiguous_strides(source.shape)[:coordinates],
+        "output_indexed_strides": _contiguous_strides(source.shape)[:coordinates],
         "slice_shape": slice_shape,
         "slice_strides": source_strides[coordinates:],
         "values_rank": len(target_shape) if values else 0,
         "values_shape": target_shape if values else (),
-        "values_strides": broadcast_strides(values.shape, target_shape, values.strides)
+        "values_strides": _broadcast_strides(values.shape, target_shape, values.strides)
         if values
         else (),
         "storage_rows": storage_rows,
         "storage_columns": storage_columns,
         "output_rows": output_rows,
         "output_columns": output_columns,
-        "dtype": DTYPE_IDS[output.dtype],
+        "dtype": _DTYPE_IDS[output.dtype],
         "masked": int(mask is not None),
         "mode": int(mode == "add"),
         "fill_bits": 0
@@ -392,29 +394,29 @@ def _indexing(
     }
 
 
-def gather(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _gather(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return _indexing(context, False)
 
 
-def scatter(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _scatter(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return _indexing(context, True)
 
 
-def reshape_strides(
-    shape: tuple[ShapeExpression, ...],
-    strides: tuple[ShapeExpression, ...],
-    target: tuple[ShapeExpression, ...],
-) -> tuple[ShapeExpression, ...] | None:
+def _reshape_strides(
+    shape: tuple[_ShapeExpression, ...],
+    strides: tuple[_ShapeExpression, ...],
+    target: tuple[_ShapeExpression, ...],
+) -> tuple[_ShapeExpression, ...] | None:
     if len(shape) != len(strides):
         raise ValueError("tensor shape and strides must have equal rank")
-    expected = constant(1)
+    expected = _constant_expression(1)
     contiguous = True
     for dimension, stride in zip(reversed(shape), reversed(strides), strict=True):
         if dimension.op != "const" or dimension.value != 1:
             contiguous = contiguous and stride == expected
-        expected = expression("mul", expected, dimension)
+        expected = _expression("mul", expected, dimension)
     if contiguous:
-        return contiguous_strides(target)
+        return _contiguous_strides(target)
     source_axes = tuple(
         (dimension, stride)
         for dimension, stride in zip(shape, strides, strict=True)
@@ -429,23 +431,23 @@ def reshape_strides(
         return None
     iterator = iter(source_axes)
     return tuple(
-        constant(0)
+        _constant_expression(0)
         if dimension.op == "const" and dimension.value == 1
         else next(iterator)[1]
         for dimension in target
     )
 
 
-def rmsnorm(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _rmsnorm(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     if not source.shape:
         raise ValueError("RMSNorm requires a channel axis")
-    source_strides = source.strides or contiguous_strides(source.shape)
-    if reshape_strides(
+    source_strides = source.strides or _contiguous_strides(source.shape)
+    if _reshape_strides(
         source.shape, source_strides, source.shape
-    ) != contiguous_strides(source.shape):
+    ) != _contiguous_strides(source.shape):
         raise ValueError("fused RMSNorm requires contiguous input")
-    rows, columns = storage_shape(source)
+    rows, columns = _storage_shape(source)
     weight = context.inputs.get("weight")
     if weight is not None and (
         len(weight.shape) != 1 or weight.shape[0] != source.shape[-1]
@@ -458,55 +460,55 @@ def rmsnorm(context: KernelBindingContext) -> dict[str, ParameterValue]:
     if not isinstance(eps, (int, float)) or not isinstance(offset, (int, float)):
         raise TypeError("RMSNorm eps and weight_offset must be numeric scalars")
     return {
-        "rows": product(source.shape[:-1]),
+        "rows": _product(source.shape[:-1]),
         "width": source.shape[-1],
         "storage_rows": rows,
         "storage_columns": columns,
-        "input_dtype": DTYPE_IDS[source.dtype],
-        "weight_dtype": DTYPE_IDS[weight.dtype] if weight else DTYPE_IDS["fp32"],
-        "output_dtype": native_dtype(context.outputs[0].dtype),
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "weight_dtype": _DTYPE_IDS[weight.dtype] if weight else _DTYPE_IDS["fp32"],
+        "output_dtype": _native_dtype(context.outputs[0].dtype),
         "eps": float(eps),
         "weight_offset": float(offset),
     }
 
 
-def linear(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     weight = context.inputs["weight"]
     output = context.outputs[0]
     if not source.shape or len(weight.shape) != 2:
         raise ValueError("linear requires a channel axis and matrix weights")
-    rows = product(source.shape[:-1])
+    rows = _product(source.shape[:-1])
     source_shape = (rows, source.shape[-1])
-    source_strides = reshape_strides(
-        source.shape, source.strides or contiguous_strides(source.shape), source_shape
+    source_strides = _reshape_strides(
+        source.shape, source.strides or _contiguous_strides(source.shape), source_shape
     )
     if source_strides is None:
         raise ValueError("fused linear requires a matrix-representable input view")
-    matrix = TensorBinding(
+    matrix = _TensorBinding(
         source_shape,
         (rows.maximum, source.maximum_shape[-1]),
         source.dtype,
         source_strides,
-        storage_shape(source),
+        _storage_shape(source),
     )
-    strides = weight.strides or contiguous_strides(weight.shape)
-    transposed = TensorBinding(
+    strides = weight.strides or _contiguous_strides(weight.shape)
+    transposed = _TensorBinding(
         (weight.shape[1], weight.shape[0]),
         (weight.maximum_shape[1], weight.maximum_shape[0]),
         weight.dtype,
         (strides[1], strides[0]),
-        storage_shape(weight),
+        _storage_shape(weight),
     )
-    result = TensorBinding(
+    result = _TensorBinding(
         (rows, weight.shape[0]), (rows.maximum, weight.maximum_shape[0]), output.dtype
     )
-    return matmul(
-        KernelBindingContext({"a": matrix, "b": transposed}, (result,), context.attrs)
+    return _matmul(
+        _KernelBindingContext({"a": matrix, "b": transposed}, (result,), context.attrs)
     )
 
 
-def bitlinear(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     weight = context.inputs["weight"]
     if (
@@ -520,34 +522,34 @@ def bitlinear(context: KernelBindingContext) -> dict[str, ParameterValue]:
     if len(weight.shape) != 2 or not source.shape:
         raise ValueError("fused BitLinear requires matrix weights")
     for binding in (source, weight):
-        strides = binding.strides or contiguous_strides(binding.shape)
-        if reshape_strides(binding.shape, strides, binding.shape) != contiguous_strides(
-            binding.shape
-        ):
+        strides = binding.strides or _contiguous_strides(binding.shape)
+        if _reshape_strides(
+            binding.shape, strides, binding.shape
+        ) != _contiguous_strides(binding.shape):
             raise ValueError("fused BitLinear requires contiguous operands")
     return {
-        "tokens": product(source.shape[:-1]),
+        "tokens": _product(source.shape[:-1]),
         "width": source.shape[-1],
         "outputs": weight.shape[0],
     }
 
 
-def avx2_bitlinear(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = bitlinear(context)
+def _avx2_bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _bitlinear(context)
     width = context.inputs["x"].shape[-1]
     if width.op != "const" or width.value is None or width.value % 128:
         raise ValueError("AVX2 BitLinear requires a fixed width divisible by 128")
     return result
 
 
-def avx2_linear(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = linear(context)
+def _avx2_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _linear(context)
     if context.inputs["x"].dtype != "fp32" or context.outputs[0].dtype != "fp32":
         raise ValueError("AVX2 linear requires FP32 activations and output")
     for name in ("a_col_stride", "b_row_stride"):
         stride = result[name]
         if (
-            not isinstance(stride, ShapeExpression)
+            not isinstance(stride, _ShapeExpression)
             or stride.op != "const"
             or stride.value != 1
         ):
@@ -555,32 +557,32 @@ def avx2_linear(context: KernelBindingContext) -> dict[str, ParameterValue]:
     return result
 
 
-def avx2_rmsnorm(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = rmsnorm(context)
+def _avx2_rmsnorm(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _rmsnorm(context)
     if context.inputs["x"].dtype != "fp32" or context.outputs[0].dtype != "fp32":
         raise ValueError("AVX2 RMSNorm requires FP32 activations and output")
     return result
 
 
-def activation(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _activation(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     for name in ("a", "b"):
         source = context.inputs[name]
-        strides = source.strides or contiguous_strides(source.shape)
+        strides = source.strides or _contiguous_strides(source.shape)
         if (
             source.dtype != "fp32"
             or source.shape != output.shape
-            or strides != contiguous_strides(source.shape)
+            or strides != _contiguous_strides(source.shape)
         ):
             raise ValueError(
                 "fused gate activation requires matching contiguous FP32 operands"
             )
     if output.dtype != "fp32":
         raise ValueError("fused gate activation requires FP32 output")
-    return {"count": product(output.shape)}
+    return {"count": _product(output.shape)}
 
 
-def rotary(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     import math
 
     source = context.inputs["x"]
@@ -614,20 +616,20 @@ def rotary(context: KernelBindingContext) -> dict[str, ParameterValue]:
         "dim": source.shape[2],
         "rotary_dim": dim,
         "rank": 3,
-        "strides": source.strides or contiguous_strides(source.shape),
-        "position_stride": broadcast_strides(
+        "strides": source.strides or _contiguous_strides(source.shape),
+        "position_stride": _broadcast_strides(
             positions.shape, (source.shape[1],), positions.strides
         )[0],
-        "position_dtype": native_dtype(positions.dtype),
+        "position_dtype": _native_dtype(positions.dtype),
         "interleaved": int(interleaved),
         "frequency_step": -2.0 * math.log(theta) / dim,
         "amplitude": float(amplitude),
     }
 
 
-def avx2_rotary(context: KernelBindingContext) -> dict[str, ParameterValue]:
-    result = rotary(context)
-    strides = context.inputs["x"].strides or contiguous_strides(
+def _avx2_rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _rotary(context)
+    strides = context.inputs["x"].strides or _contiguous_strides(
         context.inputs["x"].shape
     )
     if strides[-1].op != "const" or strides[-1].value != 1:
@@ -635,7 +637,7 @@ def avx2_rotary(context: KernelBindingContext) -> dict[str, ParameterValue]:
     return result
 
 
-def attention(context: KernelBindingContext) -> dict[str, ParameterValue]:
+def _attention(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     q, k, v = context.inputs["q"], context.inputs["k"], context.inputs["v"]
     if any(len(binding.shape) != 3 for binding in (q, k, v)):
         raise ValueError(
@@ -652,9 +654,9 @@ def attention(context: KernelBindingContext) -> dict[str, ParameterValue]:
         raise TypeError("invalid attention causal or scale attribute")
     if window is not None and (not isinstance(window, int) or window < 0):
         raise ValueError("fused attention requires a nonnegative window")
-    q_rows, q_columns = storage_shape(q)
-    k_rows, k_columns = storage_shape(k)
-    v_rows, v_columns = storage_shape(v)
+    q_rows, q_columns = _storage_shape(q)
+    k_rows, k_columns = _storage_shape(k)
+    v_rows, v_columns = _storage_shape(v)
     return {
         "heads": q.shape[0],
         "kv_heads": k.shape[0],
@@ -663,9 +665,9 @@ def attention(context: KernelBindingContext) -> dict[str, ParameterValue]:
         "key_dim": q.shape[2],
         "value_dim": v.shape[2],
         "rank": 3,
-        "q_strides": q.strides or contiguous_strides(q.shape),
-        "k_strides": k.strides or contiguous_strides(k.shape),
-        "v_strides": v.strides or contiguous_strides(v.shape),
+        "q_strides": q.strides or _contiguous_strides(q.shape),
+        "k_strides": k.strides or _contiguous_strides(k.shape),
+        "v_strides": v.strides or _contiguous_strides(v.shape),
         "q_rows": q_rows,
         "q_columns": q_columns,
         "k_rows": k_rows,
@@ -673,9 +675,9 @@ def attention(context: KernelBindingContext) -> dict[str, ParameterValue]:
         "v_rows": v_rows,
         "v_columns": v_columns,
         "window": window if isinstance(window, int) else 0,
-        "q_dtype": DTYPE_IDS[q.dtype],
-        "k_dtype": DTYPE_IDS[k.dtype],
-        "v_dtype": DTYPE_IDS[v.dtype],
+        "q_dtype": _DTYPE_IDS[q.dtype],
+        "k_dtype": _DTYPE_IDS[k.dtype],
+        "v_dtype": _DTYPE_IDS[v.dtype],
         "causal": int(causal),
         "windowed": int(window is not None),
         "default_scale": int(scale is None),

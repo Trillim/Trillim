@@ -38,7 +38,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_shape(
 
 TRILLIM_KERNEL const char *trillim_scalar_shape_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import shape as bind\n"
+           "from trillim.compiler.kernels.bindings import _shape as bind\n"
            "physical_inputs = ()\n"
            "def pattern(x: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Shape(x),)\n";

@@ -4,14 +4,14 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ...tdl.core.core_dataclasses import Shape
-from ...tdl.core.core_pydantic_models import ConstantArgs, Weight
+from ...tdl.core.core_pydantic_models import Weight, _ConstantArgs
 from ...tdl.core.graph import Graph
-from ..passes.walk import walk
-from .reader import LOGICAL_DTYPES, load_checkpoint
-from .weights_dataclasses import Checkpoint, WeightBinding, WeightEntry, WeightIndex
+from ..passes.walk import _walk
+from .reader import _LOGICAL_DTYPES, _load_checkpoint
+from .weights_dataclasses import _Checkpoint, _WeightBinding, _WeightEntry, _WeightIndex
 
 
-def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
+def _entry(checkpoint: _Checkpoint, name: str) -> _WeightEntry:
     canonical = name
     visited = set()
     while canonical in checkpoint.aliases:
@@ -40,7 +40,7 @@ def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
         ):
             raise ValueError(f"invalid packed MXFP4 checkpoint tensors: {name}")
         shape = (*blocks.shape[:-2], blocks.shape[-2] * 32)
-        return WeightEntry(
+        return _WeightEntry(
             f"{checkpoint.name}.{canonical}",
             shape,
             "mxfp4",
@@ -83,7 +83,7 @@ def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
                 raise ValueError(
                     f"packed BitNet projection needs offline configuration and scalar weight_scale: {name}"
                 )
-            return WeightEntry(
+            return _WeightEntry(
                 f"{checkpoint.name}.{canonical}",
                 (source.shape[0] * 4, source.shape[1]),
                 "mat_ternary",
@@ -96,7 +96,7 @@ def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
             )
         if source.dtype not in ("BF16", "F16", "F32"):
             raise ValueError(f"unsupported BitNet latent weight dtype: {source.dtype}")
-        return WeightEntry(
+        return _WeightEntry(
             f"{checkpoint.name}.{canonical}",
             source.shape,
             "mat_ternary",
@@ -106,38 +106,38 @@ def _entry(checkpoint: Checkpoint, name: str) -> WeightEntry:
             aliases,
             tied,
         )
-    return WeightEntry(
+    return _WeightEntry(
         f"{checkpoint.name}.{canonical}",
         source.shape,
-        LOGICAL_DTYPES[source.dtype],
+        _LOGICAL_DTYPES[source.dtype],
         source,
         aliases=aliases,
         tied_sources=tied,
     )
 
 
-def resolve_weights(
+def _resolve_weights(
     graph: Graph,
     checkpoints: Mapping[str, Path],
-) -> WeightIndex:
+) -> _WeightIndex:
     """Bind checkpoint-qualified logical identities before shape inference."""
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError("weight resolution requires a completed graph")
-    index = WeightIndex()
-    identities: dict[str, WeightEntry] = {}
-    for _, operator in walk(graph.region):
+    index = _WeightIndex()
+    identities: dict[str, _WeightEntry] = {}
+    for _, operator in _walk(graph._region):
         args = operator.args
-        if not isinstance(args, ConstantArgs) or not isinstance(args.value, Weight):
+        if not isinstance(args, _ConstantArgs) or not isinstance(args.value, Weight):
             continue
         weight = args.value
-        checkpoint = index.checkpoints.get(weight.model_name)
+        checkpoint = index.checkpoints.get(weight._model_name)
         if checkpoint is None:
-            location = checkpoints.get(weight.model_name)
+            location = checkpoints.get(weight._model_name)
             if location is None:
-                raise ValueError(f"missing checkpoint binding: {weight.model_name}")
-            checkpoint = load_checkpoint(weight.model_name, location)
-            index.checkpoints[weight.model_name] = checkpoint
-        source = _entry(checkpoint, weight.tensor_name)
+                raise ValueError(f"missing checkpoint binding: {weight._model_name}")
+            checkpoint = _load_checkpoint(weight._model_name, location)
+            index.checkpoints[weight._model_name] = checkpoint
+        source = _entry(checkpoint, weight._tensor_name)
         source = identities.setdefault(source.identity, source)
         if weight.shape is not None and (
             len(weight.shape.dimensions) != len(source.shape)
@@ -154,7 +154,7 @@ def resolve_weights(
         operator.args = args.model_copy(update={"dtype": target})
         for tensor in operator.outputs:
             tensor.shape, tensor.dtype = weight.shape, target
-            index.bindings[tensor] = WeightBinding(weight.root, source, target)
+            index.bindings[tensor] = _WeightBinding(weight.root, source, target)
         index.sources[weight.root] = source
         index.sources.setdefault(source.identity, source)
         for alias in source.aliases:

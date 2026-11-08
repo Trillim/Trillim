@@ -3,28 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...tdl.core.operator import Operator
+from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
 from ...tdl.core.types import DType
-from ..compiler_dataclasses import Inference, ShapeExpression
-from ..kernels.kernel_dataclasses import Kernel, ParameterValue, TensorBinding
+from ..compiler_dataclasses import _Inference, _ShapeExpression
+from ..kernels.kernel_dataclasses import _Kernel, _ParameterValue, _TensorBinding
 
-type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
-
-
-@dataclass(slots=True)
-class Expressions:
-    names: dict[ShapeExpression, str] = field(default_factory=dict)
-    nodes: dict[str, JSON] = field(default_factory=dict)
+type _JSON = None | bool | int | float | str | list[_JSON] | dict[str, _JSON]
 
 
 @dataclass(slots=True)
-class Buffer:
+class _Expressions:
+    names: dict[_ShapeExpression, str] = field(default_factory=dict)
+    nodes: dict[str, _JSON] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _Buffer:
     name: str
     dtype: DType
-    shape: tuple[ShapeExpression, ...]
+    shape: tuple[_ShapeExpression, ...]
     maximum_shape: tuple[int, ...]
-    strides: tuple[ShapeExpression, ...]
+    strides: tuple[_ShapeExpression, ...]
     storage: Literal["arena", "input", "weight", "constant", "alias", "cache"] = "arena"
     source: str | None = None
     offset: int = 0
@@ -32,12 +32,12 @@ class Buffer:
     alignment: int = 64
     first: int = 0
     last: int = 0
-    storage_shape: tuple[ShapeExpression, ShapeExpression] | None = None
-    byte_offset: ShapeExpression | None = None
-    values: tuple[ShapeExpression, ...] | None = None
+    storage_shape: tuple[_ShapeExpression, _ShapeExpression] | None = None
+    byte_offset: _ShapeExpression | None = None
+    values: tuple[_ShapeExpression, ...] | None = None
 
-    def binding(self) -> TensorBinding:
-        return TensorBinding(
+    def _binding(self) -> _TensorBinding:
+        return _TensorBinding(
             self.shape,
             self.maximum_shape,
             self.dtype,
@@ -48,7 +48,7 @@ class Buffer:
 
 
 @dataclass(slots=True)
-class Workspace:
+class _Workspace:
     offset: int
     size: int
     alignment: int
@@ -57,31 +57,33 @@ class Workspace:
 
 
 @dataclass(slots=True)
-class Layout:
-    inference: Inference
-    buffers: dict[Tensor, Buffer] = field(default_factory=dict)
-    parameters: dict[Operator, dict[str, ParameterValue]] = field(default_factory=dict)
-    scratch: dict[Operator, Workspace] = field(default_factory=dict)
+class _Layout:
+    inference: _Inference
+    buffers: dict[Tensor, _Buffer] = field(default_factory=dict)
+    parameters: dict[_Operator, dict[str, _ParameterValue]] = field(
+        default_factory=dict
+    )
+    scratch: dict[_Operator, _Workspace] = field(default_factory=dict)
     arena_size: int = 0
     cache_size: int = 0
     constants: bytes = b""
-    positions: dict[Operator, tuple[int, int]] = field(default_factory=dict)
-    direct_writes: set[Operator] = field(default_factory=set)
-    cache_guards: dict[Operator, list[tuple[ShapeExpression, int]]] = field(
+    positions: dict[_Operator, tuple[int, int]] = field(default_factory=dict)
+    direct_writes: set[_Operator] = field(default_factory=set)
+    cache_guards: dict[_Operator, list[tuple[_ShapeExpression, int]]] = field(
         default_factory=dict
     )
-    transfer_kernel: Kernel | None = None
-    transfer_scratch: dict[Operator, Workspace] = field(default_factory=dict)
+    transfer_kernel: _Kernel | None = None
+    transfer_scratch: dict[_Operator, _Workspace] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class Requirements:
+class _Requirements:
     inputs: tuple[int, ...]
     outputs: tuple[int, ...]
     scratch: int
 
 
 @dataclass(slots=True)
-class PackedParameters:
+class _PackedParameters:
     address: int
     owners: list[object]

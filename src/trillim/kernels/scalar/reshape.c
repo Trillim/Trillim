@@ -9,7 +9,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_reshape(
 
 TRILLIM_KERNEL const char *trillim_scalar_reshape_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import cast as bind\n"
+           "from trillim.compiler.kernels.bindings import _cast as bind\n"
            "physical_inputs = ('x',)\n"
            "def pattern(x: Tensor, *, shape) -> tuple[Tensor, ...]:\n"
            "    return (Reshape(x, shape),)\n";

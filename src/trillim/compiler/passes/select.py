@@ -3,51 +3,51 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator, Mapping
 
-from ...tdl.core.core_dataclasses import Region
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
-    BroadcastArgs,
-    CacheArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
-    ConstantArgs,
-    ConstructArgs,
-    IfArgs,
-    InputArgs,
-    OutputArgs,
-    PermuteArgs,
-    ReduceArgs,
-    WhileArgs,
+    _BroadcastArgs,
+    _CacheArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _IfArgs,
+    _InputArgs,
+    _OutputArgs,
+    _PermuteArgs,
+    _ReduceArgs,
+    _WhileArgs,
 )
 from ...tdl.core.graph import Graph
-from ...tdl.core.operator import Operator
-from .passes_dataclasses import KernelMatch, MatchSet, Selection
-from .walk import ordered_operators
+from ...tdl.core.operator import _Operator
+from .passes_dataclasses import _KernelMatch, _MatchSet, _Selection
+from .walk import _ordered_operators
 
-CostModel = Mapping[Operator, Mapping[str, float]] | Callable[[KernelMatch], float]
+_CostModel = Mapping[_Operator, Mapping[str, float]] | Callable[[_KernelMatch], float]
 _INTRINSICS = (
-    InputArgs,
-    OutputArgs,
-    ConstantArgs,
-    CacheArgs,
-    CacheReadArgs,
-    CacheAssignArgs,
-    ConstructArgs,
-    IfArgs,
-    WhileArgs,
-    ReduceArgs,
-    PermuteArgs,
-    BroadcastArgs,
+    _InputArgs,
+    _OutputArgs,
+    _ConstantArgs,
+    _CacheArgs,
+    _CacheReadArgs,
+    _CacheAssignArgs,
+    _ConstructArgs,
+    _IfArgs,
+    _WhileArgs,
+    _ReduceArgs,
+    _PermuteArgs,
+    _BroadcastArgs,
 )
 
 
-def _anchors(region: Region) -> Iterator[Operator]:
-    for operator in reversed(tuple(ordered_operators(region))):
+def _anchors(region: _Region) -> Iterator[_Operator]:
+    for operator in reversed(tuple(_ordered_operators(region))):
         yield operator
         for body in operator.regions:
             yield from _anchors(body)
 
 
-def _cost(candidate: KernelMatch, costs: CostModel | None) -> float:
+def _cost(candidate: _KernelMatch, costs: _CostModel | None) -> float:
     if costs is None:
         return 1.0
     if callable(costs):
@@ -60,8 +60,8 @@ def _cost(candidate: KernelMatch, costs: CostModel | None) -> float:
 
 
 def _choices(
-    operator: Operator, matches: MatchSet, state: Selection, costs: CostModel | None
-) -> list[tuple[KernelMatch, float]]:
+    operator: _Operator, matches: _MatchSet, state: _Selection, costs: _CostModel | None
+) -> list[tuple[_KernelMatch, float]]:
     if operator in matches.views:
         return []
     result = [
@@ -82,9 +82,9 @@ def _choices(
 
 
 def _greedy(
-    operators: tuple[Operator, ...], matches: MatchSet, costs: CostModel | None
-) -> Selection:
-    state = Selection()
+    operators: tuple[_Operator, ...], matches: _MatchSet, costs: _CostModel | None
+) -> _Selection:
+    state = _Selection()
     for operator in operators:
         if operator in state.covered:
             continue
@@ -106,29 +106,29 @@ def _greedy(
     return state
 
 
-def select(
+def _select(
     graph: Graph,
-    matches: MatchSet,
+    matches: _MatchSet,
     *,
     fast: bool = False,
-    costs: CostModel | None = None,
-) -> Selection:
+    costs: _CostModel | None = None,
+) -> _Selection:
     """Cover outer results before their implementations, retaining a complete fallback."""
-    if graph.region is None:
+    if graph._region is None:
         raise ValueError("cannot select kernels for an incomplete graph")
-    operators = tuple(_anchors(graph.region))
+    operators = tuple(_anchors(graph._region))
     best = _greedy(operators, matches, costs)
     if fast:
         return best
-    states = [Selection()]
+    states = [_Selection()]
     for operator in operators:
-        following: list[Selection] = []
+        following: list[_Selection] = []
         for state in states:
             if operator in state.covered:
                 following.append(state)
                 continue
             following.extend(
-                Selection(
+                _Selection(
                     {**state.calls, candidate.anchor: candidate},
                     state.covered | candidate.covered,
                     state.cost + cost,

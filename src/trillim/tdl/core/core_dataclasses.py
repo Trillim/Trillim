@@ -7,12 +7,12 @@ from .tensor import Tensor
 from .types import DType
 
 if TYPE_CHECKING:
-    from .operator import Operator
+    from .operator import _Operator
 
-Scalar = bool | int | float
-TensorTuple = tuple[Tensor, ...]
-Dimensions = Tensor | tuple[int | Tensor, ...]
-CacheMode = Literal["overwrite", "append", "sliding"]
+_Scalar = bool | int | float
+_TensorTuple = tuple[Tensor, ...]
+_Dimensions = Tensor | tuple[int | Tensor, ...]
+_CacheMode = Literal["overwrite", "append", "sliding"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,29 +27,29 @@ class Shape:
 
 
 @dataclass(frozen=True, slots=True)
-class CacheSpec:
+class _CacheSpec:
     name: str
     shape: Shape
     dtype: DType
-    mode: CacheMode
+    mode: _CacheMode
     axis: int | None
 
 
 @dataclass(slots=True)
-class Region:
-    parameters: TensorTuple
-    outputs: TensorTuple
-    operators: tuple[Operator, ...]
-    captures: TensorTuple
-    reads: tuple[CacheSpec, ...]
-    writes: tuple[CacheSpec, ...]
+class _Region:
+    parameters: _TensorTuple
+    outputs: _TensorTuple
+    operators: tuple[_Operator, ...]
+    captures: _TensorTuple
+    reads: tuple[_CacheSpec, ...]
+    writes: tuple[_CacheSpec, ...]
 
 
 @dataclass(eq=False, slots=True)
 class _Scope:
     parent: _Scope | None = None
-    parameters: TensorTuple = ()
-    operators: list[Operator] = field(default_factory=list)
-    cache_accesses: dict[CacheSpec, Operator] = field(default_factory=dict)
-    reads: dict[CacheSpec, None] = field(default_factory=dict)
-    writes: dict[CacheSpec, None] = field(default_factory=dict)
+    parameters: _TensorTuple = ()
+    operators: list[_Operator] = field(default_factory=list)
+    cache_accesses: dict[_CacheSpec, _Operator] = field(default_factory=dict)
+    reads: dict[_CacheSpec, None] = field(default_factory=dict)
+    writes: dict[_CacheSpec, None] = field(default_factory=dict)

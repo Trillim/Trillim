@@ -13,7 +13,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter_masked(
 
 TRILLIM_KERNEL const char *trillim_scalar_scatter_masked_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import scatter as bind\n"
+           "from trillim.compiler.kernels.bindings import _scatter as bind\n"
            "physical_inputs = ('x', 'indices', 'values', 'mask')\n"
            "def pattern(x: Tensor, indices: Tensor, values: Tensor, mask: Tensor, *, mode: str = \"replace\") -> tuple[Tensor, ...]:\n"
            "    return (Scatter(x, indices=indices, values=values, mode=mode, mask=mask),)\n";

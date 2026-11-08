@@ -7,16 +7,16 @@ from typing import TYPE_CHECKING, Self
 
 from pydantic import ConfigDict, TypeAdapter
 
-from .core_dataclasses import CacheSpec, Region, TensorTuple, _Scope
+from .core_dataclasses import _CacheSpec, _Region, _Scope, _TensorTuple
 from .tensor import Tensor
 
 if TYPE_CHECKING:
-    from .operator import Operator
+    from .operator import _Operator
 
 _current_graph: ContextVar[Graph | None] = ContextVar("tdl_core_graph", default=None)
 _current_scope: ContextVar[_Scope | None] = ContextVar("tdl_core_scope", default=None)
-_outputs = TypeAdapter[TensorTuple](
-    TensorTuple, config=ConfigDict(arbitrary_types_allowed=True, strict=True)
+_outputs = TypeAdapter[_TensorTuple](
+    _TensorTuple, config=ConfigDict(arbitrary_types_allowed=True, strict=True)
 )
 
 
@@ -29,13 +29,13 @@ class Graph:
     """
 
     def __init__(self) -> None:
-        self.inputs: dict[str, Tensor] = {}
-        self.outputs: dict[str, Tensor] = {}
-        self.caches: dict[str, CacheSpec] = {}
-        self.region: Region | None = None
+        self._inputs: dict[str, Tensor] = {}
+        self._outputs: dict[str, Tensor] = {}
+        self._caches: dict[str, _CacheSpec] = {}
+        self._region: _Region | None = None
         self._root = _Scope()
         self._tensor_scopes: dict[Tensor, _Scope] = {}
-        self._cache_declarations: dict[CacheSpec, Operator] = {}
+        self._cache_declarations: dict[_CacheSpec, _Operator] = {}
         self._tokens: tuple[Token[Graph | None], Token[_Scope | None]] | None = None
         self._sealed = False
 
@@ -61,7 +61,7 @@ class Graph:
             raise RuntimeError("graph context was not entered")
         try:
             if exc_type is None:
-                self.region = _finish_region(self._root, tuple(self.outputs.values()))
+                self._region = _finish_region(self._root, tuple(self._outputs.values()))
         finally:
             graph_token, scope_token = self._tokens
             _current_scope.reset(scope_token)
@@ -94,11 +94,13 @@ def _validate_tensor(tensor: Tensor) -> None:
     raise ValueError("tensor belongs to another graph or an inaccessible region")
 
 
-def _record_cache_access(operator: Operator, cache: CacheSpec, *, write: bool) -> None:
+def _record_cache_access(
+    operator: _Operator, cache: _CacheSpec, *, write: bool
+) -> None:
     graph = _get_graph()
     scope = _get_scope()
     declaration = graph._cache_declarations.get(cache)
-    if declaration is None or graph.caches.get(cache.name) is not cache:
+    if declaration is None or graph._caches.get(cache.name) is not cache:
         raise ValueError("cache belongs to another graph")
     previous = scope.cache_accesses.get(cache, declaration)
     operator.dependencies = tuple(dict.fromkeys((*operator.dependencies, previous)))
@@ -109,7 +111,7 @@ def _record_cache_access(operator: Operator, cache: CacheSpec, *, write: bool) -
         scope.reads[cache] = None
 
 
-def _record_operator(operator: Operator) -> None:
+def _record_operator(operator: _Operator) -> None:
     graph = _current_graph.get()
     if graph is None:
         return
@@ -131,7 +133,7 @@ def _record_operator(operator: Operator) -> None:
             scope.reads[cache] = None
 
 
-def _finish_region(scope: _Scope, outputs: TensorTuple) -> Region:
+def _finish_region(scope: _Scope, outputs: _TensorTuple) -> _Region:
     local = set(scope.parameters)
     for operator in scope.operators:
         local.update(operator.outputs)
@@ -143,7 +145,7 @@ def _finish_region(scope: _Scope, outputs: TensorTuple) -> Region:
     for tensor in outputs:
         if tensor not in local:
             captures[tensor] = None
-    return Region(
+    return _Region(
         parameters=scope.parameters,
         outputs=outputs,
         operators=tuple(scope.operators),
@@ -154,8 +156,8 @@ def _finish_region(scope: _Scope, outputs: TensorTuple) -> Region:
 
 
 def _build_region(
-    parameters: TensorTuple, build: Callable[[TensorTuple], TensorTuple]
-) -> Region:
+    parameters: _TensorTuple, build: Callable[[_TensorTuple], _TensorTuple]
+) -> _Region:
     graph = _get_graph()
     scope = _Scope(parent=_get_scope(), parameters=parameters)
     for parameter in parameters:

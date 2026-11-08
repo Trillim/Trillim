@@ -24,7 +24,7 @@ from .core import (
     Tensor,
     While,
 )
-from .math import Dim, FullLike, Softmax, Stack, Sum, Take, Value, _tensor
+from .math import Dim, FullLike, Softmax, Stack, Sum, Take, _tensor, _Value
 from .norm import L2Norm
 
 
@@ -41,7 +41,7 @@ def Attention(
     key_positions: Tensor | None = None,
     window: int | None = None,
     softcap: float | None = None,
-    sinks: Value | None = None,
+    sinks: _Value | None = None,
     softmax: bool = True,
 ) -> Tensor:
     """Grouped-query attention on [heads, tokens, channels] for one sequence.

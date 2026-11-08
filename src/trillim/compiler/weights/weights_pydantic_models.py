@@ -5,68 +5,68 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...tdl.core.types import DType
-from .weights_dataclasses import SourceDType
+from .weights_dataclasses import _SourceDType
 
-Nonnegative = Annotated[int, Field(ge=0, strict=True)]
+_Nonnegative = Annotated[int, Field(ge=0, strict=True)]
 
 
-class TensorHeader(BaseModel):
+class _TensorHeader(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    dtype: SourceDType
-    shape: list[Nonnegative]
-    data_offsets: list[Nonnegative] = Field(min_length=2, max_length=2)
+    dtype: _SourceDType
+    shape: list[_Nonnegative]
+    data_offsets: list[_Nonnegative] = Field(min_length=2, max_length=2)
 
 
-class SafetensorsIndex(BaseModel):
+class _SafetensorsIndex(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
     weight_map: dict[str, str] = Field(min_length=1)
 
 
-class QuantizationConfig(BaseModel):
+class _QuantizationConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
     quant_method: str = ""
     quantization_mode: str = ""
     linear_class: str = ""
 
 
-class CheckpointConfig(BaseModel):
+class _CheckpointConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
     model_type: str = ""
     architectures: list[str] = Field(default_factory=list)
     tie_word_embeddings: bool = False
-    quantization_config: QuantizationConfig | None = None
+    quantization_config: _QuantizationConfig | None = None
 
 
-class SourceProvenance(BaseModel):
+class _SourceProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     checkpoint: str
     tensor: str
     file: str
-    dtype: SourceDType
+    dtype: _SourceDType
     shape: list[int]
     offset: int = Field(ge=0)
     size: int = Field(ge=0)
     sha256: str = Field(min_length=64, max_length=64)
 
 
-class WeightRecord(BaseModel):
+class _WeightRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     name: str = Field(min_length=1)
     logical: str = Field(min_length=1)
     dtype: DType
-    shape: list[Nonnegative]
+    shape: list[_Nonnegative]
     layout: str = "canonical"
     offset: int = Field(ge=0)
     size: int = Field(ge=0)
     aliases: list[str] = Field(default_factory=list)
     import_method: str
-    provenance: list[SourceProvenance]
+    provenance: list[_SourceProvenance]
 
 
-class WeightManifest(BaseModel):
+class _WeightManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     format: Literal["trillim.weights"] = "trillim.weights"
     version: Literal[1] = 1
     endian: Literal["little"] = "little"
     data_start: int = Field(ge=8)
-    entries: dict[str, WeightRecord]
+    entries: dict[str, _WeightRecord]

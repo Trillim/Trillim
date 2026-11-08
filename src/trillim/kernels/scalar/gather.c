@@ -13,7 +13,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
 
 TRILLIM_KERNEL const char *trillim_scalar_gather_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import gather as bind\n"
+           "from trillim.compiler.kernels.bindings import _gather as bind\n"
            "physical_inputs = ('x', 'indices')\n"
            "def pattern(x: Tensor, indices: Tensor, *, fill = 0) -> tuple[Tensor, ...]:\n"
            "    return (Gather(x, indices=indices, fill=fill),)\n";

@@ -4,56 +4,56 @@ import shutil
 from collections.abc import Mapping
 from pathlib import Path
 
-from ...tdl.core.core_dataclasses import Region
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
-    CacheArgs,
-    CacheAssignArgs,
-    CacheReadArgs,
-    ConstantArgs,
-    ConstructArgs,
-    IfArgs,
-    InputArgs,
-    OutputArgs,
-    ReduceArgs,
-    WhileArgs,
+    _CacheArgs,
+    _CacheAssignArgs,
+    _CacheReadArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _IfArgs,
+    _InputArgs,
+    _OutputArgs,
+    _ReduceArgs,
+    _WhileArgs,
 )
 from ...tdl.core.graph import Graph
-from ...tdl.core.operator import Operator
+from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
-from ..artifacts import transfers
-from ..artifacts.artifact_dataclasses import JSON, Expressions, Layout
-from ..artifacts.artifact_pydantic_models import ExecutableManifest
-from ..artifacts.expressions import align, byte_size, number, references, serialize
-from ..compiler_dataclasses import ShapeConstraint, ShapeExpression
-from ..compiler_pydantic_models import CompileRequest
-from ..kernels.kernel_dataclasses import ParameterValue
-from .passes_dataclasses import Selection
+from ..artifacts import transfers as _transfers
+from ..artifacts.artifact_dataclasses import _JSON, _Expressions, _Layout
+from ..artifacts.artifact_pydantic_models import _ExecutableManifest
+from ..artifacts.expressions import _align, _byte_size, _number, _references, _serialize
+from ..compiler_dataclasses import _ShapeConstraint, _ShapeExpression
+from ..compiler_pydantic_models import _CompileRequest
+from ..kernels.kernel_dataclasses import _ParameterValue
+from .passes_dataclasses import _Selection
 
 
 def _parameter(
-    value: ParameterValue, names: dict[Tensor, str], expressions: Expressions
-) -> JSON:
-    if isinstance(value, ShapeExpression):
-        return serialize(value, names, expressions)
+    value: _ParameterValue, names: dict[Tensor, str], expressions: _Expressions
+) -> _JSON:
+    if isinstance(value, _ShapeExpression):
+        return _serialize(value, names, expressions)
     if isinstance(value, tuple):
         return [_parameter(item, names, expressions) for item in value]
-    return number(value)
+    return _number(value)
 
 
 def _program(
-    region: Region,
-    layout: Layout,
-    selection: Selection,
+    region: _Region,
+    layout: _Layout,
+    selection: _Selection,
     names: dict[Tensor, str],
-    guards: Mapping[Operator, list[ShapeConstraint]],
-    expressions: Expressions,
-) -> list[JSON]:
-    result: list[JSON] = []
+    guards: Mapping[_Operator, list[_ShapeConstraint]],
+    expressions: _Expressions,
+) -> list[_JSON]:
+    result: list[_JSON] = []
 
-    def tensors(values: tuple[Tensor, ...]) -> list[JSON]:
+    def tensors(values: tuple[Tensor, ...]) -> list[_JSON]:
         return [names[tensor] for tensor in values]
 
-    def copies(operator: Operator, phase: str) -> list[JSON]:
+    def copies(operator: _Operator, phase: str) -> list[_JSON]:
         kernel = layout.transfer_kernel
         if kernel is None:
             raise ValueError("control flow requires a native transfer kernel")
@@ -67,13 +67,13 @@ def _program(
                 "shape_from": {names[destination]: names[source]},
                 "parameters": {
                     key: _parameter(value, names, expressions)
-                    for key, value in transfers.parameters(
+                    for key, value in _transfers._parameters(
                         layout, source, destination
                     ).items()
                 },
                 "scratch": {"offset": workspace.offset, "size": workspace.size},
             }
-            for source, destination in transfers.pairs(operator)[phase]
+            for source, destination in _transfers._pairs(operator)[phase]
         ]
 
     for operator in region.operators:
@@ -82,18 +82,18 @@ def _program(
             continue
         args = operator.args
         owned = call.covered if call else (operator,)
-        before: list[JSON] = []
-        after: list[JSON] = []
+        before: list[_JSON] = []
+        after: list[_JSON] = []
         for owner in owned:
             for constraint in guards.get(owner, ()):
-                check: JSON = {
+                check: _JSON = {
                     "op": "guard",
                     "predicate": constraint.predicate,
-                    "left": serialize(constraint.left, names, expressions),
-                    "right": serialize(constraint.right, names, expressions),
+                    "left": _serialize(constraint.left, names, expressions),
+                    "right": _serialize(constraint.right, names, expressions),
                     "reason": constraint.reason,
                 }
-                dependencies = references(constraint.left) | references(
+                dependencies = _references(constraint.left) | _references(
                     constraint.right
                 )
                 (after if dependencies & set(operator.outputs) else before).append(
@@ -106,7 +106,7 @@ def _program(
                     {
                         "op": "guard",
                         "predicate": "le",
-                        "left": serialize(length, names, expressions),
+                        "left": _serialize(length, names, expressions),
                         "right": capacity,
                         "reason": "cache capacity",
                     }
@@ -125,16 +125,16 @@ def _program(
                     "scratch": {"offset": workspace.offset, "size": workspace.size},
                 }
             )
-        elif isinstance(args, ConstructArgs):
+        elif isinstance(args, _ConstructArgs):
             result.extend(
                 _program(
                     operator.regions[0], layout, selection, names, guards, expressions
                 )
             )
             result.append({"op": "views", "outputs": tensors(operator.outputs)})
-        elif isinstance(args, (InputArgs, OutputArgs, ConstantArgs, CacheArgs)):
+        elif isinstance(args, (_InputArgs, _OutputArgs, _ConstantArgs, _CacheArgs)):
             continue
-        elif isinstance(args, IfArgs):
+        elif isinstance(args, _IfArgs):
             result.append(
                 {
                     "op": "if",
@@ -152,7 +152,7 @@ def _program(
                     ],
                 }
             )
-        elif isinstance(args, WhileArgs):
+        elif isinstance(args, _WhileArgs):
             condition, body = operator.regions
             maximum = layout.inference.loop_iterations.get(operator)
             if maximum is None:
@@ -185,7 +185,7 @@ def _program(
                     },
                 }
             )
-        elif isinstance(args, ReduceArgs):
+        elif isinstance(args, _ReduceArgs):
             body = operator.regions[0]
             result.append(
                 {
@@ -211,7 +211,9 @@ def _program(
                     },
                 }
             )
-        elif isinstance(args, CacheReadArgs) and not isinstance(args, CacheAssignArgs):
+        elif isinstance(args, _CacheReadArgs) and not isinstance(
+            args, _CacheAssignArgs
+        ):
             result.append(
                 {
                     "op": "cache_read",
@@ -220,7 +222,7 @@ def _program(
                     "snapshot": layout.buffers[operator.outputs[0]].storage != "cache",
                 }
             )
-        elif isinstance(args, CacheAssignArgs):
+        elif isinstance(args, _CacheAssignArgs):
             result.append(
                 {
                     "op": "cache_write",
@@ -240,18 +242,18 @@ def _program(
     return result
 
 
-def emit(
+def _emit(
     graph: Graph,
-    layout: Layout,
-    selection: Selection,
-    request: CompileRequest,
+    layout: _Layout,
+    selection: _Selection,
+    request: _CompileRequest,
     destination: Path,
-) -> ExecutableManifest:
-    if graph.region is None:
+) -> _ExecutableManifest:
+    if graph._region is None:
         raise ValueError("graph is not complete")
-    expressions = Expressions()
+    expressions = _Expressions()
     names = {tensor: buffer.name for tensor, buffer in layout.buffers.items()}
-    kernels: dict[str, JSON] = {}
+    kernels: dict[str, _JSON] = {}
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "kernels").mkdir(exist_ok=True)
     libraries: dict[Path, str] = {}
@@ -291,37 +293,39 @@ def emit(
             "software": list(kernel.capabilities.software),
         }
     cache_offset = 0
-    caches: dict[str, JSON] = {}
+    caches: dict[str, _JSON] = {}
     initial = {
         operator.args.name: operator.args.initial
-        for operator in graph.region.operators
-        if isinstance(operator.args, CacheArgs)
+        for operator in graph._region.operators
+        if isinstance(operator.args, _CacheArgs)
     }
-    for name, cache in graph.caches.items():
+    for name, cache in graph._caches.items():
         shape = tuple(
             dimension for dimension in cache.shape.dimensions if dimension is not None
         )
-        size = byte_size(cache.dtype, shape)
-        cache_offset = align(cache_offset, 64)
+        size = _byte_size(cache.dtype, shape)
+        cache_offset = _align(cache_offset, 64)
         caches[name] = {
             "dtype": cache.dtype,
             "shape": list(shape),
             "mode": cache.mode,
             "axis": cache.axis,
-            "initial": number(initial[name]),
+            "initial": _number(initial[name]),
             "offset": cache_offset,
             "size": size,
         }
         cache_offset += size
-    buffers: dict[str, JSON] = {}
+    buffers: dict[str, _JSON] = {}
     for buffer in layout.buffers.values():
         if buffer.first > buffer.last:
             continue
         buffers[buffer.name] = {
             "dtype": buffer.dtype,
-            "shape": [serialize(item, names, expressions) for item in buffer.shape],
+            "shape": [_serialize(item, names, expressions) for item in buffer.shape],
             "maximum_shape": list(buffer.maximum_shape),
-            "strides": [serialize(item, names, expressions) for item in buffer.strides],
+            "strides": [
+                _serialize(item, names, expressions) for item in buffer.strides
+            ],
             "storage": buffer.storage,
             "source": buffer.source,
             "offset": buffer.offset,
@@ -329,27 +333,27 @@ def emit(
             "alignment": buffer.alignment,
             "first": buffer.first,
             "last": buffer.last,
-            "byte_offset": serialize(buffer.byte_offset, names, expressions)
+            "byte_offset": _serialize(buffer.byte_offset, names, expressions)
             if buffer.byte_offset is not None
             else 0,
         }
-    guards: dict[Operator, list[ShapeConstraint]] = {}
+    guards: dict[_Operator, list[_ShapeConstraint]] = {}
     for constraint in layout.inference.constraints:
         if constraint.operator is not None:
             guards.setdefault(constraint.operator, []).append(constraint)
-    manifest = ExecutableManifest.model_validate(
+    manifest = _ExecutableManifest.model_validate(
         {
             "backend": request.backend,
             "threads": request.threads,
             "arena_size": layout.arena_size,
             "cache_size": layout.cache_size,
-            "inputs": {name: names[tensor] for name, tensor in graph.inputs.items()},
-            "outputs": {name: names[tensor] for name, tensor in graph.outputs.items()},
+            "inputs": {name: names[tensor] for name, tensor in graph._inputs.items()},
+            "outputs": {name: names[tensor] for name, tensor in graph._outputs.items()},
             "buffers": buffers,
             "caches": caches,
             "kernels": kernels,
             "program": _program(
-                graph.region, layout, selection, names, guards, expressions
+                graph._region, layout, selection, names, guards, expressions
             ),
             "expressions": expressions.nodes,
             "transfer_kernel": layout.transfer_kernel.name

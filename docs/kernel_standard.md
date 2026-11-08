@@ -11,6 +11,8 @@ A kernel exports four functions:
 
 The compiler validates capabilities before invoking feature-dependent code. Metadata exports must be safe on the baseline CPU.
 
+These four native exports define the kernel API. The Python helpers used by built-in parameter binders are compiler-private.
+
 Logical tensors use ordinary mathematical shapes. Contiguous storage uses the last dimension as the fastest changing axis. Views may use permuted or zero strides; kernels receive the strides they need in their own parameter structs. Packed weights retain their logical dtype while the compiler selects their physical layout.
 
 Parameters contain fixed-width scalars, `size_t` values, and borrowed arrays with explicit lengths. Their native layout comes from the compiled kernel. There is no universal parameter struct or implicit argument order beyond each kernel's declared slots.

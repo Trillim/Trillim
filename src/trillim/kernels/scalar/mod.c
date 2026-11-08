@@ -10,7 +10,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_mod(
 
 TRILLIM_KERNEL const char *trillim_scalar_mod_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import binary as bind\n"
+           "from trillim.compiler.kernels.bindings import _binary as bind\n"
            "def pattern(a: Tensor, b: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Mod(a, b),)\n";
 }

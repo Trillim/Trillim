@@ -69,13 +69,13 @@ from math import prod
 import numpy as np
 from numpy.typing import NDArray
 
-from ..tdl.core.types import DType, validate_dtype
+from ..tdl.core.types import DType, _validate_dtype
 
-Encoded = tuple[NDArray[np.uint8], DType]
-Encoder = Callable[[NDArray[np.generic]], Encoded]
-Decoder = Callable[[NDArray[np.uint8], int, int], NDArray[np.generic]]
+_Encoded = tuple[NDArray[np.uint8], DType]
+_Encoder = Callable[[NDArray[np.generic]], _Encoded]
+_Decoder = Callable[[NDArray[np.uint8], int, int], NDArray[np.generic]]
 
-NATIVE_DTYPES: dict[DType, np.dtype[np.generic]] = {
+_NATIVE_DTYPES: dict[DType, np.dtype[np.generic]] = {
     "bool": np.dtype("bool"),
     "int8": np.dtype("int8"),
     "uint8": np.dtype("uint8"),
@@ -89,7 +89,7 @@ NATIVE_DTYPES: dict[DType, np.dtype[np.generic]] = {
     "fp32": np.dtype("float32"),
 }
 
-GROUP_SIZES: dict[DType, int] = {
+_GROUP_SIZES: dict[DType, int] = {
     "mat_ternary": 128,
     "grp_int8": 32,
     "grp_int4": 32,
@@ -100,7 +100,7 @@ GROUP_SIZES: dict[DType, int] = {
     "mxfp4": 32,
 }
 
-QUANTIZED_DTYPES: frozenset[DType] = frozenset({"row_int8", *GROUP_SIZES})
+_QUANTIZED_DTYPES: frozenset[DType] = frozenset({"row_int8", *_GROUP_SIZES})
 
 _MXFP4_MAGNITUDES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
 _MXFP4_VALUES = np.concatenate((_MXFP4_MAGNITUDES, -_MXFP4_MAGNITUDES))
@@ -164,7 +164,7 @@ def _pack(dtype: DType, *parts: NDArray[np.generic]) -> tuple[NDArray[np.uint8],
     return np.concatenate(tuple(sections)), dtype
 
 
-def import_mxfp4(
+def _import_mxfp4(
     blocks: NDArray[np.uint8], scales: NDArray[np.uint8]
 ) -> tuple[NDArray[np.uint8], DType]:
     """Pack checkpoint blocks [...,G,16] and scales [...,G] without decoding.
@@ -181,7 +181,7 @@ def import_mxfp4(
     return _pack("mxfp4", blocks, scales)
 
 
-def import_mat_ternary(values: NDArray[np.int8], scale: np.float32) -> Encoded:
+def _import_mat_ternary(values: NDArray[np.int8], scale: np.float32) -> _Encoded:
     """Preserve already-quantized ternary values and an explicit global scale."""
     if values.ndim != 2 or values.size == 0 or np.any((values < -1) | (values > 1)):
         raise ValueError("ternary import requires a nonempty matrix of -1, 0, 1")
@@ -259,15 +259,15 @@ def _from_rows(
     return np.ascontiguousarray(grouped.swapaxes(1, 2)).reshape(shape)
 
 
-def encode_native(target: DType, tensor: NDArray[np.generic]) -> Encoded:
-    return _pack(target, tensor.astype(NATIVE_DTYPES[target]))
+def _encode_native(target: DType, tensor: NDArray[np.generic]) -> _Encoded:
+    return _pack(target, tensor.astype(_NATIVE_DTYPES[target]))
 
 
-def encode_bf16(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_bf16(tensor: NDArray[np.generic]) -> _Encoded:
     return _pack("bf16", _bf16_bits(tensor.astype(np.float32, copy=False)))
 
 
-def encode_row_int8(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_row_int8(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     maximum = np.maximum(np.max(np.abs(source), axis=1), np.float32(1e-05))
     values = np.clip(np.rint(source * (127 / maximum[:, None])), -127, 127)
@@ -275,7 +275,7 @@ def encode_row_int8(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("row_int8", values.astype(np.int8), scales)
 
 
-def encode_mat_ternary(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_mat_ternary(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     rows = source.shape[0]
     packing_chunks = _grouped(source, 128)
@@ -287,7 +287,7 @@ def encode_mat_ternary(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("mat_ternary", packed, np.array([gamma], dtype=np.float32))
 
 
-def encode_mxfp4(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_mxfp4(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     blocks = _grouped(source, 32)
     maximum = np.max(np.abs(blocks), axis=-1)
@@ -302,7 +302,7 @@ def encode_mxfp4(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("mxfp4", packed, (exponents + 127).astype(np.uint8))
 
 
-def encode_grp_binary(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_grp_binary(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     blocks = _grouped(source, 128)
     scale = np.mean(np.abs(blocks), axis=2, dtype=np.float32)
@@ -310,7 +310,7 @@ def encode_grp_binary(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("grp_binary", packed, _bf16_bits(scale))
 
 
-def encode_grp_ternary(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_grp_ternary(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     blocks = _grouped(source, 128)
     maximum = np.max(np.abs(blocks), axis=2)
@@ -320,7 +320,7 @@ def encode_grp_ternary(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("grp_ternary", packed, _bf16_bits(maximum.astype(np.float32)))
 
 
-def encode_dubgrp_int6(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_dubgrp_int6(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     rows = source.shape[0]
     blocks = _grouped(source, 256)
@@ -354,18 +354,18 @@ def _integer_groups(
     )
 
 
-def encode_grp_int8(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_grp_int8(tensor: NDArray[np.generic]) -> _Encoded:
     quantized, scales = _integer_groups(tensor, 128, 127)
     return _pack("grp_int8", np.clip(quantized, -127, 127).astype(np.int8), scales)
 
 
-def encode_grp_int4(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_grp_int4(tensor: NDArray[np.generic]) -> _Encoded:
     quantized, scales = _integer_groups(tensor, 8, 8)
     codes = (quantized + 8).astype(np.uint8)
     return _pack("grp_int4", codes[..., :16] | (codes[..., 16:] << 4), scales)
 
 
-def encode_grp_int5(tensor: NDArray[np.generic]) -> Encoded:
+def _encode_grp_int5(tensor: NDArray[np.generic]) -> _Encoded:
     quantized, scales = _integer_groups(tensor, 16, 16)
     codes = (quantized + 16).astype(np.uint8)
     values = (codes[..., :16] & 15) | ((codes[..., 16:] & 15) << 4)
@@ -373,13 +373,13 @@ def encode_grp_int5(tensor: NDArray[np.generic]) -> Encoded:
     return _pack("grp_int5", values, scales, high)
 
 
-def payload_sections(
+def _payload_sections(
     dtype: str, shape: tuple[int, ...], *, transpose: bool = False, groups: int = 1
 ) -> tuple[tuple[str, int], ...]:
-    target = validate_dtype(dtype)
+    target = _validate_dtype(dtype)
     rows, columns = _matrix_shape(shape, transpose, groups)
-    if target in NATIVE_DTYPES:
-        return (("values", rows * columns * NATIVE_DTYPES[target].itemsize),)
+    if target in _NATIVE_DTYPES:
+        return (("values", rows * columns * _NATIVE_DTYPES[target].itemsize),)
     if target == "bf16":
         return (("values", rows * columns * 2),)
     if rows == 0 or columns == 0:
@@ -388,7 +388,7 @@ def payload_sections(
         return (("values", rows * columns), ("scales", rows * 2))
     if target == "mat_ternary":
         return (("values", rows * ((columns + 127) // 128) * 32), ("scale", 4))
-    size = GROUP_SIZES[target]
+    size = _GROUP_SIZES[target]
     count = rows * ((columns + size - 1) // size)
     widths = {
         "mxfp4": 16,
@@ -410,15 +410,15 @@ def payload_sections(
     return result
 
 
-def decode_native(
+def _decode_native(
     target: DType, payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
-    native = NATIVE_DTYPES[target]
+    native = _NATIVE_DTYPES[target]
     (values,) = _split(payload, (rows * columns * native.itemsize,))
     return _view(values, native, (rows, columns))
 
 
-def decode_bf16(
+def _decode_bf16(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     matrix_shape = (rows, columns)
@@ -427,7 +427,7 @@ def decode_bf16(
     return _bf16_values(bits)
 
 
-def decode_row_int8(
+def _decode_row_int8(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     matrix_shape = (rows, columns)
@@ -437,7 +437,7 @@ def decode_row_int8(
     return signed * _bf16_values(bits)[:, None]
 
 
-def decode_mat_ternary(
+def _decode_mat_ternary(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     count = (columns + 127) // 128
@@ -447,7 +447,7 @@ def decode_mat_ternary(
     return ((codes.astype(np.float32) - 1) * gamma).reshape(rows, -1)[:, :columns]
 
 
-def decode_mxfp4(
+def _decode_mxfp4(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     count = (columns + 31) // 32
@@ -466,15 +466,16 @@ def decode_mxfp4(
 def _group_parts(
     payload: NDArray[np.uint8], dtype: DType, rows: int, columns: int
 ) -> tuple[tuple[NDArray[np.uint8], ...], NDArray[np.float32], int]:
-    count = (columns + GROUP_SIZES[dtype] - 1) // GROUP_SIZES[dtype]
+    count = (columns + _GROUP_SIZES[dtype] - 1) // _GROUP_SIZES[dtype]
     parts = _split(
-        payload, tuple(length for _, length in payload_sections(dtype, (rows, columns)))
+        payload,
+        tuple(length for _, length in _payload_sections(dtype, (rows, columns))),
     )
     bits = _view(parts[1], np.dtype("uint16"), (rows, count)).astype(np.uint16)
     return parts, _bf16_values(bits), count
 
 
-def decode_grp_binary(
+def _decode_grp_binary(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "grp_binary", rows, columns)
@@ -489,7 +490,7 @@ def decode_grp_binary(
     return (signs * scale[..., None]).reshape(rows, -1)[:, :columns]
 
 
-def decode_grp_ternary(
+def _decode_grp_ternary(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "grp_ternary", rows, columns)
@@ -499,7 +500,7 @@ def decode_grp_ternary(
     return result.reshape(rows, -1)[:, :columns]
 
 
-def decode_dubgrp_int6(
+def _decode_dubgrp_int6(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "dubgrp_int6", rows, columns)
@@ -517,7 +518,7 @@ def decode_dubgrp_int6(
     return result.reshape(rows, -1)[:, :columns]
 
 
-def decode_grp_int8(
+def _decode_grp_int8(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "grp_int8", rows, columns)
@@ -528,7 +529,7 @@ def decode_grp_int8(
     ]
 
 
-def decode_grp_int4(
+def _decode_grp_int4(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "grp_int4", rows, columns)
@@ -537,7 +538,7 @@ def decode_grp_int4(
     return ((codes - 8) * scale[..., None]).reshape(rows, -1)[:, :columns]
 
 
-def decode_grp_int5(
+def _decode_grp_int5(
     payload: NDArray[np.uint8], rows: int, columns: int
 ) -> NDArray[np.generic]:
     parts, scale, count = _group_parts(payload, "grp_int5", rows, columns)
@@ -551,61 +552,61 @@ def decode_grp_int5(
     ]
 
 
-ENCODERS: dict[DType, Encoder] = {
-    name: partial(encode_native, name) for name in NATIVE_DTYPES
+_ENCODERS: dict[DType, _Encoder] = {
+    name: partial(_encode_native, name) for name in _NATIVE_DTYPES
 }
-ENCODERS.update(
+_ENCODERS.update(
     {
-        "bf16": encode_bf16,
-        "row_int8": encode_row_int8,
-        "mat_ternary": encode_mat_ternary,
-        "grp_int8": encode_grp_int8,
-        "grp_int4": encode_grp_int4,
-        "grp_int5": encode_grp_int5,
-        "dubgrp_int6": encode_dubgrp_int6,
-        "grp_binary": encode_grp_binary,
-        "grp_ternary": encode_grp_ternary,
-        "mxfp4": encode_mxfp4,
+        "bf16": _encode_bf16,
+        "row_int8": _encode_row_int8,
+        "mat_ternary": _encode_mat_ternary,
+        "grp_int8": _encode_grp_int8,
+        "grp_int4": _encode_grp_int4,
+        "grp_int5": _encode_grp_int5,
+        "dubgrp_int6": _encode_dubgrp_int6,
+        "grp_binary": _encode_grp_binary,
+        "grp_ternary": _encode_grp_ternary,
+        "mxfp4": _encode_mxfp4,
     }
 )
-DECODERS: dict[DType, Decoder] = {
-    name: partial(decode_native, name) for name in NATIVE_DTYPES
+_DECODERS: dict[DType, _Decoder] = {
+    name: partial(_decode_native, name) for name in _NATIVE_DTYPES
 }
-DECODERS.update(
+_DECODERS.update(
     {
-        "bf16": decode_bf16,
-        "row_int8": decode_row_int8,
-        "mat_ternary": decode_mat_ternary,
-        "grp_int8": decode_grp_int8,
-        "grp_int4": decode_grp_int4,
-        "grp_int5": decode_grp_int5,
-        "dubgrp_int6": decode_dubgrp_int6,
-        "grp_binary": decode_grp_binary,
-        "grp_ternary": decode_grp_ternary,
-        "mxfp4": decode_mxfp4,
+        "bf16": _decode_bf16,
+        "row_int8": _decode_row_int8,
+        "mat_ternary": _decode_mat_ternary,
+        "grp_int8": _decode_grp_int8,
+        "grp_int4": _decode_grp_int4,
+        "grp_int5": _decode_grp_int5,
+        "dubgrp_int6": _decode_dubgrp_int6,
+        "grp_binary": _decode_grp_binary,
+        "grp_ternary": _decode_grp_ternary,
+        "mxfp4": _decode_mxfp4,
     }
 )
 
 
-def encode(
+def _encode(
     tensor: NDArray[np.generic], dtype: str, *, transpose: bool = False, groups: int = 1
-) -> Encoded:
+) -> _Encoded:
     """Encode canonical little-endian bytes, retaining native integer precision."""
-    target = validate_dtype(dtype)
+    target = _validate_dtype(dtype)
     source = _to_rows(np.asarray(tensor), transpose, groups)
     if source.dtype.kind not in "biuf":
         raise TypeError("encode requires real numeric or boolean values")
-    if target not in NATIVE_DTYPES and target != "bf16":
+    if target not in _NATIVE_DTYPES and target != "bf16":
         if source.size == 0:
             raise ValueError("packed dtypes require nonempty tensor dimensions")
         with np.errstate(over="ignore"):
             source = source.astype(np.float32, copy=False)
         if not np.isfinite(source).all():
             raise ValueError("packed dtypes require finite FP32 values")
-    return ENCODERS[target](source)
+    return _ENCODERS[target](source)
 
 
-def decode(
+def _decode(
     encoded: tuple[NDArray[np.uint8], str],
     shape: tuple[int, ...],
     *,
@@ -614,8 +615,8 @@ def decode(
 ) -> NDArray[np.generic]:
     """Decode native values exactly; packed formats and BF16 return FP32."""
     payload, name = encoded
-    target = validate_dtype(name)
+    target = _validate_dtype(name)
     rows, columns = _matrix_shape(shape, transpose, groups)
     return _from_rows(
-        DECODERS[target](payload, rows, columns), shape, transpose, groups
+        _DECODERS[target](payload, rows, columns), shape, transpose, groups
     )

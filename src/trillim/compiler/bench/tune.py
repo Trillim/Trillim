@@ -16,51 +16,51 @@ from numpy.typing import NDArray
 from pydantic import TypeAdapter
 
 from ...tdl.core.core_pydantic_models import (
-    BinaryArgs,
-    BroadcastArgs,
-    CastArgs,
-    ConstantArgs,
-    ConstructArgs,
-    GatherArgs,
-    PermuteArgs,
-    ReshapeArgs,
-    ScatterArgs,
     Weight,
+    _BinaryArgs,
+    _BroadcastArgs,
+    _CastArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _GatherArgs,
+    _PermuteArgs,
+    _ReshapeArgs,
+    _ScatterArgs,
 )
-from ...tdl.core.operator import Operator
+from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
-from .. import dtype as codec
-from ..artifacts.artifact_dataclasses import JSON
-from ..artifacts.expressions import number
-from ..artifacts.parameters import requirements
-from ..compiler_dataclasses import Inference, ShapeExpression
-from ..compiler_pydantic_models import CompileRequest
-from ..passes.passes_dataclasses import KernelMatch, MatchSet
-from ..weights.weights_dataclasses import WeightBinding, WeightIndex
-from ..weights.weights_pydantic_models import WeightManifest
+from .. import dtype as _codec
+from ..artifacts.artifact_dataclasses import _JSON
+from ..artifacts.expressions import _number
+from ..artifacts.parameters import _requirements
+from ..compiler_dataclasses import _Inference, _ShapeExpression
+from ..compiler_pydantic_models import _CompileRequest
+from ..passes.passes_dataclasses import _KernelMatch, _MatchSet
+from ..weights.weights_dataclasses import _WeightBinding, _WeightIndex
+from ..weights.weights_pydantic_models import _WeightManifest
 from .bench_dataclasses import (
-    BenchmarkInput,
-    BenchmarkOutput,
-    BenchmarkResult,
-    ConcreteParameter,
-    Invocation,
-    Tuning,
-    TuningState,
+    _BenchmarkInput,
+    _BenchmarkOutput,
+    _BenchmarkResult,
+    _ConcreteParameter,
+    _Invocation,
+    _Tuning,
+    _TuningState,
 )
-from .benchmark import MAX_BYTES, benchmark, representative_tokens
+from .benchmark import _MAX_BYTES, _benchmark, _representative_tokens
 
 
-def _bounded(value: ShapeExpression, point: int) -> int:
+def _bounded(value: _ShapeExpression, point: int) -> int:
     if value.minimum is None or value.maximum is None:
         raise ValueError(f"benchmark scalar {value.op!r} has no finite interval")
     return max(value.minimum, min(point, value.maximum))
 
 
 def _evaluate(
-    value: ShapeExpression,
+    value: _ShapeExpression,
     point: int,
-    state: TuningState,
-    active: set[ShapeExpression] | None = None,
+    state: _TuningState,
+    active: set[_ShapeExpression] | None = None,
 ) -> int:
     key = value, point
     if key not in state.dimensions:
@@ -69,10 +69,10 @@ def _evaluate(
 
 
 def _calculate(
-    value: ShapeExpression,
+    value: _ShapeExpression,
     point: int,
-    state: TuningState,
-    active: set[ShapeExpression] | None = None,
+    state: _TuningState,
+    active: set[_ShapeExpression] | None = None,
 ) -> int:
     if value.op == "const":
         assert value.value is not None
@@ -138,12 +138,12 @@ def _calculate(
 
 
 def _parameters(
-    candidate: KernelMatch, point: int, state: TuningState
-) -> dict[str, ConcreteParameter]:
-    def scalar(value: float | ShapeExpression) -> int | float:
+    candidate: _KernelMatch, point: int, state: _TuningState
+) -> dict[str, _ConcreteParameter]:
+    def scalar(value: float | _ShapeExpression) -> int | float:
         return (
             _evaluate(value, point, state)
-            if isinstance(value, ShapeExpression)
+            if isinstance(value, _ShapeExpression)
             else value
         )
 
@@ -155,7 +155,7 @@ def _parameters(
     }
 
 
-def _shape(tensor: Tensor, point: int, state: TuningState) -> tuple[int, ...]:
+def _shape(tensor: Tensor, point: int, state: _TuningState) -> tuple[int, ...]:
     shape = state.inference.tensors[tensor].shape
     if shape is None:
         raise ValueError("benchmark tensor has unresolved rank")
@@ -166,44 +166,44 @@ def _shape(tensor: Tensor, point: int, state: TuningState) -> tuple[int, ...]:
 
 
 def _base(tensor: Tensor) -> Tensor:
-    while tensor.producer is not None and isinstance(
-        tensor.producer.args, (ReshapeArgs, PermuteArgs, BroadcastArgs)
+    while tensor._producer is not None and isinstance(
+        tensor._producer.args, (_ReshapeArgs, _PermuteArgs, _BroadcastArgs)
     ):
-        tensor = tensor.producer.args.x
+        tensor = tensor._producer.args.x
     return tensor
 
 
-def _weight(tensor: Tensor, state: TuningState) -> WeightBinding | None:
+def _weight(tensor: Tensor, state: _TuningState) -> _WeightBinding | None:
     tensor = _base(tensor)
     if tensor in state.weights.bindings:
         return state.weights.bindings[tensor]
-    producer = tensor.producer
-    if producer is not None and isinstance(producer.args, CastArgs):
+    producer = tensor._producer
+    if producer is not None and isinstance(producer.args, _CastArgs):
         return _weight(producer.args.x, state)
-    if producer is not None and isinstance(producer.args, ConstructArgs):
+    if producer is not None and isinstance(producer.args, _ConstructArgs):
         return _weight(
             producer.regions[0].outputs[producer.outputs.index(tensor)], state
         )
     return None
 
 
-def _mapped_view(tensor: Tensor, state: TuningState) -> bool:
-    producer = tensor.producer
+def _mapped_view(tensor: Tensor, state: _TuningState) -> bool:
+    producer = tensor._producer
     if producer is None:
         return True
     args = producer.args
-    if isinstance(args, ReshapeArgs) and producer not in state.views:
+    if isinstance(args, _ReshapeArgs) and producer not in state.views:
         return False
-    if isinstance(args, (ReshapeArgs, PermuteArgs, BroadcastArgs, CastArgs)):
+    if isinstance(args, (_ReshapeArgs, _PermuteArgs, _BroadcastArgs, _CastArgs)):
         return _mapped_view(args.x, state)
     return True
 
 
 def _indices(
-    tensor: Tensor, candidate: KernelMatch, point: int, state: TuningState
+    tensor: Tensor, candidate: _KernelMatch, point: int, state: _TuningState
 ) -> NDArray[np.generic] | None:
     args = candidate.anchor.args
-    if not isinstance(args, (GatherArgs, ScatterArgs)) or tensor is not args.indices:
+    if not isinstance(args, (_GatherArgs, _ScatterArgs)) or tensor is not args.indices:
         return None
     shape = _shape(tensor, point, state)
     source = _shape(args.x, point, state)
@@ -216,7 +216,7 @@ def _indices(
             "benchmark cannot sample active coordinates from an empty axis"
         )
     values = np.empty((count, width), dtype=np.int64)
-    if isinstance(args, ScatterArgs) and args.mode == "replace":
+    if isinstance(args, _ScatterArgs) and args.mode == "replace":
         available = prod(source[:width])
         if count > available:
             raise ValueError(
@@ -235,11 +235,11 @@ def _indices(
 
 def _fixture(
     tensor: Tensor,
-    candidate: KernelMatch,
+    candidate: _KernelMatch,
     point: int,
-    state: TuningState,
+    state: _TuningState,
     required: int,
-) -> tuple[bytes | BenchmarkInput, dict[str, JSON]]:
+) -> tuple[bytes | _BenchmarkInput, dict[str, _JSON]]:
     dtype = state.inference.tensors[tensor].dtype
     if dtype is None:
         raise ValueError("benchmark tensor has unresolved dtype")
@@ -268,7 +268,7 @@ def _fixture(
             raise ValueError(
                 "real benchmark weight does not cover its native footprint"
             )
-        return BenchmarkInput(
+        return _BenchmarkInput(
             state.bundle, state.manifest.data_start + record.offset, record.size
         ), {
             "source": "weight",
@@ -279,16 +279,16 @@ def _fixture(
         }
     base = _base(tensor)
     shape = _shape(base, point, state)
-    estimated = sum(size for _, size in codec.payload_sections(dtype, shape))
-    if max(estimated, required) * 3 > MAX_BYTES:
+    estimated = sum(size for _, size in _codec._payload_sections(dtype, shape))
+    if max(estimated, required) * 3 > _MAX_BYTES:
         raise ValueError("benchmark input preparation exceeds the memory budget")
     info = state.inference.tensors[base]
-    producer = base.producer
+    producer = base._producer
     data: NDArray[np.generic]
     source = "normal"
     if (
         producer is not None
-        and isinstance(producer.args, ConstantArgs)
+        and isinstance(producer.args, _ConstantArgs)
         and not isinstance(producer.args.value, Weight)
     ):
         data = np.asarray(producer.args.value)
@@ -313,7 +313,7 @@ def _fixture(
             )
             high = min(127, upper if upper is not None else 127)
             if (
-                isinstance(candidate.anchor.args, BinaryArgs)
+                isinstance(candidate.anchor.args, _BinaryArgs)
                 and candidate.anchor.op in {"floor_div", "mod"}
                 and tensor is candidate.anchor.args.b
             ):
@@ -333,7 +333,7 @@ def _fixture(
         if candidate.anchor.op in {"sqrt", "log"}:
             data = np.abs(data) + np.float32(1e-3)
             source = "positive_normal"
-    encoded = codec.encode(data, dtype)[0].tobytes()
+    encoded = _codec._encode(data, dtype)[0].tobytes()
     if len(encoded) < required:
         raise ValueError(
             "benchmark fixture does not cover the strided native footprint"
@@ -347,17 +347,20 @@ def _fixture(
 
 
 def _invocation(
-    candidate: KernelMatch,
+    candidate: _KernelMatch,
     point: int,
-    state: TuningState,
-    fixtures: dict[Tensor, bytes | BenchmarkInput],
-) -> tuple[Invocation, list[dict[str, JSON]]]:
+    state: _TuningState,
+    fixtures: dict[Tensor, bytes | _BenchmarkInput],
+) -> tuple[_Invocation, list[dict[str, _JSON]]]:
     parameters = _parameters(candidate, point, state)
-    footprint = requirements(candidate.kernel.parameter_schema, parameters)
+    footprint = _requirements(candidate.kernel.parameter_schema, parameters)
     comparison_bytes = sum(
         prod(_shape(tensor, point, state)) * 64 for tensor in candidate.outputs
     )
-    if sum(footprint.inputs) * 3 + footprint.scratch * 2 + comparison_bytes > MAX_BYTES:
+    if (
+        sum(footprint.inputs) * 3 + footprint.scratch * 2 + comparison_bytes
+        > _MAX_BYTES
+    ):
         raise ValueError(
             "benchmark native footprint exceeds the preparation/reference memory budget"
         )
@@ -373,7 +376,7 @@ def _invocation(
             description = {
                 "source": "shared_reference_input",
                 "bytes": payload.size
-                if isinstance(payload, BenchmarkInput)
+                if isinstance(payload, _BenchmarkInput)
                 else len(payload),
             }
         inputs.append(payload)
@@ -383,8 +386,8 @@ def _invocation(
         dtype = state.inference.tensors[tensor].dtype
         if dtype is None:
             raise ValueError("benchmark output dtype is unresolved")
-        outputs.append(BenchmarkOutput(dtype, _shape(tensor, point, state)))
-    return Invocation(
+        outputs.append(_BenchmarkOutput(dtype, _shape(tensor, point, state)))
+    return _Invocation(
         candidate.kernel.library,
         candidate.kernel.name,
         parameters,
@@ -394,7 +397,7 @@ def _invocation(
     ), descriptions
 
 
-def _signature(candidate: KernelMatch, point: int, state: TuningState) -> Hashable:
+def _signature(candidate: _KernelMatch, point: int, state: _TuningState) -> Hashable:
     parameters = _parameters(candidate, point, state)
     return (
         candidate.kernel.library,
@@ -412,16 +415,16 @@ def _signature(candidate: KernelMatch, point: int, state: TuningState) -> Hashab
 
 
 def _reference(
-    candidate: KernelMatch, candidates: tuple[KernelMatch, ...]
-) -> KernelMatch | None:
-    def boundary(value: KernelMatch) -> set[Tensor]:
+    candidate: _KernelMatch, candidates: tuple[_KernelMatch, ...]
+) -> _KernelMatch | None:
+    def boundary(value: _KernelMatch) -> set[Tensor]:
         result = set()
         for tensor in value.inputs:
             base = _base(tensor)
-            producer = base.producer
+            producer = base._producer
             if (
                 producer is None
-                or not isinstance(producer.args, ConstantArgs)
+                or not isinstance(producer.args, _ConstantArgs)
                 or isinstance(producer.args.value, Weight)
             ):
                 result.add(base)
@@ -441,7 +444,7 @@ def _reference(
 
 
 def _priority(
-    candidates: tuple[KernelMatch, ...], state: TuningState
+    candidates: tuple[_KernelMatch, ...], state: _TuningState
 ) -> tuple[int, int, int]:
     weighted = 0
     for candidate in candidates:
@@ -452,7 +455,7 @@ def _priority(
                     weighted,
                     sum(
                         size
-                        for _, size in codec.payload_sections(
+                        for _, size in _codec._payload_sections(
                             binding.dtype, binding.source.shape
                         )
                     ),
@@ -471,7 +474,7 @@ def _priority(
     )
 
 
-_RESULT = TypeAdapter(BenchmarkResult)
+_RESULT = TypeAdapter(_BenchmarkResult)
 _PROFILE_ROOT = Path(__file__).resolve().parents[4] / "build/kernelbench/profiles"
 
 
@@ -526,11 +529,11 @@ def _code_key() -> str:
     return digest.hexdigest()
 
 
-def _json_key(value: object) -> JSON:
+def _json_key(value: object) -> _JSON:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, (int, float)):
-        return number(value)
+        return _number(value)
     if value is None or isinstance(value, str):
         return value
     if isinstance(value, tuple):
@@ -539,10 +542,10 @@ def _json_key(value: object) -> JSON:
 
 
 def _profile_key(
-    candidate: KernelMatch,
-    reference: KernelMatch | None,
+    candidate: _KernelMatch,
+    reference: _KernelMatch | None,
     signature: Hashable,
-    state: TuningState,
+    state: _TuningState,
     cpu: str,
     code: str,
     libraries: dict[Path, str],
@@ -574,7 +577,7 @@ def _profile_key(
     ).hexdigest()
 
 
-def _load_profile(key: str) -> BenchmarkResult | None:
+def _load_profile(key: str) -> _BenchmarkResult | None:
     try:
         profile = _RESULT.validate_json((_PROFILE_ROOT / f"{key}.json").read_bytes())
         if (
@@ -598,7 +601,7 @@ def _load_profile(key: str) -> BenchmarkResult | None:
         return None
 
 
-def _save_profile(key: str, profile: BenchmarkResult) -> None:
+def _save_profile(key: str, profile: _BenchmarkResult) -> None:
     if not all(
         isfinite(value)
         for value in (
@@ -627,7 +630,7 @@ def _save_profile(key: str, profile: BenchmarkResult) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _increment(record: dict[str, JSON], operator: int) -> None:
+def _increment(record: dict[str, _JSON], operator: int) -> None:
     uses = record["uses"]
     assert isinstance(uses, int)
     record["uses"] = uses + 1
@@ -637,20 +640,20 @@ def _increment(record: dict[str, JSON], operator: int) -> None:
         operators.append(operator)
 
 
-def tune(
-    matches: MatchSet,
-    inference: Inference,
-    weights: WeightIndex,
-    manifest: WeightManifest,
+def _tune(
+    matches: _MatchSet,
+    inference: _Inference,
+    weights: _WeightIndex,
+    manifest: _WeightManifest,
     bundle: Path,
-    request: CompileRequest,
-) -> Tuning:
+    request: _CompileRequest,
+) -> _Tuning:
     """Measure unique native workloads; share verified costs across model layers."""
-    result = Tuning()
-    points = representative_tokens(request.depth)
+    result = _Tuning()
+    points = _representative_tokens(request.depth)
     if not points:
         return result
-    state = TuningState(
+    state = _TuningState(
         inference,
         weights,
         manifest,
@@ -662,10 +665,10 @@ def tune(
     cpu, code = _cpu_key(), _code_key()
     libraries: dict[Path, str] = {}
     keys: dict[tuple[Hashable, str | None], str] = {}
-    cache: dict[str, BenchmarkResult] = {}
-    records: dict[tuple[Hashable, int], dict[str, JSON]] = {}
-    rejected: set[tuple[Operator, str]] = set()
-    aggregated: dict[Operator, dict[str, list[float]]] = defaultdict(
+    cache: dict[str, _BenchmarkResult] = {}
+    records: dict[tuple[Hashable, int], dict[str, _JSON]] = {}
+    rejected: set[tuple[_Operator, str]] = set()
+    aggregated: dict[_Operator, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
     groups = sorted(
@@ -682,7 +685,7 @@ def tune(
             for candidate in ordered:
                 signature: Hashable | None = None
                 record_key: tuple[Hashable, int] | None = None
-                record: dict[str, JSON] | None = None
+                record: dict[str, _JSON] | None = None
                 try:
                     reference = _reference(candidate, candidates)
                     if candidate.kernel.backend != "scalar" and reference is None:
@@ -740,7 +743,7 @@ def tune(
                     else:
                         _increment(record, operator_index)
                     if profile is None:
-                        fixtures: dict[Tensor, bytes | BenchmarkInput] = {}
+                        fixtures: dict[Tensor, bytes | _BenchmarkInput] = {}
                         invocation, descriptions = _invocation(
                             candidate, point, state, fixtures
                         )
@@ -750,15 +753,15 @@ def tune(
                             and reference is not None
                         ):
                             golden, _ = _invocation(reference, point, state, fixtures)
-                        profile = benchmark(
+                        profile = _benchmark(
                             invocation,
                             golden=golden,
-                            max_bytes=MAX_BYTES,
+                            max_bytes=_MAX_BYTES,
                         )
                         cache[key] = profile
                         _save_profile(key, profile)
                         cache_source = "measured"
-                        inputs: list[JSON] = [
+                        inputs: list[_JSON] = [
                             description for description in descriptions
                         ]
                         record["inputs"] = inputs
@@ -779,13 +782,13 @@ def tune(
                             )
                             keys[reference_signature, None] = reference_key
                             assert golden is not None
-                            footprint = requirements(
+                            footprint = _requirements(
                                 reference.kernel.parameter_schema, golden.parameters
                             )
                             size = (
                                 sum(
                                     payload.size
-                                    if isinstance(payload, BenchmarkInput)
+                                    if isinstance(payload, _BenchmarkInput)
                                     else len(payload)
                                     for payload in golden.inputs
                                 )
@@ -793,7 +796,7 @@ def tune(
                                 + footprint.scratch
                             )
                             samples = profile.reference_samples
-                            scalar_profile = BenchmarkResult(
+                            scalar_profile = _BenchmarkResult(
                                 samples,
                                 mean(samples),
                                 median(samples),

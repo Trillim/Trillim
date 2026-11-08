@@ -10,42 +10,42 @@ import numpy as np
 from pydantic import BaseModel
 
 from ...tdl.core import Graph, Input, Output, TensorShape
-from ...tdl.core.core_dataclasses import Region
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
-    BroadcastArgs,
-    ConstantArgs,
-    ConstructArgs,
-    InputArgs,
-    PermuteArgs,
-    ReduceArgs,
-    ReshapeArgs,
     Weight,
+    _BroadcastArgs,
+    _ConstantArgs,
+    _ConstructArgs,
+    _InputArgs,
+    _PermuteArgs,
+    _ReduceArgs,
+    _ReshapeArgs,
 )
-from ...tdl.core.operator import Operator
+from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
-from ..artifacts.expressions import bound, byte_size, parameter_references
-from ..artifacts.parameters import requirements
-from ..compiler_dataclasses import Inference, ShapeConstraint, ShapeExpression
+from ..artifacts.expressions import _bound, _byte_size, _parameter_references
+from ..artifacts.parameters import _requirements
+from ..compiler_dataclasses import _Inference, _ShapeConstraint, _ShapeExpression
 from ..kernels.bindings import (
-    broadcast_strides,
-    contiguous_strides,
-    reshape_strides,
-    storage_shape,
+    _broadcast_strides,
+    _contiguous_strides,
+    _reshape_strides,
+    _storage_shape,
 )
-from ..kernels.kernel_dataclasses import Kernel, KernelBindingContext, TensorBinding
-from .infer import infer
-from .optimize import optimize
-from .passes_dataclasses import KernelMatch, KernelPattern, MatchingState, MatchSet
-from .walk import walk
+from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
+from .infer import _infer
+from .optimize import _optimize
+from .passes_dataclasses import _KernelMatch, _KernelPattern, _MatchingState, _MatchSet
+from .walk import _walk
 
 
-def _fields(operator: Operator) -> dict[str, object]:
-    if isinstance(operator.args, ConstructArgs):
+def _fields(operator: _Operator) -> dict[str, object]:
+    if isinstance(operator.args, _ConstructArgs):
         return operator.args.arguments
     return dict(vars(operator.args))
 
 
-def _pure(region: Region, state: MatchingState) -> bool:
+def _pure(region: _Region, state: _MatchingState) -> bool:
     identity = id(region)
     if identity not in state.purity:
         state.purity[identity] = (
@@ -62,14 +62,14 @@ def _pure(region: Region, state: MatchingState) -> bool:
 
 
 def _unwrapped(
-    tensor: Tensor, state: MatchingState, covered: set[Operator] | None = None
+    tensor: Tensor, state: _MatchingState, covered: set[_Operator] | None = None
 ) -> Tensor:
     original = tensor
     if original not in state.unwrapped:
-        wrappers: list[Operator] = []
+        wrappers: list[_Operator] = []
         while (
-            (producer := tensor.producer) is not None
-            and isinstance(producer.args, ConstructArgs)
+            (producer := tensor._producer) is not None
+            and isinstance(producer.args, _ConstructArgs)
             and _pure(producer.regions[0], state)
         ):
             wrappers.append(producer)
@@ -102,11 +102,11 @@ def _literal_equal(left: object, right: object) -> bool:
 def _equivalent(
     pattern: Tensor,
     target: Tensor,
-    template: KernelPattern,
-    state: MatchingState,
+    template: _KernelPattern,
+    state: _MatchingState,
     bindings: dict[str, Tensor],
     parameters: dict[Tensor, Tensor],
-    covered: set[Operator],
+    covered: set[_Operator],
     pairs: set[tuple[Tensor, Tensor]],
 ) -> bool:
     if pattern in template.inputs:
@@ -129,7 +129,7 @@ def _equivalent(
         != state.inference.tensors[target].dtype
     ):
         return False
-    p, t = pattern.producer, target.producer
+    p, t = pattern._producer, target._producer
     if p is None or t is None or p.op != t.op:
         return False
     if p.outputs.index(pattern) != t.outputs.index(target) or len(p.regions) != len(
@@ -139,7 +139,8 @@ def _equivalent(
     if t.op in {"cache", "cache_assign", "cache_read", "while", "if"}:
         return False
     if p.regions and not (
-        isinstance(p.args, ReduceArgs) and all(_pure(body, state) for body in t.regions)
+        isinstance(p.args, _ReduceArgs)
+        and all(_pure(body, state) for body in t.regions)
     ):
         return False
     p_fields, t_fields = _fields(p), _fields(t)
@@ -193,13 +194,13 @@ def _equivalent(
             for a, b in zip(p_body.outputs, t_body.outputs, strict=True)
         ):
             return False
-    if not isinstance(t.args, ConstantArgs):
+    if not isinstance(t.args, _ConstantArgs):
         covered.add(t)
     pairs.add(pair)
     return True
 
 
-def available(kernel: Kernel) -> bool:
+def _available(kernel: _Kernel) -> bool:
     if kernel.capabilities.abi_version != 1:
         return False
     features: set[str] = set()
@@ -224,7 +225,7 @@ def available(kernel: Kernel) -> bool:
     return True
 
 
-def _signature(kernel: Kernel) -> tuple[tuple[str, inspect.Parameter, object], ...]:
+def _signature(kernel: _Kernel) -> tuple[tuple[str, inspect.Parameter, object], ...]:
     annotations = inspect.get_annotations(kernel.pattern, eval_str=True)
     return tuple(
         (name, parameter, annotations.get(name))
@@ -233,7 +234,7 @@ def _signature(kernel: Kernel) -> tuple[tuple[str, inspect.Parameter, object], .
 
 
 def _arguments(
-    target: Operator,
+    target: _Operator,
     signature: tuple[tuple[str, inspect.Parameter, object], ...],
 ) -> dict[str, object] | None:
     actual = _fields(target)
@@ -250,8 +251,8 @@ def _arguments(
                     (
                         output
                         for body in target.regions
-                        for _, node in walk(body)
-                        if isinstance(node.args, ConstantArgs)
+                        for _, node in _walk(body)
+                        if isinstance(node.args, _ConstantArgs)
                         and isinstance(node.args.value, Weight)
                         and node.args.value.root == value.root
                         for output in node.outputs
@@ -271,7 +272,7 @@ def _arguments(
     return arguments
 
 
-def _key(value: object, inference: Inference) -> object:
+def _key(value: object, inference: _Inference) -> object:
     if isinstance(value, Tensor):
         info = inference.tensors[value]
         shape = (
@@ -290,8 +291,8 @@ def _key(value: object, inference: Inference) -> object:
 
 
 def _pattern(
-    kernel: Kernel, arguments: dict[str, object], inference: Inference
-) -> KernelPattern | None:
+    kernel: _Kernel, arguments: dict[str, object], inference: _Inference
+) -> _KernelPattern | None:
     leaves: dict[Tensor, str] = {}
     graph = Graph()
 
@@ -327,15 +328,15 @@ def _pattern(
             )
             for index, output in enumerate(outputs):
                 Output(output, name=f"output{index}")
-        facts = infer(graph)
-        if optimize(graph, facts):
-            facts = infer(graph)
-        return KernelPattern(graph, leaves, tuple(graph.outputs.values()), facts)
+        facts = _infer(graph)
+        if _optimize(graph, facts):
+            facts = _infer(graph)
+        return _KernelPattern(graph, leaves, tuple(graph._outputs.values()), facts)
     except (TypeError, ValueError, IndexError, NotImplementedError):
         return None
 
 
-def _binding(tensor: Tensor, state: MatchingState) -> TensorBinding:
+def _binding(tensor: Tensor, state: _MatchingState) -> _TensorBinding:
     if tensor in state.tensor_bindings:
         return state.tensor_bindings[tensor]
     result = _tensor_binding(tensor, state)
@@ -343,7 +344,7 @@ def _binding(tensor: Tensor, state: MatchingState) -> TensorBinding:
     return result
 
 
-def _tensor_binding(tensor: Tensor, state: MatchingState) -> TensorBinding:
+def _tensor_binding(tensor: Tensor, state: _MatchingState) -> _TensorBinding:
     inference = state.inference
     info = inference.tensors[tensor]
     if info.shape is None or info.maximum_shape is None or info.dtype is None:
@@ -367,41 +368,43 @@ def _tensor_binding(tensor: Tensor, state: MatchingState) -> TensorBinding:
     ):
         low, high = inference.value_ranges.get(tensor, (None, None))
         values = (
-            ShapeExpression("scalar", tensor=tensor, axis=0, minimum=low, maximum=high),
+            _ShapeExpression(
+                "scalar", tensor=tensor, axis=0, minimum=low, maximum=high
+            ),
         )
-    result = TensorBinding(
+    result = _TensorBinding(
         info.shape,
         info.maximum_shape,
         info.dtype,
-        contiguous_strides(info.shape),
+        _contiguous_strides(info.shape),
         values=values,
     )
-    producer = tensor.producer
+    producer = tensor._producer
     if producer is None:
         return result
     args = producer.args
-    if isinstance(args, ConstructArgs) and _pure(producer.regions[0], state):
+    if isinstance(args, _ConstructArgs) and _pure(producer.regions[0], state):
         return _binding(
             producer.regions[0].outputs[producer.outputs.index(tensor)], state
         )
-    if isinstance(args, (PermuteArgs, BroadcastArgs, ReshapeArgs)):
+    if isinstance(args, (_PermuteArgs, _BroadcastArgs, _ReshapeArgs)):
         source = _binding(args.x, state)
-        strides = source.strides or contiguous_strides(source.shape)
-        if isinstance(args, PermuteArgs):
+        strides = source.strides or _contiguous_strides(source.shape)
+        if isinstance(args, _PermuteArgs):
             strides = tuple(strides[axis] for axis in args.axes)
-        elif isinstance(args, BroadcastArgs):
-            strides = broadcast_strides(source.shape, info.shape, strides)
+        elif isinstance(args, _BroadcastArgs):
+            strides = _broadcast_strides(source.shape, info.shape, strides)
         else:
-            reshaped = reshape_strides(source.shape, strides, info.shape)
+            reshaped = _reshape_strides(source.shape, strides, info.shape)
             if reshaped is None:
                 return result
             strides = reshaped
-        return TensorBinding(
+        return _TensorBinding(
             info.shape,
             info.maximum_shape,
             info.dtype,
             strides,
-            storage_shape(source),
+            _storage_shape(source),
             info.values,
         )
     return result
@@ -425,51 +428,55 @@ def _tensor_arguments(value: object, name: str) -> dict[str, Tensor]:
     return {}
 
 
-def _safe_boundary(tensor: Tensor, internals: set[Operator]) -> bool:
-    producer = tensor.producer
+def _safe_boundary(tensor: Tensor, internals: set[_Operator]) -> bool:
+    producer = tensor._producer
     if producer not in internals:
         return True
-    if isinstance(producer.args, ConstantArgs):
+    if isinstance(producer.args, _ConstantArgs):
         return True
-    if isinstance(producer.args, (PermuteArgs, ReshapeArgs, BroadcastArgs)):
+    if isinstance(producer.args, (_PermuteArgs, _ReshapeArgs, _BroadcastArgs)):
         return _safe_boundary(producer.args.x, internals)
     return False
 
 
-def _capacity(binding: TensorBinding) -> int:
-    dimensions = storage_shape(binding)
-    return byte_size(binding.dtype, tuple(bound(value) for value in dimensions))
+def _capacity(binding: _TensorBinding) -> int:
+    dimensions = _storage_shape(binding)
+    return _byte_size(binding.dtype, tuple(_bound(value) for value in dimensions))
 
 
-def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> MatchSet:
-    if graph.region is None:
+def _match(
+    graph: Graph, kernels: tuple[_Kernel, ...], inference: _Inference
+) -> _MatchSet:
+    if graph._region is None:
         raise ValueError("cannot match an incomplete graph")
-    result = MatchSet()
-    state = MatchingState(inference)
-    eligible = tuple(kernel for kernel in kernels if available(kernel))
+    result = _MatchSet()
+    state = _MatchingState(inference)
+    eligible = tuple(kernel for kernel in kernels if _available(kernel))
     signatures = {id(kernel): _signature(kernel) for kernel in eligible}
-    constraints: dict[Operator | None, list[ShapeConstraint]] = {}
+    constraints: dict[_Operator | None, list[_ShapeConstraint]] = {}
     for constraint in inference.constraints:
         constraints.setdefault(constraint.operator, []).append(constraint)
-    cache: dict[tuple[int, object], KernelPattern | None] = {}
-    for _, operator in walk(graph.region):
-        if isinstance(operator.args, (PermuteArgs, BroadcastArgs)):
+    cache: dict[tuple[int, object], _KernelPattern | None] = {}
+    for _, operator in _walk(graph._region):
+        if isinstance(operator.args, (_PermuteArgs, _BroadcastArgs)):
             result.views.add(operator)
-        elif isinstance(operator.args, ReshapeArgs):
+        elif isinstance(operator.args, _ReshapeArgs):
             source = _binding(operator.args.x, state)
             if (
-                reshape_strides(
+                _reshape_strides(
                     source.shape,
-                    source.strides or contiguous_strides(source.shape),
+                    source.strides or _contiguous_strides(source.shape),
                     _binding(operator.outputs[0], state).shape,
                 )
                 is not None
             ):
                 result.views.add(operator)
-        if not operator.outputs or isinstance(operator.args, (InputArgs, ConstantArgs)):
+        if not operator.outputs or isinstance(
+            operator.args, (_InputArgs, _ConstantArgs)
+        ):
             continue
-        matches: list[KernelMatch] = []
-        internals = {node for body in operator.regions for _, node in walk(body)}
+        matches: list[_KernelMatch] = []
+        internals = {node for body in operator.regions for _, node in _walk(body)}
         for kernel in eligible:
             if kernel.parameter_schema.output_count != len(operator.outputs):
                 continue
@@ -484,14 +491,14 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                 continue
             if all(output in pattern.inputs for output in pattern.outputs):
                 continue
-            if isinstance(operator.args, ConstructArgs) and not all(
-                output.producer is not None
-                and isinstance(output.producer.args, ConstructArgs)
+            if isinstance(operator.args, _ConstructArgs) and not all(
+                output._producer is not None
+                and isinstance(output._producer.args, _ConstructArgs)
                 for output in pattern.outputs
             ):
                 continue
             bindings: dict[str, Tensor] = {}
-            covered: set[Operator] = set()
+            covered: set[_Operator] = set()
             pairs: set[tuple[Tensor, Tensor]] = set()
             if not all(
                 _equivalent(p, t, pattern, state, bindings, {}, covered, pairs)
@@ -522,17 +529,17 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                 _unwrapped(output, state) for output in operator.outputs
             }
             covered.add(operator)
-            if any(value.producer in covered for value in bindings.values()):
+            if any(value._producer in covered for value in bindings.values()):
                 continue
             if any(
                 output not in outputs
-                and any(consumer not in covered for consumer in output.consumers)
+                and any(consumer not in covered for consumer in output._consumers)
                 for internal in covered
                 for output in internal.outputs
             ):
                 continue
             try:
-                context = KernelBindingContext(
+                context = _KernelBindingContext(
                     {
                         name: _binding(tensor, state)
                         for name, tensor in bindings.items()
@@ -542,13 +549,13 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                 )
                 parameters = kernel.bind(context)
                 references = set().union(
-                    *(parameter_references(value) for value in parameters.values())
+                    *(_parameter_references(value) for value in parameters.values())
                 )
                 for owner in (*covered, None):
                     for constraint in constraints.get(owner, ()):
                         references.update(
-                            parameter_references(constraint.left)
-                            | parameter_references(constraint.right)
+                            _parameter_references(constraint.left)
+                            | _parameter_references(constraint.right)
                         )
                 eliminated = {
                     value
@@ -563,7 +570,7 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                     for value in references
                 ):
                     continue
-                spans = requirements(kernel.parameter_schema, parameters)
+                spans = _requirements(kernel.parameter_schema, parameters)
                 for name, size in zip(physical, spans.inputs, strict=True):
                     capacity = _capacity(context.inputs[name])
                     if size > capacity:
@@ -588,7 +595,7 @@ def match(graph: Graph, kernels: tuple[Kernel, ...], inference: Inference) -> Ma
                 result.rejections.setdefault(operator, {})[kernel.name] = str(error)
                 continue
             matches.append(
-                KernelMatch(
+                _KernelMatch(
                     kernel,
                     operator,
                     frozenset(covered),
