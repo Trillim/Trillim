@@ -1,5 +1,4 @@
 #include "common.h"
-#include <math.h>
 #include <immintrin.h>
 
 #define AVX2 __attribute__((target("avx2")))
@@ -55,9 +54,6 @@ AVX2 static int32_t sum_ints(__m256i value) {
 
 AVX2 static TrillimStatus activation_sum(const LinearTask *task, size_t row, int64_t *result) {
     const LinearParameters *p = task->params;
-    if (!isfinite(task->scales[row]) || task->scales[row] <= 0) {
-        return TRILLIM_ERROR;
-    }
     const __m256i ones8 = _mm256_set1_epi8(1);
     const __m256i ones16 = _mm256_set1_epi16(1);
     int64_t sum = 0;
@@ -321,6 +317,6 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_quantized_linear_avx2_p
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_x86_quantized_linear_avx2_capabilities(void) {
-    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_X86_AVX2 | TRILLIM_CAP_LIBM};
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_X86_AVX2};
     return &capabilities;
 }
