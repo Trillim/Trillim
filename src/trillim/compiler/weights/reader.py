@@ -4,15 +4,12 @@ import json
 import math
 import struct
 from pathlib import Path
-from typing import cast
 
 import numpy as np
-from numpy.typing import NDArray
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
-from ...tdl.core.types import DType
 from .weights_dataclasses import _Checkpoint, _SourceDType, _WeightSource
-from .weights_pydantic_models import _CheckpointConfig, _SafetensorsIndex, _TensorHeader
+from .weights_pydantic_models import _SafetensorsIndex, _TensorHeader
 
 _SOURCE_DTYPES: dict[_SourceDType, str] = {
     "BOOL": "?",
@@ -27,20 +24,6 @@ _SOURCE_DTYPES: dict[_SourceDType, str] = {
     "F16": "<f2",
     "BF16": "<u2",
     "F32": "<f4",
-}
-_LOGICAL_DTYPES: dict[_SourceDType, DType] = {
-    "BOOL": "bool",
-    "I8": "int8",
-    "U8": "uint8",
-    "I16": "int16",
-    "U16": "uint16",
-    "I32": "int32",
-    "U32": "uint32",
-    "I64": "int64",
-    "U64": "uint64",
-    "F16": "fp16",
-    "BF16": "bf16",
-    "F32": "fp32",
 }
 _OBJECT = TypeAdapter(dict[str, JsonValue], config=ConfigDict(strict=True))
 _METADATA = TypeAdapter(dict[str, str], config=ConfigDict(strict=True))
@@ -65,11 +48,7 @@ def _load_checkpoint(name: str, location: Path) -> _Checkpoint:
     location = location.absolute()
     directory = location if location.is_dir() else location.parent
     config_path = directory / "config.json"
-    config = (
-        _CheckpointConfig.model_validate(_json_object(config_path.read_bytes()))
-        if config_path.is_file()
-        else _CheckpointConfig()
-    )
+    config = _json_object(config_path.read_bytes()) if config_path.is_file() else {}
     index_path = (
         location
         if location.name.endswith(".index.json")
@@ -151,29 +130,7 @@ def _load_checkpoint(name: str, location: Path) -> _Checkpoint:
         raise ValueError(f"checkpoint contains no tensors: {location}")
     if weight_map and set(tensors) != set(weight_map):
         raise ValueError("safetensors shard index contains missing tensors")
-    aliases = {
-        key: value
-        for key, value in metadata.items()
-        if value in tensors and key != value
-    }
-    if config.tie_word_embeddings:
-        candidates = {
-            "lm_head.weight": (
-                "model.embed_tokens.weight",
-                "transformer.wte.weight",
-                "model.decoder.embed_tokens.weight",
-            ),
-            "proj_out.weight": (
-                "model.decoder.embed_tokens.weight",
-                "decoder.embed_tokens.weight",
-            ),
-        }
-        for head, embeddings in candidates.items():
-            for embedding in embeddings:
-                if embedding in tensors:
-                    aliases[head] = embedding
-                    break
-    return _Checkpoint(name, config, tensors, aliases)
+    return _Checkpoint(name, config, tensors, metadata)
 
 
 def _unchanged(source: _WeightSource) -> None:
@@ -182,18 +139,14 @@ def _unchanged(source: _WeightSource) -> None:
         raise ValueError(f"checkpoint changed while compiling: {source.path}")
 
 
-def _read_values(source: _WeightSource, start: int, count: int) -> NDArray[np.generic]:
-    length = math.prod(source.shape)
-    if start < 0 or count < 0 or start + count > length:
+def _read_bytes(source: _WeightSource, start: int, size: int) -> bytes:
+    if start < 0 or size < 0 or start + size > source.size:
         raise ValueError(f"checkpoint slice exceeds tensor: {source.tensor}")
     _unchanged(source)
-    dtype = np.dtype(_SOURCE_DTYPES[source.dtype])
     with source.path.open("rb") as file:
-        file.seek(source.offset + start * dtype.itemsize)
-        data = file.read(count * dtype.itemsize)
-    if len(data) != count * dtype.itemsize:
+        file.seek(source.offset + start)
+        data = file.read(size)
+    if len(data) != size:
         raise ValueError(f"checkpoint tensor truncated: {source.tensor}")
-    values = np.frombuffer(data, dtype=dtype)
-    if source.dtype == "BF16":
-        return (values.astype(np.uint32) << 16).view(np.float32)
-    return cast(NDArray[np.generic], values)
+    _unchanged(source)
+    return data
