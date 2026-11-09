@@ -5,8 +5,11 @@
 The compiler uses these private weight helpers:
 
 - `_resolve_weights(graph, checkpoints) -> _WeightIndex`
-- `_write_weights(index, destination, required_representations=None) -> _WeightManifest`
+- `_resolve_payloads(index, requests=None) -> Iterator[_ResolvedWeight]`
+- `_write_weights(weights, destination) -> _WeightManifest`
 - `_read_manifest(bundle) -> _WeightManifest`
+
+`reader.py` reads checkpoint metadata and raw byte slices. Configuration and safetensors metadata remain available without interpreting them. `resolve.py` owns aliases, source-format interpretation and every conversion to the requested Trillim dtype and packing. It supplies output records and bounded iterators of final encoded byte chunks. `bundle.py` assigns file offsets, writes those chunks and publishes the completed bundle; it does not decode or encode tensors.
 
 `checkpoints` maps TDL model names to a safetensors file, shard index, or checkpoint directory. Resolution validates tensor extents and indexed shard membership, then binds concrete shapes and logical dtypes to weight constants. Identities include the checkpoint name, so equal tensor names in different checkpoints remain distinct.
 
@@ -28,7 +31,7 @@ The header contains `format="trillim.weights"`, `version=1`, `endian="little"`, 
 
 `canonical` payloads store value bytes first, followed by their scale sections. Grouped INT5 adds high bits after its BF16 scales. Grouped INT6 then adds high bits and signed subscales. Matrix ternary stores one FP32 gamma after its values. MXFP4 stores E8M0 scales after its packed values. `trillim.compiler.dtype._payload_sections` returns the section names and byte lengths. Internal sections have no alignment padding; readers must handle unaligned scales.
 
-The writer streams bounded row or column chunks into each section's final position. It does not concatenate independently encoded chunks, which would interleave value and scale sections incorrectly. It writes a temporary file and replaces the destination after completion.
+Resolve supplies each encoded chunk with its offset within the tensor payload, keeping values, scales and other sections separate. The writer places those bytes at the corresponding file positions. It writes a temporary file and replaces the destination after completion.
 
 ## Checkpoint imports
 

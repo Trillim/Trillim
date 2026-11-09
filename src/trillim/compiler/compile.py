@@ -24,7 +24,7 @@ from .passes.validate import _validate
 from .passes.verify import _verify
 from .passes.walk import _collect_checkpoints
 from .weights.bundle import _write_weights
-from .weights.resolve import _resolve_weights
+from .weights.resolve import _resolve_payloads, _resolve_weights
 
 
 def _compile_model(
@@ -114,7 +114,7 @@ def _compile_model(
                 },
             )
         report("Writing model weights")
-        manifest = _write_weights(weights, temporary / "weights.bin")
+        manifest = _write_weights(_resolve_payloads(weights), temporary / "weights.bin")
         if request.depth != "none":
             report("Benchmarking representative kernel workloads")
         tuning = _tune(
