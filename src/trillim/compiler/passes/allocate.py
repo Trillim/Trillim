@@ -27,7 +27,7 @@ from ..artifacts.expressions import (
     _parameter_references,
     _references,
 )
-from ..artifacts.parameters import _requirements
+from ..artifacts.parameters import _can_alias, _requirements
 from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..dtype import _encode
 from ..kernels.bindings import (
@@ -228,6 +228,62 @@ def _lifetimes(layout: _Layout, live: set[Tensor]) -> None:
                     queued.add(dependency)
 
 
+def _inplace(layout: _Layout, selection: _Selection) -> None:
+    by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
+
+    def backing(tensor: Tensor) -> _Buffer:
+        buffer = layout.buffers[tensor]
+        while buffer.storage == "alias":
+            assert buffer.source is not None
+            buffer = by_name[buffer.source]
+        return buffer
+
+    for operator, call in sorted(
+        selection.calls.items(), key=lambda item: layout.positions[item[0]][0]
+    ):
+        schema = call.kernel.parameter_schema
+        if schema.can_alias_address is None:
+            continue
+        start = layout.positions[operator][0]
+        claimed: set[str] = set()
+        for output_slot, tensor in enumerate(call.outputs):
+            output = layout.buffers[tensor]
+            if output.storage != "arena" or output.first != start:
+                continue
+            for source in call.inputs:
+                original, root = layout.buffers[source], backing(source)
+                if (
+                    root.storage != "arena"
+                    or root.name in claimed
+                    or root.last != start
+                    or root.size < output.size
+                    or original.dtype != output.dtype
+                    or original.shape != output.shape
+                    or original.strides != _contiguous_strides(output.shape)
+                    or original.byte_offset is not None
+                ):
+                    continue
+                overlapping = [
+                    slot
+                    for slot, value in enumerate(call.inputs)
+                    if backing(value) is root
+                ]
+                if not all(
+                    _can_alias(schema, layout.parameters[operator], output_slot, slot)
+                    for slot in overlapping
+                ):
+                    continue
+                output.storage, output.source = "alias", root.name
+                root.last = max(root.last, output.last)
+                root.alignment = max(
+                    root.alignment,
+                    output.alignment,
+                    schema.output_alignments[output_slot],
+                )
+                claimed.add(root.name)
+                break
+
+
 def _allocate(
     graph: Graph,
     inference: _Inference,
@@ -411,6 +467,8 @@ def _allocate(
                 first,
                 last,
             )
+    _lifetimes(layout, live)
+    _inplace(layout, selection)
     _lifetimes(layout, live)
     items: list[_Buffer | _Workspace] = [
         buffer

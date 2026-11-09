@@ -26,19 +26,28 @@ def _checked_scalar(kind: str, value: float, name: str) -> int | float:
 
 def _pack(
     schema: _ParameterSchema,
-    parameters: Mapping[str, int | float | tuple[int | float, ...]],
+    parameters: Mapping[str, _ParameterValue],
 ) -> _PackedParameters:
+    def scalar(value: float | _ShapeExpression) -> int | float:
+        return _bound(value) if isinstance(value, _ShapeExpression) else value
+
+    concrete = {
+        name: tuple(scalar(item) for item in value)
+        if isinstance(value, tuple)
+        else scalar(value)
+        for name, value in parameters.items()
+    }
     value = schema.native_type()
     owners: list[object] = [value]
-    if set(parameters) != {item.name for item in schema.fields}:
+    if set(concrete) != {item.name for item in schema.fields}:
         raise ValueError("kernel parameter fields do not match the native schema")
     for item in schema.fields:
-        argument = parameters[item.name]
+        argument = concrete[item.name]
         native = _NATIVE_TYPES[item.type]
         if item.length is not None:
             if (
                 not isinstance(argument, tuple)
-                or len(argument) != parameters[item.length]
+                or len(argument) != concrete[item.length]
             ):
                 raise ValueError(f"invalid parameter array: {item.name}")
             array = c.create_string_buffer(len(argument) * c.sizeof(native))
@@ -67,18 +76,7 @@ def _pack(
 def _requirements(
     schema: _ParameterSchema, parameters: Mapping[str, _ParameterValue]
 ) -> _Requirements:
-    def scalar(value: float | _ShapeExpression) -> int | float:
-        return _bound(value) if isinstance(value, _ShapeExpression) else value
-
-    packed = _pack(
-        schema,
-        {
-            name: tuple(scalar(item) for item in value)
-            if isinstance(value, tuple)
-            else scalar(value)
-            for name, value in parameters.items()
-        },
-    )
+    packed = _pack(schema, parameters)
     inputs = (c.c_size_t * schema.input_count)()
     outputs = (c.c_size_t * schema.output_count)()
     scratch = c.c_size_t()
@@ -93,3 +91,22 @@ def _requirements(
     if status:
         raise ValueError(f"kernel rejected bounded parameters (status {status})")
     return _Requirements(tuple(inputs), tuple(outputs), scratch.value)
+
+
+def _can_alias(
+    schema: _ParameterSchema,
+    parameters: Mapping[str, _ParameterValue],
+    output: int,
+    input: int,
+) -> bool:
+    if schema.can_alias_address is None or any(
+        isinstance(item, _ShapeExpression) and item.op != "const"
+        for value in parameters.values()
+        for item in (value if isinstance(value, tuple) else (value,))
+    ):
+        return False
+    packed = _pack(schema, parameters)
+    function = c.CFUNCTYPE(c.c_bool, c.c_void_p, c.c_size_t, c.c_size_t)(
+        schema.can_alias_address
+    )
+    return bool(function(packed.address, output, input))

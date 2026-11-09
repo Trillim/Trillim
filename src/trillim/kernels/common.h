@@ -318,4 +318,16 @@ static inline size_t trillim_offset(size_t flat, size_t rank, const size_t *shap
     }
     return result;
 }
+
+static inline bool trillim_contiguous(size_t rank, const size_t *shape, const size_t *strides) {
+    size_t stride = 1;
+    for (size_t axis = rank; axis > 0; --axis) {
+        size_t i = axis - 1;
+        if ((shape[i] > 1 && strides[i] != stride) || (shape[i] != 0 && stride > SIZE_MAX / shape[i])) {
+            return false;
+        }
+        stride *= shape[i];
+    }
+    return true;
+}
 #endif
