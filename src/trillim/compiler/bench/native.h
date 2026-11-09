@@ -30,10 +30,10 @@ struct TrillimBenchContext {
     void *task_context;
 };
 
-TrillimBenchContext *trillim_bench_create(size_t workers);
-void trillim_bench_destroy(TrillimBenchContext *context);
-void trillim_bench_cancel(TrillimBenchContext *context);
-TrillimStatus trillim_bench_run(
+TRILLIM_KERNEL TrillimBenchContext *trillim_bench_create(size_t workers);
+TRILLIM_KERNEL void trillim_bench_destroy(TrillimBenchContext *context);
+TRILLIM_KERNEL void trillim_bench_cancel(TrillimBenchContext *context);
+TRILLIM_KERNEL TrillimStatus trillim_bench_run(
     TrillimBenchContext *context, TrillimKernel kernel,
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, size_t samples, double *seconds

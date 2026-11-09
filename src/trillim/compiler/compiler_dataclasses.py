@@ -28,6 +28,12 @@ class _CompileArguments(Namespace):
 
 
 @dataclass(slots=True)
+class _KernelArguments(Namespace):
+    sources: list[Path] = field(init=False)
+    backend: str | None = None
+
+
+@dataclass(slots=True)
 class _ValidationState:
     graph: Graph
     regions: set[int] = field(default_factory=set)

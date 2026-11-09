@@ -1,8 +1,20 @@
 # Kernel ABI 1
 
-Each backend builds its kernel sources into one `backend.o` and one loadable library under `$TRILLIM_HOME/1.0.0/kernels/<backend>/<build-hash>/`. `TRILLIM_HOME` defaults to `~/.trillim`. A backend has no dependency on another backend's library.
+`trillim kernels` rebuilds all built-in kernels for the host backend and the scalar reference backend. `--backend scalar|x86|neon` selects one backend instead. The source build currently targets the host architecture; cross-platform release builds are separate.
 
-`common.h` is the sole shared kernel header. It contains the ABI, native dtype access and basic indexing utilities. Each kernel lives in one `.c` file with its own parameter structs, static helpers and four exported functions; it includes no other project files.
+`trillim kernels path/to/kernel.c --backend x86` compiles that kernel and relinks it with the installed objects. Multiple source paths are accepted. An existing kernel with the same exported name is replaced; a new name is added. No source paths means a full rebuild, removing previously added custom kernels from that backend.
+
+Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containing `kernels.so`, `backend.o`, `index.json` and an `objects/` directory. The index lists kernel symbols and has format version 1. Individual objects are retained for incremental linking; packages must include them to support updates without the original sources. Kernel discovery loads the library and index without invoking a C compiler or reading kernel sources.
+
+The native benchmark helper uses the same compiler hierarchy and is cached separately under `bench/`. Benchmarking builds that helper if it is absent.
+
+Compilers are tried in order: `zig cc`, an explicit `CC` command if set, then `cc`. On Windows, MinGW variants follow; `gcc` and `clang` are additional fallbacks. Unavailable tools are skipped. A failed compiler attempt is discarded before trying the next; compilation fails only after all available candidates fail. The current sources require a GCC-compatible driver, including Zig, GCC, Clang or MinGW.
+
+Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. All build files and Zig caches stay beneath `TRILLIM_HOME`, which defaults to `~/.trillim`.
+
+A backend has no dependency on another backend's library. Portable scalar kernels are compiled into each backend's own library.
+
+`common.h` is the sole shared kernel header. It contains the ABI, native dtype access and basic indexing utilities. Each kernel lives in one `.c` file with its own parameter structs, static helpers and four `TRILLIM_KERNEL` functions; it includes no other project files. The export marker keeps these entrypoints visible when building libraries with hidden visibility. The builder indexes the compiler-generated assembly, so C macros and conditional compilation are resolved by the C compiler.
 
 A kernel exports four functions:
 

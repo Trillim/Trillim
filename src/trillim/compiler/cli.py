@@ -6,8 +6,9 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .compiler_dataclasses import _CompileArguments
+from .compiler_dataclasses import _CompileArguments, _KernelArguments
 from .compiler_pydantic_models import _CompileRequest
+from .kernels.kernel_pydantic_models import _KernelRequest
 
 
 def _checkpoint(value: str) -> tuple[str, Path]:
@@ -60,3 +61,22 @@ def _parse_args(args: Sequence[str] | None = None) -> _CompileRequest:
         detail = error.errors()[0]
         field = ".".join(str(item) for item in detail["loc"])
         parser.error(f"{field}: {detail['msg']}")
+
+
+def _parse_kernel_args(args: Sequence[str] | None = None) -> _KernelRequest:
+    parser = ArgumentParser(prog="trillim kernels")
+    parser.add_argument(
+        "sources",
+        type=Path,
+        nargs="*",
+        metavar="SOURCE.c",
+        help="update these kernels; omit to rebuild all built-in kernels",
+    )
+    parser.add_argument("--backend", choices=("scalar", "x86", "neon"))
+    arguments = parser.parse_intermixed_args(args, namespace=_KernelArguments())
+    try:
+        return _KernelRequest.model_validate(
+            {"sources": tuple(arguments.sources), "backend": arguments.backend}
+        )
+    except ValidationError as error:
+        parser.error(error.errors()[0]["msg"])
