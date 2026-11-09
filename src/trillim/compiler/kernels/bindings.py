@@ -77,6 +77,8 @@ def _binary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
 def _unary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     source = context.inputs["x"]
+    if source.dtype != output.dtype:
+        raise ValueError("unary input must have the output's physical dtype")
     return {
         "count": _product(output.shape),
         "rank": len(output.shape),
@@ -239,6 +241,8 @@ def _select(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
         )
     )
     condition = context.inputs["condition"]
+    if condition.dtype != "bool":
+        raise ValueError("selection condition must have bool storage")
     result["condition_strides"] = _broadcast_strides(
         condition.shape, context.outputs[0].shape, condition.strides
     )
@@ -331,6 +335,12 @@ def _indexing(
     source = context.inputs["x"]
     indices = context.inputs["indices"]
     output = context.outputs[0]
+    if (
+        source.dtype != output.dtype
+        or scatter_operation
+        and context.inputs["values"].dtype != output.dtype
+    ):
+        raise ValueError("indexing data must have the output's physical dtype")
     coordinates = indices.shape[-1].value
     if coordinates is None or coordinates < 0 or coordinates > len(source.shape):
         raise ValueError("indexed coordinate width must be statically known")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Hashable
 from dataclasses import dataclass, field
 
 from ...tdl.core.operator import _Operator
@@ -17,6 +18,7 @@ class _KernelMatch:
     inputs: tuple[Tensor, ...]
     outputs: tuple[Tensor, ...]
     parameters: dict[str, _ParameterValue]
+    attributes: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -40,6 +42,19 @@ class _Selection:
     cost: float = 0.0
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _Canonical:
+    op: str
+    arguments: tuple[_Canonical, ...]
+    value: Hashable | None
+    key: int
+    sources: tuple[Tensor, ...] = ()
+    origins: frozenset[_Operator] = frozenset()
+    lower: float | None = None
+    upper: float | None = None
+    finite: bool = False
+
+
 @dataclass(slots=True)
 class _MatchingState:
     inference: _Inference
@@ -50,3 +65,11 @@ class _MatchingState:
         default_factory=dict
     )
     tensor_bindings: dict[Tensor, _TensorBinding] = field(default_factory=dict)
+    normal: dict[tuple[Tensor, tuple[Tensor, ...]], _Canonical] = field(
+        default_factory=dict
+    )
+    normal_keys: dict[tuple[str, tuple[int, ...], Hashable | None], int] = field(
+        default_factory=dict
+    )
+    normal_budget: int = 4096
+    normal_active: set[tuple[Tensor, tuple[Tensor, ...]]] = field(default_factory=set)
