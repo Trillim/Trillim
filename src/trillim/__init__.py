@@ -28,14 +28,14 @@ def _main() -> None:
             _compile_model(_parse_args(arguments[1:]), progress=print)
         elif arguments[0] == "run":
             from .runtime.cli import _run
-            from .runtime.errors import CancelledError, ExecutionError
+            from .runtime.errors import CancelledError
 
             try:
                 _run(arguments[1:])
             except CancelledError:
                 print("Execution cancelled.", file=_sys.stderr)
                 raise SystemExit(130) from None
-            except (OSError, ValueError, ExecutionError) as error:
+            except (OSError, ValueError, RuntimeError) as error:
                 print(f"Execution failed: {error}", file=_sys.stderr)
                 raise SystemExit(1) from None
         else:
