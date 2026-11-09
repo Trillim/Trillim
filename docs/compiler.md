@@ -38,7 +38,7 @@ The compiler edits the traced TDL graph directly. It validates checkpoint refere
 
 Shapes and parameters use integer expressions. `scalar` reads a tensor using its declared dtype; `dimension` reads a tensor's captured actual shape; `cache_length` reads current cache metadata. Other expressions combine these values using arithmetic or broadcasting rules. Every actual dimension must fit its declared maximum. Non-finite metadata floats use `{"float": "-inf"}`, `{"float": "inf"}`, or `{"float": "nan"}`; tensor constants remain binary.
 
-An `if` executes its chosen branch and its native result-copy calls. A `while` initializes its output bank, copies that bank to condition/body parameters, and copies body results back after each iteration. `shape_from` captures a destination's actual shape before a transfer. Distinct live banks make these transfers safe when a loop swaps carried values.
+An `if` executes its chosen branch and its native result-copy calls. A `while` borrows its state for condition inputs and reuses state storage for body inputs and results when liveness and kernel alias permissions allow it. Dead arena inputs can initialize a loop without copying. Swapped values, changing shapes and live snapshots retain separate buffers where needed. Shared transfers are views; remaining transfers use native copy calls, with `shape_from` capturing the actual shape before a transfer.
 
 A generic `reduce` iterates retained coordinates and reduced coordinates, initializes scalar accumulators, executes its pure reducer program, and stores each result. Its native transfer kernel handles element decoding and strided reads; mathematical reducers remain ordinary kernel calls. Common reductions use fused kernels instead.
 
