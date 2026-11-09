@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as c
 import ctypes.util
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -36,7 +37,10 @@ def _available_capabilities(backend: _Backend) -> int:
     aliases = {"neon": "asimd", "dotprod": "asimddp"}
     available = 0
     for name, flag in _CAPABILITY_FLAGS[backend].items():
-        if name in _SOFTWARE_CAPABILITIES:
+        if name == "m" and sys.platform == "win32":
+            # Loaded Windows kernels resolve standard math through their CRT.
+            available |= flag
+        elif name in _SOFTWARE_CAPABILITIES:
             library = ctypes.util.find_library(name)
             if library is None:
                 continue

@@ -4,7 +4,14 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <malloc.h>
+#else
 #include <time.h>
+#endif
 
 static volatile sig_atomic_t signal_cancelled;
 
@@ -14,11 +21,23 @@ static void cancel_signal(int signal_number) {
 }
 
 static void *allocate(size_t size, size_t alignment) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
     void *address = NULL;
     if (posix_memalign(&address, alignment, size) != 0) {
         return NULL;
     }
     return address;
+#endif
+}
+
+static void release(void *address) {
+#ifdef _WIN32
+    _aligned_free(address);
+#else
+    free(address);
+#endif
 }
 
 static bool is_cancelled(void *context) {
@@ -37,11 +56,23 @@ static void spin_pause(void) {
 }
 
 static uint64_t monotonic_nanoseconds(void) {
+#ifdef _WIN32
+    LARGE_INTEGER now, frequency;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&now)) {
+        return 0;
+    }
+    uint64_t ticks = (uint64_t)now.QuadPart;
+    uint64_t rate = (uint64_t)frequency.QuadPart;
+    return (ticks / rate) * UINT64_C(1000000000) +
+        (uint64_t)((long double)(ticks % rate) * 1000000000.0L / rate);
+#else
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
         return 0;
     }
     return (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
+#endif
 }
 
 static TrillimStatus execute_tasks(
@@ -186,12 +217,12 @@ TrillimBenchContext *trillim_bench_create(size_t worker_count) {
     atomic_init(&backend->generation, 0);
     atomic_init(&backend->next_task, 0);
     if (pthread_mutex_init(&backend->mutex, NULL) != 0) {
-        free(backend);
+        release(backend);
         return NULL;
     }
     if (pthread_cond_init(&backend->work_ready, NULL) != 0) {
         pthread_mutex_destroy(&backend->mutex);
-        free(backend);
+        release(backend);
         return NULL;
     }
     backend->pool = (TrillimThreadPool){backend, worker_count, run};
@@ -226,10 +257,10 @@ void trillim_bench_destroy(TrillimBenchContext *backend) {
     for (size_t index = 1; index < backend->pool.worker_count; ++index) {
         pthread_join(backend->workers[index].thread, NULL);
     }
-    free(backend->workers);
+    release(backend->workers);
     pthread_cond_destroy(&backend->work_ready);
     pthread_mutex_destroy(&backend->mutex);
-    free(backend);
+    release(backend);
 }
 
 void trillim_bench_cancel(TrillimBenchContext *context) {
@@ -241,26 +272,34 @@ TrillimStatus trillim_bench_run(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, size_t samples, double *seconds
 ) {
+#ifdef _WIN32
+    if (signal(SIGTERM, cancel_signal) == SIG_ERR) {
+        return TRILLIM_ERROR;
+    }
+#else
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = cancel_signal;
     sigemptyset(&action.sa_mask);
-    sigaction(SIGTERM, &action, NULL);
+    if (sigaction(SIGTERM, &action, NULL) != 0) {
+        return TRILLIM_ERROR;
+    }
+#endif
     signal_cancelled = 0;
     for (size_t index = 0; index < samples; ++index) {
-        struct timespec start, end;
-        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        uint64_t start = monotonic_nanoseconds();
+        if (start == 0) {
             return TRILLIM_ERROR;
         }
         TrillimStatus status = kernel(outputs, inputs, scratch, parameters, &backend->context);
         if (status != TRILLIM_OK) {
             return status;
         }
-        if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        uint64_t end = monotonic_nanoseconds();
+        if (end == 0 || end < start) {
             return TRILLIM_ERROR;
         }
-        seconds[index] = (double)(end.tv_sec - start.tv_sec) +
-            (double)(end.tv_nsec - start.tv_nsec) * 1e-9;
+        seconds[index] = (double)(end - start) * 1e-9;
     }
     return TRILLIM_OK;
 }
