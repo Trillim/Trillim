@@ -23,7 +23,7 @@ from ...compiler.kernels.kernel_dataclasses import _ParameterSchema, _ParameterV
 from ...compiler.kernels.native import _read_capabilities, _read_schema
 from ...compiler.passes.verify import _verify
 from ...compiler.weights.bundle import _read_manifest
-from .cpu_dataclasses import _Allocation
+from .cpu_dataclasses import _Allocation, _PreparedCall
 from .errors import CancelledError, ExecutionError
 
 
@@ -64,6 +64,7 @@ class _CPU:
         self.mappings: list[mmap.mmap] = []
         self.mapping_views: list[NDArray[np.uint8]] = []
         self.inputs: dict[str, NDArray[np.generic]] = {}
+        self._calls: dict[int, _PreparedCall] = {}
         try:
             self._load(directory, threads)
         except BaseException:
@@ -180,6 +181,7 @@ class _CPU:
                 self._finalizer()
                 self.context = None
         self.inputs.clear()
+        self._calls.clear()
         self.mapping_views.clear()
         for mapping in self.mappings:
             mapping.close()
@@ -434,6 +436,7 @@ class _CPU:
 
     def invoke(
         self,
+        identity: int,
         kernel: str,
         parameters: dict[str, _ParameterValue],
         inputs: list[tuple[int, int]],
@@ -441,7 +444,13 @@ class _CPU:
         scratch: dict[str, JsonValue],
     ) -> None:
         _, schema, pointer = self.kernels[kernel]
-        footprint = _requirements(schema, parameters)
+        prepared = self._calls.get(identity)
+        if prepared is None or prepared.parameters != parameters:
+            prepared = _PreparedCall(
+                parameters, _pack(schema, parameters), _requirements(schema, parameters)
+            )
+            self._calls[identity] = prepared
+        footprint = prepared.requirements
         for (address, capacity), size, alignment in zip(
             inputs, footprint.inputs, schema.input_alignments, strict=True
         ):
@@ -458,7 +467,6 @@ class _CPU:
             or scratch_address % schema.scratch_alignment
         ):
             raise ValueError(f"{kernel}: scratch footprint/alignment invalid")
-        packed = _pack(schema, parameters)
         source = (c.c_void_p * len(inputs))(*(address for address, _ in inputs))
         target = (c.c_void_p * len(outputs))(*(address for address, _ in outputs))
         status = self.native(
@@ -467,7 +475,7 @@ class _CPU:
             target,
             source,
             scratch_address,
-            packed.address,
+            prepared.packed.address,
         )
         if status == 1:
             raise CancelledError(f"{kernel}: execution cancelled")
@@ -490,6 +498,7 @@ class _CPU:
             for name, value in _object(instruction["parameters"]).items()
         }
         self.invoke(
+            id(instruction),
             _text(instruction["kernel"]),
             parameters,
             [(self.address(name), self.span(name)) for name in inputs],
@@ -542,6 +551,7 @@ class _CPU:
             "output_dtype": _DTYPE_IDS[dst.dtype],
         }
         self.invoke(
+            id(transfer),
             _text(transfer["kernel"]),
             parameters,
             [(self.address(source), self.span(source))],
