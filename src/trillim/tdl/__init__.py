@@ -61,7 +61,7 @@ from .core import (
 )
 from .embedding import Embedding, InterpolatedEmbedding
 from .ffn import FFN
-from .linear import BitLinear, Linear
+from .linear import BitLinear, Linear, QuantizedLinear, QuantizeInt8
 from .math import (
     Abs,
     Argmax,
@@ -165,6 +165,8 @@ __all__ = [
     "Pad",
     "Permute",
     "Pool",
+    "QuantizeInt8",
+    "QuantizedLinear",
     "RMSNorm",
     "Random",
     "Reduce",

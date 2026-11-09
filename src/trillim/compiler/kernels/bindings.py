@@ -534,6 +534,57 @@ def _bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     }
 
 
+def _quantize_int8(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source = context.inputs["x"]
+    if not source.shape or source.dtype not in {"fp16", "bf16", "fp32"}:
+        raise ValueError("INT8 activation quantization requires floating rows")
+    if (source.strides or _contiguous_strides(source.shape)) != _contiguous_strides(
+        source.shape
+    ):
+        raise ValueError("INT8 activation quantization requires contiguous input")
+    codes, scale = context.outputs
+    if (
+        codes.dtype != "int8"
+        or codes.shape != source.shape
+        or scale.dtype != "fp32"
+        or scale.shape != (*source.shape[:-1], _constant_expression(1))
+    ):
+        raise ValueError("INT8 activation codes or scales have incompatible metadata")
+    return {
+        "tokens": _product(source.shape[:-1]),
+        "width": source.shape[-1],
+        "input_dtype": _DTYPE_IDS[source.dtype],
+    }
+
+
+def _quantized_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, weight, scale = (context.inputs[name] for name in ("x", "weight", "scale"))
+    if (
+        not source.shape
+        or len(weight.shape) != 2
+        or source.shape[-1] != weight.shape[-1]
+        or source.dtype != "int8"
+        or weight.dtype != "mat_ternary"
+        or scale.dtype != "fp32"
+        or scale.shape != (*source.shape[:-1], _constant_expression(1))
+        or context.outputs[0].dtype not in {"fp16", "bf16", "fp32"}
+    ):
+        raise ValueError(
+            "quantized linear requires INT8 rows, ternary weights and FP32 scales"
+        )
+    for binding in (source, weight, scale):
+        if (
+            binding.strides or _contiguous_strides(binding.shape)
+        ) != _contiguous_strides(binding.shape):
+            raise ValueError("quantized linear requires contiguous operands")
+    return {
+        "tokens": _product(source.shape[:-1]),
+        "width": source.shape[-1],
+        "outputs": weight.shape[0],
+        "output_dtype": _DTYPE_IDS[context.outputs[0].dtype],
+    }
+
+
 def _avx2_bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     result = _bitlinear(context)
     width = context.inputs["x"].shape[-1]
