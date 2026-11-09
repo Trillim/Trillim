@@ -254,6 +254,9 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
 }
 
 static bool can_alias(const void *parameters, size_t output, size_t input) {
+    if (parameters == NULL) {
+        return output == 0 && input == 0;
+    }
     const TrillimRMSNormParameters *p = parameters;
     return output == 0 && input == 0 && p->input_dtype == p->output_dtype;
 }

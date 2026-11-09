@@ -73,6 +73,9 @@ static inline TrillimStatus trillim_binary_task(void *opaque, size_t tile, size_
 }
 
 static bool can_alias(const void *parameters, size_t output, size_t input) {
+    if (parameters == NULL) {
+        return output == 0 && input < 2;
+    }
     const TrillimBinaryParameters *p = (const TrillimBinaryParameters *)parameters;
     return output == 0 && input < 2 && trillim_contiguous(
         p->rank, p->shape, input == 0 ? p->a_strides : p->b_strides);

@@ -19,6 +19,7 @@ from .core import (
     Mul,
     Permute,
     Reshape,
+    Scatter,
     Select,
     Shape,
     Sqrt,
@@ -106,7 +107,6 @@ def GatedDelta(
     k = L2Norm(k)
     initial_state = state.read()
     output = FullLike(v)
-    positions = Reshape(Iota(Dim(v, 0)), (-1, 1, 1))
 
     def step(values: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         index, memory, result = values
@@ -123,7 +123,7 @@ def GatedDelta(
             memory, Mul(key, Reshape(update, (Dim(update, 0), 1, Dim(update, 1))))
         )
         token = Sum(Mul(memory, Reshape(qt, (Dim(qt, 0), Dim(qt, 1), 1))), axes=(-2,))
-        result = Select(Compare(positions, index, predicate="eq"), token, result)
+        result = Scatter(result, indices=Reshape(index, (1,)), values=token)
         return Add(index, 1), memory, result
 
     result = While(

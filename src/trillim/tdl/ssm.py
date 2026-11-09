@@ -14,7 +14,7 @@ from .core import (
     Mul,
     Permute,
     Reshape,
-    Select,
+    Scatter,
     Tensor,
     While,
 )
@@ -61,7 +61,6 @@ def Mamba(
 
     initial_state = state.read()
     output = FullLike(x)
-    positions = Reshape(Iota(Dim(x, 0)), (-1, 1))
 
     def step(values: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         i, memory, result = values
@@ -72,7 +71,7 @@ def Mamba(
         update = Mul(Mul(dt, Reshape(xt, (-1, 1))), bt)
         memory = Add(Mul(memory, Exp(Mul(dt, a))), update)
         token = Add(Sum(Mul(memory, ct), axes=(-1,)), Mul(xt, skip))
-        result = Select(Compare(positions, i, predicate="eq"), token, result)
+        result = Scatter(result, indices=Reshape(i, (1,)), values=token)
         return Add(i, 1), memory, result
 
     result = While(
@@ -102,7 +101,6 @@ def Mamba2(
     b, c = Take(b, indices, axis=1, rank=3), Take(c, indices, axis=1, rank=3)
     initial_state = state.read()
     output = FullLike(x)
-    positions = Reshape(Iota(Dim(x, 0)), (-1, 1, 1))
 
     def step(values: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         i, memory, result = values
@@ -120,7 +118,7 @@ def Mamba2(
             Sum(Mul(memory, Reshape(ct, (heads, 1, Dim(ct, -1)))), axes=(-1,)),
             Mul(xt, Reshape(skip, (-1, 1))),
         )
-        result = Select(Compare(positions, i, predicate="eq"), token, result)
+        result = Scatter(result, indices=Reshape(i, (1,)), values=token)
         return Add(i, 1), memory, result
 
     result = While(
