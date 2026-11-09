@@ -149,6 +149,7 @@ typedef struct {
     size_t v_rows;
     size_t v_columns;
     size_t window;
+    uint32_t output_dtype;
     uint32_t q_dtype;
     uint32_t k_dtype;
     uint32_t v_dtype;
@@ -159,7 +160,7 @@ typedef struct {
 } TrillimAttentionParameters;
 
 typedef struct {
-    float *output;
+    void *output;
     const void *query;
     const void *keys;
     const void *values;
@@ -185,9 +186,9 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         return TRILLIM_OK;
     }
     if (p->rank != 3 || p->kv_heads == 0 || p->heads % p->kv_heads != 0 ||
-        p->key_dim == 0 || p->value_dim == 0 || p->causal > 1 || p->windowed > 1 || p->default_scale > 1 ||
+        p->key_dim == 0 || p->value_dim == 0 || !trillim_float(p->output_dtype) || p->causal > 1 || p->windowed > 1 || p->default_scale > 1 ||
         p->queries > INT64_MAX || p->length > INT64_MAX ||
-        p->heads > SIZE_MAX / p->queries || p->heads * p->queries > SIZE_MAX / sizeof(float) / p->value_dim) {
+        p->heads > SIZE_MAX / p->queries || p->heads * p->queries > SIZE_MAX / trillim_itemsize(p->output_dtype) / p->value_dim) {
         return TRILLIM_ERROR;
     }
     size_t query_shape[] = {p->heads, p->queries, p->key_dim};
@@ -208,7 +209,7 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         p->heads * tiles > SIZE_MAX / sizeof(float) / (p->value_dim + 64)) {
         return TRILLIM_ERROR;
     }
-    outputs[0] = p->heads * p->queries * p->value_dim * sizeof(float);
+    outputs[0] = p->heads * p->queries * p->value_dim * trillim_itemsize(p->output_dtype);
     *scratch = p->heads * tiles * (p->value_dim + 64) * sizeof(float);
     return TRILLIM_OK;
 }
@@ -306,12 +307,14 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
                 }
             }
         }
-        size_t output = (head * p->queries + qi) * p->value_dim;
+        size_t output = (qi * p->heads + head) * p->value_dim;
         for (size_t channel = 0; channel < p->value_dim; ++channel) {
             if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            task->output[output + channel] = accumulator[channel] / denominator;
+            TrillimValue value;
+            value.f = accumulator[channel] / denominator;
+            trillim_store(task->output, output + channel, p->output_dtype, value);
         }
     }
     return TRILLIM_OK;
@@ -333,8 +336,8 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_attention(
 TRILLIM_KERNEL const char *trillim_scalar_attention_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _attention as bind\n"
-           "def pattern(q: Tensor, k: Tensor, v: Tensor, *, causal: bool = True, scale = None, window = None) -> tuple[Tensor, ...]:\n"
-           "    return (Attention(q, k, v, causal=causal, scale=scale, window=window),)\n";
+           "def pattern(q: Tensor, k: Tensor, v: Tensor, *, causal: bool = True, scale = None, window = None, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
+           "    return (Attention(q, k, v, causal=causal, scale=scale, window=window, dtype=dtype),)\n";
 }
 
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_attention_parameters(void) {
@@ -356,6 +359,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_attention_parameters
         {"v_rows", "size_t", offsetof(TrillimAttentionParameters, v_rows), NULL},
         {"v_columns", "size_t", offsetof(TrillimAttentionParameters, v_columns), NULL},
         {"window", "size_t", offsetof(TrillimAttentionParameters, window), NULL},
+        {"output_dtype", "uint32_t", offsetof(TrillimAttentionParameters, output_dtype), NULL},
         {"q_dtype", "uint32_t", offsetof(TrillimAttentionParameters, q_dtype), NULL},
         {"k_dtype", "uint32_t", offsetof(TrillimAttentionParameters, k_dtype), NULL},
         {"v_dtype", "uint32_t", offsetof(TrillimAttentionParameters, v_dtype), NULL},
@@ -365,7 +369,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_attention_parameters
         {"scale", "float", offsetof(TrillimAttentionParameters, scale), NULL},
     };
     static const size_t inputs[] = {1, 1, 1};
-    static const size_t outputs[] = {4};
+    static const size_t outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(TrillimAttentionParameters), TRILLIM_ALIGNOF(TrillimAttentionParameters),
         sizeof(fields) / sizeof(fields[0]), fields, 3, 1,

@@ -213,6 +213,11 @@ static inline TrillimStatus trillim_rms_task(void *opaque, size_t row, size_t wo
     return TRILLIM_OK;
 }
 
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    const TrillimRMSNormParameters *p = parameters;
+    return output == 0 && input == 0 && p->input_dtype == p->output_dtype;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_rmsnorm(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -229,8 +234,8 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_rmsnorm(
 TRILLIM_KERNEL const char *trillim_scalar_rmsnorm_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _rmsnorm as bind\n"
-           "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0) -> tuple[Tensor, ...]:\n"
-           "    return (RMSNorm(x, weight=weight, weight_offset=weight_offset, eps=eps),)\n";
+           "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
+           "    return (RMSNorm(x, weight=weight, weight_offset=weight_offset, eps=eps, dtype=dtype),)\n";
 }
 
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rmsnorm_parameters(void) {
@@ -250,7 +255,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rmsnorm_parameters(v
     static const TrillimParameterSchema schema = {
         sizeof(TrillimRMSNormParameters), TRILLIM_ALIGNOF(TrillimRMSNormParameters),
         sizeof(fields) / sizeof(fields[0]), fields, 2, 1, trillim_rms_requirements,
-        NULL, inputs, outputs, 1
+        can_alias, inputs, outputs, 1
     };
     return &schema;
 }

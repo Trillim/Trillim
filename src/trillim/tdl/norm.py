@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .core import Add, Construct, Div, Mul, Reshape, Sqrt, Sub, Tensor
+from .core import Add, Cast, Construct, Div, DType, Mul, Reshape, Sqrt, Sub, Tensor
 from .math import Dim, Mean, Sum, _dims, _tensor, _Value
 
 
@@ -31,11 +31,13 @@ def RMSNorm(
     weight: _Value | None = None,
     eps: float = 1e-6,
     weight_offset: float = 0.0,
+    dtype: DType | None = None,
 ) -> Tensor:
     result = Div(x, Sqrt(Add(Mean(Mul(x, x), axes=(-1,), keepdims=True), eps)))
-    return (
+    result = (
         result if weight is None else Mul(result, Add(_tensor(weight), weight_offset))
     )
+    return result if dtype is None else Cast(result, dtype)
 
 
 @Construct

@@ -124,6 +124,8 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
             by_name[name].storage_shape = storage_shape
     by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
 
+    tensors_by_name = {buffer.name: tensor for tensor, buffer in layout.buffers.items()}
+
     def cache_source(name: str) -> str | None:
         buffer = by_name[name]
         while buffer.storage == "alias" and buffer.source is not None:
@@ -139,12 +141,21 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
         ):
             continue
         source = args.value
-        producer = source._producer
+        source_buffer = layout.buffers[source]
+        buffer = source_buffer
+        while buffer.storage == "alias" and buffer.source is not None:
+            buffer = by_name[buffer.source]
+        output = tensors_by_name[buffer.name]
+        producer = output._producer
         call = selection.calls.get(producer) if producer is not None else None
-        if call is None or source._consumers != [operator]:
+        if call is None or buffer.last > layout.positions[operator][0]:
             continue
-        buffer = layout.buffers[source]
-        if buffer.storage != "arena" or buffer.dtype != args.cache.dtype:
+        if (
+            buffer.storage != "arena"
+            or buffer.dtype != args.cache.dtype
+            or source_buffer.byte_offset is not None
+            or source_buffer.strides != _contiguous_strides(source_buffer.shape)
+        ):
             continue
         capacity_shape = tuple(
             dimension
@@ -152,7 +163,7 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
             if dimension is not None
         )
         axis = args.cache.axis
-        if args.action == "assign" and buffer.maximum_shape != capacity_shape:
+        if args.action == "assign" and source_buffer.maximum_shape != capacity_shape:
             continue
         if args.action == "append":
             if axis is None or math.prod(capacity_shape[:axis]) != 1:
@@ -160,13 +171,13 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
             if (
                 any(
                     dimension != capacity_shape[index]
-                    for index, dimension in enumerate(buffer.maximum_shape)
+                    for index, dimension in enumerate(source_buffer.maximum_shape)
                     if index != axis
                 )
-                or buffer.maximum_shape[axis] > capacity_shape[axis]
+                or source_buffer.maximum_shape[axis] > capacity_shape[axis]
             ):
                 continue
-            slot = call.outputs.index(source)
+            slot = call.outputs.index(output)
             alignment = call.kernel.parameter_schema.output_alignments[slot]
             if (
                 alignment > 64
@@ -216,6 +227,6 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
                 ),
             )
             layout.cache_guards.setdefault(call.anchor, []).append(
-                (_expression("add", length, buffer.shape[axis]), capacity)
+                (_expression("add", length, source_buffer.shape[axis]), capacity)
             )
         layout.direct_writes.add(operator)
