@@ -1,87 +1,10 @@
 #include "common.h"
 #include <math.h>
-#include <string.h>
 
-static inline float trillim_read_float(
-    const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
-) {
-    if (trillim_itemsize(dtype) != 0) {
-        TrillimValue value = trillim_load(data, index, dtype);
-        if (trillim_float(dtype)) {
-            return value.f;
-        }
-        return trillim_unsigned(dtype) ? (float)value.u : (float)value.i;
-    }
-    const uint8_t *values = (const uint8_t *)data;
-    size_t row = index / columns;
-    size_t column = index % columns;
-    if (dtype == TRILLIM_ROW_INT8) {
-        uint16_t bits;
-        int8_t code;
-        memcpy(&bits, values + rows * columns + row * 2, 2);
-        memcpy(&code, values + index, 1);
-        return (float)code * trillim_bf16(bits);
-    }
-    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 :
-        ((dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_BINARY ||
-          dtype == TRILLIM_GRP_TERNARY) ? 128 : 32);
-    size_t groups = columns / group + (columns % group != 0);
-    size_t total = rows * groups;
-    size_t block = row * groups + column / group;
-    size_t offset = column % group;
-    if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
-        size_t code = (values[block * 32 + offset % 32] >> (6 - (offset / 32) * 2)) & 3;
-        float scale;
-        if (dtype == TRILLIM_MAT_TERNARY) {
-            memcpy(&scale, values + total * 32, sizeof(scale));
-        } else {
-            uint16_t bits;
-            memcpy(&bits, values + total * 32 + block * 2, 2);
-            scale = trillim_bf16(bits);
-        }
-        return code == 3 ? NAN : (float)((int32_t)code - 1) * scale;
-    }
-    if (dtype == TRILLIM_MXFP4) {
-        static const float magnitudes[] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
-        uint8_t code = (values[block * 16 + offset / 2] >> ((offset % 2) * 4)) & 15;
-        uint8_t exponent = values[total * 16 + block];
-        float value = magnitudes[code & 7];
-        if ((code & 8) != 0) {
-            value = -value;
-        }
-        return exponent == 255 ? NAN : ldexpf(value, (int)exponent - 127);
-    }
-    size_t value_width = dtype == TRILLIM_GRP_INT8 ? 32 :
-        (dtype == TRILLIM_DUBGRP_INT6 ? 128 : 16);
-    size_t scale_start = total * value_width;
-    uint16_t bits;
-    memcpy(&bits, values + scale_start + block * 2, 2);
-    float scale = trillim_bf16(bits);
-    if (dtype == TRILLIM_GRP_INT8) {
-        int8_t code;
-        memcpy(&code, values + block * 32 + offset, 1);
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_BINARY) {
-        int32_t code = ((values[block * 16 + offset / 8] >> (7 - offset % 8)) & 1) ? 1 : -1;
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5) {
-        int32_t code = (values[block * 16 + offset % 16] >> ((offset / 16) * 4)) & 15;
-        if (dtype == TRILLIM_GRP_INT5) {
-            code |= ((values[scale_start + total * 2 + block * 4 + offset / 8] >> (offset % 8)) & 1) << 4;
-        }
-        return (float)(code - (dtype == TRILLIM_GRP_INT4 ? 8 : 16)) * scale;
-    }
-    size_t half = offset / 128;
-    size_t lane = (offset % 128) / 32;
-    size_t low = block * 128 + half * 64 + (lane / 2) * 32 + offset % 32;
-    size_t high = scale_start + total * 2 + block * 64 + half * 32 + offset % 32;
-    int32_t code = (values[low] >> ((lane % 2) * 4)) & 15;
-    code |= ((values[high] >> (lane * 2)) & 3) << 4;
-    int8_t subscale;
-    memcpy(&subscale, values + scale_start + total * (2 + 64) + block * 16 + offset / 16, 1);
-    return (float)((code - 32) * subscale) * scale;
+static inline float trillim_read_float(const void *data, size_t index, uint32_t dtype) {
+    TrillimValue value = trillim_load(data, index, dtype);
+    return trillim_float(dtype) ? value.f :
+        (trillim_unsigned(dtype) ? (float)value.u : (float)value.i);
 }
 
 typedef struct {
@@ -93,14 +16,16 @@ typedef struct {
     const size_t *strides;
     size_t position_stride;
     uint32_t position_dtype;
+    uint32_t input_dtype;
+    uint32_t output_dtype;
     uint32_t interleaved;
     float frequency_step;
     float amplitude;
 } TrillimRotaryParameters;
 
 typedef struct {
-    float *output;
-    const float *input;
+    void *output;
+    const void *input;
     const void *positions;
     const TrillimRotaryParameters *parameters;
     const TrillimKernelContext *context;
@@ -114,7 +39,8 @@ static inline TrillimStatus trillim_rotary_requirements(const void *parameters, 
     *scratch = 0;
     size_t position_bytes = trillim_itemsize(p->position_dtype);
     if (p->rank != 3 || p->rotary_dim == 0 || p->rotary_dim % 2 != 0 ||
-        p->rotary_dim > p->dim || position_bytes == 0 || p->interleaved > 1) {
+        p->rotary_dim > p->dim || position_bytes == 0 ||
+        !trillim_float(p->input_dtype) || !trillim_float(p->output_dtype) || p->interleaved > 1) {
         return TRILLIM_ERROR;
     }
     if (p->heads == 0 || p->tokens == 0) {
@@ -122,8 +48,8 @@ static inline TrillimStatus trillim_rotary_requirements(const void *parameters, 
     }
     size_t shape[] = {p->heads, p->tokens, p->dim};
     size_t span;
-    if (!trillim_span(3, shape, p->strides, &span) || span > SIZE_MAX / sizeof(float) ||
-        p->heads > SIZE_MAX / p->tokens || p->heads * p->tokens > SIZE_MAX / sizeof(float) / p->dim ||
+    if (!trillim_span(3, shape, p->strides, &span) || span > SIZE_MAX / trillim_itemsize(p->input_dtype) ||
+        p->heads > SIZE_MAX / p->tokens || p->heads * p->tokens > SIZE_MAX / trillim_itemsize(p->output_dtype) / p->dim ||
         (p->position_stride != 0 && p->tokens - 1 > (SIZE_MAX - 1) / p->position_stride)) {
         return TRILLIM_ERROR;
     }
@@ -131,10 +57,16 @@ static inline TrillimStatus trillim_rotary_requirements(const void *parameters, 
     if (positions > SIZE_MAX / position_bytes) {
         return TRILLIM_ERROR;
     }
-    inputs[0] = span * sizeof(float);
+    inputs[0] = span * trillim_itemsize(p->input_dtype);
     inputs[1] = positions * position_bytes;
-    outputs[0] = p->heads * p->tokens * p->dim * sizeof(float);
+    outputs[0] = p->heads * p->tokens * p->dim * trillim_itemsize(p->output_dtype);
     return TRILLIM_OK;
+}
+
+static void store(const TrillimRotaryTask *task, size_t index, float result) {
+    TrillimValue value;
+    value.f = result;
+    trillim_store(task->output, index, task->parameters->output_dtype, value);
 }
 
 static inline void trillim_rotate_pair(const TrillimRotaryTask *task, size_t base, size_t output, float position, size_t pair) {
@@ -145,10 +77,10 @@ static inline void trillim_rotate_pair(const TrillimRotaryTask *task, size_t bas
     float angle = position * frequency;
     float cosine = cosf(angle) * p->amplitude;
     float sine = sinf(angle) * p->amplitude;
-    float first = task->input[base + a * p->strides[2]];
-    float second = task->input[base + b * p->strides[2]];
-    task->output[output + a] = first * cosine - second * sine;
-    task->output[output + b] = second * cosine + first * sine;
+    float first = trillim_read_float(task->input, base + a * p->strides[2], p->input_dtype);
+    float second = trillim_read_float(task->input, base + b * p->strides[2], p->input_dtype);
+    store(task, output + a, first * cosine - second * sine);
+    store(task, output + b, second * cosine + first * sine);
 }
 
 static inline TrillimStatus trillim_rotary_task(void *opaque, size_t index, size_t worker) {
@@ -158,14 +90,14 @@ static inline TrillimStatus trillim_rotary_task(void *opaque, size_t index, size
     size_t head = index / p->tokens;
     size_t token = index % p->tokens;
     size_t base = head * p->strides[0] + token * p->strides[1];
-    size_t output = index * p->dim;
-    for (size_t column = 0; column < p->dim; ++column) {
+    size_t output = (token * p->heads + head) * p->dim;
+    for (size_t column = p->rotary_dim; column < p->dim; ++column) {
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        task->output[output + column] = task->input[base + column * p->strides[2]];
+        store(task, output + column, trillim_read_float(task->input, base + column * p->strides[2], p->input_dtype));
     }
-    float position = trillim_read_float(task->positions, token * p->position_stride, p->position_dtype, 1, p->tokens);
+    float position = trillim_read_float(task->positions, token * p->position_stride, p->position_dtype);
     for (size_t pair = 0; pair < p->rotary_dim / 2; ++pair) {
         if ((pair & 127) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -173,6 +105,13 @@ static inline TrillimStatus trillim_rotary_task(void *opaque, size_t index, size
         trillim_rotate_pair(task, base, output, position, pair);
     }
     return TRILLIM_OK;
+}
+
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    const TrillimRotaryParameters *p = parameters;
+    return output == 0 && input == 0 && p->input_dtype == p->output_dtype &&
+        p->strides[2] == 1 && (p->heads <= 1 || p->strides[0] == p->dim) &&
+        (p->tokens <= 1 || p->strides[1] == p->heads * p->dim);
 }
 
 TRILLIM_KERNEL TrillimStatus trillim_scalar_rotary(
@@ -184,15 +123,15 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_rotary(
         return TRILLIM_CANCELLED;
     }
     const TrillimRotaryParameters *p = (const TrillimRotaryParameters *)parameters;
-    TrillimRotaryTask task = {(float *)outputs[0], (const float *)inputs[0], inputs[1], p, context};
+    TrillimRotaryTask task = {outputs[0], inputs[0], inputs[1], p, context};
     return context->thread_pool->run(context->thread_pool->context, p->heads * p->tokens, trillim_rotary_task, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_scalar_rotary_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _rotary as bind\n"
-           "def pattern(x: Tensor, positions: Tensor, *, dim: int, theta: float = 10000.0, interleaved: bool = False, amplitude: float = 1.0) -> tuple[Tensor, ...]:\n"
-           "    return (Rotary(x, positions, dim=dim, theta=theta, interleaved=interleaved, amplitude=amplitude),)\n";
+           "def pattern(x: Tensor, positions: Tensor, *, dim: int, theta: float = 10000.0, interleaved: bool = False, amplitude: float = 1.0, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
+           "    return (Rotary(x, positions, dim=dim, theta=theta, interleaved=interleaved, amplitude=amplitude, dtype=dtype),)\n";
 }
 
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rotary_parameters(void) {
@@ -205,16 +144,18 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rotary_parameters(vo
         {"strides", "size_t", offsetof(TrillimRotaryParameters, strides), "rank"},
         {"position_stride", "size_t", offsetof(TrillimRotaryParameters, position_stride), NULL},
         {"position_dtype", "uint32_t", offsetof(TrillimRotaryParameters, position_dtype), NULL},
+        {"input_dtype", "uint32_t", offsetof(TrillimRotaryParameters, input_dtype), NULL},
+        {"output_dtype", "uint32_t", offsetof(TrillimRotaryParameters, output_dtype), NULL},
         {"interleaved", "uint32_t", offsetof(TrillimRotaryParameters, interleaved), NULL},
         {"frequency_step", "float", offsetof(TrillimRotaryParameters, frequency_step), NULL},
         {"amplitude", "float", offsetof(TrillimRotaryParameters, amplitude), NULL}
     };
-    static const size_t inputs[] = {4, 1};
-    static const size_t outputs[] = {4};
+    static const size_t inputs[] = {1, 1};
+    static const size_t outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(TrillimRotaryParameters), TRILLIM_ALIGNOF(TrillimRotaryParameters),
         sizeof(fields) / sizeof(fields[0]), fields, 2, 1,
-        trillim_rotary_requirements, NULL, inputs, outputs, 1
+        trillim_rotary_requirements, can_alias, inputs, outputs, 1
     };
     return &schema;
 }

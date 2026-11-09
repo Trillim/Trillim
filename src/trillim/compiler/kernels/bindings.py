@@ -641,11 +641,11 @@ def _rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     if (
         len(source.shape) != 3
         or len(positions.shape) != 1
-        or source.dtype != "fp32"
-        or context.outputs[0].dtype != "fp32"
+        or source.dtype not in {"fp16", "bf16", "fp32"}
+        or context.outputs[0].dtype not in {"fp16", "bf16", "fp32"}
     ):
         raise ValueError(
-            "fused Rotary requires FP32 [heads,tokens,channels] and one-dimensional positions"
+            "fused Rotary requires floating [tokens,heads,channels] and one-dimensional positions"
         )
     dim = context.attrs["dim"]
     theta = context.attrs.get("theta", 10000.0)
@@ -662,14 +662,19 @@ def _rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     if not isinstance(interleaved, bool):
         raise TypeError("interleaved must be boolean")
     return {
-        "heads": source.shape[0],
-        "tokens": source.shape[1],
+        "heads": source.shape[1],
+        "tokens": source.shape[0],
         "dim": source.shape[2],
         "rotary_dim": dim,
         "rank": 3,
-        "strides": source.strides or _contiguous_strides(source.shape),
+        "strides": tuple(
+            (source.strides or _contiguous_strides(source.shape))[axis]
+            for axis in (1, 0, 2)
+        ),
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "output_dtype": _DTYPE_IDS[context.outputs[0].dtype],
         "position_stride": _broadcast_strides(
-            positions.shape, (source.shape[1],), positions.strides
+            positions.shape, (source.shape[0],), positions.strides
         )[0],
         "position_dtype": _native_dtype(positions.dtype),
         "interleaved": int(interleaved),
@@ -692,10 +697,14 @@ def _attention(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     q, k, v = context.inputs["q"], context.inputs["k"], context.inputs["v"]
     if any(len(binding.shape) != 3 for binding in (q, k, v)):
         raise ValueError(
-            "fused attention requires rank-three head/token/channel tensors"
+            "fused attention requires rank-three token/head/channel tensors"
         )
-    if q.dtype != "fp32" or context.outputs[0].dtype != "fp32":
-        raise ValueError("fused attention requires FP32 queries and output")
+    if q.dtype not in {"fp16", "bf16", "fp32"} or context.outputs[0].dtype not in {
+        "fp16",
+        "bf16",
+        "fp32",
+    }:
+        raise ValueError("fused attention requires floating queries and output")
     causal = context.attrs.get("causal", True)
     scale = context.attrs.get("scale")
     window = context.attrs.get("window")
@@ -709,16 +718,22 @@ def _attention(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     k_rows, k_columns = _storage_shape(k)
     v_rows, v_columns = _storage_shape(v)
     return {
-        "heads": q.shape[0],
-        "kv_heads": k.shape[0],
-        "queries": q.shape[1],
-        "length": k.shape[1],
+        "heads": q.shape[1],
+        "kv_heads": k.shape[1],
+        "queries": q.shape[0],
+        "length": k.shape[0],
         "key_dim": q.shape[2],
         "value_dim": v.shape[2],
         "rank": 3,
-        "q_strides": q.strides or _contiguous_strides(q.shape),
-        "k_strides": k.strides or _contiguous_strides(k.shape),
-        "v_strides": v.strides or _contiguous_strides(v.shape),
+        "q_strides": tuple(
+            (q.strides or _contiguous_strides(q.shape))[axis] for axis in (1, 0, 2)
+        ),
+        "k_strides": tuple(
+            (k.strides or _contiguous_strides(k.shape))[axis] for axis in (1, 0, 2)
+        ),
+        "v_strides": tuple(
+            (v.strides or _contiguous_strides(v.shape))[axis] for axis in (1, 0, 2)
+        ),
         "q_rows": q_rows,
         "q_columns": q_columns,
         "k_rows": k_rows,
@@ -726,6 +741,7 @@ def _attention(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
         "v_rows": v_rows,
         "v_columns": v_columns,
         "window": window if isinstance(window, int) else 0,
+        "output_dtype": _DTYPE_IDS[context.outputs[0].dtype],
         "q_dtype": _DTYPE_IDS[q.dtype],
         "k_dtype": _DTYPE_IDS[k.dtype],
         "v_dtype": _DTYPE_IDS[v.dtype],

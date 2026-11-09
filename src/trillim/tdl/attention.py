@@ -5,10 +5,12 @@ from .core import (
     Add,
     Broadcast,
     Cache,
+    Cast,
     Compare,
     Constant,
     Construct,
     Div,
+    DType,
     Exp,
     FloorDiv,
     Gather,
@@ -43,28 +45,31 @@ def Attention(
     softcap: float | None = None,
     sinks: _Value | None = None,
     softmax: bool = True,
+    dtype: DType = "fp32",
 ) -> Tensor:
-    """Grouped-query attention on [heads, tokens, channels] for one sequence.
+    """Grouped-query attention on [tokens, heads, channels] for one sequence.
 
     Masks add to scores. Explicit positions are absolute one-dimensional token
     indices; defaults align queries to the right edge of keys for cached decode.
     """
-    groups = FloorDiv(Dim(q, 0), Dim(k, 0))
-    head_indices = FloorDiv(Iota(Dim(q, 0)), groups)
-    k = Take(k, head_indices, axis=0, rank=3)
-    v = Take(v, head_indices, axis=0, rank=3)
-    scores = Matmul(q, Permute(k, (0, 2, 1)))
-    factor = Div(Constant(1.0), Sqrt(Dim(q, -1))) if scale is None else Constant(scale)
+    queries, length = Dim(q, 0), Dim(k, 0)
+    heads, kv_heads = Dim(q, 1), Dim(k, 1)
+    groups = FloorDiv(heads, kv_heads)
+    key_dim, value_dim = Dim(q, -1), Dim(v, -1)
+    grouped_q = Permute(Reshape(q, (queries, kv_heads, groups, key_dim)), (1, 2, 0, 3))
+    grouped_k = Reshape(Permute(k, (1, 2, 0)), (kv_heads, 1, key_dim, length))
+    scores = Reshape(Matmul(grouped_q, grouped_k), (heads, queries, length))
+    factor = Div(Constant(1.0), Sqrt(key_dim)) if scale is None else Constant(scale)
     scores = Mul(scores, factor)
     if softcap is not None:
         scores = Mul(Tanh(Div(scores, softcap)), softcap)
     if causal or window is not None:
         qp = (
-            Add(Iota(Dim(q, 1)), Sub(Dim(k, 1), Dim(q, 1)))
+            Add(Iota(queries), Sub(length, queries))
             if query_positions is None
             else query_positions
         )
-        kp = Iota(Dim(k, 1)) if key_positions is None else key_positions
+        kp = Iota(length) if key_positions is None else key_positions
         distance = Sub(Reshape(qp, (-1, 1)), kp)
         visible = (
             Compare(distance, 0, predicate="ge")
@@ -78,7 +83,12 @@ def Attention(
         scores = Add(scores, mask)
     sink_values = None if sinks is None else Reshape(_tensor(sinks), (-1, 1, 1))
     probabilities = Softmax(scores, sinks=sink_values) if softmax else scores
-    return Matmul(probabilities, v)
+    grouped = Reshape(probabilities, (kv_heads, groups, queries, length))
+    grouped = Reshape(
+        Permute(grouped, (2, 0, 1, 3)), (queries, kv_heads, groups, 1, length)
+    )
+    grouped_v = Reshape(Permute(v, (1, 0, 2)), (1, kv_heads, 1, length, value_dim))
+    return Cast(Reshape(Matmul(grouped, grouped_v), (queries, heads, value_dim)), dtype)
 
 
 @Construct
@@ -136,7 +146,11 @@ def RelativeAttention(
     position_bias: Tensor,
     mask: Tensor | None = None,
 ) -> Tensor:
-    """Transformer-XL scores; relative keys [H,2T-1,D], descending positions."""
+    """Transformer-XL scores; relative keys [2T-1,H,D], descending positions."""
+
+    q, k, v, relative_keys = (
+        Permute(value, (1, 0, 2)) for value in (q, k, v, relative_keys)
+    )
 
     content = Matmul(
         Add(q, Reshape(content_bias, (Dim(q, 0), 1, Dim(q, 2)))), Permute(k, (0, 2, 1))
@@ -155,17 +169,21 @@ def RelativeAttention(
     scores = Div(Add(content, shifted), Sqrt(Dim(q, -1)))
     if mask is not None:
         scores = Add(scores, mask)
-    return Matmul(Softmax(scores), v)
+    probabilities = Reshape(
+        Permute(Softmax(scores), (1, 0, 2)), (length, Dim(q, 0), 1, length)
+    )
+    values = Reshape(v, (1, Dim(v, 0), length, Dim(v, 2)))
+    return Reshape(Matmul(probabilities, values), (length, Dim(q, 0), Dim(v, 2)))
 
 
 @Construct
 def SplitHeads(x: Tensor, *, heads: int, head_dim: int | None = None) -> Tensor:
-    """Convert [T,H*D] to [H,T,D]."""
+    """View [T,H*D] as [T,H,D]."""
     width = FloorDiv(Dim(x, -1), heads) if head_dim is None else head_dim
-    return Permute(Reshape(x, (Dim(x, 0), heads, width)), (1, 0, 2))
+    return Reshape(x, (Dim(x, 0), heads, width))
 
 
 @Construct
 def MergeHeads(x: Tensor) -> Tensor:
-    """Convert [H,T,D] to [T,H*D]."""
-    return Reshape(Permute(x, (1, 0, 2)), (Dim(x, 1), -1))
+    """View [T,H,D] as [T,H*D]."""
+    return Reshape(x, (Dim(x, 0), -1))

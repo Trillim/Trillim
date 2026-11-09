@@ -6,9 +6,11 @@ import numpy as np
 
 from .core import (
     Add,
+    Cast,
     Constant,
     Construct,
     Cos,
+    DType,
     Exp,
     Gather,
     Iota,
@@ -32,8 +34,9 @@ def Rotary(
     interleaved: bool = False,
     frequencies: Tensor | None = None,
     amplitude: float = 1.0,
+    dtype: DType = "fp32",
 ) -> Tensor:
-    """Rotate a prefix of [H,T,D]; positions have shape [T]."""
+    """Rotate a prefix of [T,H,D]; positions have shape [T]."""
     if dim <= 0 or dim % 2 or theta <= 0:
         raise ValueError("rotary dimension must be positive/even and theta positive")
     frequency = (
@@ -42,9 +45,9 @@ def Rotary(
         else frequencies
     )
     angles = Mul(Reshape(positions, (-1, 1)), frequency)
-    angles = Reshape(angles, (1, -1, dim // 2))
+    angles = Reshape(angles, (-1, 1, dim // 2))
     return RotaryFromAngles(
-        x, angles, dim=dim, interleaved=interleaved, amplitude=amplitude
+        x, angles, dim=dim, interleaved=interleaved, amplitude=amplitude, dtype=dtype
     )
 
 
@@ -56,8 +59,9 @@ def RotaryFromAngles(
     dim: int,
     interleaved: bool = False,
     amplitude: float = 1.0,
+    dtype: DType = "fp32",
 ) -> Tensor:
-    """Apply a supplied [1,T,dim/2] frequency phase to a prefix of X."""
+    """Apply a supplied [T,1,dim/2] frequency phase to a prefix of X."""
     cosine = Mul(Cos(angles), amplitude)
     sine = Mul(Sin(angles), amplitude)
     prefix = Slice(x, axis=2, stop=dim, rank=3)
@@ -76,7 +80,9 @@ def RotaryFromAngles(
         )
     else:
         rotated = Concat((first, second), axis=2, rank=3)
-    return Concat((rotated, Slice(x, axis=2, start=dim, rank=3)), axis=2, rank=3)
+    return Cast(
+        Concat((rotated, Slice(x, axis=2, start=dim, rank=3)), axis=2, rank=3), dtype
+    )
 
 
 @Construct
@@ -92,6 +98,7 @@ def YaRN(
     beta_slow: float = 1.0,
     attention_factor: float | None = None,
     truncate: bool = True,
+    dtype: DType = "fp32",
 ) -> Tensor:
     def correction(rotations: float) -> float:
         return (
@@ -116,7 +123,13 @@ def YaRN(
         0.1 * math.log(factor) + 1 if attention_factor is None else attention_factor
     )
     return Rotary(
-        x, positions, dim=dim, theta=theta, frequencies=frequencies, amplitude=amplitude
+        x,
+        positions,
+        dim=dim,
+        theta=theta,
+        frequencies=frequencies,
+        amplitude=amplitude,
+        dtype=dtype,
     )
 
 
@@ -128,6 +141,7 @@ def AxialRotary(
     sections: tuple[int, ...],
     theta: float = 10000.0,
     interleaved: bool = True,
+    dtype: DType = "fp32",
 ) -> Tensor:
     """Positions [T,axes]; sections specify full rotary dimensions per axis."""
     pieces: list[Tensor] = []
@@ -136,11 +150,17 @@ def AxialRotary(
         part = Slice(x, axis=2, start=offset, stop=offset + dim, rank=3)
         position = Take(positions, Constant(axis), axis=1, rank=2, index_rank=0)
         pieces.append(
-            Rotary(part, position, dim=dim, theta=theta, interleaved=interleaved)
+            Rotary(
+                part,
+                position,
+                dim=dim,
+                theta=theta,
+                interleaved=interleaved,
+            )
         )
         offset += dim
     pieces.append(Slice(x, axis=2, start=offset, rank=3))
-    return Concat(tuple(pieces), axis=2, rank=3)
+    return Cast(Concat(tuple(pieces), axis=2, rank=3), dtype)
 
 
 @Construct
@@ -152,6 +172,7 @@ def MRope(
     sections: tuple[int, ...],
     theta: float = 10000.0,
     interleaved_frequencies: bool = True,
+    dtype: DType = "fp32",
 ) -> Tensor:
     """Qwen multimodal positions [T,axes] with shared inverse frequencies."""
 
@@ -168,5 +189,5 @@ def MRope(
     )
     selected = Permute(selected, (1, 0))
     frequencies = Exp(Mul(Iota(dim // 2), -2 * math.log(theta) / dim))
-    angles = Reshape(Mul(selected, frequencies), (1, Dim(positions, 0), dim // 2))
-    return RotaryFromAngles(x, angles, dim=dim)
+    angles = Reshape(Mul(selected, frequencies), (Dim(positions, 0), 1, dim // 2))
+    return RotaryFromAngles(x, angles, dim=dim, dtype=dtype)
