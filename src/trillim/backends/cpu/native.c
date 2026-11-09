@@ -16,7 +16,8 @@
 #include <time.h>
 #endif
 
-static volatile sig_atomic_t signal_cancelled;
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "cancellation requires lock-free atomics");
+static atomic_bool signal_cancelled;
 static atomic_flag executing = ATOMIC_FLAG_INIT;
 
 uint64_t trillim_cpu_features(void) {
@@ -49,7 +50,7 @@ uint64_t trillim_cpu_features(void) {
 
 static void cancel_signal(int signal_number) {
     (void)signal_number;
-    signal_cancelled = 1;
+    atomic_store_explicit(&signal_cancelled, true, memory_order_relaxed);
 }
 
 static void *allocate(size_t size, size_t alignment) {
@@ -74,7 +75,8 @@ static void release(void *address) {
 
 static bool is_cancelled(void *context) {
     TrillimCpuContext *backend = context;
-    return signal_cancelled != 0 || atomic_load_explicit(&backend->cancelled, memory_order_relaxed);
+    return atomic_load_explicit(&signal_cancelled, memory_order_relaxed) ||
+        atomic_load_explicit(&backend->cancelled, memory_order_relaxed);
 }
 
 static void spin_pause(void) {
@@ -307,7 +309,7 @@ TrillimStatus trillim_cpu_enter(TrillimCpuContext *context) {
     if (atomic_flag_test_and_set(&executing)) {
         return TRILLIM_ERROR;
     }
-    signal_cancelled = 0;
+    atomic_store_explicit(&signal_cancelled, false, memory_order_relaxed);
 #ifdef _WIN32
     context->previous_interrupt = signal(SIGINT, cancel_signal);
     if (context->previous_interrupt == SIG_ERR) {
@@ -378,7 +380,7 @@ TrillimStatus trillim_cpu_run(
         return TRILLIM_ERROR;
     }
 #endif
-    signal_cancelled = 0;
+    atomic_store_explicit(&signal_cancelled, false, memory_order_relaxed);
     for (size_t index = 0; index < samples; ++index) {
         uint64_t start = monotonic_nanoseconds();
         if (start == 0) {
