@@ -7,6 +7,7 @@ from .core import (
     Constant,
     Construct,
     Div,
+    DType,
     Matmul,
     Mod,
     Mul,
@@ -44,8 +45,9 @@ def Linear(
 
 
 @Construct
-def BitLinear(x: Tensor, weight: _Value) -> Tensor:
-    """Project nearest-even INT8 activation codes and rescale the output to FP32."""
+def QuantizeInt8(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return nearest-even INT8 codes and the FP32 per-row multiplier."""
+    x = Cast(x, "fp32")
     scale = Div(Constant(127.0), Maximum(Max(Abs(x), axes=(-1,), keepdims=True), 1e-5))
     scaled = Mul(x, scale)
     magnitude = Abs(scaled)
@@ -59,4 +61,19 @@ def BitLinear(x: Tensor, weight: _Value) -> Tensor:
     rounded = Add(integer, Cast(increment, "int8"))
     signed = Select(Compare(scaled, 0.0, predicate="lt"), Mul(rounded, -1), rounded)
     quantized = Cast(Clip(signed, -128, 127), "int8")
-    return Div(Linear(quantized, weight), scale)
+    return quantized, scale
+
+
+@Construct
+def QuantizedLinear(
+    x: Tensor, weight: _Value, scale: Tensor, *, dtype: DType = "fp32"
+) -> Tensor:
+    """Project shared activation codes, then undo their quantization multiplier."""
+    return Cast(Div(Linear(x, weight), scale), dtype)
+
+
+@Construct
+def BitLinear(x: Tensor, weight: _Value) -> Tensor:
+    """Quantize activations and project them to FP32 in one composition."""
+    codes, scale = QuantizeInt8(x)
+    return QuantizedLinear(codes, weight, scale)

@@ -31,6 +31,8 @@ These four native exports define the kernel API. The Python helpers used by buil
 
 Logical tensors use ordinary mathematical shapes. Contiguous storage uses the last dimension as the fastest changing axis. Views may use permuted or zero strides; kernels receive the strides they need in their own parameter structs. Packed weights retain their logical dtype while the compiler selects their physical layout.
 
+`QuantizeInt8(x)` returns contiguous INT8 activation codes and an FP32 multiplier per row, shaped `[..., 1]`. The multiplier is `127 / max(abs(x), 1e-5)` along the final axis; codes round to nearest even. `QuantizedLinear(codes, weight, multiplier, dtype=...)` projects these shared codes and divides by the multiplier. Its scalar and AVX2 kernels consume canonical ternary weights and write FP16, BF16 or FP32 without an activation quantization workspace. A model can quantize once for Q/K/V or gate/up instead of repeating the work in each projection. `BitLinear` composes both stages when sharing is unnecessary.
+
 Parameters contain fixed-width scalars, `size_t` values, and borrowed arrays with explicit lengths. Their native layout comes from the compiled kernel. There is no universal parameter struct or implicit argument order beyond each kernel's declared slots.
 
 The requirements function reports all readable input bytes, writable output bytes, and scratch bytes for an invocation. Kernels must stay within those spans. Outputs and temporary workspace share the compiler's arena; live outputs cannot be overwritten. Kernels must not allocate heap memory or retain pointers after returning.

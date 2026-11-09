@@ -323,7 +323,10 @@ def _fixture(
             source = "bounded_integer"
     else:
         data = state.rng.standard_normal(shape, dtype=np.float32)
-        if candidate.anchor.op in {"sqrt", "log"}:
+        if candidate.anchor.op in {"sqrt", "log"} or (
+            candidate.anchor.op == "trillim.tdl.linear.QuantizedLinear"
+            and candidate.bindings.get("scale") is tensor
+        ):
             data = np.abs(data) + np.float32(1e-3)
             source = "positive_normal"
     encoded = _codec._encode(data, dtype)[0].tobytes()
