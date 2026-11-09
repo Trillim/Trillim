@@ -51,6 +51,11 @@ static inline TrillimStatus trillim_activation_task(void *opaque, size_t tile, s
     return TRILLIM_OK;
 }
 
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    (void)parameters;
+    return output == 0 && input < 2;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_silu_mul(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -79,7 +84,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_silu_mul_parameters(
     static const size_t outputs[] = {4};
     static const TrillimParameterSchema schema = {
         sizeof(TrillimActivationParameters), TRILLIM_ALIGNOF(TrillimActivationParameters),
-        1, fields, 2, 1, trillim_activation_requirements, NULL, inputs, outputs, 1
+        1, fields, 2, 1, trillim_activation_requirements, can_alias, inputs, outputs, 1
     };
     return &schema;
 }

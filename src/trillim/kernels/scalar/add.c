@@ -72,6 +72,12 @@ static inline TrillimStatus trillim_binary_task(void *opaque, size_t tile, size_
     return TRILLIM_OK;
 }
 
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    const TrillimBinaryParameters *p = (const TrillimBinaryParameters *)parameters;
+    return output == 0 && input < 2 && trillim_contiguous(
+        p->rank, p->shape, input == 0 ? p->a_strides : p->b_strides);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_add(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -107,7 +113,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_add_parameters(void)
     static const TrillimParameterSchema schema = {
         sizeof(TrillimBinaryParameters), TRILLIM_ALIGNOF(TrillimBinaryParameters),
         sizeof(fields) / sizeof(fields[0]), fields, 2, 1,
-        trillim_binary_requirements, NULL, inputs, outputs, 1
+        trillim_binary_requirements, can_alias, inputs, outputs, 1
     };
     return &schema;
 }

@@ -35,6 +35,8 @@ Parameters contain fixed-width scalars, `size_t` values, and borrowed arrays wit
 
 The requirements function reports all readable input bytes, writable output bytes, and scratch bytes for an invocation. Kernels must stay within those spans. Outputs and temporary workspace share the compiler's arena; live outputs cannot be overwritten. Kernels must not allocate heap memory or retain pointers after returning.
 
+`can_alias(parameters, output_slot, input_slot)` permits an output pointer to equal the specified input pointer. A null callback forbids overlap. Every overlapping input slot must grant permission, including when multiple inputs share one tensor. Permission must account for strides, broadcasting and worker access order. The compiler reuses only dead arena storage with matching dtype, shape and contiguous access; it preserves live views and excludes caller inputs, weights and caches. It currently queries permissions only when all parameters are statically known. Reused outputs remain separate logical tensors and appear as aliases in the manifest.
+
 Only one kernel runs at a time. Its borrowed thread pool runs numbered tasks synchronously; workers claim tasks as they become free. Returning from the pool drains all tasks, including after failure or cancellation. Nested pool calls are unsupported.
 
 Kernels check cancellation between bounded chunks of work and return `TRILLIM_CANCELLED`. Any other failure ends execution of the model. No output or cache state from a failed invocation may be reused.

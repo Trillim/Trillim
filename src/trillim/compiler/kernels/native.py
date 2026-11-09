@@ -134,5 +134,6 @@ def _read_schema(library: c.CDLL, name: str) -> _ParameterSchema:
         else (),
         native.scratch_alignment,
         int(native.requirements),
+        int(native.can_alias) if native.can_alias else None,
         native_type,
     )
