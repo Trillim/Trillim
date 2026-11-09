@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ...tdl.core.graph import Graph
 from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
 from ..compiler_dataclasses import _Inference
@@ -22,7 +21,6 @@ class _KernelMatch:
 
 @dataclass(slots=True)
 class _KernelPattern:
-    graph: Graph
     inputs: dict[Tensor, str]
     outputs: tuple[Tensor, ...]
     inference: _Inference

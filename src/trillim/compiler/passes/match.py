@@ -304,7 +304,7 @@ def _pattern(
         facts = _infer(graph)
         if _optimize(graph, facts):
             facts = _infer(graph)
-        return _KernelPattern(graph, leaves, tuple(graph._outputs.values()), facts)
+        return _KernelPattern(leaves, tuple(graph._outputs.values()), facts)
     except (TypeError, ValueError, IndexError, NotImplementedError):
         return None
 

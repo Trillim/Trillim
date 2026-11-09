@@ -1217,7 +1217,7 @@ def _ordinary(
 
 
 def _joined_shape(
-    state: _InferenceState, output: Tensor, left: _TensorInfo, right: _TensorInfo
+    output: Tensor, left: _TensorInfo, right: _TensorInfo
 ) -> tuple[_ShapeExpression, ...]:
     if left.shape is None or right.shape is None or len(left.shape) != len(right.shape):
         raise ValueError("control-flow results must have a stable tensor rank")
@@ -1491,7 +1491,7 @@ def _control(
         ):
             dtype = _promote(_dtype(state, a), _dtype(state, b), numeric=False)
             shape = _joined_shape(
-                state, output, state.result.tensors[a], state.result.tensors[b]
+                output, state.result.tensors[a], state.result.tensors[b]
             )
             left_outputs[index] = _cast(state, left, a, dtype, convert)
             right_outputs[index] = _cast(state, right, b, dtype, convert)
@@ -1600,7 +1600,7 @@ def _control(
                     raise ValueError("reducer must return scalar accumulator values")
                 shape = ()
             else:
-                shape = _joined_shape(state, body.parameters[index], start, end)
+                shape = _joined_shape(body.parameters[index], start, end)
             joined_infos.append(
                 _TensorInfo(shape, tuple(d.maximum for d in shape), dtype)
             )

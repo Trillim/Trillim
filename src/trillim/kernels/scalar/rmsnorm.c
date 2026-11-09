@@ -149,17 +149,14 @@ typedef struct {
     const void *weight;
     const TrillimRMSNormParameters *parameters;
     const TrillimKernelContext *context;
-    bool weighted;
 } TrillimRMSNormTask;
 
 static inline TrillimStatus trillim_rms_requirements(
-    const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch, bool weighted
+    const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch
 ) {
     const TrillimRMSNormParameters *p = (const TrillimRMSNormParameters *)parameters;
     inputs[0] = 0;
-    if (weighted) {
-        inputs[1] = 0;
-    }
+    inputs[1] = 0;
     outputs[0] = 0;
     *scratch = 0;
     size_t bytes = trillim_itemsize(p->output_dtype);
@@ -175,19 +172,11 @@ static inline TrillimStatus trillim_rms_requirements(
         !trillim_payload_size(p->storage_rows, p->storage_columns, p->input_dtype, &inputs[0])) {
         return TRILLIM_ERROR;
     }
-    if (weighted && !trillim_payload_size(1, p->width, p->weight_dtype, &inputs[1])) {
+    if (!trillim_payload_size(1, p->width, p->weight_dtype, &inputs[1])) {
         return TRILLIM_ERROR;
     }
     outputs[0] = p->rows * p->width * bytes;
     return TRILLIM_OK;
-}
-
-static inline TrillimStatus trillim_rms_weighted_requirements(const void *p, size_t *inputs, size_t *outputs, size_t *scratch) {
-    return trillim_rms_requirements(p, inputs, outputs, scratch, true);
-}
-
-static inline TrillimStatus trillim_rms_plain_requirements(const void *p, size_t *inputs, size_t *outputs, size_t *scratch) {
-    return trillim_rms_requirements(p, inputs, outputs, scratch, false);
 }
 
 static inline TrillimStatus trillim_rms_task(void *opaque, size_t row, size_t worker) {
@@ -216,10 +205,8 @@ static inline TrillimStatus trillim_rms_task(void *opaque, size_t row, size_t wo
             TrillimValue value;
             value.f = trillim_read_float(task->input, row * p->width + column,
                 p->input_dtype, p->storage_rows, p->storage_columns) / denominator;
-            if (task->weighted) {
-                float weight = trillim_read_float(task->weight, column, p->weight_dtype, 1, p->width);
-                value.f *= weight + p->weight_offset;
-            }
+            float weight = trillim_read_float(task->weight, column, p->weight_dtype, 1, p->width);
+            value.f *= weight + p->weight_offset;
             trillim_store(task->output, row * p->width + column, p->output_dtype, value);
         }
     }
@@ -235,7 +222,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_rmsnorm(
         return TRILLIM_CANCELLED;
     }
     const TrillimRMSNormParameters *p = (const TrillimRMSNormParameters *)parameters;
-    TrillimRMSNormTask task = {outputs[0], inputs[0], true ? inputs[1] : NULL, p, context, true};
+    TrillimRMSNormTask task = {outputs[0], inputs[0], inputs[1], p, context};
     return context->thread_pool->run(context->thread_pool->context, p->rows, trillim_rms_task, &task);
 }
 
@@ -260,17 +247,12 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_rmsnorm_parameters(v
     };
     static const size_t inputs[] = {1, 1};
     static const size_t outputs[] = {1};
-    static const TrillimParameterSchema weighted_schema = {
+    static const TrillimParameterSchema schema = {
         sizeof(TrillimRMSNormParameters), TRILLIM_ALIGNOF(TrillimRMSNormParameters),
-        sizeof(fields) / sizeof(fields[0]), fields, 2, 1, trillim_rms_weighted_requirements,
+        sizeof(fields) / sizeof(fields[0]), fields, 2, 1, trillim_rms_requirements,
         NULL, inputs, outputs, 1
     };
-    static const TrillimParameterSchema plain_schema = {
-        sizeof(TrillimRMSNormParameters), TRILLIM_ALIGNOF(TrillimRMSNormParameters),
-        sizeof(fields) / sizeof(fields[0]), fields, 1, 1, trillim_rms_plain_requirements,
-        NULL, inputs, outputs, 1
-    };
-    return true ? &weighted_schema : &plain_schema;
+    return &schema;
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_rmsnorm_capabilities(void) {
