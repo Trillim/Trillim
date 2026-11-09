@@ -611,8 +611,11 @@ def _avx2_bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue
 
 def _avx2_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     result = _linear(context)
-    if context.inputs["x"].dtype != "fp32" or context.outputs[0].dtype != "fp32":
-        raise ValueError("AVX2 linear requires FP32 activations and output")
+    if (
+        context.inputs["x"].dtype not in {"fp32", "bf16"}
+        or context.outputs[0].dtype not in {"fp32", "bf16"}
+    ):
+        raise ValueError("AVX2 linear requires FP32 or BF16 activations and output")
     for name in ("a_col_stride", "b_row_stride"):
         stride = result[name]
         if (
