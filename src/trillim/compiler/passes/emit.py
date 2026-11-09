@@ -59,23 +59,29 @@ def _program(
         if kernel is None:
             raise ValueError("control flow requires a native transfer kernel")
         workspace = layout.transfer_scratch[operator]
-        return [
-            {
-                "op": "call",
-                "kernel": kernel.name,
-                "inputs": [names[source]],
-                "outputs": [names[destination]],
-                "shape_from": {names[destination]: names[source]},
-                "parameters": {
-                    key: _parameter(value, names, expressions)
-                    for key, value in _transfers._parameters(
-                        layout, source, destination
-                    ).items()
-                },
-                "scratch": {"offset": workspace.offset, "size": workspace.size},
-            }
-            for source, destination in _transfers._pairs(operator)[phase]
-        ]
+        result: list[_JSON] = []
+        for source, destination in _transfers._pairs(operator)[phase]:
+            if (source, destination) in layout.shared_transfers:
+                if layout.buffers[destination].storage == "alias":
+                    result.append({"op": "views", "outputs": [names[destination]]})
+                continue
+            result.append(
+                {
+                    "op": "call",
+                    "kernel": kernel.name,
+                    "inputs": [names[source]],
+                    "outputs": [names[destination]],
+                    "shape_from": {names[destination]: names[source]},
+                    "parameters": {
+                        key: _parameter(value, names, expressions)
+                        for key, value in _transfers._parameters(
+                            layout, source, destination
+                        ).items()
+                    },
+                    "scratch": {"offset": workspace.offset, "size": workspace.size},
+                }
+            )
+        return result
 
     for operator in region.operators:
         call = selection.calls.get(operator)

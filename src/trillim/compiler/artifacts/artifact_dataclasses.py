@@ -32,6 +32,7 @@ class _Buffer:
     alignment: int = 64
     first: int = 0
     last: int = 0
+    last_read: int = 0
     storage_shape: tuple[_ShapeExpression, _ShapeExpression] | None = None
     byte_offset: _ShapeExpression | None = None
     values: tuple[_ShapeExpression, ...] | None = None
@@ -74,6 +75,7 @@ class _Layout:
     )
     transfer_kernel: _Kernel | None = None
     transfer_scratch: dict[_Operator, _Workspace] = field(default_factory=dict)
+    shared_transfers: set[tuple[Tensor, Tensor]] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)

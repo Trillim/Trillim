@@ -15,7 +15,6 @@ from ...tdl.core.core_pydantic_models import (
     _PermuteArgs,
     _ReduceArgs,
     _ReshapeArgs,
-    _WhileArgs,
 )
 from ...tdl.core.graph import Graph
 from ...tdl.core.tensor import Tensor
@@ -27,7 +26,7 @@ from ..artifacts.expressions import (
     _parameter_references,
     _references,
 )
-from ..artifacts.parameters import _can_alias, _requirements
+from ..artifacts.parameters import _requirements
 from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..dtype import _encode
 from ..kernels.bindings import (
@@ -42,6 +41,7 @@ from ..weights.weights_pydantic_models import _WeightManifest
 from .cache import _bind_caches
 from .infer import _constant_expression
 from .passes_dataclasses import _Selection
+from .reuse import _bind_loops, _inplace, _reuse_loops
 from .walk import _walk
 
 
@@ -60,6 +60,7 @@ def _schedule(
             buffer = layout.buffers[tensor]
             buffer.first = min(buffer.first, position)
             buffer.last = max(buffer.last, position)
+            buffer.last_read = max(buffer.last_read, position)
 
     touch(region.parameters, clock[0])
     for operator in region.operators:
@@ -72,20 +73,24 @@ def _schedule(
         if call is not None:
             for parameter in call.parameters.values():
                 touch(_parameter_references(parameter), start)
+        if call is None:
+            for body in operator.regions:
+                _schedule(body, selection, layout, live, clock)
+        stop = clock[0]
+        clock[0] += 1
         for constraint in layout.inference.constraints:
             if (
                 constraint.operator is operator
                 or call is not None
                 and constraint.operator in call.covered
             ):
-                touch(
-                    _references(constraint.left) | _references(constraint.right), start
+                references = _references(constraint.left) | _references(
+                    constraint.right
                 )
-        if call is None:
-            for body in operator.regions:
-                _schedule(body, selection, layout, live, clock)
-        stop = clock[0]
-        clock[0] += 1
+                touch(
+                    references,
+                    stop if references & set(operator.outputs) else start,
+                )
         touch(operator.outputs, start)
         if (
             operator.regions
@@ -97,7 +102,7 @@ def _schedule(
             touch(body.outputs, stop)
             # Captures must survive every iteration, even after their final textual use.
             touch(body.captures, stop)
-            if isinstance(operator.args, (_WhileArgs, _ReduceArgs)):
+            if isinstance(operator.args, _ReduceArgs):
                 touch(body.parameters, stop)
         layout.positions[operator] = start, stop
     touch(region.outputs, clock[0])
@@ -194,6 +199,7 @@ def _views(region: _Region, selection: _Selection, layout: _Layout) -> None:
 def _lifetimes(layout: _Layout, live: set[Tensor]) -> None:
     by_name = {buffer.name: tensor for tensor, buffer in layout.buffers.items()}
     dependencies: dict[Tensor, set[Tensor]] = {}
+    value_dependencies: dict[Tensor, set[Tensor]] = {}
     for tensor, buffer in layout.buffers.items():
         values = (
             *buffer.shape,
@@ -211,6 +217,28 @@ def _lifetimes(layout: _Layout, live: set[Tensor]) -> None:
         if not related <= layout.buffers.keys():
             raise ValueError("tensor metadata references an eliminated tensor")
         dependencies[tensor] = related
+        # Dimensions can outlive tensor contents; scalar expressions still read data.
+        pending_values = list(values)
+        visited_values: set[_ShapeExpression] = set()
+        dimensions: set[Tensor] = set()
+        scalar_reads: set[Tensor] = set()
+        while pending_values:
+            value = pending_values.pop()
+            if value in visited_values:
+                continue
+            visited_values.add(value)
+            pending_values.extend(value.args)
+            if value.op == "scalar" and value.tensor is not None:
+                scalar_reads.add(value.tensor)
+            elif (
+                value.op == "dimension"
+                and value.tensor is not None
+                and value.tensor not in dimensions
+            ):
+                dimensions.add(value.tensor)
+                pending_values.extend(layout.buffers[value.tensor].shape)
+        scalar_reads.discard(tensor)
+        value_dependencies[tensor] = scalar_reads
     pending = deque(live)
     queued = set(live)
     while pending:
@@ -226,62 +254,14 @@ def _lifetimes(layout: _Layout, live: set[Tensor]) -> None:
                 if dependency not in queued:
                     pending.append(dependency)
                     queued.add(dependency)
-
-
-def _inplace(layout: _Layout, selection: _Selection) -> None:
-    by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
-
-    def backing(tensor: Tensor) -> _Buffer:
-        buffer = layout.buffers[tensor]
-        while buffer.storage == "alias":
-            assert buffer.source is not None
-            buffer = by_name[buffer.source]
-        return buffer
-
-    for operator, call in sorted(
-        selection.calls.items(), key=lambda item: layout.positions[item[0]][0]
-    ):
-        schema = call.kernel.parameter_schema
-        if schema.can_alias_address is None:
-            continue
-        start = layout.positions[operator][0]
-        claimed: set[str] = set()
-        for output_slot, tensor in enumerate(call.outputs):
-            output = layout.buffers[tensor]
-            if output.storage != "arena" or output.first != start:
-                continue
-            for source in call.inputs:
-                original, root = layout.buffers[source], backing(source)
-                if (
-                    root.storage != "arena"
-                    or root.name in claimed
-                    or root.last != start
-                    or root.size < output.size
-                    or original.dtype != output.dtype
-                    or original.shape != output.shape
-                    or original.strides != _contiguous_strides(output.shape)
-                    or original.byte_offset is not None
-                ):
-                    continue
-                overlapping = [
-                    slot
-                    for slot, value in enumerate(call.inputs)
-                    if backing(value) is root
-                ]
-                if not all(
-                    _can_alias(schema, layout.parameters[operator], output_slot, slot)
-                    for slot in overlapping
-                ):
-                    continue
-                output.storage, output.source = "alias", root.name
-                root.last = max(root.last, output.last)
-                root.alignment = max(
-                    root.alignment,
-                    output.alignment,
-                    schema.output_alignments[output_slot],
-                )
-                claimed.add(root.name)
-                break
+        for dependency in value_dependencies[tensor]:
+            target = layout.buffers[dependency]
+            if target.last_read < buffer.last_read:
+                target.last_read = buffer.last_read
+                live.add(dependency)
+                if dependency not in queued:
+                    pending.append(dependency)
+                    queued.add(dependency)
 
 
 def _allocate(
@@ -383,6 +363,9 @@ def _allocate(
     _bind_caches(graph, layout, selection)
     _views(graph._region, selection, layout)
     _lifetimes(layout, live)
+    _bind_loops(graph._region, layout, selection)
+    _views(graph._region, selection, layout)
+    _lifetimes(layout, live)
     for operator, call in selection.calls.items():
         context = _KernelBindingContext(
             {
@@ -415,6 +398,7 @@ def _allocate(
                 buffer = layout.buffers[tensor]
                 buffer.first = min(buffer.first, layout.positions[operator][0])
                 buffer.last = max(buffer.last, layout.positions[operator][1])
+                buffer.last_read = max(buffer.last_read, layout.positions[operator][0])
         start, stop = layout.positions[operator]
         layout.scratch[operator] = _Workspace(
             0,
@@ -423,6 +407,8 @@ def _allocate(
             start,
             stop,
         )
+    _lifetimes(layout, live)
+    _reuse_loops(graph._region, layout, selection)
     if transfer_kernel is not None:
         for _, operator in _walk(graph._region):
             if (
@@ -435,6 +421,8 @@ def _allocate(
             scratch = 0
             for phase in _transfers._pairs(operator).values():
                 for source, destination in phase:
+                    if (source, destination) in layout.shared_transfers:
+                        continue
                     required = _requirements(
                         transfer_kernel.parameter_schema,
                         _transfers._parameters(layout, source, destination),

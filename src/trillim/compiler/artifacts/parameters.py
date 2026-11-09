@@ -99,14 +99,15 @@ def _can_alias(
     output: int,
     input: int,
 ) -> bool:
-    if schema.can_alias_address is None or any(
+    if schema.can_alias_address is None:
+        return False
+    dynamic = any(
         isinstance(item, _ShapeExpression) and item.op != "const"
         for value in parameters.values()
         for item in (value if isinstance(value, tuple) else (value,))
-    ):
-        return False
-    packed = _pack(schema, parameters)
+    )
+    packed = None if dynamic else _pack(schema, parameters)
     function = c.CFUNCTYPE(c.c_bool, c.c_void_p, c.c_size_t, c.c_size_t)(
         schema.can_alias_address
     )
-    return bool(function(packed.address, output, input))
+    return bool(function(None if packed is None else packed.address, output, input))
