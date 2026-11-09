@@ -11,14 +11,27 @@ _VERSION_ROOT = (
 
 
 def _main() -> None:
-    from .compiler.cli import _parse_args
+    from argparse import ArgumentParser
+
+    from .compiler.cli import _parse_args, _parse_kernel_args
     from .compiler.compile import _compile_model
+    from .compiler.kernels.build import _build
 
     arguments = _sys.argv[1:]
-    if arguments and arguments[0] == "compile":
-        arguments = arguments[1:]
+    if not arguments or arguments[0] not in {"compile", "kernels"}:
+        parser = ArgumentParser(prog="trillim")
+        parser.add_argument("command", choices=("compile", "kernels"))
+        parser.parse_args(arguments)
+        return
     try:
-        _compile_model(_parse_args(arguments), progress=print)
+        if arguments[0] == "compile":
+            _compile_model(_parse_args(arguments[1:]), progress=print)
+        else:
+            try:
+                _build(_parse_kernel_args(arguments[1:]), progress=print)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"Kernel compilation failed: {error}", file=_sys.stderr)
+                raise SystemExit(1) from None
     except KeyboardInterrupt:
         print("Compilation cancelled.", file=_sys.stderr)
         raise SystemExit(130) from None

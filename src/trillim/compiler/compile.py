@@ -65,7 +65,7 @@ def _compile_model(
             )
         _validate(graph)
         _schedule(graph, inference)
-        report("Building and matching kernels")
+        report("Loading and matching kernels")
         backends: tuple[_Backend, ...] = (
             ("scalar", request.backend)
             if request.backend != "scalar" and request.depth != "none"

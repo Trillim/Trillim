@@ -2,6 +2,8 @@
 
 `trillim compile MODEL.tdl model=/path/to/model adapter=/path/to/adapter`
 
+Kernel libraries must already be installed. From a source checkout, run `trillim kernels` to rebuild the host and scalar backends, or `trillim kernels path/to/kernel.c --backend x86` to update individual kernels. See [kernel_standard.md](kernel_standard.md) for the build layout and compiler fallback order. Model compilation does not build kernels implicitly.
+
 The supported Python API is `trillim.tdl` and `trillim.tdl.core` for model authoring. Compilation is exposed through the command above; compiler functions, types and helpers are private.
 
 Generated files use `$TRILLIM_HOME/1.0.0/`, where `TRILLIM_HOME` defaults to `~/.trillim`. Only version 1.0.0 is read. `kernels/` holds backend builds, `bench/` holds the native benchmark helper, and `compiled/` holds model bundles. Benchmark timings are reused only within the current compilation; the executable records the measurements used for selection.

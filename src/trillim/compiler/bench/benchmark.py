@@ -1,22 +1,17 @@
 from __future__ import annotations
 
 import ctypes as c
-import hashlib
 import mmap
 import multiprocessing as mp
-import os
-import subprocess
-import tempfile
 from multiprocessing.connection import Connection
 from pathlib import Path
 from statistics import mean, median, pvariance
 
 import numpy as np
 
-from ... import _VERSION_ROOT
 from ..artifacts.parameters import _pack, _requirements
 from ..dtype import _decode
-from ..kernels.build import _KERNEL_ROOT, _run
+from ..kernels.build import _build_harness
 from ..kernels.native import _read_schema
 from .bench_dataclasses import (
     _BenchmarkFailure,
@@ -36,53 +31,6 @@ def _representative_tokens(level: _BenchmarkLevel) -> tuple[int, ...]:
         "low": (1, 8, 64),
         "high": (1, 8, 64, 512, 4096, 32768),
     }[level]
-
-
-def _harness() -> Path:
-    source = Path(__file__).with_name("native.c")
-    header = _KERNEL_ROOT / "common.h"
-    compiler = os.environ.get("CC", "cc")
-    flags = (
-        "-O2",
-        "-std=c11",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-Wpedantic",
-        "-pthread",
-        "-shared",
-        "-fPIC",
-    )
-    identity = subprocess.check_output([compiler, "--version"])
-    digest = hashlib.sha256(
-        compiler.encode()
-        + identity
-        + repr(flags).encode()
-        + Path(__file__).read_bytes()
-        + source.read_bytes()
-        + source.with_suffix(".h").read_bytes()
-        + header.read_bytes()
-    ).hexdigest()[:16]
-    destination = _VERSION_ROOT / "bench" / digest / "native.so"
-    if not destination.exists():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=".bench-", dir=destination.parent
-        ) as directory:
-            temporary = Path(directory) / "native.so"
-            _run(
-                [
-                    compiler,
-                    *flags,
-                    "-I",
-                    str(header.parent),
-                    str(source),
-                    "-o",
-                    str(temporary),
-                ]
-            )
-            temporary.replace(destination)
-    return destination
 
 
 def _allocation(size: int, alignment: int = 64) -> _NativeAllocation:
@@ -291,7 +239,7 @@ def _benchmark(
     timeout: float = 10.0,
     max_bytes: int = _MAX_BYTES,
 ) -> _BenchmarkResult:
-    harness = _harness()
+    harness = _build_harness()
     context = mp.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
     process = context.Process(

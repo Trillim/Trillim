@@ -71,6 +71,15 @@ _NATIVE_TYPES: dict[
 }
 
 
+def _read_capabilities(library: c.CDLL, name: str) -> int:
+    function = getattr(library, f"{name}_capabilities")
+    function.argtypes, function.restype = [], c.POINTER(_NativeCapabilities)
+    capabilities = cast("c._Pointer[_NativeCapabilities]", function()).contents
+    if capabilities.abi_version != 1:
+        raise ValueError(f"{name}: incompatible kernel ABI")
+    return int(capabilities.required)
+
+
 def _read_schema(library: c.CDLL, name: str) -> _ParameterSchema:
     native_function = getattr(library, f"{name}_parameters")
     native_function.argtypes, native_function.restype = (

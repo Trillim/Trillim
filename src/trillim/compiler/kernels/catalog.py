@@ -6,18 +6,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+from ... import _VERSION_ROOT
 from ...tdl.core.core_dataclasses import _TensorTuple
-from .build import _build
 from .kernel_dataclasses import (
     _Backend,
     _Kernel,
     _KernelBindingContext,
     _ParameterValue,
 )
+from .kernel_pydantic_models import _KernelIndex
 from .native import (
     _CAPABILITY_FLAGS,
     _SOFTWARE_CAPABILITIES,
-    _NativeCapabilities,
+    _read_capabilities,
     _read_schema,
 )
 
@@ -52,22 +53,20 @@ def _available_capabilities(backend: _Backend) -> int:
 def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ...]:
     result: list[_Kernel] = []
     for backend in backends:
-        artifact = _build(backend)
-        library = _LIBRARIES.get(artifact.library)
-        if library is None:
-            library = c.CDLL(str(artifact.library))
-            _LIBRARIES[artifact.library] = library
-        for name in artifact.symbols:
-            capability_function = getattr(library, f"{name}_capabilities")
-            capability_function.argtypes, capability_function.restype = (
-                [],
-                c.POINTER(_NativeCapabilities),
+        directory = (_VERSION_ROOT / "kernels" / backend).resolve()
+        index_path = directory / "index.json"
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"no installed kernels for {backend}; run trillim kernels"
             )
-            capabilities = cast(
-                "c._Pointer[_NativeCapabilities]", capability_function()
-            ).contents
-            if capabilities.abi_version != 1:
-                raise ValueError(f"{name}: incompatible kernel ABI")
+        index = _KernelIndex.model_validate_json(index_path.read_bytes())
+        path = directory / "kernels.so"
+        library = _LIBRARIES.get(path)
+        if library is None:
+            library = c.CDLL(str(path))
+            _LIBRARIES[path] = library
+        for name in index.symbols:
+            capabilities = _read_capabilities(library, name)
             schema = _read_schema(library, name)
             tdl_function = getattr(library, f"{name}_tdl")
             tdl_function.argtypes, tdl_function.restype = [], c.c_char_p
@@ -95,9 +94,9 @@ def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ..
                     backend,
                     pattern,
                     schema,
-                    int(capabilities.required),
+                    capabilities,
                     binder,
-                    artifact.library,
+                    path,
                     cast(tuple[str, ...] | None, physical),
                 )
             )

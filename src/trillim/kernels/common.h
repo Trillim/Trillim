@@ -21,12 +21,17 @@
 #define TRILLIM_CAP_LIBM (UINT64_C(1) << 32)
 #define TRILLIM_CAP_BLAS (UINT64_C(1) << 33)
 
+#if defined(_WIN32)
+#define TRILLIM_EXPORT __declspec(dllexport)
+#else
+#define TRILLIM_EXPORT __attribute__((visibility("default")))
+#endif
 #ifdef __cplusplus
-#define TRILLIM_KERNEL extern "C"
+#define TRILLIM_KERNEL extern "C" TRILLIM_EXPORT
 #define TRILLIM_ALIGNOF(type) alignof(type)
 extern "C" {
 #else
-#define TRILLIM_KERNEL
+#define TRILLIM_KERNEL TRILLIM_EXPORT
 #define TRILLIM_ALIGNOF(type) _Alignof(type)
 #endif
 typedef int32_t TrillimStatus;

@@ -66,11 +66,3 @@ class _Kernel:
     bind: Callable[[_KernelBindingContext], dict[str, _ParameterValue]]
     library: Path
     physical_inputs: tuple[str, ...] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _BuildArtifact:
-    backend: _Backend
-    library: Path
-    symbols: tuple[str, ...]
-    object_path: Path
