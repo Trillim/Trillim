@@ -7,7 +7,6 @@ import numpy as np
 from pydantic import BaseModel
 
 from ...tdl.core import Graph, Input, Output, TensorShape
-from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
     Weight,
     _BroadcastArgs,
@@ -31,6 +30,7 @@ from ..kernels.bindings import (
 )
 from ..kernels.catalog import _available_capabilities
 from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
+from .canonicalize import _canonical, _pure, _terms, _unwrapped
 from .infer import _infer
 from .optimize import _optimize
 from .passes_dataclasses import _KernelMatch, _KernelPattern, _MatchingState, _MatchSet
@@ -41,42 +41,6 @@ def _fields(operator: _Operator) -> dict[str, object]:
     if isinstance(operator.args, _ConstructArgs):
         return operator.args.arguments
     return dict(vars(operator.args))
-
-
-def _pure(region: _Region, state: _MatchingState) -> bool:
-    identity = id(region)
-    if identity not in state.purity:
-        state.purity[identity] = (
-            not region.reads
-            and not region.writes
-            and all(
-                operator.op
-                not in {"cache", "cache_assign", "cache_read", "while", "if"}
-                and all(_pure(body, state) for body in operator.regions)
-                for operator in region.operators
-            )
-        )
-    return state.purity[identity]
-
-
-def _unwrapped(
-    tensor: Tensor, state: _MatchingState, covered: set[_Operator] | None = None
-) -> Tensor:
-    original = tensor
-    if original not in state.unwrapped:
-        wrappers: list[_Operator] = []
-        while (
-            (producer := tensor._producer) is not None
-            and isinstance(producer.args, _ConstructArgs)
-            and _pure(producer.regions[0], state)
-        ):
-            wrappers.append(producer)
-            tensor = producer.regions[0].outputs[producer.outputs.index(tensor)]
-        state.unwrapped[original] = tensor, tuple(wrappers)
-    result, wrappers_tuple = state.unwrapped[original]
-    if covered is not None:
-        covered.update(wrappers_tuple)
-    return result
 
 
 def _literal_equal(left: object, right: object) -> bool:
@@ -107,18 +71,35 @@ def _equivalent(
     covered: set[_Operator],
     pairs: set[tuple[Tensor, Tensor]],
 ) -> bool:
+    if state.canonical:
+        pattern = _canonical(pattern, template.inference, state)
+        target = _canonical(target, state.inference, state, covered)
     if pattern in template.inputs:
         if (
             template.inference.tensors[pattern].dtype
             != state.inference.tensors[target].dtype
         ):
             return False
+        if state.canonical:
+            expected = template.inference.tensors[pattern].shape
+            actual = state.inference.tensors[target].shape
+            if (
+                expected is None
+                or actual is None
+                or len(expected) != len(actual)
+                or any(
+                    dimension.op == "const" and dimension.value != value.value
+                    for dimension, value in zip(expected, actual, strict=True)
+                )
+            ):
+                return False
         name = template.inputs[pattern]
         previous = bindings.setdefault(name, target)
         return _unwrapped(previous, state) is _unwrapped(target, state)
     if pattern in parameters:
         return parameters[pattern] is target
-    pattern, target = _unwrapped(pattern, state), _unwrapped(target, state, covered)
+    pattern = _unwrapped(pattern, state)
+    target = _unwrapped(target, state, covered)
     pair = pattern, target
     if pair in pairs:
         return True
@@ -176,6 +157,60 @@ def _equivalent(
         matched = all(
             equal_value(value, swapped[name]) for name, value in p_fields.items()
         )
+    if not matched and saved is not None and state.canonical:
+        saved_bindings, saved_covered, saved_pairs = saved
+        bindings.clear()
+        bindings.update(saved_bindings)
+        covered.clear()
+        covered.update(saved_covered)
+        pairs.clear()
+        pairs.update(saved_pairs)
+        dtype = template.inference.tensors[pattern].dtype
+        if dtype is not None and (dtype == "fp32" or dtype.startswith(("int", "uint"))):
+            nodes: set[_Operator] = set()
+            left = _terms(
+                pattern, p.op, dtype, template.inference, state, template.inputs, set()
+            )
+            right = _terms(target, t.op, dtype, state.inference, state, {}, nodes)
+            if (
+                left is not None
+                and right is not None
+                and len(left) > 2
+                and len(left) == len(right)
+            ):
+                # Bind constrained expressions before wildcard inputs.
+                ordered = sorted(left, key=lambda value: value in template.inputs)
+
+                def assign(index: int, pending: tuple[Tensor, ...]) -> bool:
+                    if index == len(ordered):
+                        return True
+                    for slot, value in enumerate(pending):
+                        if state.remaining == 0:
+                            return False
+                        state.remaining -= 1
+                        before = dict(bindings), set(covered), set(pairs)
+                        if _equivalent(
+                            ordered[index],
+                            value,
+                            template,
+                            state,
+                            bindings,
+                            parameters,
+                            covered,
+                            pairs,
+                        ) and assign(index + 1, pending[:slot] + pending[slot + 1 :]):
+                            return True
+                        bindings.clear()
+                        bindings.update(before[0])
+                        covered.clear()
+                        covered.update(before[1])
+                        pairs.clear()
+                        pairs.update(before[2])
+                    return False
+
+                matched = assign(0, right)
+                if matched:
+                    covered.update(nodes)
     if not matched:
         return False
     for p_body, t_body in zip(p.regions, t.regions, strict=True):
@@ -481,10 +516,22 @@ def _match(
             bindings: dict[str, Tensor] = {}
             covered: set[_Operator] = set()
             pairs: set[tuple[Tensor, Tensor]] = set()
-            if not all(
+            state.canonical = False
+            matched = all(
                 _equivalent(p, t, pattern, state, bindings, {}, covered, pairs)
                 for p, t in zip(pattern.outputs, operator.outputs, strict=True)
-            ):
+            )
+            if not matched:
+                bindings.clear()
+                covered.clear()
+                pairs.clear()
+                state.canonical = True
+                state.remaining = 256
+                matched = all(
+                    _equivalent(p, t, pattern, state, bindings, {}, covered, pairs)
+                    for p, t in zip(pattern.outputs, operator.outputs, strict=True)
+                )
+            if not matched:
                 continue
             # Metadata-only inputs can disappear when their shape is statically known.
             for name, value in arguments.items():
