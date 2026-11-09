@@ -328,7 +328,7 @@ def _build_cpu() -> Path:
     failures: list[str] = []
     for compiler in _compilers():
         with tempfile.TemporaryDirectory(
-            prefix=".bench-", dir=destination.parent
+            prefix=".cpu-", dir=destination.parent
         ) as name:
             temporary = Path(name) / "native.so"
             try:
@@ -356,5 +356,5 @@ def _build_cpu() -> Path:
             except (OSError, subprocess.CalledProcessError, AttributeError) as error:
                 failures.append(f"{' '.join(compiler)}: {error}")
     raise RuntimeError(
-        "all C compilers failed for benchmark helper:\n" + "\n".join(failures)
+        "all C compilers failed for CPU helper:\n" + "\n".join(failures)
     )
