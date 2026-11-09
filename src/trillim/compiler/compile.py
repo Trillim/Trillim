@@ -71,7 +71,9 @@ def _compile_model(
             else (request.backend,)
         )
         kernels = _discover(backends)
-        all_matches = _match(graph, kernels, inference)
+        all_matches = _match(
+            graph, kernels, inference, algebraic=request.depth != "none"
+        )
         matches = replace(
             all_matches,
             candidates={

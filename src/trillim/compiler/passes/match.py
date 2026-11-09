@@ -561,7 +561,11 @@ def _capacity(binding: _TensorBinding) -> int:
 
 
 def _match(
-    graph: Graph, kernels: tuple[_Kernel, ...], inference: _Inference
+    graph: Graph,
+    kernels: tuple[_Kernel, ...],
+    inference: _Inference,
+    *,
+    algebraic: bool = True,
 ) -> _MatchSet:
     if graph._region is None:
         raise ValueError("cannot match an incomplete graph")
@@ -656,7 +660,7 @@ def _match(
                     _equivalent(p, t, pattern, state, bindings, {}, covered, pairs)
                     for p, t in zip(pattern.outputs, operator.outputs, strict=True)
                 )
-            mathematical = not matched
+            mathematical = algebraic and not matched
             if mathematical:
                 bindings.clear()
                 covered.clear()

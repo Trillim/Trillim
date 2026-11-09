@@ -14,12 +14,12 @@ def _node(
     arguments: tuple[_Canonical, ...] = (),
     value: Hashable | None = None,
 ) -> _Canonical:
+    if state.normal_budget <= 0:
+        raise OverflowError("canonical expression budget exceeded")
+    state.normal_budget -= 1
     signature = op, tuple(argument.key for argument in arguments), value
     key = state.normal_keys.get(signature)
     if key is None:
-        if state.normal_budget <= 0:
-            raise OverflowError("canonical expression budget exceeded")
-        state.normal_budget -= 1
         key = len(state.normal_keys)
         state.normal_keys[signature] = key
     lower: float | None = None

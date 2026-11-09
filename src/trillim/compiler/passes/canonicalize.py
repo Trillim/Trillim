@@ -173,6 +173,8 @@ def _normal(
     cache_key = tensor, context
     if cache_key in state.normal:
         return state.normal[cache_key]
+    if len(state.normal_active) >= 64:
+        return replace(_node(state, "leaf", value=tensor), sources=(tensor,))
     if cache_key in state.normal_active:
         return _node(state, "leaf", value=tensor)
     state.normal_active.add(cache_key)
