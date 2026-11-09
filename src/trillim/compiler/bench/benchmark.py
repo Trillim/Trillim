@@ -11,7 +11,7 @@ import numpy as np
 
 from ..artifacts.parameters import _pack, _requirements
 from ..dtype import _decode
-from ..kernels.build import _build_harness
+from ..kernels.build import _build_cpu
 from ..kernels.native import _read_schema
 from .bench_dataclasses import (
     _BenchmarkFailure,
@@ -96,16 +96,16 @@ def _invoke(
     outputs = [_allocation(size) for size in output_sizes]
     scratch = _allocation(scratch_size)
     harness_library = c.CDLL(str(harness))
-    create = harness_library.trillim_bench_create
+    create = harness_library.trillim_cpu_create
     create.argtypes, create.restype = [c.c_size_t], c.c_void_p
-    destroy = harness_library.trillim_bench_destroy
+    destroy = harness_library.trillim_cpu_destroy
     destroy.argtypes, destroy.restype = [c.c_void_p], None
     if invocation.threads < 1:
         raise ValueError("benchmark threads must be positive")
     context = create(invocation.threads)
     if not context:
         raise MemoryError("cannot create benchmark thread pool")
-    native = harness_library.trillim_bench_run
+    native = harness_library.trillim_cpu_run
     native.argtypes = [
         c.c_void_p,
         c.c_void_p,
@@ -239,7 +239,7 @@ def _benchmark(
     timeout: float = 10.0,
     max_bytes: int = _MAX_BYTES,
 ) -> _BenchmarkResult:
-    harness = _build_harness()
+    harness = _build_cpu()
     context = mp.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
     process = context.Process(

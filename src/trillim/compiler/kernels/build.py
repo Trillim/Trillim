@@ -307,8 +307,8 @@ def _build_backend(
     return destination
 
 
-def _build_harness() -> Path:
-    source = Path(__file__).resolve().parents[1] / "bench/native.c"
+def _build_cpu() -> Path:
+    source = Path(__file__).resolve().parents[2] / "backends/cpu/native.c"
     flags = (
         *_FLAGS,
         *(("-pthread",) if sys.platform != "win32" else ()),
@@ -321,7 +321,7 @@ def _build_harness() -> Path:
         + source.with_suffix(".h").read_bytes()
         + (_KERNEL_ROOT / "common.h").read_bytes()
     ).hexdigest()[:16]
-    destination = _VERSION_ROOT / "bench" / digest / "native.so"
+    destination = _VERSION_ROOT / "kernels/cpu" / digest / "native.so"
     if destination.is_file():
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -350,7 +350,7 @@ def _build_harness() -> Path:
                 )
                 library = c.CDLL(str(temporary))
                 for function in ("create", "destroy", "cancel", "run"):
-                    getattr(library, f"trillim_bench_{function}")
+                    getattr(library, f"trillim_cpu_{function}")
                 temporary.replace(destination)
                 return destination
             except (OSError, subprocess.CalledProcessError, AttributeError) as error:
