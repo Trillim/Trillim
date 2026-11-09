@@ -311,7 +311,7 @@ def _build_harness() -> Path:
     source = Path(__file__).resolve().parents[1] / "bench/native.c"
     flags = (
         *_FLAGS,
-        "-pthread",
+        *(("-pthread",) if sys.platform != "win32" else ()),
         "-dynamiclib" if sys.platform == "darwin" else "-shared",
     )
     digest = hashlib.sha256(
@@ -339,6 +339,11 @@ def _build_harness() -> Path:
                         "-I",
                         str(_KERNEL_ROOT),
                         str(source),
+                        *(
+                            ["-Wl,-Bstatic", "-lwinpthread", "-Wl,-Bdynamic"]
+                            if sys.platform == "win32"
+                            else []
+                        ),
                         "-o",
                         str(temporary),
                     ]

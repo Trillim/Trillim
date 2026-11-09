@@ -8,6 +8,8 @@ Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containin
 
 The native benchmark helper uses the same compiler hierarchy and is cached separately under `bench/`. Benchmarking builds that helper if it is absent.
 
+Windows benchmark builds statically link Winpthreads and use CRT aligned allocation and QueryPerformanceCounter timing. Zig supplies Winpthreads; other Windows toolchains need its headers and static library. Windows kernels resolve standard mathematical functions through their CRT, so capability detection does not require a separate libm DLL.
+
 Compilers are tried in order: `zig cc`, an explicit `CC` command if set, then `cc`. On Windows, MinGW variants follow; `gcc` and `clang` are additional fallbacks. Unavailable tools are skipped. A failed compiler attempt is discarded before trying the next; compilation fails only after all available candidates fail. The current sources require a GCC-compatible driver, including Zig, GCC, Clang or MinGW.
 
 Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. All build files and Zig caches stay beneath `TRILLIM_HOME`, which defaults to `~/.trillim`.
