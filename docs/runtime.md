@@ -24,4 +24,6 @@ with Runtime("compiled/model", threads=4) as model:
 
 Scalar and x86 manifests share the CPU backend's allocator, mappings, interpreter and persistent native thread pool. Their compiled kernels and capability requirements select the actual implementations. Kernels run sequentially and can divide each invocation across the pool. The benchmark uses this same pool. Source installs build and cache the native helper on first use, using the kernel compiler hierarchy.
 
+The backend prepares manifest arithmetic as Python functions and retains unchanged kernel parameter structs. Cache positions, tensor dimensions, pointers and footprint checks still update as execution proceeds.
+
 `Runtime.cancel()` can be called from another thread. During execution, native SIGINT/SIGTERM handlers signal cancellation directly so a long kernel can stop before returning to Python. Previous handlers are restored after the run. Cancellation and execution failures invalidate the session; close it and create another. `close()` requests cancellation before waiting for execution to finish and releases resources. V1 permits one active model execution per process.
