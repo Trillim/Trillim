@@ -263,10 +263,14 @@ class _CPU:
         try:
             self.check_cancelled()
             self.program(list(self.manifest.program))
-            return {
-                name: self.logical_array(tensor).copy()
-                for name, tensor in self.manifest.outputs.items()
-            }
+            outputs = {}
+            for name, tensor in self.manifest.outputs.items():
+                value = self.logical_array(tensor)
+                output = np.empty(value.shape, dtype=value.dtype)
+                self.copy_array(output, value)
+                outputs[name] = output
+            self.check_cancelled()
+            return outputs
         finally:
             self.harness.trillim_cpu_leave(self.context)
 
@@ -663,9 +667,10 @@ class _CPU:
     def program(self, program: list[JsonValue]) -> None:
         for value in program:
             self.check_cancelled()
-            self._expression_values.clear()
             instruction = _object(value)
             operation = _text(instruction["op"])
+            if operation != "guard":
+                self._expression_values.clear()
             if operation == "call":
                 self.call(instruction)
             elif operation == "guard":
@@ -785,5 +790,6 @@ class _CPU:
                     )
             else:
                 raise ValueError(f"unknown instruction {operation}")
-            self._expression_values.clear()
+            if operation != "guard":
+                self._expression_values.clear()
         self.check_cancelled()
