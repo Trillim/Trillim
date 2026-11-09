@@ -6,7 +6,7 @@
 
 Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containing `kernels.so`, `backend.o`, `index.json` and an `objects/` directory. The index lists kernel symbols and has format version 1. Individual objects are retained for incremental linking; packages must include them to support updates without the original sources. Kernel discovery loads the library and index without invoking a C compiler or reading kernel sources.
 
-The native benchmark helper uses the same compiler hierarchy and is cached separately under `bench/`. Benchmarking builds that helper if it is absent.
+The runtime and benchmark share the CPU backend's native thread pool, cached under `kernels/cpu/`. Source installations build this helper through the same compiler hierarchy when it is absent.
 
 Windows benchmark builds statically link Winpthreads and use CRT aligned allocation and QueryPerformanceCounter timing. Zig supplies Winpthreads; other Windows toolchains need its headers and static library. Windows kernels resolve standard mathematical functions through their CRT, so capability detection does not require a separate libm DLL.
 

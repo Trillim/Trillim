@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "native.h"
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +17,35 @@
 #endif
 
 static volatile sig_atomic_t signal_cancelled;
+static atomic_flag executing = ATOMIC_FLAG_INIT;
+
+uint64_t trillim_cpu_features(void) {
+    uint64_t features = 0;
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned int a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1U << 27)) || !(c & (1U << 28))) {
+        return 0;
+    }
+    unsigned int xcr0, high;
+    __asm__ __volatile__("xgetbv" : "=a"(xcr0), "=d"(high) : "c"(0));
+    (void)high;
+    if ((xcr0 & 6) != 6) return 0;
+    if (c & (1U << 12)) features |= TRILLIM_CAP_X86_FMA;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return features;
+    if (b & (1U << 5)) features |= TRILLIM_CAP_X86_AVX2;
+    if ((xcr0 & 0xe6) == 0xe6) {
+        if (b & (1U << 16)) features |= TRILLIM_CAP_X86_AVX512F;
+        if (b & (1U << 30)) features |= TRILLIM_CAP_X86_AVX512BW;
+        if (b & (1U << 17)) features |= TRILLIM_CAP_X86_AVX512DQ;
+        if (b & (1U << 31)) features |= TRILLIM_CAP_X86_AVX512VL;
+        if (c & (1U << 11)) features |= TRILLIM_CAP_X86_AVX512_VNNI;
+    }
+    if (a >= 1 && __get_cpuid_count(7, 1, &a, &b, &c, &d) && (a & (1U << 4))) {
+        features |= TRILLIM_CAP_X86_AVX_VNNI;
+    }
+#endif
+    return features;
+}
 
 static void cancel_signal(int signal_number) {
     (void)signal_number;
@@ -41,7 +73,7 @@ static void release(void *address) {
 }
 
 static bool is_cancelled(void *context) {
-    TrillimBenchContext *backend = context;
+    TrillimCpuContext *backend = context;
     return signal_cancelled != 0 || atomic_load_explicit(&backend->cancelled, memory_order_relaxed);
 }
 
@@ -76,10 +108,10 @@ static uint64_t monotonic_nanoseconds(void) {
 }
 
 static TrillimStatus execute_tasks(
-    TrillimBenchWorker *worker, TrillimTask task,
+    TrillimCpuWorker *worker, TrillimTask task,
     void *task_context, size_t task_count, bool parallel
 ) {
-    TrillimBenchContext *backend = worker->backend;
+    TrillimCpuContext *backend = worker->backend;
     size_t completed = 0;
     TrillimStatus status = TRILLIM_OK;
     while (!is_cancelled(backend)) {
@@ -100,8 +132,8 @@ static TrillimStatus execute_tasks(
 }
 
 static void *worker_main(void *context) {
-    TrillimBenchWorker *worker = context;
-    TrillimBenchContext *backend = worker->backend;
+    TrillimCpuWorker *worker = context;
+    TrillimCpuContext *backend = worker->backend;
     size_t generation = 0;
     for (;;) {
         uint64_t start = monotonic_nanoseconds();
@@ -147,7 +179,7 @@ static void *worker_main(void *context) {
 static TrillimStatus run(
     void *context, size_t task_count, TrillimTask task, void *task_context
 ) {
-    TrillimBenchContext *backend = context;
+    TrillimCpuContext *backend = context;
     if (task_count == 0) {
         return TRILLIM_OK;
     }
@@ -182,7 +214,7 @@ static TrillimStatus run(
     if (parallel) {
         /* Cancellation still drains every worker before releasing borrowed task data. */
         for (size_t index = 1; index < backend->pool.worker_count; ++index) {
-            TrillimBenchWorker *worker = &backend->workers[index];
+            TrillimCpuWorker *worker = &backend->workers[index];
             while (atomic_load_explicit(&worker->generation, memory_order_acquire) != generation) {
                 spin_pause();
             }
@@ -203,11 +235,11 @@ static TrillimStatus run(
     return status;
 }
 
-TrillimBenchContext *trillim_bench_create(size_t worker_count) {
-    if (worker_count == 0 || worker_count > SIZE_MAX / sizeof(TrillimBenchWorker)) {
+TrillimCpuContext *trillim_cpu_create(size_t worker_count) {
+    if (worker_count == 0 || worker_count > SIZE_MAX / sizeof(TrillimCpuWorker)) {
         return NULL;
     }
-    TrillimBenchContext *backend = allocate(sizeof(*backend), 64);
+    TrillimCpuContext *backend = allocate(sizeof(*backend), 64);
     if (backend == NULL) {
         return NULL;
     }
@@ -230,25 +262,25 @@ TrillimBenchContext *trillim_bench_create(size_t worker_count) {
     backend->workers = allocate(worker_count * sizeof(*backend->workers), 64);
     if (backend->workers == NULL) {
         backend->pool.worker_count = 0;
-        trillim_bench_destroy(backend);
+        trillim_cpu_destroy(backend);
         return NULL;
     }
     memset(backend->workers, 0, worker_count * sizeof(*backend->workers));
     for (size_t index = 0; index < worker_count; ++index) {
-        TrillimBenchWorker *worker = &backend->workers[index];
+        TrillimCpuWorker *worker = &backend->workers[index];
         worker->backend = backend;
         worker->index = index;
         atomic_init(&worker->generation, 0);
         if (index != 0 && pthread_create(&worker->thread, NULL, worker_main, worker) != 0) {
             backend->pool.worker_count = index;
-            trillim_bench_destroy(backend);
+            trillim_cpu_destroy(backend);
             return NULL;
         }
     }
     return backend;
 }
 
-void trillim_bench_destroy(TrillimBenchContext *backend) {
+void trillim_cpu_destroy(TrillimCpuContext *backend) {
     pthread_mutex_lock(&backend->mutex);
     atomic_store_explicit(&backend->shutdown, true, memory_order_relaxed);
     atomic_store(&backend->cancelled, true);
@@ -263,12 +295,73 @@ void trillim_bench_destroy(TrillimBenchContext *backend) {
     release(backend);
 }
 
-void trillim_bench_cancel(TrillimBenchContext *context) {
+void trillim_cpu_cancel(TrillimCpuContext *context) {
     atomic_store_explicit(&context->cancelled, true, memory_order_relaxed);
 }
 
-TrillimStatus trillim_bench_run(
-    TrillimBenchContext *backend, TrillimKernel kernel,
+bool trillim_cpu_cancelled(TrillimCpuContext *context) {
+    return is_cancelled(context);
+}
+
+TrillimStatus trillim_cpu_enter(TrillimCpuContext *context) {
+    if (atomic_flag_test_and_set(&executing)) {
+        return TRILLIM_ERROR;
+    }
+    signal_cancelled = 0;
+#ifdef _WIN32
+    context->previous_interrupt = signal(SIGINT, cancel_signal);
+    if (context->previous_interrupt == SIG_ERR) {
+        atomic_flag_clear(&executing);
+        return TRILLIM_ERROR;
+    }
+    context->previous_terminate = signal(SIGTERM, cancel_signal);
+    if (context->previous_terminate == SIG_ERR) {
+        signal(SIGINT, context->previous_interrupt);
+        atomic_flag_clear(&executing);
+        return TRILLIM_ERROR;
+    }
+#else
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = cancel_signal;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, &context->previous_interrupt) != 0) {
+        atomic_flag_clear(&executing);
+        return TRILLIM_ERROR;
+    }
+    if (sigaction(SIGTERM, &action, &context->previous_terminate) != 0) {
+        sigaction(SIGINT, &context->previous_interrupt, NULL);
+        atomic_flag_clear(&executing);
+        return TRILLIM_ERROR;
+    }
+#endif
+    return TRILLIM_OK;
+}
+
+void trillim_cpu_leave(TrillimCpuContext *context) {
+#ifdef _WIN32
+    signal(SIGINT, context->previous_interrupt);
+    signal(SIGTERM, context->previous_terminate);
+#else
+    sigaction(SIGINT, &context->previous_interrupt, NULL);
+    sigaction(SIGTERM, &context->previous_terminate, NULL);
+#endif
+    atomic_flag_clear(&executing);
+}
+
+TrillimStatus trillim_cpu_invoke(
+    TrillimCpuContext *backend, TrillimKernel kernel,
+    void *const *outputs, const void *const *inputs, void *scratch,
+    const void *parameters
+) {
+    if (is_cancelled(backend)) {
+        return TRILLIM_CANCELLED;
+    }
+    return kernel(outputs, inputs, scratch, parameters, &backend->context);
+}
+
+TrillimStatus trillim_cpu_run(
+    TrillimCpuContext *backend, TrillimKernel kernel,
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, size_t samples, double *seconds
 ) {

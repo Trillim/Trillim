@@ -18,14 +18,26 @@ def _main() -> None:
     from .compiler.kernels.build import _build
 
     arguments = _sys.argv[1:]
-    if not arguments or arguments[0] not in {"compile", "kernels"}:
+    if not arguments or arguments[0] not in {"compile", "kernels", "run"}:
         parser = ArgumentParser(prog="trillim")
-        parser.add_argument("command", choices=("compile", "kernels"))
+        parser.add_argument("command", choices=("compile", "kernels", "run"))
         parser.parse_args(arguments)
         return
     try:
         if arguments[0] == "compile":
             _compile_model(_parse_args(arguments[1:]), progress=print)
+        elif arguments[0] == "run":
+            from .runtime.cli import _run
+            from .runtime.errors import CancelledError, ExecutionError
+
+            try:
+                _run(arguments[1:])
+            except CancelledError:
+                print("Execution cancelled.", file=_sys.stderr)
+                raise SystemExit(130) from None
+            except (OSError, ValueError, ExecutionError) as error:
+                print(f"Execution failed: {error}", file=_sys.stderr)
+                raise SystemExit(1) from None
         else:
             try:
                 _build(_parse_kernel_args(arguments[1:]), progress=print)
@@ -33,5 +45,10 @@ def _main() -> None:
                 print(f"Kernel compilation failed: {error}", file=_sys.stderr)
                 raise SystemExit(1) from None
     except KeyboardInterrupt:
-        print("Compilation cancelled.", file=_sys.stderr)
+        print(
+            "Execution cancelled."
+            if arguments[0] == "run"
+            else "Compilation cancelled.",
+            file=_sys.stderr,
+        )
         raise SystemExit(130) from None
