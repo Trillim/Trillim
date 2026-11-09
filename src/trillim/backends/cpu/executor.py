@@ -242,7 +242,14 @@ class _CPU:
                 ):
                     raise ValueError(f"{name}: input values do not fit {record.dtype}")
             self.shapes[self.manifest.inputs[name]] = array.shape
-            self.inputs[name] = _encode(array, record.dtype)[0]
+            payload = _encode(array, record.dtype)[0]
+            if payload.ctypes.data % record.alignment:
+                owner = np.empty(payload.nbytes + record.alignment - 1, dtype=np.uint8)
+                offset = -owner.ctypes.data % record.alignment
+                aligned = owner[offset : offset + payload.nbytes]
+                np.copyto(aligned, payload)
+                payload = aligned
+            self.inputs[name] = payload
         if self.manifest.workload:
             source = self._base_manifest.inputs[_text(self.manifest.workload["input"])]
             count = self.shapes[source][_integer(self.manifest.workload["axis"])]
