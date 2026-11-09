@@ -1,5 +1,4 @@
 #include "common.h"
-#include <math.h>
 
 typedef struct {
     size_t tokens;
@@ -56,9 +55,6 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     float gamma;
     memcpy(&gamma, task->weight + p->outputs * packed_row, sizeof(gamma));
     float scale = task->scales[row];
-    if (!isfinite(scale) || scale <= 0) {
-        return TRILLIM_ERROR;
-    }
     for (size_t column = begin; column < end; ++column) {
         int64_t sum = 0;
         for (size_t k = 0; k < p->width; ++k) {
@@ -117,6 +113,6 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_quantized_linear_par
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_quantized_linear_capabilities(void) {
-    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, 0};
     return &capabilities;
 }
