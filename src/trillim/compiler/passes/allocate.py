@@ -375,7 +375,11 @@ def _allocate(
             tuple(layout.buffers[tensor]._binding() for tensor in call.outputs),
             dict(vars(operator.args)),
         )
-        if isinstance(operator.args, _ConstructArgs):
+        if call.attributes:
+            context = _KernelBindingContext(
+                context.inputs, context.outputs, call.attributes
+            )
+        elif isinstance(operator.args, _ConstructArgs):
             context = _KernelBindingContext(
                 context.inputs, context.outputs, operator.args.arguments
             )

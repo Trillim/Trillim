@@ -58,8 +58,6 @@ def _node(
     elif op == "exp":
         lower = 0.0
         finite = arguments[0].finite
-        if finite:
-            lower = math.nextafter(0.0, 1.0)
     elif op in {"sin", "cos", "erf"}:
         lower, upper = -1.0, 1.0
         finite = arguments[0].finite
@@ -101,7 +99,12 @@ def _number(state: _MatchingState, value: float | Fraction) -> _Canonical:
 
 
 def _positive(value: _Canonical) -> bool:
-    return value.lower is not None and value.lower > 0
+    return (
+        value.lower is not None
+        and value.lower > 0
+        or value.op == "exp"
+        and value.arguments[0].finite
+    )
 
 
 def _nonnegative(value: _Canonical) -> bool:
@@ -134,6 +137,15 @@ def _power(state: _MatchingState, base: _Canonical, exponent: Fraction) -> _Cano
                 return _inherit(
                     _number(state, Fraction(numerator, denominator)), (base,)
                 )
+    if base.op == "exp" and exponent > 0:
+        return _inherit(
+            _function(
+                state,
+                "exp",
+                _product(state, (_number(state, exponent), base.arguments[0])),
+            ),
+            (base,),
+        )
     if base.op == "power" and isinstance(base.value, Fraction):
         original = base.arguments[0]
         if base.value == 2 and exponent == Fraction(1, 2):
@@ -345,6 +357,20 @@ def _function(state: _MatchingState, op: str, value: _Canonical) -> _Canonical:
                 (value,),
             )
     if op == "exp":
+        if (
+            value.op == "mul"
+            and len(value.arguments) == 2
+            and value.arguments[0].op == "constant"
+            and isinstance(value.arguments[0].value, Fraction)
+            and value.arguments[1].op == "log"
+            and _positive(value.arguments[1].arguments[0])
+        ):
+            return _inherit(
+                _power(
+                    state, value.arguments[1].arguments[0], value.arguments[0].value
+                ),
+                (value, value.arguments[1]),
+            )
         if value.op == "log" and _positive(value.arguments[0]):
             return _inherit(value.arguments[0], (value,))
         if value.op == "add" and all(

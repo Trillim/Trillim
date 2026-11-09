@@ -44,6 +44,8 @@ class _Selection:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class _Canonical:
+    """Temporary comparison form, with links to the unchanged executable graph."""
+
     op: str
     arguments: tuple[_Canonical, ...]
     value: Hashable | None

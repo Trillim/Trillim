@@ -23,7 +23,13 @@ The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compi
 
 The compiler edits the traced TDL graph directly. It validates checkpoint references, infers shapes and dtypes, simplifies computations, matches kernel TDL, selects a covering, schedules work, and assigns shared memory. Compilation publishes a complete directory with one atomic rename. An existing output directory is preserved; Ctrl+C removes the unfinished directory and stops active benchmark workers.
 
-Kernel matching first tries the original structure, then retries with a canonical view of pure expressions. It removes no-op casts and cancelling reshape/transpose chains from that view, and matches reassociated FP32 or integer Add/Mul chains. Associative searches are bounded to 16 terms and 256 assignments per candidate. Explicit dtype changes, cache effects and control flow remain boundaries. The executable graph is unchanged; candidate coverage, intermediate users, shape guards and native requirements retain their existing checks.
+Kernel matching tries the original structure, a cheap normalization of views and Add/Mul chains, then broader mathematical normalization. These are temporary comparison forms; the compiler continues to use the traced TDL graph for execution.
+
+The broader rules cover arithmetic reassociation, distribution, constants, coefficients, powers, roots, exp/log and trig identities, comparisons and selections, tensor views, matrix products, common reductions, shape expressions and proven indexing round trips. Other pure operations retain their operator and normalized arguments. Rules requiring positive values, nonzero divisors, compatible shapes or valid indices run only when those conditions are proved. Generic reducers retain their bodies and initial values; recognized reductions preserve empty-input behavior.
+
+Casts are treated as mathematically lossless during comparison, as agreed for this compiler stage. Native binding still checks physical dtypes, packing, strides and buffer spans. Kernel inputs must refer to existing tensors; matching does not invent an unmaterialized intermediate. Cache effects and control flow stay outside normalization. Replacing a pure region covers its unused internal computations too, while external users and shape guards can prevent a match.
+
+Normalization caches expressions and retains links to original tensors and operators. Each broad attempt allows 4096 new expression keys and 4096 matching visits, limits distribution to 32 terms and stops after eight rewrite rounds. Reaching a limit leaves the earlier matching options available. This pass finds additional kernel choices; it does not hoist work across loops or change scheduling.
 
 # Executable format 1
 
