@@ -23,6 +23,8 @@ The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compi
 
 The compiler edits the traced TDL graph directly. It validates checkpoint references, infers shapes and dtypes, simplifies computations, matches kernel TDL, selects a covering, schedules work, and assigns shared memory. Compilation publishes a complete directory with one atomic rename. An existing output directory is preserved; Ctrl+C removes the unfinished directory and stops active benchmark workers.
 
+Kernel matching first tries the original structure, then retries with a canonical view of pure expressions. It removes no-op casts and cancelling reshape/transpose chains from that view, and matches reassociated FP32 or integer Add/Mul chains. Associative searches are bounded to 16 terms and 256 assignments per candidate. Explicit dtype changes, cache effects and control flow remain boundaries. The executable graph is unchanged; candidate coverage, intermediate users, shape guards and native requirements retain their existing checks.
+
 # Executable format 1
 
 `executable.json` is a compact single-line JSON object. All paths are relative to its directory.

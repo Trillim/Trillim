@@ -43,6 +43,8 @@ class _Selection:
 @dataclass(slots=True)
 class _MatchingState:
     inference: _Inference
+    canonical: bool = False
+    remaining: int = 0
     purity: dict[int, bool] = field(default_factory=dict)
     unwrapped: dict[Tensor, tuple[Tensor, tuple[_Operator, ...]]] = field(
         default_factory=dict
