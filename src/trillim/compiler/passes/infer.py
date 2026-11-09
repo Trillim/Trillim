@@ -1393,12 +1393,24 @@ def _iteration_bound(
             step is not None and step < 0 and high is not None and guard_low is not None
         ):
             candidates.append(max(0, (high - guard_low) // -step + 1))
-    for _, current in _operators(body):
+    # Cache capacity bounds iterations only with unconditional, monotonic growth.
+    reset = {
+        current.args.cache
+        for _, current in _operators(body)
+        if isinstance(current.args, _CacheAssignArgs)
+        and current.args.action == "assign"
+    }
+    pending = list(body.operators)
+    while pending:
+        current = pending.pop()
         args = current.args
+        if isinstance(args, _ConstructArgs):
+            pending.extend(current.regions[0].operators)
         if (
             isinstance(args, _CacheAssignArgs)
             and args.action == "append"
             and args.cache.mode == "append"
+            and args.cache not in reset
         ):
             axis = args.cache.axis
             assert axis is not None
