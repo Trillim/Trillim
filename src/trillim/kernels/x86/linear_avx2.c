@@ -210,7 +210,9 @@ static inline TrillimStatus trillim_matmul_requirements(const void *parameters, 
     inputs[1] = 0;
     outputs[0] = 0;
     *scratch = 0;
-    if (bytes == 0 || !trillim_span(p->rank, p->batch_shape, p->a_batch_strides, &a_span) ||
+    if ((p->a_dtype != TRILLIM_FP32 && p->a_dtype != TRILLIM_BF16) ||
+        (p->out_dtype != TRILLIM_FP32 && p->out_dtype != TRILLIM_BF16) ||
+        !trillim_span(p->rank, p->batch_shape, p->a_batch_strides, &a_span) ||
         !trillim_span(p->rank, p->batch_shape, p->b_batch_strides, &b_span)) {
         return TRILLIM_ERROR;
     }
@@ -267,7 +269,7 @@ TRILLIM_AVX2 static TrillimStatus linear_task(void *opaque, size_t index, size_t
                 task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            __m256 a = _mm256_loadu_ps((const float *)task->a + a_base + k);
+            __m256 a = trillim_avx2_load8(task->a, a_base + k, p->a_dtype, p->a_storage_rows, p->a_storage_columns);
             sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(a, trillim_avx2_load8(task->b, b0 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns)));
             sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(a, trillim_avx2_load8(task->b, b1 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns)));
             sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(a, trillim_avx2_load8(task->b, b2 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns)));
@@ -275,14 +277,15 @@ TRILLIM_AVX2 static TrillimStatus linear_task(void *opaque, size_t index, size_t
         }
         float values[] = {trillim_avx2_sum(sum0), trillim_avx2_sum(sum1), trillim_avx2_sum(sum2), trillim_avx2_sum(sum3)};
         for (; k < p->k; ++k) {
-            float a = ((const float *)task->a)[a_base + k];
+            float a = trillim_read_float(task->a, a_base + k, p->a_dtype, p->a_storage_rows, p->a_storage_columns);
             values[0] += a * trillim_read_float(task->b, b0 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
             values[1] += a * trillim_read_float(task->b, b1 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
             values[2] += a * trillim_read_float(task->b, b2 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
             values[3] += a * trillim_read_float(task->b, b3 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
         }
         for (size_t lane = 0; lane < lanes; ++lane) {
-            memcpy((uint8_t *)task->output + (token * p->n + column + lane) * sizeof(float), &values[lane], sizeof(float));
+            TrillimValue value = {.f = values[lane]};
+            trillim_store(task->output, token * p->n + column + lane, p->out_dtype, value);
         }
     }
     return TRILLIM_OK;

@@ -6,6 +6,7 @@ import mmap
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from threading import Lock
 from weakref import finalize
 
 import numpy as np
@@ -57,6 +58,7 @@ def _dtype(name: str) -> np.dtype[np.generic]:
 
 class _CPU:
     def __init__(self, directory: Path, threads: int | None) -> None:
+        self._lifecycle = Lock()
         self.context: int | None = None
         self._finalizer: Callable[[], object] | None = None
         self.mappings: list[mmap.mmap] = []
@@ -171,11 +173,12 @@ class _CPU:
         return int(view.ctypes.data)
 
     def close(self) -> None:
-        if self.context:
-            self.cancel()
-            assert self._finalizer is not None
-            self._finalizer()
-            self.context = None
+        self.cancel()
+        with self._lifecycle:
+            if self.context:
+                assert self._finalizer is not None
+                self._finalizer()
+                self.context = None
         self.inputs.clear()
         self.mapping_views.clear()
         for mapping in self.mappings:
@@ -185,8 +188,9 @@ class _CPU:
         self.cache = self._allocation(0)
 
     def cancel(self) -> None:
-        if self.context:
-            self.harness.trillim_cpu_cancel(self.context)
+        with self._lifecycle:
+            if self.context:
+                self.harness.trillim_cpu_cancel(self.context)
 
     def check_cancelled(self) -> None:
         if self.harness.trillim_cpu_cancelled(self.context):
@@ -285,7 +289,8 @@ class _CPU:
         value = self.array(name)
         if record.dtype == "bf16":
             return _decode(
-                (np.ascontiguousarray(value).view(np.uint8), "bf16"), value.shape
+                (np.ascontiguousarray(value).view(np.uint8).reshape(-1), "bf16"),
+                value.shape,
             )
         return value
 
