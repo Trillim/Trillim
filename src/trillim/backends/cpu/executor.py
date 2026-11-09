@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from threading import Lock
+from typing import cast
 from weakref import finalize
 
 import numpy as np
@@ -14,6 +15,7 @@ from numpy.typing import NDArray
 from pydantic import JsonValue
 
 from ...compiler.artifacts.artifact_pydantic_models import _ExecutableManifest
+from ...compiler.artifacts.expressions import _byte_size
 from ...compiler.artifacts.parameters import _pack, _requirements
 from ...compiler.dtype import _NATIVE_DTYPES, _QUANTIZED_DTYPES, _decode, _encode
 from ...compiler.kernels.bindings import _DTYPE_IDS
@@ -65,6 +67,8 @@ class _CPU:
         self.mapping_views: list[NDArray[np.uint8]] = []
         self.inputs: dict[str, NDArray[np.generic]] = {}
         self._calls: dict[int, _PreparedCall] = {}
+        self._expressions: dict[int, Callable[[], int]] = {}
+        self._expression_values: dict[str, int] = {}
         try:
             self._load(directory, threads)
         except BaseException:
@@ -89,7 +93,6 @@ class _CPU:
         self.arena = self._allocation(self.manifest.arena_size)
         self.cache = self._allocation(self.manifest.cache_size)
         self.shapes: dict[str, tuple[int, ...]] = {}
-        self.expression_values: dict[str, int] = {}
         self.lengths = dict.fromkeys(self.manifest.caches, 0)
         self.weight_address = self.map_file(directory / self.manifest.weights)
         self.constant_address = self.map_file(directory / self.manifest.constants)
@@ -182,6 +185,7 @@ class _CPU:
                 self.context = None
         self.inputs.clear()
         self._calls.clear()
+        self._expressions.clear()
         self.mapping_views.clear()
         for mapping in self.mappings:
             mapping.close()
@@ -208,7 +212,7 @@ class _CPU:
         self.manifest = self._base_manifest
         self.shapes.clear()
         self.inputs.clear()
-        self.expression_values.clear()
+        self._expression_values.clear()
         for name, value in inputs.items():
             record = self.manifest.buffers[self.manifest.inputs[name]]
             array = np.asarray(value)
@@ -269,8 +273,11 @@ class _CPU:
     def logical_array(self, name: str) -> NDArray[np.generic]:
         record = self.manifest.buffers[name]
         if record.dtype in _QUANTIZED_DTYPES:
-            raw = (c.c_ubyte * self.span(name)).from_address(self.address(name))
             rows, columns = self.storage_shape(name)
+            size = _byte_size(record.dtype, (rows, columns))
+            if size > self.span(name):
+                raise ExecutionError("packed tensor exceeds storage")
+            raw = (c.c_ubyte * size).from_address(self.address(name))
             decoded = _decode(
                 (np.frombuffer(raw, dtype=np.uint8), record.dtype), (rows, columns)
             )
@@ -296,53 +303,69 @@ class _CPU:
             )
         return value
 
+    @staticmethod
+    def _broadcast(a: int, b: int) -> int:
+        if a != b and a != 1 and b != 1:
+            raise ValueError("incompatible broadcast")
+        return b if a == 1 else a
+
+    def _expression_source(self, value: JsonValue) -> str:
+        if isinstance(value, int):
+            return repr(value)
+        expression = _object(value)
+        if "expr" in expression:
+            return f"backend._named_value({_text(expression['expr'])!r})"
+        operation = _text(expression["op"])
+        if operation in {"dimension", "scalar"}:
+            tensor = repr(_text(expression["tensor"]))
+            axis = _integer(expression.get("axis", 0))
+            if operation == "dimension":
+                return f"backend.shape({tensor})[{axis}]"
+            return f"int(backend.array({tensor}).flat[{axis}])"
+        if operation == "cache_length":
+            return f"backend.lengths[{_text(expression['cache'])!r}]"
+        a, b = (self._expression_source(item) for item in _list(expression["args"]))
+        symbols = {"add": "+", "sub": "-", "mul": "*", "floor_div": "//", "mod": "%"}
+        if operation in symbols:
+            return f"({a} {symbols[operation]} {b})"
+        if operation == "ceil_div":
+            return f"(-(-{a} // {b}))"
+        if operation in {"min", "max"}:
+            return f"{operation}({a}, {b})"
+        if operation == "broadcast_stride":
+            return f"(0 if {a} == 1 else {b})"
+        if operation == "broadcast":
+            return f"backend._broadcast({a}, {b})"
+        raise ValueError(f"unknown expression {operation}")
+
+    def _named_value(self, name: str) -> int:
+        if name not in self._expression_values:
+            self._expression_values[name] = self.evaluate(self.manifest.expressions[name])
+        return self._expression_values[name]
+
     def evaluate(self, value: JsonValue) -> int:
         if isinstance(value, int):
             return value
-        expression = _object(value)
-        if "expr" in expression:
-            name = _text(expression["expr"])
-            if name not in self.expression_values:
-                self.expression_values[name] = self.evaluate(
-                    self.manifest.expressions[name]
-                )
-            return self.expression_values[name]
-        operation = _text(expression["op"])
-        if operation == "dimension":
-            return self.shape(_text(expression["tensor"]))[_integer(expression["axis"])]
-        if operation == "scalar":
-            return int(
-                self.array(_text(expression["tensor"])).flat[
-                    _integer(expression.get("axis", 0))
-                ]
+        identity = id(value)
+        function = self._expressions.get(identity)
+        if function is None:
+            # Only fixed operators and quoted tensor names enter generated code.
+            source = "lambda: " + self._expression_source(value)
+            function = cast(
+                Callable[[], int],
+                eval(
+                    source,
+                    {
+                        "__builtins__": {},
+                        "backend": self,
+                        "int": int,
+                        "min": min,
+                        "max": max,
+                    },
+                ),
             )
-        if operation == "cache_length":
-            return self.lengths[_text(expression["cache"])]
-        arguments = [self.evaluate(item) for item in _list(expression["args"])]
-        a, b = arguments
-        if operation == "add":
-            return a + b
-        if operation == "sub":
-            return a - b
-        if operation == "mul":
-            return a * b
-        if operation == "floor_div":
-            return a // b
-        if operation == "ceil_div":
-            return -(-a // b)
-        if operation == "mod":
-            return a % b
-        if operation == "min":
-            return min(a, b)
-        if operation == "max":
-            return max(a, b)
-        if operation == "broadcast_stride":
-            return 0 if a == 1 else b
-        if operation == "broadcast":
-            if a != b and a != 1 and b != 1:
-                raise ValueError("incompatible broadcast")
-            return b if a == 1 else a
-        raise ValueError(f"unknown expression {operation}")
+            self._expressions[identity] = function
+        return function()
 
     def shape(self, name: str) -> tuple[int, ...]:
         if name in self.shapes:
@@ -640,7 +663,7 @@ class _CPU:
     def program(self, program: list[JsonValue]) -> None:
         for value in program:
             self.check_cancelled()
-            self.expression_values.clear()
+            self._expression_values.clear()
             instruction = _object(value)
             operation = _text(instruction["op"])
             if operation == "call":
@@ -762,5 +785,5 @@ class _CPU:
                     )
             else:
                 raise ValueError(f"unknown instruction {operation}")
-            self.expression_values.clear()
+            self._expression_values.clear()
         self.check_cancelled()
