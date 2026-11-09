@@ -10,6 +10,7 @@ from ...tdl.core import Graph, Input, Output, TensorShape
 from ...tdl.core.core_pydantic_models import (
     Weight,
     _BroadcastArgs,
+    _CastArgs,
     _ConstantArgs,
     _ConstructArgs,
     _InputArgs,
@@ -30,10 +31,16 @@ from ..kernels.bindings import (
 )
 from ..kernels.catalog import _available_capabilities
 from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
-from .canonicalize import _canonical, _pure, _terms, _unwrapped
+from .canonicalize import _canonical, _normal, _pure, _terms, _unwrapped
 from .infer import _infer
 from .optimize import _optimize
-from .passes_dataclasses import _KernelMatch, _KernelPattern, _MatchingState, _MatchSet
+from .passes_dataclasses import (
+    _Canonical,
+    _KernelMatch,
+    _KernelPattern,
+    _MatchingState,
+    _MatchSet,
+)
 from .walk import _walk
 
 
@@ -231,6 +238,107 @@ def _equivalent(
         covered.add(t)
     pairs.add(pair)
     return True
+
+
+def _shape_matches(
+    pattern: Tensor, target: Tensor, template: _KernelPattern, state: _MatchingState
+) -> bool:
+    expected = template.inference.tensors[pattern].shape
+    actual = state.inference.tensors[target].shape
+    return (
+        expected is not None
+        and actual is not None
+        and len(expected) == len(actual)
+        and all(
+            dimension.op != "const" or dimension.value == value.value
+            for dimension, value in zip(expected, actual, strict=True)
+        )
+    )
+
+
+def _mathematical(
+    pattern: _Canonical,
+    target: _Canonical,
+    template: _KernelPattern,
+    state: _MatchingState,
+    bindings: dict[str, Tensor],
+    covered: set[_Operator],
+) -> bool:
+    if state.remaining <= 0:
+        return False
+    state.remaining -= 1
+    if (
+        pattern.op == "leaf"
+        and isinstance(pattern.value, Tensor)
+        and pattern.value in template.inputs
+    ):
+        source = pattern.value
+        candidates = [
+            value
+            for value in target.sources
+            if _shape_matches(source, value, template, state)
+        ]
+        dtype = template.inference.tensors[source].dtype
+        typed = [
+            value
+            for value in candidates
+            if state.inference.tensors[value].dtype == dtype
+        ]
+        choices = typed or candidates
+        if not choices:
+            return False
+        value = choices[-1]
+        name = template.inputs[source]
+        previous = bindings.get(name)
+        if previous is not None and (
+            state.inference.tensors[previous].shape
+            != state.inference.tensors[value].shape
+            or previous is not value
+            and _normal(previous, state.inference, state).key
+            != _normal(value, state.inference, state).key
+        ):
+            return False
+        bindings.setdefault(name, value)
+        covered.update(target.origins - _normal(value, state.inference, state).origins)
+        return True
+    if (
+        pattern.op != target.op
+        or pattern.value != target.value
+        or len(pattern.arguments) != len(target.arguments)
+    ):
+        return False
+    covered.update(target.origins)
+    commutative = (
+        pattern.op in {"add", "mul", "min", "max"}
+        or pattern.op == "compare"
+        and pattern.value in {"eq", "ne"}
+    )
+    if not commutative:
+        return all(
+            _mathematical(a, b, template, state, bindings, covered)
+            for a, b in zip(pattern.arguments, target.arguments, strict=True)
+        )
+    ordered = sorted(
+        pattern.arguments,
+        key=lambda value: value.op == "leaf" and value.value in template.inputs,
+    )
+
+    def assign(index: int, remaining: tuple[_Canonical, ...]) -> bool:
+        if index == len(ordered):
+            return True
+        for position, value in enumerate(remaining):
+            before = dict(bindings), set(covered)
+            if _mathematical(
+                ordered[index], value, template, state, bindings, covered
+            ) and assign(index + 1, remaining[:position] + remaining[position + 1 :]):
+                return True
+            bindings.clear()
+            bindings.update(before[0])
+            covered.clear()
+            covered.update(before[1])
+        return False
+
+    return assign(0, target.arguments)
 
 
 def _signature(kernel: _Kernel) -> tuple[tuple[str, inspect.Parameter, object], ...]:
@@ -498,6 +606,23 @@ def _match(
                 continue
             arguments = _arguments(operator, signatures[id(kernel)])
             if arguments is None:
+                base = operator
+                while (
+                    isinstance(
+                        base.args,
+                        (_CastArgs, _ReshapeArgs, _PermuteArgs, _BroadcastArgs),
+                    )
+                    and base.args.x._producer is not None
+                ):
+                    base = base.args.x._producer
+                if base is not operator:
+                    arguments = _arguments(base, signatures[id(kernel)])
+                    if arguments is not None:
+                        outer = _fields(operator)
+                        for name in arguments:
+                            if name in outer and not isinstance(outer[name], Tensor):
+                                arguments[name] = outer[name]
+            if arguments is None:
                 continue
             key = (id(kernel), _key(arguments, inference))
             if key not in cache:
@@ -531,8 +656,44 @@ def _match(
                     _equivalent(p, t, pattern, state, bindings, {}, covered, pairs)
                     for p, t in zip(pattern.outputs, operator.outputs, strict=True)
                 )
+            mathematical = not matched
+            if mathematical:
+                bindings.clear()
+                covered.clear()
+                state.normal_budget = 4096
+                state.remaining = 4096
+                try:
+                    matched = all(
+                        _shape_matches(p, t, pattern, state)
+                        and _mathematical(
+                            _normal(p, pattern.inference, state),
+                            _normal(t, inference, state),
+                            pattern,
+                            state,
+                            bindings,
+                            covered,
+                        )
+                        for p, t in zip(pattern.outputs, operator.outputs, strict=True)
+                    )
+                except (OverflowError, RecursionError, ValueError, ZeroDivisionError):
+                    matched = False
             if not matched:
                 continue
+            boundary = internals
+            if mathematical:
+                # Replacing a region also removes its unused pure computations.
+                removed_nodes = {
+                    node
+                    for parent in covered
+                    for body in parent.regions
+                    for _, node in _walk(body)
+                }
+                boundary = internals | removed_nodes
+                covered.update(
+                    node
+                    for node in removed_nodes
+                    if not isinstance(node.args, (_ConstantArgs, _InputArgs))
+                )
             # Metadata-only inputs can disappear when their shape is statically known.
             for name, value in arguments.items():
                 for path, tensor in _tensor_arguments(value, name).items():
@@ -551,7 +712,7 @@ def _match(
                     f"{kernel.parameter_schema.input_count} or named tensor bindings"
                 )
                 continue
-            if any(not _safe_boundary(value, internals) for value in bindings.values()):
+            if any(not _safe_boundary(value, boundary) for value in bindings.values()):
                 continue
             outputs = set(operator.outputs) | {
                 _unwrapped(output, state) for output in operator.outputs
@@ -567,13 +728,22 @@ def _match(
             ):
                 continue
             try:
+                attributes = {
+                    **_fields(operator),
+                    **{
+                        name: bindings.get(name, value)
+                        if isinstance(value, Tensor)
+                        else value
+                        for name, value in arguments.items()
+                    },
+                }
                 context = _KernelBindingContext(
                     {
                         name: _binding(tensor, state)
                         for name, tensor in bindings.items()
                     },
                     tuple(_binding(tensor, state) for tensor in operator.outputs),
-                    _fields(operator),
+                    attributes,
                 )
                 parameters = kernel.bind(context)
                 references = set().union(
@@ -631,6 +801,7 @@ def _match(
                     tuple(bindings[name] for name in physical),
                     operator.outputs,
                     parameters,
+                    attributes,
                 )
             )
         result.candidates[operator] = tuple(

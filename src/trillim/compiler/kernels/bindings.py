@@ -215,6 +215,8 @@ def _argmax(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
 
 def _compare(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
+    if output.dtype != "bool":
+        raise ValueError("comparison output must have bool storage")
     dtype = context.inputs["a"].dtype
     promoted = _TensorBinding(output.shape, output.maximum_shape, dtype)
     result = _binary(_KernelBindingContext(context.inputs, (promoted,), context.attrs))
@@ -281,6 +283,8 @@ def _broadcast(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
 
 
 def _shape(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    if context.outputs[0].dtype != "int64":
+        raise ValueError("shape output must have int64 storage")
     source = context.inputs["x"]
     return {"rank": len(source.shape), "shape": source.shape}
 
@@ -354,6 +358,8 @@ def _indexing(
     storage_rows, storage_columns = _storage_shape(source)
     output_rows, output_columns = _storage_shape(output)
     mask = context.inputs.get("mask")
+    if mask is not None and mask.dtype != "bool":
+        raise ValueError("indexing masks must have bool storage")
     fill = context.attrs.get("fill", 0)
     if not isinstance(fill, (int, float)):
         raise TypeError("gather fill must be a numeric scalar")
