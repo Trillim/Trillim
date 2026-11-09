@@ -50,6 +50,7 @@ typedef struct {
     size_t input_count;
     size_t output_count;
     TrillimStatus (*requirements)(const void *, size_t *, size_t *, size_t *);
+    /* NULL parameters ask for size-independent alias permission after layout checks. */
     bool (*can_alias)(const void *, size_t, size_t);
     const size_t *input_alignments;
     const size_t *output_alignments;

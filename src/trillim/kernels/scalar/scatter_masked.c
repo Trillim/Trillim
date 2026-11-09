@@ -428,6 +428,11 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     return trillim_index_requirements(parameters, inputs, outputs, scratch, true, true);
 }
 
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    const TrillimIndexParameters *p = parameters;
+    return output == 0 && input == 0 && (p == NULL || trillim_itemsize(p->dtype) != 0);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter_masked(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -438,7 +443,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter_masked(
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {inputs, p, context};
     TrillimStatus status;
-    if (p->slice_size != 0) {
+    if (outputs[0] != inputs[0] && p->slice_size != 0) {
         for (size_t begin = 0; begin < p->count; begin += 1024) {
             if (context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -563,7 +568,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_scatter_masked_param
     static const size_t outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(TrillimIndexParameters), TRILLIM_ALIGNOF(TrillimIndexParameters),
-        sizeof(fields) / sizeof(fields[0]), fields, 4, 1, requirements, NULL, inputs, outputs, TRILLIM_ALIGNOF(size_t)
+        sizeof(fields) / sizeof(fields[0]), fields, 4, 1, requirements, can_alias, inputs, outputs, TRILLIM_ALIGNOF(size_t)
     };
     return &schema;
 }

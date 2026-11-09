@@ -108,6 +108,9 @@ static inline TrillimStatus trillim_rotary_task(void *opaque, size_t index, size
 }
 
 static bool can_alias(const void *parameters, size_t output, size_t input) {
+    if (parameters == NULL) {
+        return output == 0 && input == 0;
+    }
     const TrillimRotaryParameters *p = parameters;
     return output == 0 && input == 0 && p->input_dtype == p->output_dtype &&
         p->strides[2] == 1 && (p->heads <= 1 || p->strides[0] == p->dim) &&
