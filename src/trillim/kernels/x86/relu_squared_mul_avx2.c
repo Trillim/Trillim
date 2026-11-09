@@ -1,7 +1,6 @@
 #include "common.h"
 #include <immintrin.h>
 #include <math.h>
-#include <string.h>
 
 #define TRILLIM_AVX2 __attribute__((target("avx2")))
 

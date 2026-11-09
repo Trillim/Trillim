@@ -312,53 +312,6 @@ static inline TrillimStatus trillim_encode_quant(
     return TRILLIM_OK;
 }
 
-typedef enum {
-    TRILLIM_ADD, TRILLIM_SUB, TRILLIM_MUL, TRILLIM_DIV,
-    TRILLIM_FLOOR_DIV, TRILLIM_MOD, TRILLIM_EXP, TRILLIM_LOG,
-    TRILLIM_SQRT, TRILLIM_SIN, TRILLIM_COS, TRILLIM_ERF
-} TrillimElementwiseOperation;
-
-static inline TrillimStatus trillim_binary_value(
-    TrillimElementwiseOperation operation, TrillimValue a, TrillimValue b,
-    uint32_t dtype, TrillimValue *result
-) {
-    if (trillim_float(dtype)) {
-        switch (operation) {
-        case TRILLIM_ADD: result->f = a.f + b.f; break;
-        case TRILLIM_SUB: result->f = a.f - b.f; break;
-        case TRILLIM_MUL: result->f = a.f * b.f; break;
-        case TRILLIM_DIV: result->f = a.f / b.f; break;
-        default: return TRILLIM_ERROR;
-        }
-    } else {
-        switch (operation) {
-        case TRILLIM_ADD: result->u = a.u + b.u; break;
-        case TRILLIM_SUB: result->u = a.u - b.u; break;
-        case TRILLIM_MUL: result->u = a.u * b.u; break;
-        case TRILLIM_FLOOR_DIV: case TRILLIM_MOD:
-            if (b.u == 0) {
-                return TRILLIM_ERROR;
-            }
-            if (trillim_unsigned(dtype)) {
-                result->u = operation == TRILLIM_MOD ? a.u % b.u : a.u / b.u;
-            } else if (a.i == INT64_MIN && b.i == -1) {
-                result->i = operation == TRILLIM_MOD ? 0 : INT64_MIN;
-            } else {
-                int64_t quotient = a.i / b.i;
-                int64_t remainder = a.i % b.i;
-                if (remainder != 0 && (remainder < 0) != (b.i < 0)) {
-                    --quotient;
-                    remainder += b.i;
-                }
-                result->i = operation == TRILLIM_MOD ? remainder : quotient;
-            }
-            break;
-        default: return TRILLIM_ERROR;
-        }
-    }
-    return TRILLIM_OK;
-}
-
 typedef struct {
     size_t count;
     size_t items;
@@ -395,7 +348,6 @@ typedef struct {
     float *scratch;
     const TrillimIndexParameters *parameters;
     const TrillimKernelContext *context;
-    bool scatter;
 } TrillimIndexTask;
 
 static inline bool trillim_index_table_size(size_t items, size_t *capacity) {
@@ -484,7 +436,7 @@ static inline TrillimStatus trillim_coordinates(
     *active = true;
     if (p->masked != 0) {
         size_t index = trillim_offset(item, p->index_rank, p->index_shape, p->mask_strides);
-        if (((const uint8_t *)task->inputs[task->scatter ? 3 : 2])[index] == 0) {
+        if (((const uint8_t *)task->inputs[2])[index] == 0) {
             *active = false;
             return TRILLIM_OK;
         }
@@ -561,90 +513,8 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather_masked(
         return TRILLIM_CANCELLED;
     }
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
-    TrillimIndexTask task = {outputs[0], inputs, (float *)scratch, p, context, false};
-    TrillimStatus status;
-    if (!false) {
-        status = context->thread_pool->run(context->thread_pool->context, p->items, trillim_gather_task, &task);
-    } else {
-        if (p->slice_size != 0) {
-            for (size_t begin = 0; begin < p->count; begin += 1024) {
-                if (context->is_cancelled(context->cancellation_context)) {
-                    return TRILLIM_CANCELLED;
-                }
-                size_t end = p->count - begin < 1024 ? p->count : begin + 1024;
-                for (size_t i = begin; i < end; ++i) {
-                    size_t source = trillim_offset(i / p->slice_size, p->coordinates, p->indexed_shape, p->indexed_strides) +
-                        trillim_offset(i % p->slice_size, p->slice_rank, p->slice_shape, p->slice_strides);
-                    TrillimValue value = trillim_load(inputs[0], source, p->dtype);
-                    trillim_store(outputs[0], i, p->dtype, value);
-                }
-            }
-        }
-        size_t table_capacity = 0;
-        size_t *table = (size_t *)scratch;
-        if (p->mode == 0 && p->items != 0) {
-            if (!trillim_index_table_size(p->items, &table_capacity)) {
-                return TRILLIM_ERROR;
-            }
-            for (size_t begin = 0; begin < table_capacity; begin += 128) {
-                if (context->is_cancelled(context->cancellation_context)) {
-                    return TRILLIM_CANCELLED;
-                }
-                size_t count = table_capacity - begin < 128 ? table_capacity - begin : 128;
-                memset(table + begin, 255, count * sizeof(size_t));
-            }
-        }
-        for (size_t item = 0; item < p->items; ++item) {
-            if (context->is_cancelled(context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
-            size_t source, destination, key;
-            bool active;
-            status = trillim_coordinates(&task, item, &source, &destination, &key, &active);
-            if (status != TRILLIM_OK) {
-                return status;
-            }
-            if (!active) {
-                continue;
-            }
-            if (p->mode == 0) {
-                if (key == SIZE_MAX) {
-                    return TRILLIM_ERROR;
-                }
-                size_t slot = (key * (size_t)UINT64_C(0x9e3779b97f4a7c15)) & (table_capacity - 1);
-                size_t probes = 0;
-                while (table[slot] != SIZE_MAX) {
-                    if ((probes++ & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
-                        return TRILLIM_CANCELLED;
-                    }
-                    if (table[slot] == key) {
-                        return TRILLIM_ERROR;
-                    }
-                    slot = (slot + 1) & (table_capacity - 1);
-                }
-                table[slot] = key;
-            }
-            for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
-                if (context->is_cancelled(context->cancellation_context)) {
-                    return TRILLIM_CANCELLED;
-                }
-                size_t end = p->slice_size - begin < 1024 ? p->slice_size : begin + 1024;
-                for (size_t i = begin; i < end; ++i) {
-                    size_t index = trillim_offset(item * p->slice_size + i, p->values_rank, p->values_shape, p->values_strides);
-                    TrillimValue value = trillim_load(inputs[2], index, p->dtype);
-                    if (p->mode != 0) {
-                        TrillimValue previous = trillim_load(outputs[0], destination + i, p->dtype);
-                        status = trillim_binary_value(TRILLIM_ADD, previous, value, p->dtype, &value);
-                        if (status != TRILLIM_OK) {
-                            return status;
-                        }
-                    }
-                    trillim_store(outputs[0], destination + i, p->dtype, value);
-                }
-            }
-        }
-        status = TRILLIM_OK;
-    }
+    TrillimIndexTask task = {outputs[0], inputs, (float *)scratch, p, context};
+    TrillimStatus status = context->thread_pool->run(context->thread_pool->context, p->items, trillim_gather_task, &task);
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return status;
     }

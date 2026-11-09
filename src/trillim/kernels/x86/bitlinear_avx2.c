@@ -1,7 +1,6 @@
 #include "common.h"
 #include <float.h>
 #include <immintrin.h>
-#include <math.h>
 #include <string.h>
 
 #define AVX2 __attribute__((target("avx2")))

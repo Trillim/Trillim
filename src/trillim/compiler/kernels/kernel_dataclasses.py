@@ -52,7 +52,6 @@ class _ParameterSchema:
     output_alignments: tuple[int, ...]
     scratch_alignment: int
     requirements_address: int
-    can_alias_address: int | None
     native_type: type[ctypes.Structure]
 
 

@@ -1,6 +1,4 @@
 #include "common.h"
-#include <math.h>
-#include <string.h>
 
 typedef struct {
     size_t rank;
