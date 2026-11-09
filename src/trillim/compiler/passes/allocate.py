@@ -276,12 +276,15 @@ def _allocate(
     if graph._region is None:
         raise ValueError("graph is not complete")
     layout = _Layout(inference, transfer_kernel=transfer_kernel)
-    tensors: dict[Tensor, None] = {}
+    tensors: set[Tensor] = set()
     for region, operator in _walk(graph._region):
-        tensors.update(dict.fromkeys(region.parameters))
-        tensors.update(dict.fromkeys(operator.outputs))
+        tensors.update(region.parameters)
+        tensors.update(operator.outputs)
     constants = bytearray()
-    for index, tensor in enumerate(tensors):
+    # Workload schedules share buffer identities and the same constant file.
+    for index, tensor in enumerate(
+        tensor for tensor in inference.tensors if tensor in tensors
+    ):
         info = inference.tensors[tensor]
         if (
             info.dtype is None

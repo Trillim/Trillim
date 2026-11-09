@@ -64,7 +64,6 @@ def _compile_model(
                 max_input_size=request.max_input_size,
             )
         _validate(graph)
-        _schedule(graph, inference)
         report("Loading and matching kernels")
         backends: tuple[_Backend, ...] = (
             ("scalar", request.backend)
@@ -132,6 +131,8 @@ def _compile_model(
                 costs=tuning.costs,
                 fast=request.depth != "high",
             )
+        report("Scheduling selected kernels")
+        _schedule(graph, inference, selection)
         report("Allocating intermediate and cache memory")
         layout = _allocate(
             graph,
@@ -181,6 +182,7 @@ def _compile_model(
                 for operator, call in chosen.calls.items()
             )
             if costs and workload is not None and fingerprint != baseline:
+                _schedule(graph, inference, chosen)
                 variant_layout = _allocate(
                     graph,
                     inference,
