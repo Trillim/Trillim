@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -66,3 +66,4 @@ class _Kernel:
     bind: Callable[[_KernelBindingContext], dict[str, _ParameterValue]]
     library: Path
     physical_inputs: tuple[str, ...] | None = None
+    packings: dict[str, str] = field(default_factory=dict)

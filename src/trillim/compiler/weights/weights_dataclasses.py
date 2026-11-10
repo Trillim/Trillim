@@ -59,6 +59,7 @@ class _WeightBinding:
     logical: str
     source: _WeightEntry
     dtype: DType
+    packing: str = "canonical"
 
 
 @dataclass(slots=True)

@@ -17,6 +17,7 @@ from .passes.emit import _emit
 from .passes.infer import _infer
 from .passes.match import _match
 from .passes.optimize import _optimize
+from .passes.packing import _set_packings
 from .passes.schedule import _schedule
 from .passes.select import _select
 from .passes.trace import _trace
@@ -25,6 +26,7 @@ from .passes.verify import _verify
 from .passes.walk import _collect_checkpoints
 from .weights.bundle import _write_weights
 from .weights.resolve import _resolve_payloads, _resolve_weights
+from .weights.weights_dataclasses import _WeightRequest
 
 
 def _compile_model(
@@ -115,7 +117,25 @@ def _compile_model(
                 },
             )
         report("Writing model weights")
-        manifest = _write_weights(_resolve_payloads(weights), temporary / "weights.bin")
+        selection = _set_packings(graph, matches, selection, weights)
+        representations = None
+        if request.depth != "none":
+            formats = {
+                (binding.logical, binding.dtype, "canonical")
+                for binding in weights.bindings.values()
+            }
+            for candidates in all_matches.candidates.values():
+                for candidate in candidates:
+                    for tensor, packing in candidate.packings.items():
+                        binding = weights.bindings[tensor]
+                        formats.add((binding.logical, binding.dtype, packing))
+            representations = [
+                _WeightRequest(logical, dtype, packing, f"{logical}@{dtype}@{packing}")
+                for logical, dtype, packing in sorted(formats)
+            ]
+        manifest = _write_weights(
+            _resolve_payloads(weights, representations), temporary / "weights.bin"
+        )
         if request.depth != "none":
             report("Benchmarking representative kernel workloads")
         tuning = _tune(
@@ -134,6 +154,9 @@ def _compile_model(
                 fast=request.depth != "high",
             )
         report("Scheduling selected kernels")
+        selection = _set_packings(
+            graph, matches, selection, weights, tuning.costs or None
+        )
         _schedule(graph, inference, selection)
         report("Allocating intermediate and cache memory")
         layout = _allocate(
@@ -179,6 +202,7 @@ def _compile_model(
                 costs=costs,
                 fast=request.depth != "high",
             )
+            chosen = _set_packings(graph, matches, chosen, weights, costs)
             fingerprint = tuple(
                 (id(operator), call.kernel.name)
                 for operator, call in chosen.calls.items()

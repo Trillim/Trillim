@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ...tdl.core.types import DType
 from .. import dtype as _codec
+from .packing import _validate_packing
 from .reader import _CHUNK_BYTES, _unchanged
 from .weights_dataclasses import _ResolvedWeight, _WeightSource
 from .weights_pydantic_models import _WeightManifest, _WeightRecord
@@ -94,7 +95,8 @@ def _read_manifest(bundle: Path) -> _WeightManifest:
             length
             for _, length in _codec._payload_sections(entry.dtype, tuple(entry.shape))
         )
-        if entry.layout != "canonical" or entry.size != expected:
+        _validate_packing(entry.dtype, tuple(entry.shape), entry.layout)
+        if entry.size != expected:
             raise ValueError(f"invalid weight bundle representation: {name}")
         for alias in entry.aliases:
             other = manifest.entries.get(alias)

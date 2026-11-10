@@ -68,10 +68,16 @@ AVX2 static TrillimStatus activation_sum(const LinearTask *task, size_t row, int
     return TRILLIM_OK;
 }
 
-static void store(const LinearTask *task, size_t index, int64_t sum, size_t row) {
-    TrillimValue value;
-    value.f = ((float)sum * task->gamma) / task->scales[row];
-    trillim_store(task->output, index, task->params->output_dtype, value);
+static inline __attribute__((always_inline)) void store(const LinearTask *task, size_t index, int64_t sum, float multiplier) {
+    TrillimValue value = {.f = (float)sum * multiplier};
+    if (task->params->output_dtype == TRILLIM_BF16) {
+        uint16_t bits = trillim_to_bf16(value.f);
+        memcpy((uint8_t *)task->output + index * 2, &bits, sizeof(bits));
+    } else if (task->params->output_dtype == TRILLIM_FP32) {
+        memcpy((uint8_t *)task->output + index * 4, &value.f, sizeof(value.f));
+    } else {
+        trillim_store(task->output, index, task->params->output_dtype, value);
+    }
 }
 
 AVX2 static inline __m256i packed_dot(
@@ -107,6 +113,7 @@ AVX2 static TrillimStatus decode(void *task_context, size_t task_index, size_t w
         ? p->outputs : begin + task->decode_columns;
     size_t packed_row = p->width / 4;
     const int8_t *input = task->codes;
+    float multiplier = task->gamma / task->scales[0];
     const __m256i ones16 = _mm256_set1_epi16(1);
     int64_t row_sum;
     TrillimStatus status = activation_sum(task, 0, &row_sum);
@@ -156,15 +163,15 @@ AVX2 static TrillimStatus decode(void *task_context, size_t task_index, size_t w
             sum2 += sum_ints(_mm256_madd_epi16(dp2, ones16));
             sum3 += sum_ints(_mm256_madd_epi16(dp3, ones16));
         }
-        store(task, column, sum0 - row_sum, 0);
+        store(task, column, sum0 - row_sum, multiplier);
         if (lanes > 1) {
-            store(task, column + 1, sum1 - row_sum, 0);
+            store(task, column + 1, sum1 - row_sum, multiplier);
         }
         if (lanes > 2) {
-            store(task, column + 2, sum2 - row_sum, 0);
+            store(task, column + 2, sum2 - row_sum, multiplier);
         }
         if (lanes > 3) {
-            store(task, column + 3, sum3 - row_sum, 0);
+            store(task, column + 3, sum3 - row_sum, multiplier);
         }
     }
     return TRILLIM_OK;
@@ -204,7 +211,9 @@ AVX2 static TrillimStatus project(void *task_context, size_t task_index, size_t 
     const __m256i mask = _mm256_set1_epi8(3);
     const __m256i ones16 = _mm256_set1_epi16(1);
     int64_t row_sums[4];
+    float multipliers[4];
     for (size_t row = 0; row < rows; ++row) {
+        multipliers[row] = task->gamma / task->scales[first_token + row];
         TrillimStatus status = activation_sum(task, first_token + row, &row_sums[row]);
         if (status != TRILLIM_OK) {
             return status;
@@ -256,7 +265,7 @@ AVX2 static TrillimStatus project(void *task_context, size_t task_index, size_t 
         for (size_t lane = 0; lane < rows; ++lane) {
             size_t token = first_token + lane;
             size_t output_column = first_column + column;
-            store(task, token * p->outputs + output_column, sums[lane] - row_sums[lane], token);
+            store(task, token * p->outputs + output_column, sums[lane] - row_sums[lane], multipliers[lane]);
         }
     }
     return TRILLIM_OK;

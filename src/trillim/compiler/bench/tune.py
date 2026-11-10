@@ -29,6 +29,7 @@ from ..artifacts.parameters import _requirements
 from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..compiler_pydantic_models import _CompileRequest
 from ..passes.passes_dataclasses import _KernelMatch, _MatchSet
+from ..weights.packing import _repack_row_int8
 from ..weights.weights_dataclasses import _WeightBinding, _WeightIndex
 from ..weights.weights_pydantic_models import _WeightManifest
 from .bench_dataclasses import (
@@ -242,31 +243,41 @@ def _fixture(
             raise ValueError(
                 "benchmark weight needs a non-contiguous materialized transformation"
             )
-        record = next(
-            (
-                value
-                for value in state.manifest.entries.values()
-                if value.dtype == dtype
-                and (
-                    value.logical == binding.logical or binding.logical in value.aliases
-                )
-            ),
-            None,
-        )
-        if record is None:
+        packing = candidate.packings.get(tensor, "canonical")
+        records = [
+            value
+            for value in state.manifest.entries.values()
+            if value.dtype == dtype
+            and (value.logical == binding.logical or binding.logical in value.aliases)
+        ]
+        if not records:
             raise ValueError(
                 f"benchmark lacks real weight representation {binding.logical}:{dtype}"
             )
+        record = next(
+            (value for value in records if value.layout == packing), records[0]
+        )
         if record.size < required:
             raise ValueError(
                 "real benchmark weight does not cover its native footprint"
             )
-        return _BenchmarkInput(
+        payload: bytes | _BenchmarkInput = _BenchmarkInput(
             state.bundle, state.manifest.data_start + record.offset, record.size
-        ), {
+        )
+        if record.layout != packing:
+            with state.bundle.open("rb") as stream:
+                stream.seek(state.manifest.data_start + record.offset)
+                packed_bytes = np.frombuffer(stream.read(record.size), dtype=np.uint8)
+            if dtype != "row_int8":
+                raise ValueError("benchmark cannot repack this logical dtype")
+            payload = _repack_row_int8(
+                packed_bytes, tuple(record.shape), record.layout, packing
+            ).tobytes()
+        return payload, {
             "source": "weight",
             "logical": binding.logical,
             "dtype": dtype,
+            "packing": packing,
             "shape": list(record.shape),
             "bytes": record.size,
         }
@@ -343,7 +354,7 @@ def _invocation(
     candidate: _KernelMatch,
     point: int,
     state: _TuningState,
-    fixtures: dict[Tensor, bytes | _BenchmarkInput],
+    fixtures: dict[tuple[Tensor, str], bytes | _BenchmarkInput],
 ) -> tuple[_Invocation, list[dict[str, _JSON]]]:
     parameters = _parameters(candidate, point, state)
     footprint = _requirements(candidate.kernel.parameter_schema, parameters)
@@ -360,7 +371,7 @@ def _invocation(
     inputs = []
     descriptions = []
     for tensor, size in zip(candidate.inputs, footprint.inputs, strict=True):
-        fixture_key = _base(tensor)
+        fixture_key = (_base(tensor), candidate.packings.get(tensor, "canonical"))
         if fixture_key not in fixtures:
             payload, description = _fixture(tensor, candidate, point, state, size)
             fixtures[fixture_key] = payload
@@ -559,7 +570,7 @@ def _tune(
                     else:
                         _increment(record, operator_index)
                     if profile is None:
-                        fixtures: dict[Tensor, bytes | _BenchmarkInput] = {}
+                        fixtures: dict[tuple[Tensor, str], bytes | _BenchmarkInput] = {}
                         invocation, descriptions = _invocation(
                             candidate, point, state, fixtures
                         )

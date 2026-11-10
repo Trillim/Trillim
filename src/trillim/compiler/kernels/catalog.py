@@ -85,6 +85,12 @@ def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ..
             if not callable(pattern) or not callable(binder):
                 raise TypeError(f"{name}: pattern and bind must be callable")
             physical = namespace.get("physical_inputs")
+            packings = namespace.get("packings", {})
+            if not isinstance(packings, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in packings.items()
+            ):
+                raise TypeError(f"{name}: packings must map input names to formats")
             if physical is not None and (
                 not isinstance(physical, tuple)
                 or not all(isinstance(item, str) for item in physical)
@@ -102,6 +108,7 @@ def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ..
                     binder,
                     path,
                     cast(tuple[str, ...] | None, physical),
+                    cast(dict[str, str], packings),
                 )
             )
     return tuple(result)

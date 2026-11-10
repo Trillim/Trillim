@@ -626,6 +626,25 @@ def _match(
                         for name in arguments:
                             if name in outer and not isinstance(outer[name], Tensor):
                                 arguments[name] = outer[name]
+            if arguments is None and isinstance(operator.args, _ConstructArgs):
+                # A fusion can need attributes from an upstream composition.
+                pending = list(operator.inputs)
+                visited = {operator}
+                for tensor in pending:
+                    upstream = tensor._producer
+                    if (
+                        upstream is None
+                        or upstream in visited
+                        or any(not _pure(body, state) for body in upstream.regions)
+                        or upstream.op
+                        in {"cache", "cache_assign", "cache_read", "while", "if"}
+                    ):
+                        continue
+                    visited.add(upstream)
+                    arguments = _arguments(upstream, signatures[id(kernel)])
+                    if arguments is not None or len(visited) >= 16:
+                        break
+                    pending.extend(upstream.inputs)
             if arguments is None:
                 continue
             key = (id(kernel), _key(arguments, inference))
@@ -718,6 +737,25 @@ def _match(
                 continue
             if any(not _safe_boundary(value, boundary) for value in bindings.values()):
                 continue
+            if any(
+                name not in physical
+                or (producer := bindings[name]._producer) is None
+                or not isinstance(producer.args, _ConstantArgs)
+                or not isinstance(producer.args.value, Weight)
+                for name in kernel.packings
+            ):
+                continue
+            storage = {
+                bindings[name]: packing
+                for name, packing in kernel.packings.items()
+                if packing != "canonical"
+            }
+            if any(
+                storage.get(bindings[name], "canonical")
+                != kernel.packings.get(name, "canonical")
+                for name in physical
+            ):
+                continue
             outputs = set(operator.outputs) | {
                 _unwrapped(output, state) for output in operator.outputs
             }
@@ -806,6 +844,7 @@ def _match(
                     operator.outputs,
                     parameters,
                     attributes,
+                    storage,
                 )
             )
         result.candidates[operator] = tuple(

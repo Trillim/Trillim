@@ -23,13 +23,15 @@ The bundle is one file:
 
 1. An eight-byte little-endian unsigned JSON-header length.
 2. A UTF-8 JSON header, padded with spaces to a 64-byte boundary.
-3. Canonical tensor payloads, each beginning at a 64-byte boundary.
+3. Tensor payloads in their selected physical layouts, each beginning at a 64-byte boundary.
 
 The header length includes its trailing spaces. `data_start` is the absolute start of the payload area. Each entry's `offset` is relative to that area, so its file address is `data_start + offset`. All multibyte values are little-endian.
 
 The header contains `format="trillim.weights"`, `version=1`, `endian="little"`, `data_start`, and an `entries` mapping. Entries record their name, logical reference, dtype, shape, layout, byte extent, representation aliases, import method, and source provenance. Provenance includes the checkpoint-qualified tensor name, original file extent, source dtype/shape, and SHA256 of the source tensor bytes.
 
 `canonical` payloads store value bytes first, followed by their scale sections. Grouped INT5 adds high bits after its BF16 scales. Grouped INT6 then adds high bits and signed subscales. Matrix ternary stores one FP32 gamma after its values. MXFP4 stores E8M0 scales after its packed values. `trillim.compiler.dtype._payload_sections` returns the section names and byte lengths. Internal sections have no alignment padding; readers must handle unaligned scales.
+
+`row_int8_block32` retains logical dtype `row_int8`, dimensions `[outputs, inputs]`, and the same payload size. Codes are stored as `[outputs/32, inputs/32, 32, 32]`, followed by the unchanged BF16 scale for each output row. Both dimensions must be positive multiples of 32. The compiler selects this layout for compatible kernels; TDL authors continue to specify the logical dtype. Benchmarks repack the same encoded codes and scales when comparing physical layouts, rather than requantizing them.
 
 Resolve supplies each encoded chunk with its offset within the tensor payload, keeping values, scales and other sections separate. The writer places those bytes at the corresponding file positions. It writes a temporary file and replaces the destination after completion.
 

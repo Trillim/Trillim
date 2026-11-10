@@ -19,6 +19,7 @@ class _KernelMatch:
     outputs: tuple[Tensor, ...]
     parameters: dict[str, _ParameterValue]
     attributes: dict[str, object] = field(default_factory=dict)
+    packings: dict[Tensor, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

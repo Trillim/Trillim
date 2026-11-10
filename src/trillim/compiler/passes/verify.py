@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import JsonValue
 
 from ..artifacts.artifact_pydantic_models import _BufferRecord, _ExecutableManifest
-from ..artifacts.expressions import _byte_size
+from ..artifacts.expressions import _byte_size, _dimension_dependencies
 from ..weights.bundle import _read_manifest
 from ..weights.weights_pydantic_models import _WeightManifest
 
@@ -71,13 +71,27 @@ def _program(
     program: list[dict[str, JsonValue]],
     manifest: _ExecutableManifest,
     available: set[str],
+    weights: _WeightManifest,
 ) -> set[str]:
-    def require(values: list[str]) -> None:
-        if not set(values) <= available:
-            raise ValueError(
-                f"instruction uses unavailable tensors: {set(values) - available}"
-            )
+    resolving: set[str] = set()
+    dimensions: dict[str, frozenset[str] | None] = {}
 
+    def require(values: list[str]) -> None:
+        for name in set(values) - available:
+            if name not in manifest.buffers or name in resolving:
+                raise ValueError(f"unavailable tensor: {name}")
+            buffer = manifest.buffers[name]
+            dependencies = _dimension_dependencies(
+                [*buffer.shape, *buffer.strides, buffer.byte_offset],
+                manifest.expressions,
+                dimensions,
+            )
+            if buffer.storage != "alias" or buffer.source is None or dependencies is None:
+                raise ValueError(f"unavailable tensor: {name}")
+            resolving.add(name)
+            require([buffer.source, *dependencies])
+            resolving.remove(name)
+            available.add(name)
     def define(values: list[str]) -> None:
         if not set(values) <= manifest.buffers.keys():
             raise ValueError("instruction defines an unknown tensor")
@@ -105,12 +119,39 @@ def _program(
                 _strings(instruction.get("outputs"), "outputs"),
             )
             require(inputs)
+            formats = _strings(
+                instruction.get("input_packings", ["canonical"] * len(inputs)),
+                "input packings",
+            )
+            if len(formats) != len(inputs):
+                raise ValueError("kernel packing count mismatch")
+            for tensor, packing in zip(inputs, formats, strict=True):
+                buffer = manifest.buffers[tensor]
+                while buffer.storage == "alias":
+                    assert buffer.source is not None
+                    buffer = manifest.buffers[buffer.source]
+                actual = (
+                    weights.entries[buffer.source].layout
+                    if buffer.storage == "weight" and buffer.source is not None
+                    else "canonical"
+                )
+                if packing != actual:
+                    raise ValueError(
+                        f"kernel input packing mismatch: {tensor}: {packing} != {actual}"
+                    )
             if len(inputs) != kernel["inputs"] or len(outputs) != kernel["outputs"]:
                 raise ValueError("kernel binding count mismatch")
             arguments = instruction.get("parameters")
             if not isinstance(arguments, dict):
                 raise ValueError("missing invocation parameters")
             require(sorted(_references(arguments, manifest.expressions)))
+            require(
+                sorted(
+                    _references(
+                        instruction.get("argument_key", []), manifest.expressions
+                    )
+                )
+            )
             schema = kernel.get("parameters")
             if not isinstance(schema, dict) or not isinstance(
                 schema.get("fields"), list
@@ -173,10 +214,16 @@ def _program(
                 if not isinstance(branch, dict):
                     raise TypeError("invalid branch")
                 branch_available = _program(
-                    _block(branch.get("program")), manifest, available.copy()
+                    _block(branch.get("program")),
+                    manifest,
+                    available.copy(),
+                    weights,
                 )
                 copied = _program(
-                    _block(branch.get("copies")), manifest, branch_available.copy()
+                    _block(branch.get("copies")),
+                    manifest,
+                    branch_available.copy(),
+                    weights,
                 )
                 if not set(outputs) <= copied:
                     raise ValueError("branch outputs are not transferred")
@@ -194,7 +241,10 @@ def _program(
             if not isinstance(limit, int) or limit < 0 or len(initial) != len(outputs):
                 raise ValueError("invalid loop bound or carried values")
             state = _program(
-                _block(instruction.get("initial_copies")), manifest, available.copy()
+                _block(instruction.get("initial_copies")),
+                manifest,
+                available.copy(),
+                weights,
             )
             if not set(outputs) <= state:
                 raise ValueError("loop state is not initialized")
@@ -205,13 +255,20 @@ def _program(
                 parameters = _strings(block.get("parameters"), "loop parameters")
                 if len(parameters) != len(initial):
                     raise ValueError("loop parameter arity mismatch")
-                entered = _program(_block(block.get("copies")), manifest, state.copy())
+                entered = _program(
+                    _block(block.get("copies")), manifest, state.copy(), weights
+                )
                 if not set(parameters) <= entered:
                     raise ValueError("loop parameters are not transferred")
-                local = _program(_block(block.get("program")), manifest, entered)
+                local = _program(
+                    _block(block.get("program")), manifest, entered, weights
+                )
                 if name == "body":
                     updated = _program(
-                        _block(block.get("updates")), manifest, local.copy()
+                        _block(block.get("updates")),
+                        manifest,
+                        local.copy(),
+                        weights,
                     )
                     if not set(outputs) <= updated:
                         raise ValueError("loop state is not updated")
@@ -236,6 +293,7 @@ def _program(
                 _block(instruction.get("program")),
                 manifest,
                 available | set(parameters),
+                weights,
             )
             results = _strings(instruction.get("results"), "reducer results")
             outputs = _strings(instruction.get("outputs"), "reduction outputs")
@@ -360,7 +418,7 @@ def _verify_plan(
         for name, buffer in manifest.buffers.items()
         if buffer.storage in {"constant", "weight", "input"}
     }
-    available = _program(manifest.program, manifest, available)
+    available = _program(manifest.program, manifest, available, weights)
     if not set(manifest.outputs.values()) <= available:
         raise ValueError("model output is not produced by the program")
 

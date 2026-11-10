@@ -28,6 +28,8 @@ from ..compiler_dataclasses import _ShapeConstraint, _ShapeExpression
 from ..compiler_pydantic_models import _CompileRequest
 from ..kernels.kernel_dataclasses import _ParameterValue
 from ..kernels.native import _CAPABILITY_FLAGS
+from .cleanup import _cleanup
+from .optimize import _observable
 from .passes_dataclasses import _Selection
 
 
@@ -50,6 +52,7 @@ def _program(
     expressions: _Expressions,
 ) -> list[_JSON]:
     result: list[_JSON] = []
+    by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
 
     def tensors(values: tuple[Tensor, ...]) -> list[_JSON]:
         return [names[tensor] for tensor in values]
@@ -119,16 +122,60 @@ def _program(
                     }
                 )
             workspace = layout.scratch[operator]
+            parameters = layout.parameters[operator]
+            argument_key = dict.fromkeys(
+                value
+                for field in parameters.values()
+                for value in (field if isinstance(field, tuple) else (field,))
+                if isinstance(value, _ShapeExpression) and value.op != "const"
+            )
+            for tensor in (*call.inputs, *call.outputs):
+                buffer = layout.buffers[tensor]
+                while True:
+                    argument_key.update(
+                        dict.fromkeys(
+                            value
+                            for value in (
+                                *buffer.shape,
+                                *buffer.strides,
+                                buffer.byte_offset,
+                            )
+                            if value is not None and value.op != "const"
+                        )
+                    )
+                    if buffer.storage != "alias":
+                        break
+                    assert buffer.source is not None
+                    buffer = by_name[buffer.source]
+            pending = list(argument_key)
+            argument_key.clear()
+            visited: set[_ShapeExpression] = set()
+            while pending:
+                value = pending.pop()
+                if value in visited:
+                    continue
+                visited.add(value)
+                if value.args:
+                    pending.extend(value.args)
+                elif value.op != "const":
+                    argument_key[value] = None
             result.append(
                 {
                     "op": "call",
                     "kernel": call.kernel.name,
+                    "effectful": any(_observable(owner) for owner in owned),
                     "inputs": tensors(call.inputs),
                     "outputs": tensors(call.outputs),
+                    "input_packings": [
+                        call.packings.get(tensor, "canonical") for tensor in call.inputs
+                    ],
                     "parameters": {
                         key: _parameter(value, names, expressions)
-                        for key, value in layout.parameters[operator].items()
+                        for key, value in parameters.items()
                     },
+                    "argument_key": [
+                        _serialize(value, names, expressions) for value in argument_key
+                    ],
                     "scratch": {"offset": workspace.offset, "size": workspace.size},
                 }
             )
@@ -372,6 +419,7 @@ def _emit(
             else None,
         }
     )
+    manifest = _cleanup(manifest)
     (destination / "constants.bin").write_bytes(layout.constants)
     (destination / "executable.json").write_text(manifest.model_dump_json() + "\n")
     return manifest

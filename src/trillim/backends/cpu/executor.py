@@ -25,7 +25,7 @@ from ...compiler.kernels.kernel_dataclasses import _ParameterSchema, _ParameterV
 from ...compiler.kernels.native import _read_capabilities, _read_schema
 from ...compiler.passes.verify import _verify
 from ...compiler.weights.bundle import _read_manifest
-from .cpu_dataclasses import _Allocation, _PreparedCall
+from .cpu_dataclasses import _Allocation, _BoundCall, _PreparedCall
 from .errors import CancelledError, ExecutionError
 
 
@@ -67,6 +67,7 @@ class _CPU:
         self.mapping_views: list[NDArray[np.uint8]] = []
         self.inputs: dict[str, NDArray[np.generic]] = {}
         self._calls: dict[int, _PreparedCall] = {}
+        self._bound_calls: dict[int, _BoundCall] = {}
         self._expressions: dict[int, Callable[[], int]] = {}
         self._expression_values: dict[str, int] = {}
         try:
@@ -185,6 +186,7 @@ class _CPU:
                 self.context = None
         self.inputs.clear()
         self._calls.clear()
+        self._bound_calls.clear()
         self._expressions.clear()
         self.mapping_views.clear()
         for mapping in self.mappings:
@@ -212,6 +214,7 @@ class _CPU:
         self.manifest = self._base_manifest
         self.shapes.clear()
         self.inputs.clear()
+        self._bound_calls.clear()
         self._expression_values.clear()
         for name, value in inputs.items():
             record = self.manifest.buffers[self.manifest.inputs[name]]
@@ -351,7 +354,9 @@ class _CPU:
 
     def _named_value(self, name: str) -> int:
         if name not in self._expression_values:
-            self._expression_values[name] = self.evaluate(self.manifest.expressions[name])
+            self._expression_values[name] = self.evaluate(
+                self.manifest.expressions[name]
+            )
         return self._expression_values[name]
 
     def evaluate(self, value: JsonValue) -> int:
@@ -476,12 +481,19 @@ class _CPU:
         inputs: list[tuple[int, int]],
         outputs: list[tuple[int, int]],
         scratch: dict[str, JsonValue],
+        *,
+        cache: bool = False,
     ) -> None:
         _, schema, pointer = self.kernels[kernel]
         prepared = self._calls.get(identity)
         if prepared is None or prepared.parameters != parameters:
+            packed = _pack(
+                schema,
+                parameters,
+                previous=(prepared.packed, prepared.parameters) if prepared else None,
+            )
             prepared = _PreparedCall(
-                parameters, _pack(schema, parameters), _requirements(schema, parameters)
+                parameters, packed, _requirements(schema, parameters, packed=packed)
             )
             self._calls[identity] = prepared
         footprint = prepared.requirements
@@ -501,24 +513,50 @@ class _CPU:
             or scratch_address % schema.scratch_alignment
         ):
             raise ValueError(f"{kernel}: scratch footprint/alignment invalid")
-        source = (c.c_void_p * len(inputs))(*(address for address, _ in inputs))
-        target = (c.c_void_p * len(outputs))(*(address for address, _ in outputs))
+        call = self._bound_calls.get(identity) if cache else None
+        if call is None:
+            source = (c.c_void_p * len(inputs))(*(address for address, _ in inputs))
+            target = (c.c_void_p * len(outputs))(*(address for address, _ in outputs))
+            call = _BoundCall(kernel, pointer, source, target, scratch_address, prepared)
+        else:
+            for index, (address, _) in enumerate(inputs):
+                call.source[index] = address
+            for index, (address, _) in enumerate(outputs):
+                call.target[index] = address
+            call.scratch = scratch_address
+            call.prepared = prepared
+        if cache:
+            self._bound_calls[identity] = call
+        self._invoke_bound(call)
+
+    def _invoke_bound(self, call: _BoundCall) -> None:
         status = self.native(
             self.context,
-            pointer,
-            target,
-            source,
-            scratch_address,
-            prepared.packed.address,
+            call.pointer,
+            call.target,
+            call.source,
+            call.scratch,
+            call.prepared.packed.address,
         )
         if status == 1:
-            raise CancelledError(f"{kernel}: execution cancelled")
+            raise CancelledError(f"{call.kernel}: execution cancelled")
         if status:
             raise ExecutionError(
-                f"{kernel} failed with status {status}, parameters={parameters}"
+                f"{call.kernel} failed with status {status}, parameters={call.prepared.parameters}"
             )
 
     def call(self, instruction: dict[str, JsonValue]) -> None:
+        dependencies = instruction.get("argument_key")
+        key = (
+            tuple(self.evaluate(value) for value in dependencies)
+            if isinstance(dependencies, list)
+            else None
+        )
+        bound = self._bound_calls.get(id(instruction))
+        if bound is not None and bound.key == key:
+            self.shapes.update(bound.shapes)
+            self._invoke_bound(bound)
+            return
         for destination, source in _object(instruction.get("shape_from", {})).items():
             self.shapes[destination] = self.shape(_text(source))
         inputs = [_text(item) for item in _list(instruction["inputs"])]
@@ -527,10 +565,15 @@ class _CPU:
             if name not in _object(instruction.get("shape_from", {})):
                 self.shapes.pop(name, None)
                 self.shapes[name] = self.shape(name)
-        parameters = {
-            name: self.parameter(value)
-            for name, value in _object(instruction["parameters"]).items()
-        }
+        if bound is None:
+            parameters = {
+                name: self.parameter(value)
+                for name, value in _object(instruction["parameters"]).items()
+            }
+        else:
+            parameters = bound.prepared.parameters | {
+                name: self.parameter(value) for name, value in bound.varying.items()
+            }
         self.invoke(
             id(instruction),
             _text(instruction["kernel"]),
@@ -538,7 +581,21 @@ class _CPU:
             [(self.address(name), self.span(name)) for name in inputs],
             [(self.address(name), self.span(name)) for name in outputs],
             _object(instruction["scratch"]),
+            cache=key is not None,
         )
+        if key is not None:
+            bound = self._bound_calls[id(instruction)]
+            if bound.key is None:
+                bound.varying = {
+                    name: value
+                    for name, value in _object(instruction["parameters"]).items()
+                    if any(
+                        isinstance(item, dict) and "float" not in item
+                        for item in (value if isinstance(value, list) else [value])
+                    )
+                }
+            bound.key = key
+            bound.shapes = {name: self.shapes[name] for name in outputs}
 
     def storage_shape(self, name: str) -> tuple[int, int]:
         buffer = self.manifest.buffers[name]
@@ -673,9 +730,10 @@ class _CPU:
 
     def program(self, program: list[JsonValue]) -> None:
         for value in program:
-            self.check_cancelled()
             instruction = _object(value)
             operation = _text(instruction["op"])
+            if operation != "call":
+                self.check_cancelled()
             if operation != "guard":
                 self._expression_values.clear()
             if operation == "call":
@@ -732,9 +790,14 @@ class _CPU:
             elif operation == "cache_read":
                 cache = _text(instruction["cache"])
                 output = _text(instruction["output"])
-                snapshot = self.cache_array(cache)
-                self.shapes[output] = snapshot.shape
+                metadata = self.manifest.caches[cache]
+                snapshot_shape = [_integer(item) for item in _list(metadata["shape"])]
+                axis = metadata["axis"]
+                if isinstance(axis, int):
+                    snapshot_shape[axis] = self.lengths[cache]
+                self.shapes[output] = tuple(snapshot_shape)
                 if instruction["snapshot"]:
+                    snapshot = self.cache_array(cache)
                     if self.manifest.buffers[output].dtype in _QUANTIZED_DTYPES:
                         payload = _encode(
                             snapshot, self.manifest.buffers[output].dtype
@@ -750,39 +813,42 @@ class _CPU:
                 metadata = self.manifest.caches[cache]
                 shape = self.shape(source)
                 axis = metadata["axis"]
-                target = self.cache_array(cache, capacity=True)
+                capacity_shape = tuple(_integer(item) for item in _list(metadata["shape"]))
                 kind = _text(metadata["dtype"])
-                values = (
-                    self.logical_array(source)
-                    if kind in _QUANTIZED_DTYPES
-                    else self.array(source)
-                )
+                if not instruction["metadata_only"]:
+                    target = self.cache_array(cache, capacity=True)
+                    values = (
+                        self.logical_array(source)
+                        if kind in _QUANTIZED_DTYPES
+                        else self.array(source)
+                    )
                 if isinstance(axis, int):
                     begin = (
                         self.lengths[cache] if instruction["action"] == "append" else 0
                     )
                     end = begin + shape[axis]
-                    capacity = target.shape[axis]
+                    capacity = capacity_shape[axis]
                     if (
                         end > capacity
                         and metadata["mode"] == "sliding"
                         and instruction["action"] == "append"
                     ):
-                        previous = self.cache_array(cache)
-                        values = np.concatenate((previous, values), axis=axis)
-                        slices = [slice(None)] * len(shape)
-                        slices[axis] = slice(max(0, end - capacity), end)
-                        values = values[tuple(slices)]
+                        if not instruction["metadata_only"]:
+                            previous = self.cache_array(cache)
+                            values = np.concatenate((previous, values), axis=axis)
+                            slices = [slice(None)] * len(shape)
+                            slices[axis] = slice(max(0, end - capacity), end)
+                            values = values[tuple(slices)]
                         begin, end = 0, min(end, capacity)
                     elif end > capacity:
                         raise ExecutionError("cache capacity exceeded")
-                    slices = [slice(None)] * len(shape)
-                    slices[axis] = slice(begin, end)
                     if not instruction["metadata_only"]:
+                        slices = [slice(None)] * len(shape)
+                        slices[axis] = slice(begin, end)
                         self.copy_array(target[tuple(slices)], values)
                     self.lengths[cache] = end
                 else:
-                    if target.shape != shape:
+                    if capacity_shape != shape:
                         raise ExecutionError(
                             "overwrite cache shape differs from its capacity"
                         )

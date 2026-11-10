@@ -248,6 +248,25 @@ TRILLIM_AVX2 static inline TrillimStatus trillim_attention_score(
     float sum = 0.0f;
     size_t channel = 0;
     __m256 accumulator = _mm256_setzero_ps();
+    __m256 sum1 = accumulator, sum2 = accumulator, sum3 = accumulator;
+    for (; p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->key_dim - channel >= 32; channel += 32) {
+        if (p->key_dim > 1024 && (channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(
+            trillim_avx2_load8(task->query, query + channel, p->q_dtype, p->q_rows, p->q_columns),
+            trillim_avx2_load8(task->keys, key + channel, p->k_dtype, p->k_rows, p->k_columns)));
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+            trillim_avx2_load8(task->query, query + channel + 8, p->q_dtype, p->q_rows, p->q_columns),
+            trillim_avx2_load8(task->keys, key + channel + 8, p->k_dtype, p->k_rows, p->k_columns)));
+        sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(
+            trillim_avx2_load8(task->query, query + channel + 16, p->q_dtype, p->q_rows, p->q_columns),
+            trillim_avx2_load8(task->keys, key + channel + 16, p->k_dtype, p->k_rows, p->k_columns)));
+        sum3 = _mm256_add_ps(sum3, _mm256_mul_ps(
+            trillim_avx2_load8(task->query, query + channel + 24, p->q_dtype, p->q_rows, p->q_columns),
+            trillim_avx2_load8(task->keys, key + channel + 24, p->k_dtype, p->k_rows, p->k_columns)));
+    }
+    accumulator = _mm256_add_ps(_mm256_add_ps(accumulator, sum1), _mm256_add_ps(sum2, sum3));
     for (; p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->key_dim - channel >= 8; channel += 8) {
         if (p->key_dim > 1024 && (channel & 1023) == 0 &&
             task->context->is_cancelled(task->context->cancellation_context)) {
@@ -332,9 +351,31 @@ TRILLIM_AVX2 static inline TrillimStatus trillim_attention_task(void *opaque, si
             }
             denominator = denominator * previous + block_sum;
             maximum = next_maximum;
+            size_t first_channel = 0;
+            for (; p->v_strides[2] == 1 && p->value_dim - first_channel >= 32; first_channel += 32) {
+                if (task->context->is_cancelled(task->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                __m256 a = _mm256_loadu_ps(accumulator + first_channel);
+                __m256 b = _mm256_loadu_ps(accumulator + first_channel + 8);
+                __m256 c = _mm256_loadu_ps(accumulator + first_channel + 16);
+                __m256 d = _mm256_loadu_ps(accumulator + first_channel + 24);
+                for (size_t j = 0; j < count; ++j) {
+                    size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + first_channel;
+                    __m256 probability = _mm256_set1_ps(scores[j]);
+                    a = _mm256_add_ps(a, _mm256_mul_ps(probability, trillim_avx2_load8(task->values, value, p->v_dtype, p->v_rows, p->v_columns)));
+                    b = _mm256_add_ps(b, _mm256_mul_ps(probability, trillim_avx2_load8(task->values, value + 8, p->v_dtype, p->v_rows, p->v_columns)));
+                    c = _mm256_add_ps(c, _mm256_mul_ps(probability, trillim_avx2_load8(task->values, value + 16, p->v_dtype, p->v_rows, p->v_columns)));
+                    d = _mm256_add_ps(d, _mm256_mul_ps(probability, trillim_avx2_load8(task->values, value + 24, p->v_dtype, p->v_rows, p->v_columns)));
+                }
+                _mm256_storeu_ps(accumulator + first_channel, a);
+                _mm256_storeu_ps(accumulator + first_channel + 8, b);
+                _mm256_storeu_ps(accumulator + first_channel + 16, c);
+                _mm256_storeu_ps(accumulator + first_channel + 24, d);
+            }
             for (size_t j = 0; j < count; ++j) {
                 size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1];
-                size_t channel = 0;
+                size_t channel = first_channel;
                 __m256 probability = _mm256_set1_ps(scores[j]);
                 for (; p->v_strides[2] == 1 && p->value_dim - channel >= 8; channel += 8) {
                     if (p->value_dim > 1024 && (channel & 1023) == 0 &&
