@@ -472,24 +472,24 @@ def _reshape_strides(
 def _rmsnorm(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     source = context.inputs["x"]
     if not source.shape:
-        raise ValueError("RMSNorm requires a channel axis")
+        raise ValueError("normalization requires a channel axis")
     source_strides = source.strides or _contiguous_strides(source.shape)
     if _reshape_strides(
         source.shape, source_strides, source.shape
     ) != _contiguous_strides(source.shape):
-        raise ValueError("fused RMSNorm requires contiguous input")
+        raise ValueError("fused normalization requires contiguous input")
     rows, columns = _storage_shape(source)
     weight = context.inputs.get("weight")
     if weight is not None and (
         len(weight.shape) != 1 or weight.shape[0] != source.shape[-1]
     ):
         raise ValueError(
-            "fused RMSNorm requires a vector weight matching the channel axis"
+            "fused normalization requires a vector weight matching the channel axis"
         )
     eps = context.attrs.get("eps", 1e-6)
     offset = context.attrs.get("weight_offset", 0.0)
     if not isinstance(eps, (int, float)) or not isinstance(offset, (int, float)):
-        raise TypeError("RMSNorm eps and weight_offset must be numeric scalars")
+        raise TypeError("normalization parameters must be numeric scalars")
     return {
         "rows": _product(source.shape[:-1]),
         "width": source.shape[-1],
@@ -537,6 +537,100 @@ def _linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return _matmul(
         _KernelBindingContext({"a": matrix, "b": transposed}, (result,), context.attrs)
     )
+
+
+def _floating_contiguous(*bindings: _TensorBinding) -> None:
+    if any(
+        value.dtype not in {"fp32", "bf16"}
+        or (value.strides or _contiguous_strides(value.shape))
+        != _contiguous_strides(value.shape)
+        for value in bindings
+    ):
+        raise ValueError("kernel requires contiguous FP32 or BF16 tensors")
+
+
+def _layernorm(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source = context.inputs["x"]
+    if context.attrs.get("axes", (-1,)) != (-1,):
+        raise ValueError("fused LayerNorm requires the final channel axis")
+    result = _rmsnorm(context)
+    bias = context.inputs["bias"]
+    if bias.shape != source.shape[-1:]:
+        raise ValueError("LayerNorm bias must match the channel axis")
+    _floating_contiguous(*context.inputs.values(), *context.outputs)
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in {"storage_rows", "storage_columns", "weight_offset"}
+    } | {"bias_dtype": _DTYPE_IDS[bias.dtype]}
+
+
+def _conv1d(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, weight, bias = (context.inputs[name] for name in ("x", "weight", "bias"))
+    stride = context.attrs.get("stride", 1)
+    if isinstance(stride, tuple) and len(stride) == 1:
+        stride = stride[0]
+    if (
+        context.attrs.get("kernel") != (3,)
+        or stride not in {1, 2}
+        or context.attrs.get("padding", 1) not in (1, (1,))
+        or context.attrs.get("dilation", 1) not in (1, (1,))
+        or context.attrs.get("groups", 1) != 1
+        or len(source.shape) != 2
+        or len(weight.shape) != 3
+        or weight.shape[1] != source.shape[0]
+        or weight.shape[2].value != 3
+        or bias.shape != weight.shape[:1]
+    ):
+        raise ValueError(
+            "fused Conv1D requires a padded size-three kernel and stride 1 or 2"
+        )
+    _floating_contiguous(*context.inputs.values(), *context.outputs)
+    assert isinstance(stride, int)
+    return {
+        "channels": source.shape[0],
+        "length": source.shape[1],
+        "outputs": weight.shape[0],
+        "stride": stride,
+        "output_length": context.outputs[0].shape[1],
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "weight_dtype": _DTYPE_IDS[weight.dtype],
+        "bias_dtype": _DTYPE_IDS[bias.dtype],
+        "output_dtype": _DTYPE_IDS[context.outputs[0].dtype],
+    }
+
+
+def _gelu(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, output = context.inputs["x"], context.outputs[0]
+    if context.attrs.get("approximate", "none") != "none":
+        raise ValueError("fused GELU requires the erf definition")
+    if source.shape != output.shape:
+        raise ValueError("GELU input and output shapes must match")
+    _floating_contiguous(source, output)
+    return {
+        "count": _product(source.shape),
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "output_dtype": _DTYPE_IDS[output.dtype],
+    }
+
+
+def _bias_add(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, bias = context.inputs["a"], context.inputs["b"]
+    output = context.outputs[0]
+    if (
+        not source.shape
+        or bias.shape != source.shape[-1:]
+        or output.shape != source.shape
+    ):
+        raise ValueError("fused bias addition requires a matching channel vector")
+    _floating_contiguous(source, bias, output)
+    return {
+        "rows": _product(source.shape[:-1]),
+        "width": source.shape[-1],
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "bias_dtype": _DTYPE_IDS[bias.dtype],
+        "output_dtype": _DTYPE_IDS[output.dtype],
+    }
 
 
 def _bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
@@ -620,6 +714,10 @@ def _quantized_linear(
 
 def _row_int8_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return _quantized_linear(context, weight_dtype="row_int8")
+
+
+def _group_int8_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    return _quantized_linear(context, weight_dtype="grp_int8")
 
 
 def _row_int8_blocked(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
@@ -721,6 +819,23 @@ def _activation(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return {"count": result["count"]}
 
 
+def _silu_mul(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, other = context.inputs["a"], context.inputs["b"]
+    output = context.outputs[0]
+    _floating_contiguous(source, other, output)
+    if (
+        source.dtype != other.dtype
+        or source.shape != other.shape
+        or output.shape != source.shape
+    ):
+        raise ValueError("SiLU gate requires matching input dtypes and tensor shapes")
+    return {
+        "count": _product(output.shape),
+        "input_dtype": _DTYPE_IDS[source.dtype],
+        "output_dtype": _DTYPE_IDS[output.dtype],
+    }
+
+
 def _rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     import math
 
@@ -787,10 +902,12 @@ def _bf16_attention(context: _KernelBindingContext) -> dict[str, _ParameterValue
         source = context.inputs[name]
         if (
             source.dtype != "bf16"
-            or source.shape[-1].value != 128
+            or source.shape[-1].value not in {64, 128}
             or (source.strides or _contiguous_strides(source.shape))[-1].value != 1
         ):
-            raise ValueError("BF16 attention requires contiguous channels of width 128")
+            raise ValueError(
+                "BF16 attention requires contiguous channels of width 64 or 128"
+            )
     if context.outputs[0].dtype not in {"bf16", "fp32"}:
         raise ValueError("BF16 attention requires BF16 or FP32 output")
     return result

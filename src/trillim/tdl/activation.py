@@ -4,10 +4,12 @@ from typing import Literal
 
 from .core import (
     Add,
+    Cast,
     Compare,
     Constant,
     Construct,
     Div,
+    DType,
     Erf,
     Exp,
     FloorDiv,
@@ -49,6 +51,11 @@ def Gelu(x: Tensor, *, approximate: Literal["none", "tanh"] = "none") -> Tensor:
 @Construct
 def Silu(x: Tensor) -> Tensor:
     return Mul(x, Sigmoid(x))
+
+
+@Construct
+def SiluMul(a: Tensor, b: Tensor, *, dtype: DType = "fp32") -> Tensor:
+    return Cast(Mul(Silu(a), b), dtype)
 
 
 @Construct
