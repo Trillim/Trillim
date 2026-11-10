@@ -45,7 +45,7 @@ def _invoke(
     library = c.CDLL(str(invocation.library))
     schema = _read_schema(library, invocation.kernel)
     packed = _pack(schema, invocation.parameters)
-    footprint = _requirements(schema, invocation.parameters)
+    footprint = _requirements(schema, invocation.parameters, packed=packed)
     input_sizes = footprint.inputs
     output_sizes = footprint.outputs
     scratch_size = footprint.scratch

@@ -70,6 +70,30 @@ def _expression(op: _ShapeOperation, *args: _ShapeExpression) -> _ShapeExpressio
     }:
         raise ValueError(f"{op!r} requires two arithmetic shape operands")
     left, right = args
+    if op in {"min", "max"}:
+        if left == right:
+            return left
+        for smaller, larger in ((left, right), (right, left)):
+            if (
+                smaller.maximum is not None
+                and larger.minimum is not None
+                and smaller.maximum <= larger.minimum
+            ):
+                return smaller if op == "min" else larger
+            if (
+                smaller.op == "max"
+                and larger.minimum is not None
+                and larger.minimum >= 0
+            ):
+                for difference, zero in (smaller.args, tuple(reversed(smaller.args))):
+                    if (
+                        zero.value == 0
+                        and difference.op == "sub"
+                        and difference.args[0] == larger
+                        and difference.args[1].minimum is not None
+                        and difference.args[1].minimum >= 0
+                    ):
+                        return smaller if op == "min" else larger
     if left.op == right.op == "const":
         assert left.value is not None and right.value is not None
         a, b = left.value, right.value
@@ -92,6 +116,23 @@ def _expression(op: _ShapeOperation, *args: _ShapeExpression) -> _ShapeExpressio
         return left
     if op == "add" and left.op == "const" and left.value == 0:
         return right
+    if op == "add":
+        for number, other in ((left, right), (right, left)):
+            if number.op == "const" and number.value is not None and number.value < 0:
+                return _expression("sub", other, _constant_expression(-number.value))
+    if op == "sub" and left == right:
+        return _constant_expression(0)
+    if op == "sub" and right.op in {"min", "max"}:
+        for difference, zero in (right.args, tuple(reversed(right.args))):
+            if (
+                zero.op == "const"
+                and zero.value == 0
+                and difference.op == "sub"
+                and difference.args[0] == left
+            ):
+                return _expression(
+                    "min" if right.op == "max" else "max", left, difference.args[1]
+                )
     if op == "mul":
         if left.value == 0 or right.value == 0:
             return _constant_expression(0)
@@ -99,8 +140,31 @@ def _expression(op: _ShapeOperation, *args: _ShapeExpression) -> _ShapeExpressio
             return right
         if right.op == "const" and right.value == 1:
             return left
+        if left.op == "const":
+            left, right = right, left
+        if right.op == "const" and left.op == "mul" and left.args[1].op == "const":
+            return _expression(
+                "mul", left.args[0], _expression("mul", left.args[1], right)
+            )
     if op in {"floor_div", "ceil_div"} and right.op == "const" and right.value == 1:
         return left
+    if (
+        op in {"floor_div", "ceil_div", "mod"}
+        and right.op == "const"
+        and right.value
+        and left.op == "mul"
+        and left.args[1].op == "const"
+    ):
+        factor = left.args[1].value
+        assert factor is not None
+        if factor % right.value == 0:
+            return (
+                _constant_expression(0)
+                if op == "mod"
+                else _expression(
+                    "mul", left.args[0], _constant_expression(factor // right.value)
+                )
+            )
     if op == "broadcast":
         if left.op == "const":
             return right if left.value == 1 else left
@@ -204,7 +268,7 @@ def _expression(op: _ShapeOperation, *args: _ShapeExpression) -> _ShapeExpressio
     elif op == "broadcast_stride":
         low = None if right.minimum is None else min(0, right.minimum)
         high = None if right.maximum is None else max(0, right.maximum)
-    return _ShapeExpression(op, args, minimum=low, maximum=high)
+    return _ShapeExpression(op, (left, right), minimum=low, maximum=high)
 
 
 _FLOATS = {"fp16", "bf16", "fp32"}
@@ -409,6 +473,16 @@ def _constraint(
 ) -> None:
     if left == right and predicate in {"eq", "le", "ge", "broadcast"}:
         return
+    if predicate == "broadcast" and (left.value == 1 or right.value == 1):
+        return
+    if predicate in {"le", "ge"}:
+        smaller, larger = (left, right) if predicate == "le" else (right, left)
+        if (
+            smaller.maximum is not None
+            and larger.minimum is not None
+            and smaller.maximum <= larger.minimum
+        ):
+            return
     if left.op == right.op == "const":
         assert left.value is not None and right.value is not None
         a, b = left.value, right.value
@@ -784,28 +858,25 @@ def _ordinary(
         )
         a, b = _values(state, args.a), _values(state, args.b)
         values = None
-        if (
-            a is not None
-            and b is not None
-            and len(a) == len(b) == 1
-            and a[0].op == b[0].op == "const"
-        ):
-            x, y = a[0].value, b[0].value
-            assert x is not None and y is not None
-            values = (
-                _constant_expression(
-                    int(
-                        {
-                            "eq": x == y,
-                            "ne": x != y,
-                            "lt": x < y,
-                            "le": x <= y,
-                            "gt": x > y,
-                            "ge": x >= y,
-                        }[args.predicate]
-                    )
-                ),
-            )
+        if a is not None and b is not None and len(a) == len(b) == 1:
+            difference = _expression("sub", a[0], b[0])
+            low, high = difference.minimum, difference.maximum
+            negative = high is not None and high < 0
+            positive = low is not None and low > 0
+            nonpositive = high is not None and high <= 0
+            nonnegative = low is not None and low >= 0
+            zero = low == high == 0
+            nonzero = negative or positive
+            proven_true, proven_false = {
+                "eq": (zero, nonzero),
+                "ne": (nonzero, zero),
+                "lt": (negative, nonnegative),
+                "le": (nonpositive, positive),
+                "gt": (positive, nonpositive),
+                "ge": (nonnegative, negative),
+            }[args.predicate]
+            if proven_true or proven_false:
+                values = (_constant_expression(int(proven_true)),)
         _store(state, output, shape, "bool", values, (0, 1))
     elif isinstance(args, _BinaryArgs):
         dtype = _binary_dtype(_dtype(state, args.a), args.b, state)
@@ -972,14 +1043,7 @@ def _ordinary(
                 "reshape inferred dimension has an ambiguous zero divisor",
                 convert,
             )
-            _constraint(
-                state,
-                "divisible",
-                _product(source),
-                denominator,
-                "reshape element count is not divisible by its explicit shape",
-                convert,
-            )
+            # Element-count equality below also rejects fractional inferred dimensions.
             reshape_dimensions[index] = _reshape_quotient(_product(source), denominator)
         for value in reshape_dimensions:
             _constraint(

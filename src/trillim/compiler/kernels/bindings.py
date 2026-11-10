@@ -213,6 +213,21 @@ def _argmax(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     return _reduction(context, (axis,))
 
 
+def _vector_argmax(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source, output = context.inputs["x"], context.outputs[0]
+    if (
+        source.dtype != "fp32"
+        or len(source.shape) != 1
+        or output.shape
+        or output.dtype not in {"int32", "int64"}
+        or source.maximum_shape[0] is None
+        or source.maximum_shape[0] > 2**31 - 1
+        or (source.strides and source.strides != (_constant_expression(1),))
+    ):
+        raise ValueError("vector argmax requires contiguous FP32 and a scalar index")
+    return {"count": source.shape[0], "output_dtype": _DTYPE_IDS[output.dtype]}
+
+
 def _compare(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     if output.dtype != "bool":
@@ -573,20 +588,22 @@ def _quantize_int8(context: _KernelBindingContext) -> dict[str, _ParameterValue]
     }
 
 
-def _quantized_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+def _quantized_linear(
+    context: _KernelBindingContext, *, weight_dtype: DType = "mat_ternary"
+) -> dict[str, _ParameterValue]:
     source, weight, scale = (context.inputs[name] for name in ("x", "weight", "scale"))
     if (
         not source.shape
         or len(weight.shape) != 2
         or source.shape[-1] != weight.shape[-1]
         or source.dtype != "int8"
-        or weight.dtype != "mat_ternary"
+        or weight.dtype != weight_dtype
         or scale.dtype != "fp32"
         or scale.shape != (*source.shape[:-1], _constant_expression(1))
         or context.outputs[0].dtype not in {"fp16", "bf16", "fp32"}
     ):
         raise ValueError(
-            "quantized linear requires INT8 rows, ternary weights and FP32 scales"
+            f"quantized linear requires INT8 rows, {weight_dtype} weights and FP32 scales"
         )
     for binding in (source, weight, scale):
         if (
@@ -601,6 +618,50 @@ def _quantized_linear(context: _KernelBindingContext) -> dict[str, _ParameterVal
     }
 
 
+def _row_int8_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    return _quantized_linear(context, weight_dtype="row_int8")
+
+
+def _row_int8_blocked(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    parameters = _row_int8_linear(context)
+    for name in ("width", "outputs"):
+        value = parameters[name]
+        if (
+            not isinstance(value, _ShapeExpression)
+            or value.op != "const"
+            or value.value is None
+            or value.value % 32
+        ):
+            raise ValueError(
+                "blocked INT8 weights require fixed dimensions divisible by 32"
+            )
+    return parameters
+
+
+def _rmsnorm_quantize(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    source = context.inputs["x"]
+    dtype = context.attrs.get("dtype") or source.dtype
+    if dtype not in {"bf16", "fp32"}:
+        raise ValueError(
+            "fused RMSNorm quantization requires BF16 or FP32 normalization"
+        )
+    normalized = _TensorBinding(source.shape, source.maximum_shape, dtype)
+    if source.dtype not in {"bf16", "fp32"}:
+        raise ValueError("fused RMSNorm quantization requires BF16 or FP32 inputs")
+    result = _rmsnorm(
+        _KernelBindingContext(context.inputs, (normalized,), context.attrs)
+    )
+    _quantize_int8(_KernelBindingContext({"x": normalized}, context.outputs, {}))
+    weight = context.inputs["weight"]
+    if weight.dtype not in {"bf16", "fp32"}:
+        raise ValueError("fused RMSNorm quantization requires BF16 or FP32 weights")
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in {"storage_rows", "storage_columns"}
+    }
+
+
 def _avx2_bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     result = _bitlinear(context)
     width = context.inputs["x"].shape[-1]
@@ -611,10 +672,9 @@ def _avx2_bitlinear(context: _KernelBindingContext) -> dict[str, _ParameterValue
 
 def _avx2_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     result = _linear(context)
-    if (
-        context.inputs["x"].dtype not in {"fp32", "bf16"}
-        or context.outputs[0].dtype not in {"fp32", "bf16"}
-    ):
+    if context.inputs["x"].dtype not in {"fp32", "bf16"} or context.outputs[
+        0
+    ].dtype not in {"fp32", "bf16"}:
         raise ValueError("AVX2 linear requires FP32 or BF16 activations and output")
     for name in ("a_col_stride", "b_row_stride"):
         stride = result[name]
@@ -629,27 +689,36 @@ def _avx2_linear(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
 
 def _avx2_rmsnorm(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     result = _rmsnorm(context)
-    if context.inputs["x"].dtype != "fp32" or context.outputs[0].dtype != "fp32":
-        raise ValueError("AVX2 RMSNorm requires FP32 activations and output")
+    if context.inputs["x"].dtype not in {"fp32", "bf16"} or context.outputs[
+        0
+    ].dtype not in {"fp32", "bf16"}:
+        raise ValueError("AVX2 RMSNorm requires FP32 or BF16 activations and output")
     return result
 
 
-def _activation(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+def _contiguous_binary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     output = context.outputs[0]
     for name in ("a", "b"):
         source = context.inputs[name]
         strides = source.strides or _contiguous_strides(source.shape)
         if (
-            source.dtype != "fp32"
+            source.dtype != output.dtype
             or source.shape != output.shape
             or strides != _contiguous_strides(source.shape)
         ):
             raise ValueError(
-                "fused gate activation requires matching contiguous FP32 operands"
+                "fused elementwise kernel requires matching contiguous operands"
             )
-    if output.dtype != "fp32":
-        raise ValueError("fused gate activation requires FP32 output")
-    return {"count": _product(output.shape)}
+    if output.dtype not in {"fp32", "bf16"}:
+        raise ValueError("fused elementwise kernel requires FP32 or BF16 output")
+    return {"count": _product(output.shape), "dtype": _DTYPE_IDS[output.dtype]}
+
+
+def _activation(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _contiguous_binary(context)
+    if context.outputs[0].dtype != "fp32":
+        raise ValueError("scalar gate activation requires FP32 operands and output")
+    return {"count": result["count"]}
 
 
 def _rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
@@ -709,6 +778,21 @@ def _avx2_rotary(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
     )
     if strides[-1].op != "const" or strides[-1].value != 1:
         raise ValueError("AVX2 Rotary requires contiguous channels")
+    return result
+
+
+def _bf16_attention(context: _KernelBindingContext) -> dict[str, _ParameterValue]:
+    result = _attention(context)
+    for name in ("q", "k", "v"):
+        source = context.inputs[name]
+        if (
+            source.dtype != "bf16"
+            or source.shape[-1].value != 128
+            or (source.strides or _contiguous_strides(source.shape))[-1].value != 1
+        ):
+            raise ValueError("BF16 attention requires contiguous channels of width 128")
+    if context.outputs[0].dtype not in {"bf16", "fp32"}:
+        raise ValueError("BF16 attention requires BF16 or FP32 output")
     return result
 
 

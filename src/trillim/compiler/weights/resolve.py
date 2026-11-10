@@ -15,6 +15,7 @@ from ...tdl.core.graph import Graph
 from ...tdl.core.types import DType
 from .. import dtype as _codec
 from ..passes.walk import _walk
+from .packing import _repack_row_int8, _validate_packing
 from .reader import (
     _CHUNK_BYTES,
     _SOURCE_DTYPES,
@@ -377,12 +378,23 @@ def _encoded_chunks(
     entry: _WeightEntry,
     target: DType,
     scales: dict[str, tuple[np.float32, np.float32]],
+    packing: str = "canonical",
 ) -> Iterator[tuple[int, bytes]]:
     scale = None
     if entry.method in ("bitnet_absmean", "bitnet_packed"):
         if entry.identity not in scales:
             scales[entry.identity] = _bitnet_scale(entry)
         scale = scales[entry.identity]
+    if packing != "canonical":
+        _validate_packing(target, entry.shape, packing)
+        rows, columns = entry.shape
+        for row in range(0, rows, 32):
+            values = _effective(entry, row * columns, 32 * columns, scale)
+            encoded = _codec._encode(values.reshape(32, columns), target)[0]
+            packed = _repack_row_int8(encoded, (32, columns), "canonical", packing)
+            yield row * columns, packed[: 32 * columns].tobytes()
+            yield rows * columns + row * 2, packed[32 * columns :].tobytes()
+        return
     sections = _codec._payload_sections(target, entry.shape)
     positions = []
     cursor = 0
@@ -472,24 +484,26 @@ def _resolve_payloads(
     requests: Sequence[_WeightRequest] | None = None,
 ) -> Iterator[_ResolvedWeight]:
     if requests is None:
-        targets: dict[str, set[DType]] = {}
+        targets: dict[str, set[tuple[DType, str]]] = {}
         for binding in index.bindings.values():
-            targets.setdefault(binding.logical, set()).add(binding.dtype)
+            targets.setdefault(binding.logical, set()).add(
+                (binding.dtype, binding.packing)
+            )
         requests = [
             _WeightRequest(
                 logical,
                 dtype,
-                name=logical if len(dtypes) == 1 else f"{logical}@{dtype}",
+                packing,
+                name=logical if len(dtypes) == 1 else f"{logical}@{dtype}@{packing}",
             )
             for logical, dtypes in targets.items()
-            for dtype in sorted(dtypes)
+            for dtype, packing in sorted(dtypes)
         ]
     fingerprints: dict[_WeightSource, _SourceProvenance] = {}
     scales: dict[str, tuple[np.float32, np.float32]] = {}
     for request in requests:
-        if request.packing != "canonical":
-            raise ValueError(f"unsupported backend weight packing: {request.packing}")
         entry = index.sources[request.logical]
+        _validate_packing(request.dtype, entry.shape, request.packing)
         sources = tuple(
             dict.fromkeys((entry.source, *entry.components, *entry.tied_sources))
         )
@@ -521,5 +535,5 @@ def _resolve_payloads(
             entry.identity,
             record,
             sources,
-            _encoded_chunks(entry, request.dtype, scales),
+            _encoded_chunks(entry, request.dtype, scales, request.packing),
         )

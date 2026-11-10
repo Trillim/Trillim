@@ -339,6 +339,7 @@ def _allocate(
                         for record in manifest.entries.values()
                         if record.logical == binding.logical
                         and record.dtype == binding.dtype
+                        and record.layout == binding.packing
                     ),
                     None,
                 )

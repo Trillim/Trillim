@@ -2,6 +2,50 @@
 
 The public `Runtime` API and `trillim run` execute compiler-generated manifests through one shared CPU backend. Scalar and x86 select different kernel libraries; allocation, cache handling, control flow, cancellation and the thread pool share an implementation. See [runtime usage](runtime.md).
 
+## BitNet: 256-token prefill and 128 decode steps
+
+The current BitNet path uses all 30 layers, BF16 activations and KV caches, ternary projections, and an INT8 output head. The model TDL explicitly selects these logical dtypes. The x86 backend uses AVX-VNNI when available and retains AVX2 implementations for machines without it. Scalar implementations provide numerical references.
+
+Both implementations reserve 4,096 cache tokens and run with four threads on the same four physical cores, CPU IDs 0, 2, 4 and 5. Measurements use the same 256-token English prompt, followed by 128 generated decode steps; the first prediction comes from prefill, so each run returns 129 tokens. Backbone, vocabulary projection and greedy selection are included. Loading, tokenization and printing are excluded. The compiled timing includes the model's body instructions; session setup and loop bookkeeping are reflected in the separately recorded total wall time.
+
+Models are warmed before measurement, AC power and turbo remain enabled, and timed runs are separated by at least 60 seconds. Each accepted run starts below 48°C, has no major page faults and records less than 0.1 CPU core of competing work. No BLAS is used. Preliminary runs with a 385-token cache are excluded from this comparison.
+
+Accepted-run medians:
+
+| Implementation | Accepted samples | Prefill tokens/s | Generation tokens/s |
+| --- | ---: | ---: | ---: |
+| DarkNet old-main | 3 | 136.96 | 27.32 |
+| Compiler-generated BitNet | 4 | 152.50 | 27.17 |
+
+Prefill is 11.3% faster; generation remains 0.5% behind. Median total wall time is 6.43 seconds, compared with DarkNet's 6.55 seconds. Both paths use INT8 head codes, but Trillim's logical `row_int8` dtype stores BF16 row scales while DarkNet stores FP32 scales; identical greedy continuations are not guaranteed.
+
+Changes retained after measurement:
+
+- Shape inference bounds the last-token slice to one row, so the output head no longer reserves space for a full prefill's vocabulary scores.
+- Matching finds the captured weights needed to combine RMSNorm and activation quantization; emission removes unused compositions, repeated guards and unnecessary view instructions.
+- A decode body now has 743 instructions, including 528 kernel calls and 92 guards, compared with 2,083 instructions, 654 calls and 1,055 guards in the first local build.
+- BF16 normalization, attention, residual addition and MLP activation kernels avoid FP32 activation buffers; ternary kernels reuse INT8 activations across projections.
+- The output head uses row-INT8 weights in blocks of 32 output rows, selected by the compiler without exposing physical packing in model TDL.
+- Prepared calls reuse checked pointers, C parameter storage and unchanged arrays; metadata-only cache operations avoid constructing NumPy arrays.
+- Cancellation polling uses bounded chunks instead of polling for every four projection outputs.
+
+The final compiled allocation is 11.80 MiB of intermediate space and 300.02 MiB of caches at a maximum input size of 256. The compiler, manifest format and kernel ABI remain version 1. Experiments with four-output vector stores, split dot-product accumulators, smaller head register groups and vectorized exponentials were discarded when kernel or full-model measurements showed no reliable gain.
+
+Validation covered numerical kernel references, AVX2/VNNI parity, packed versus canonical head results, partial tiles, argmax ties/NaNs, changing invocation sizes, session reuse and cancellation. Reusing a prefix produced the same 129 outputs as reset/full prefill. Decode cancellation completed in about 0.22 ms. Lint, strict mypy and all 68 existing tests passed; no tests were added.
+
+The executable is `build/bitnet-opt/bitnet-bf16/executable.json`; weights and the selected kernel library are alongside it. Raw records are in `build/bitnet-opt/bench-samples.jsonl`, with accepted final samples in `compare-final*.log` and the DarkNet reference in `compare-pinned.log`. Generated files stay under the repository's ignored `build/` directory. The ignored model recipe is `TDL/bitnet_2b.tdl`.
+
+Files changed for this work:
+
+- `compiler/passes/`: inference, matching, packing selection, allocation, emission, verification and final program cleanup.
+- `compiler/artifacts/`, `compiler/weights/` and `compiler/compile.py`: reusable arguments, physical packing and weight representation selection.
+- `compiler/kernels/` and `compiler/bench/`: bindings, packing metadata, build flags and equivalent benchmark inputs.
+- `kernels/x86/` and `kernels/scalar/`: the optimized kernels and scalar references.
+- `backends/cpu/executor.py` and `cpu_dataclasses.py`: prepared calls and cache metadata handling.
+- `TDL/bitnet_2b.tdl`, `docs/kernel_standard.md`, `docs/compiler_weights.md` and this report.
+
+## Earlier runtime validation
+
 Full BitNet and Qwen3-0.6B were compiled from `../../models/trillim/base/`. The x86 runs generated 512 outputs with all 30 BitNet layers and all 28 Qwen layers. Full scalar models also ran, generating one output each: 791 for BitNet and 2776 for Qwen, matching their first x86 predictions. Repeated x86 runs produced identical outputs within each implementation. BitNet answered "The capital of France is Paris." Qwen produced a coherent mathematical continuation. Tokenization was used only to inspect results, outside the runtime.
 
 Measurements used an Intel i7-1255U, four threads, resident models, turbo enabled, and at least 60 seconds between timed runs. No BLAS was used. Every timed run started below 48°C. Background CPU use at the final runs' start was 0.08–0.55%. No compilation or diagnostics ran alongside the reported final samples. One overlapping attempt was discarded.

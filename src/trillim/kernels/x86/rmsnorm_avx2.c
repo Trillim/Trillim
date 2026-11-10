@@ -5,6 +5,28 @@
 
 #define TRILLIM_AVX2 __attribute__((target("avx2")))
 
+
+TRILLIM_AVX2 static __m256 load8(const void *data, size_t index, uint32_t dtype) {
+    if (dtype == TRILLIM_FP32) return _mm256_loadu_ps((const float *)data + index);
+    __m128i raw = _mm_loadu_si128((const __m128i *)((const uint16_t *)data + index));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+}
+
+TRILLIM_AVX2 static void store8(void *data, size_t index, uint32_t dtype, __m256 value) {
+    if (dtype == TRILLIM_FP32) {
+        _mm256_storeu_ps((float *)data + index, value);
+        return;
+    }
+    __m256i bits = _mm256_castps_si256(value);
+    __m256i upper = _mm256_srli_epi32(bits, 16);
+    __m256i rounded = _mm256_srli_epi32(_mm256_add_epi32(bits,
+        _mm256_add_epi32(_mm256_set1_epi32(0x7fff), _mm256_and_si256(upper, _mm256_set1_epi32(1)))), 16);
+    __m256i nan = _mm256_cmpgt_epi32(_mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff)), _mm256_set1_epi32(0x7f800000));
+    rounded = _mm256_blendv_epi8(rounded, _mm256_or_si256(upper, _mm256_set1_epi32(0x40)), nan);
+    _mm_storeu_si128((__m128i *)((uint16_t *)data + index),
+        _mm_packus_epi32(_mm256_castsi256_si128(rounded), _mm256_extracti128_si256(rounded, 1)));
+}
+
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
     size_t itemsize = trillim_itemsize(dtype);
     if (columns != 0 && rows > SIZE_MAX / columns) {
@@ -210,7 +232,7 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
     (void)worker;
     const TrillimRMSNormTask *task = (const TrillimRMSNormTask *)opaque;
     const TrillimRMSNormParameters *p = task->parameters;
-    const float *input = (const float *)task->input + row * p->width;
+    size_t start = row * p->width;
     __m256 sum0 = _mm256_setzero_ps();
     __m256 sum1 = _mm256_setzero_ps();
     __m256 sum2 = _mm256_setzero_ps();
@@ -220,10 +242,10 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        __m256 a = _mm256_loadu_ps(input + column);
-        __m256 b = _mm256_loadu_ps(input + column + 8);
-        __m256 c = _mm256_loadu_ps(input + column + 16);
-        __m256 d = _mm256_loadu_ps(input + column + 24);
+        __m256 a = load8(task->input, start + column, p->input_dtype);
+        __m256 b = load8(task->input, start + column + 8, p->input_dtype);
+        __m256 c = load8(task->input, start + column + 16, p->input_dtype);
+        __m256 d = load8(task->input, start + column + 24, p->input_dtype);
         sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(a, a));
         sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(b, b));
         sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(c, c));
@@ -231,7 +253,8 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
     }
     float sum = trillim_avx2_sum(_mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3)));
     for (; column < p->width; ++column) {
-        sum += input[column] * input[column];
+        float value = trillim_load(task->input, start + column, p->input_dtype).f;
+        sum += value * value;
     }
     float denominator = sqrtf(sum / (float)p->width + p->eps);
     __m256 divisor = _mm256_set1_ps(denominator);
@@ -241,14 +264,15 @@ TRILLIM_AVX2 static TrillimStatus normalize(void *opaque, size_t row, size_t wor
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        __m256 value = _mm256_div_ps(_mm256_loadu_ps(input + column), divisor);
+        __m256 value = _mm256_div_ps(load8(task->input, start + column, p->input_dtype), divisor);
         __m256 weight = trillim_avx2_load8(task->weight, column, p->weight_dtype, 1, p->width);
         value = _mm256_mul_ps(value, _mm256_add_ps(weight, offset));
-        _mm256_storeu_ps((float *)task->output + row * p->width + column, value);
+        store8(task->output, start + column, p->output_dtype, value);
     }
     for (; column < p->width; ++column) {
         float weight = trillim_read_float(task->weight, column, p->weight_dtype, 1, p->width);
-        ((float *)task->output)[row * p->width + column] = (input[column] / denominator) * (weight + p->weight_offset);
+        TrillimValue value = {.f = (trillim_load(task->input, start + column, p->input_dtype).f / denominator) * (weight + p->weight_offset)};
+        trillim_store(task->output, start + column, p->output_dtype, value);
     }
     return TRILLIM_OK;
 }
@@ -271,7 +295,8 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_rmsnorm_avx2(
     }
     const TrillimRMSNormParameters *p = (const TrillimRMSNormParameters *)parameters;
     TrillimRMSNormTask task = {outputs[0], inputs[0], inputs[1], p, context};
-    return context->thread_pool->run(context->thread_pool->context, p->rows, normalize, &task);
+    return p->rows == 1 ? normalize(&task, 0, 0) :
+        context->thread_pool->run(context->thread_pool->context, p->rows, normalize, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_x86_rmsnorm_avx2_tdl(void) {

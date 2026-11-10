@@ -20,8 +20,14 @@ from .kernel_pydantic_models import _KernelIndex, _KernelRequest
 from .native import _read_capabilities, _read_schema
 
 _KERNEL_ROOT = Path(__file__).resolve().parents[2] / "kernels"
+_ARCH_FLAGS = {
+    "x86_64": ("-march=x86-64",),
+    "amd64": ("-march=x86-64",),
+    "aarch64": ("-march=armv8-a",),
+    "arm64": ("-march=armv8-a",),
+}
 _FLAGS = (
-    "-O2",
+    "-O3",
     "-std=c11",
     "-Wall",
     "-Wextra",
@@ -102,7 +108,12 @@ def _compilers() -> tuple[tuple[str, ...], ...]:
         identity = (str(Path(executable).resolve()), *command[1:])
         if identity not in seen:
             seen.add(identity)
-            result.append((executable, *command[1:]))
+            flags = (
+                ("-mcpu=baseline",)
+                if Path(executable).stem.lower() == "zig"
+                else _ARCH_FLAGS.get(platform.machine().lower(), ())
+            )
+            result.append((executable, *command[1:], *flags))
     if not result:
         raise RuntimeError("no C compiler found; install Zig, cc or MinGW")
     return tuple(result)
@@ -355,6 +366,4 @@ def _build_cpu() -> Path:
                 return destination
             except (OSError, subprocess.CalledProcessError, AttributeError) as error:
                 failures.append(f"{' '.join(compiler)}: {error}")
-    raise RuntimeError(
-        "all C compilers failed for CPU helper:\n" + "\n".join(failures)
-    )
+    raise RuntimeError("all C compilers failed for CPU helper:\n" + "\n".join(failures))

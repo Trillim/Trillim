@@ -3,11 +3,44 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
+from pydantic import JsonValue
+
 from ...tdl.core.tensor import Tensor
 from ..compiler_dataclasses import _ShapeExpression
 from ..dtype import _payload_sections
 from ..kernels.kernel_dataclasses import _ParameterValue
 from .artifact_dataclasses import _JSON, _Expressions
+
+
+def _dimension_dependencies(
+    value: JsonValue,
+    expressions: Mapping[str, JsonValue],
+    memo: dict[str, frozenset[str] | None],
+) -> frozenset[str] | None:
+    """Return shape dependencies, or None when values must be captured."""
+    if isinstance(value, dict):
+        name = value.get("expr")
+        if isinstance(name, str):
+            if name not in memo:
+                memo[name] = _dimension_dependencies(expressions[name], expressions, memo)
+            return memo[name]
+        if value.get("op") in {"scalar", "cache_length"}:
+            return None
+        tensor = value.get("tensor")
+        if isinstance(tensor, str):
+            return frozenset({tensor})
+        values = iter(value.values())
+    elif isinstance(value, list):
+        values = iter(value)
+    else:
+        return frozenset()
+    result: set[str] = set()
+    for item in values:
+        dependencies = _dimension_dependencies(item, expressions, memo)
+        if dependencies is None:
+            return None
+        result.update(dependencies)
+    return frozenset(result)
 
 
 def _number(value: float) -> _JSON:

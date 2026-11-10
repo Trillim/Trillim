@@ -12,6 +12,8 @@ Windows benchmark builds statically link Winpthreads and use CRT aligned allocat
 
 Compilers are tried in order: `zig cc`, an explicit `CC` command if set, then `cc`. On Windows, MinGW variants follow; `gcc` and `clang` are additional fallbacks. Unavailable tools are skipped. A failed compiler attempt is discarded before trying the next; compilation fails only after all available candidates fail. The current sources require a GCC-compatible driver, including Zig, GCC, Clang or MinGW.
 
+Kernels compile with `-O3` for the architecture's baseline CPU, including `-mcpu=baseline` with Zig. Optional instructions belong in functions with explicit target attributes and corresponding capability bits; building on a newer CPU must not silently add undeclared instruction requirements.
+
 Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. All build files and Zig caches stay beneath `TRILLIM_HOME`, which defaults to `~/.trillim`.
 
 A backend has no dependency on another backend's library. Portable scalar kernels are compiled into each backend's own library.
@@ -33,11 +35,15 @@ These four native exports define the kernel API. The Python helpers used by buil
 
 Logical tensors use ordinary mathematical shapes. Contiguous storage uses the last dimension as the fastest changing axis. Views may use permuted or zero strides; kernels receive the strides they need in their own parameter structs. Packed weights retain their logical dtype while the compiler selects their physical layout.
 
+A kernel's TDL may declare `packings = {"weight": "row_int8_block32"}` for a checkpoint input. Undeclared inputs require `canonical` packing. Matching validates the logical computation and the binder's shape/stride restrictions; selection chooses the representation before weight conversion. The executable records each input's required packing, which verification checks against the weight manifest. A weight also needed by a canonical consumer currently selects canonical kernels throughout, rather than duplicating its storage. Packing names are compiler-private.
+
 Attention and rotary tensors use `[tokens, heads, channels]`. KV caches use `[capacity, kv_heads, channels]` and append along axis 0. Splitting and merging heads are reshape views. GQA groups query heads without replicating K/V. The planner can bind a producer's contiguous output through reshape views directly to the next cache slot, with a capacity check before the producer runs.
 
-`QuantizeInt8(x)` returns contiguous INT8 activation codes and an FP32 multiplier per row, shaped `[..., 1]`. The multiplier is `127 / max(abs(x), 1e-5)` along the final axis; codes round to nearest even. `QuantizedLinear(codes, weight, multiplier, dtype=...)` projects these shared codes and divides by the multiplier. Its scalar and AVX2 kernels consume canonical ternary weights and write FP16, BF16 or FP32 without an activation quantization workspace. A model can quantize once for Q/K/V or gate/up instead of repeating the work in each projection. `BitLinear` composes both stages when sharing is unnecessary.
+`QuantizeInt8(x)` returns contiguous INT8 activation codes and an FP32 multiplier per row, shaped `[..., 1]`. The multiplier is `127 / max(abs(x), 1e-5)` along the final axis; codes round to nearest even. `QuantizedLinear(codes, weight, multiplier, dtype=...)` projects these shared codes and divides by the multiplier. Scalar and x86 kernels support ternary and row-INT8 weights, with FP16, BF16 or FP32 outputs. A model can quantize once for Q/K/V or gate/up instead of repeating the work in each projection. `BitLinear` composes both stages when sharing is unnecessary. Fused RMSNorm/quantization preserves the normalization output's dtype rounding before quantizing it. AVX-VNNI variants require both AVX2 and AVX-VNNI capability bits.
 
 Parameters contain fixed-width scalars, `size_t` values, and borrowed arrays with explicit lengths. Their native layout comes from the compiled kernel. There is no universal parameter struct or implicit argument order beyond each kernel's declared slots.
+
+The compiler emits an `argument_key` containing the changing source values that determine a call's parameters and buffer metadata. Within one input binding, the backend can reuse checked pointers and packed parameters when that key is unchanged; it still executes the kernel every time. Changed keys update the parameters, and rebinding inputs clears prepared calls. Unchanged parameter arrays retain their storage. This does not change the native ABI.
 
 The requirements function reports all readable input bytes, writable output bytes, and scratch bytes for an invocation. Kernels must stay within those spans. Outputs and temporary workspace share the compiler's arena; live outputs cannot be overwritten. Kernels must not allocate heap memory or retain pointers after returning.
 
@@ -50,3 +56,5 @@ Only one kernel runs at a time. Its borrowed thread pool runs numbered tasks syn
 Kernels check cancellation between bounded chunks of work and return `TRILLIM_CANCELLED`. Any other failure ends execution of the model. No output or cache state from a failed invocation may be reused.
 
 Caches are persistent allocations with explicit capacity and update policy. A cache read preserves the values and dimensions observed at that point, even if a later instruction updates the cache. Direct cache writes or reads by a fused kernel must declare the same effects and respect capacity.
+
+Pure views whose metadata depends only on dimensions can be described by buffer aliases without an execution instruction. Views that capture scalar values or cache lengths, and control-flow bindings, retain explicit instructions. Metadata-only cache writes update lengths without constructing tensor arrays or copying values.
