@@ -83,3 +83,52 @@ Validation also covered BF16 linear results against NumPy, changing-size packed 
 Lint, strict mypy and all 68 existing tests passed. No tests were added. The CPU helper also cross-compiled for Windows x86-64, Windows ARM64 and Linux ARM64; execution was validated on Linux x86-64. API cancellation stopped execution in under a millisecond in the diagnostic, while SIGINT/SIGTERM subprocess shutdown took approximately 81–142 ms.
 
 Local raw records and diagnostics are under `build/runtime/`: `latest.jsonl`, `compare-bitnet.jsonl`, `compare-qwen-final.jsonl`, `native-short-isolated.jsonl`, `compare-logits.log`, `validate-fp32.log`, `validate-full-scalar.log`, `cancellation-final.log` and `cross-compile.log`. Executable manifests are `bitnet-full/executable.json` and `qwen-bf16/executable.json`. These generated files are intentionally untracked.
+
+## Qwen INT8 and Whisper base, 2026-11-10
+
+Qwen3-0.6B now matches DarkNet's performance with small measured gains. Whisper base takes about 13% less time than the official PyTorch model on the 9.984-second Ryan clip. These measurements use an Intel i7-1255U, four threads and CPU affinity 0,2,4,5. Each reported median contains two accepted runs, after warming the model and waiting at least 60 seconds between runs. Every accepted run starts below 48°C, stays on AC with turbo enabled, has no major page faults and records less than 0.1 CPU core of competing work.
+
+| Qwen workload | DarkNet old-main | Trillim | Throughput change |
+|---|---:|---:|---:|
+| 256-token prefill | 217.70 tokens/s | 225.10 tokens/s | +3.40% |
+| 128 decode steps | 35.24 tokens/s | 35.68 tokens/s | +1.25% |
+| Complete run | 4.808 s | 4.767 s | 0.86% less time |
+
+Both use the same prompt, all 28 layers, a 4,096-token cache, INT8 projections/head and BF16 activations/caches. Each run returns 129 predictions, including the prefill prediction. Trillim selects AVX-VNNI kernels on this CPU and also supplies AVX2 implementations. Neither implementation uses BLAS. The INT8 formats differ: Trillim stores group/head scales as BF16, while DarkNet stores FP32 scales. Their quantization rounding also differs, so these are not precision-identical models.
+
+| Whisper base workload | PyTorch | Trillim |
+|---|---:|---:|
+| Ryan clip, 9.984 s of audio | 0.981 s | 0.855 s |
+
+The Whisper reference uses OpenAI Whisper 20250625 with PyTorch 2.8.0 CPU, FP32 weights/activations, four threads and a plain greedy loop using the official model and KV-cache implementation. Its predictions were checked against `whisper.decode`. Both receive the same precomputed 80×3000 mel tensor and four-token English transcription prefix, use no token suppression, and produce 32 tokens including EOS. Loading, audio preprocessing, confidence scoring and text decoding are excluded. Trillim uses grouped INT8 projections, an INT8 head and BF16 activations/caches. Cross-attention K/V preparation happens before its decoding loop; total inference time includes that work on both sides.
+
+### Implementation
+
+- Added grouped INT8 scalar, AVX2 and VNNI projection kernels, using an eight-row/two-column prefill tile and bounded fallbacks for partial tiles.
+- Shared Qwen's activation quantization across Q/K/V and gate/up projections, and added the `SiluMul` composition with independent input/output dtypes.
+- Added fused Conv1D, LayerNorm, bias addition and GELU kernels for Whisper.
+- Extended BF16 attention to 64-channel heads, shared K/V reads across four noncausal queries, and vectorized softmax.
+- Shared RoPE angle calculation across heads and traversed its output in physical token order.
+- Kept the existing compiler passes; compiler changes bind and validate parameters for the new kernels.
+
+### Validation and limits
+
+- Fixed-history Qwen comparisons cover both generated trajectories, each with 129 prediction points: mean KL divergence 0.0457–0.0849 nats, maximum 1.5225, and greedy agreement 114–118/129. These differences remain material despite valid kernel-level numerical checks; the measurements establish speed parity, not output-quality parity.
+- Whisper's Ryan predictions exactly match PyTorch's 32 tokens. Mean KL divergence is 0.00764 nats, maximum 0.03766.
+- Additional audio checks found only a punctuation difference on the first ten seconds of PG, and word differences on the Danish clip. No dataset-level accuracy claim is made.
+- Reusing one Whisper session across Ryan, Danish, PG and Ryan again, with reset requested each time, reproduced the original Ryan output.
+- Numerical checks cover grouped INT8 reference results, AVX2/VNNI parity, negative activation extremes, partial tiles, convolution boundaries, normalization, attention windows and mixed SiLU dtypes. GELU was checked over every BF16 bit pattern; its BF16 output differs from scalar at three finite inputs, by at most 1.53e-5. The softmax exponential sweep stayed within one FP32 ULP.
+- Self-review fixed empty RoPE tensors accessing unallocated scratch and a potential extra BF16 read at the stride-two convolution boundary. Cancellation polling is bounded in the new loops. API cancellation checks returned in 0.066 ms for Qwen and 0.082 ms for Whisper.
+- The review agent found no remaining P0/P1 issues. Lint, strict mypy and all 68 existing tests passed; no tests were added.
+
+### Files and local evidence
+
+- Compiler: `src/trillim/compiler/kernels/bindings.py`.
+- TDL library: `src/trillim/tdl/activation.py` and `src/trillim/tdl/__init__.py`.
+- Model recipes: `TDL/qwen3_06b.tdl` and new `TDL/whisper_base.tdl`; these remain ignored, following the existing repository convention.
+- New scalar kernels: `src/trillim/kernels/scalar/group_int8_linear.c` and `gelu.c`.
+- New x86 kernels: `src/trillim/kernels/x86/group_int8_avx2.c`, `group_int8_vnni.c`, `conv1d_avx2.c`, `layernorm_avx2.c`, `bias_add_avx2.c` and `gelu_avx2.c`.
+- Updated x86 kernels: `attention_bf16_fma.c`, `rotary_avx2.c` and `silu_mul_avx2.c`.
+- This report: `docs/runtime_performance.md`.
+
+Fresh CLI-generated manifests and weights are in `build/qwen-int8/compiled/` and `build/whisper-bench/compiled/`. Their outputs agree with the benchmark artifacts. Timing records are `build/qwen-int8/bench-samples.jsonl` and `build/whisper-bench/bench-samples.jsonl`; accepted candidate records name the `fast8` artifacts. Numerical comparisons are in `build/qwen-int8/kl-final/results.json`, `build/whisper-bench/kl-results.json` and `build/whisper-bench/audio-validation.json`. Reference wrappers, checkpoint conversion and manual checks stay under `build/`.
