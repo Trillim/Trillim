@@ -534,10 +534,10 @@ static TrillimStatus trillim_mxfp4_copy_slice(void *opaque, size_t tile, size_t 
         return TRILLIM_CANCELLED;
     }
     size_t groups = p->storage_columns / 32;
-    size_t tiles = groups / 4096 + (groups % 4096 != 0);
+    size_t tiles = groups / 32768 + (groups % 32768 != 0);
     size_t item = tile / tiles;
-    size_t first = tile % tiles * 4096;
-    size_t count = groups - first < 4096 ? groups - first : 4096;
+    size_t first = tile % tiles * 32768;
+    size_t count = groups - first < 32768 ? groups - first : 32768;
     int64_t selected;
     memcpy(&selected, indices + item * sizeof(selected), sizeof(selected));
     size_t source = (size_t)selected * groups + first;
@@ -589,7 +589,7 @@ static TrillimStatus trillim_mxfp4_gather(TrillimIndexTask *task) {
         }
     }
     size_t groups = p->storage_columns / 32;
-    size_t tiles = groups / 4096 + (groups % 4096 != 0);
+    size_t tiles = groups / 32768 + (groups % 32768 != 0);
     size_t tasks = p->items * tiles;
     return tasks == 1 ? trillim_mxfp4_copy_slice(task, 0, 0)
                       : task->context->thread_pool->run(task->context->thread_pool->context,
