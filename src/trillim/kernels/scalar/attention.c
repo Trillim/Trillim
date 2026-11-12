@@ -283,7 +283,7 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
             float previous = maximum == -INFINITY ? 0.0f : expf(maximum - next_maximum);
             float block_sum = 0.0f;
             for (size_t j = 0; j < count; ++j) {
-                scores[j] = expf(scores[j] - next_maximum);
+                scores[j] = expf(scores[j] - (next_maximum == -INFINITY ? 0.0f : next_maximum));
                 block_sum += scores[j];
             }
             for (size_t channel = 0; channel < p->value_dim; ++channel) {
@@ -307,6 +307,7 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
                 }
             }
         }
+        denominator = denominator > 0.0f ? denominator : 1.0f;
         size_t output = (qi * p->heads + head) * p->value_dim;
         for (size_t channel = 0; channel < p->value_dim; ++channel) {
             if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
