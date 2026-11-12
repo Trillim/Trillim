@@ -256,8 +256,8 @@ static inline VectorPair load8(const void *data, size_t index, uint32_t dtype) {
     return value;
 }
 
-static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
-                                 size_t output, size_t first, size_t last) {
+static inline __attribute__((always_inline)) TrillimStatus decode_typed_tile(const Task *t, size_t a_base, size_t b_base,
+                                 size_t output, size_t first, size_t last, uint32_t a_dtype, uint32_t b_dtype) {
     const Parameters *p = t->p;
     float gates[4], ups[4];
     size_t buffered = 0;
@@ -273,32 +273,32 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
             if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            VectorPair x0 = load8(t->a, a_base + k, p->a_dtype);
-            VectorPair x1 = load8(t->a, a_base + k + 8, p->a_dtype);
-            VectorPair gate = load8(t->b, weight + k, p->b_dtype);
-            VectorPair up = load8(t->up, weight + k, p->b_dtype);
+            VectorPair x0 = load8(t->a, a_base + k, a_dtype);
+            VectorPair x1 = load8(t->a, a_base + k + 8, a_dtype);
+            VectorPair gate = load8(t->b, weight + k, b_dtype);
+            VectorPair up = load8(t->up, weight + k, b_dtype);
             g0 = vfmaq_f32(g0, x0.low, gate.low);
             g1 = vfmaq_f32(g1, x0.high, gate.high);
             u0 = vfmaq_f32(u0, x0.low, up.low);
             u1 = vfmaq_f32(u1, x0.high, up.high);
-            gate = load8(t->b, weight + k + 8, p->b_dtype);
-            up = load8(t->up, weight + k + 8, p->b_dtype);
+            gate = load8(t->b, weight + k + 8, b_dtype);
+            up = load8(t->up, weight + k + 8, b_dtype);
             g2 = vfmaq_f32(g2, x1.low, gate.low);
             g3 = vfmaq_f32(g3, x1.high, gate.high);
             u2 = vfmaq_f32(u2, x1.low, up.low);
             u3 = vfmaq_f32(u3, x1.high, up.high);
         }
         for (; p->k - k >= 4; k += 4) {
-            float32x4_t x = load4(t->a, a_base + k, p->a_dtype);
-            g0 = vfmaq_f32(g0, x, load4(t->b, weight + k, p->b_dtype));
-            u0 = vfmaq_f32(u0, x, load4(t->up, weight + k, p->b_dtype));
+            float32x4_t x = load4(t->a, a_base + k, a_dtype);
+            g0 = vfmaq_f32(g0, x, load4(t->b, weight + k, b_dtype));
+            u0 = vfmaq_f32(u0, x, load4(t->up, weight + k, b_dtype));
         }
         float gate = vaddvq_f32(vaddq_f32(vaddq_f32(g0, g1), vaddq_f32(g2, g3)));
         float up = vaddvq_f32(vaddq_f32(vaddq_f32(u0, u1), vaddq_f32(u2, u3)));
         for (; k < p->k; ++k) {
-            float x = trillim_load(t->a, a_base + k, p->a_dtype).f;
-            gate = fmaf(x, trillim_load(t->b, weight + k, p->b_dtype).f, gate);
-            up = fmaf(x, trillim_load(t->up, weight + k, p->b_dtype).f, up);
+            float x = trillim_load(t->a, a_base + k, a_dtype).f;
+            gate = fmaf(x, trillim_load(t->b, weight + k, b_dtype).f, gate);
+            up = fmaf(x, trillim_load(t->up, weight + k, b_dtype).f, up);
         }
         gates[buffered] = gate;
         ups[buffered] = up;
@@ -312,6 +312,15 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
         store(t, output + last - buffered + lane, gates[lane], ups[lane]);
     }
     return TRILLIM_OK;
+}
+
+static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
+                                 size_t output, size_t first, size_t last) {
+    const Parameters *p = t->p;
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_BF16) {
+        return decode_typed_tile(t, a_base, b_base, output, first, last, TRILLIM_FP32, TRILLIM_BF16);
+    }
+    return decode_typed_tile(t, a_base, b_base, output, first, last, p->a_dtype, p->b_dtype);
 }
 
 static TrillimStatus project_tile(const Task *t, size_t a_base, size_t b_base,

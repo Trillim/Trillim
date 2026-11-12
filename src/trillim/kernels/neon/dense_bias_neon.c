@@ -214,8 +214,8 @@ static inline VectorPair load8(const void *data, size_t index, uint32_t dtype) {
     return value;
 }
 
-static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
-                                 size_t output, size_t first, size_t last) {
+static inline __attribute__((always_inline)) TrillimStatus decode_typed_tile(const Task *t, size_t a_base, size_t b_base,
+                                 size_t output, size_t first, size_t last, uint32_t a_dtype, uint32_t b_dtype) {
     const Parameters *p = t->p;
     for (size_t column = first; column < last; column += 2) {
         size_t columns = last - column < 2 ? last - column : 2;
@@ -232,28 +232,28 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
             if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            VectorPair x0 = load8(t->a, a_base + k + 0, p->a_dtype);
-            VectorPair x1 = load8(t->a, a_base + k + 8, p->a_dtype);
+            VectorPair x0 = load8(t->a, a_base + k + 0, a_dtype);
+            VectorPair x1 = load8(t->a, a_base + k + 8, a_dtype);
             size_t w0 = b_base + (column + (columns > 0 ? 0 : 0)) * p->b_col_stride + k;
-            VectorPair w0_0 = load8(t->b, w0 + 0, p->b_dtype);
+            VectorPair w0_0 = load8(t->b, w0 + 0, b_dtype);
             s00 = vfmaq_f32(s00, x0.low, w0_0.low);
             s01 = vfmaq_f32(s01, x0.high, w0_0.high);
-            VectorPair w0_1 = load8(t->b, w0 + 8, p->b_dtype);
+            VectorPair w0_1 = load8(t->b, w0 + 8, b_dtype);
             s02 = vfmaq_f32(s02, x1.low, w0_1.low);
             s03 = vfmaq_f32(s03, x1.high, w0_1.high);
             size_t w1 = b_base + (column + (columns > 1 ? 1 : 0)) * p->b_col_stride + k;
-            VectorPair w1_0 = load8(t->b, w1 + 0, p->b_dtype);
+            VectorPair w1_0 = load8(t->b, w1 + 0, b_dtype);
             s10 = vfmaq_f32(s10, x0.low, w1_0.low);
             s11 = vfmaq_f32(s11, x0.high, w1_0.high);
-            VectorPair w1_1 = load8(t->b, w1 + 8, p->b_dtype);
+            VectorPair w1_1 = load8(t->b, w1 + 8, b_dtype);
             s12 = vfmaq_f32(s12, x1.low, w1_1.low);
             s13 = vfmaq_f32(s13, x1.high, w1_1.high);
         }
         float sums[2] = {vaddvq_f32(vaddq_f32(vaddq_f32(s00, s01), vaddq_f32(s02, s03))), vaddvq_f32(vaddq_f32(vaddq_f32(s10, s11), vaddq_f32(s12, s13)))};
         for (; k < p->k; ++k) {
-            float x = trillim_load(t->a, a_base + k, p->a_dtype).f;
+            float x = trillim_load(t->a, a_base + k, a_dtype).f;
             for (size_t c = 0; c < columns; ++c) {
-                float w = trillim_load(t->b, b_base + (column + c) * p->b_col_stride + k, p->b_dtype).f;
+                float w = trillim_load(t->b, b_base + (column + c) * p->b_col_stride + k, b_dtype).f;
                 sums[c] = fmaf(x, w, sums[c]);
             }
         }
@@ -262,6 +262,15 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
         }
     }
     return TRILLIM_OK;
+}
+
+static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
+                                 size_t output, size_t first, size_t last) {
+    const Parameters *p = t->p;
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_BF16) {
+        return decode_typed_tile(t, a_base, b_base, output, first, last, TRILLIM_FP32, TRILLIM_BF16);
+    }
+    return decode_typed_tile(t, a_base, b_base, output, first, last, p->a_dtype, p->b_dtype);
 }
 
 static TrillimStatus ordered_dot_tile(const Task *t, size_t a_base, size_t b_base,
