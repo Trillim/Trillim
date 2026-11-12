@@ -272,88 +272,6 @@ static inline __attribute__((always_inline)) void decode16(
     }
 }
 
-static inline float trillim_read_float(
-    const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
-) {
-    if (trillim_itemsize(dtype) != 0) {
-        TrillimValue value = trillim_load(data, index, dtype);
-        if (trillim_float(dtype)) {
-            return value.f;
-        }
-        return trillim_unsigned(dtype) ? (float)value.u : (float)value.i;
-    }
-    const uint8_t *values = (const uint8_t *)data;
-    size_t row = index / columns;
-    size_t column = index % columns;
-    if (dtype == TRILLIM_ROW_INT8) {
-        uint16_t bits;
-        int8_t code;
-        memcpy(&bits, values + rows * columns + row * 2, 2);
-        memcpy(&code, values + index, 1);
-        return (float)code * trillim_bf16(bits);
-    }
-    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 :
-        ((dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_BINARY ||
-          dtype == TRILLIM_GRP_TERNARY) ? 128 : 32);
-    size_t groups = columns / group + (columns % group != 0);
-    size_t total = rows * groups;
-    size_t block = row * groups + column / group;
-    size_t offset = column % group;
-    if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
-        size_t code = (values[block * 32 + offset % 32] >> (6 - (offset / 32) * 2)) & 3;
-        float scale;
-        if (dtype == TRILLIM_MAT_TERNARY) {
-            memcpy(&scale, values + total * 32, sizeof(scale));
-        } else {
-            uint16_t bits;
-            memcpy(&bits, values + total * 32 + block * 2, 2);
-            scale = trillim_bf16(bits);
-        }
-        return code == 3 ? NAN : (float)((int32_t)code - 1) * scale;
-    }
-    if (dtype == TRILLIM_MXFP4) {
-        static const float magnitudes[] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
-        uint8_t code = (values[block * 16 + offset / 2] >> ((offset % 2) * 4)) & 15;
-        uint8_t exponent = values[total * 16 + block];
-        float value = magnitudes[code & 7];
-        if ((code & 8) != 0) {
-            value = -value;
-        }
-        return exponent == 255 ? NAN : ldexpf(value, (int)exponent - 127);
-    }
-    size_t value_width = dtype == TRILLIM_GRP_INT8 ? 32 :
-        (dtype == TRILLIM_DUBGRP_INT6 ? 128 : 16);
-    size_t scale_start = total * value_width;
-    uint16_t bits;
-    memcpy(&bits, values + scale_start + block * 2, 2);
-    float scale = trillim_bf16(bits);
-    if (dtype == TRILLIM_GRP_INT8) {
-        int8_t code;
-        memcpy(&code, values + block * 32 + offset, 1);
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_BINARY) {
-        int32_t code = ((values[block * 16 + offset / 8] >> (7 - offset % 8)) & 1) ? 1 : -1;
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5) {
-        int32_t code = (values[block * 16 + offset % 16] >> ((offset / 16) * 4)) & 15;
-        if (dtype == TRILLIM_GRP_INT5) {
-            code |= ((values[scale_start + total * 2 + block * 4 + offset / 8] >> (offset % 8)) & 1) << 4;
-        }
-        return (float)(code - (dtype == TRILLIM_GRP_INT4 ? 8 : 16)) * scale;
-    }
-    size_t half = offset / 128;
-    size_t lane = (offset % 128) / 32;
-    size_t low = block * 128 + half * 64 + (lane / 2) * 32 + offset % 32;
-    size_t high = scale_start + total * 2 + block * 64 + half * 32 + offset % 32;
-    int32_t code = (values[low] >> ((lane % 2) * 4)) & 15;
-    code |= ((values[high] >> (lane * 2)) & 3) << 4;
-    int8_t subscale;
-    memcpy(&subscale, values + scale_start + total * (2 + 64) + block * 16 + offset / 16, 1);
-    return (float)((code - 32) * subscale) * scale;
-}
-
 static inline __attribute__((always_inline)) void store_result(
     void *output, size_t index, uint32_t dtype, TrillimValue value
 ) {
@@ -421,15 +339,6 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
         } \
         float sums[4][2] = {{vaddvq_f32(s00), vaddvq_f32(s01)}, {vaddvq_f32(s10), vaddvq_f32(s11)}, \
             {vaddvq_f32(s20), vaddvq_f32(s21)}, {vaddvq_f32(s30), vaddvq_f32(s31)}}; \
-        for (; k < p->k; ++k) { \
-            float w0 = trillim_read_float(task->weight, b0 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns); \
-            float w1 = trillim_read_float(task->weight, b1 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns); \
-            for (size_t r = 0; r < rows; ++r) { \
-                float x = trillim_load(task->input, a_base + (row + r) * p->a_row_stride + k, p->a_dtype).f; \
-                sums[r][0] += x * w0; \
-                sums[r][1] += x * w1; \
-            } \
-        } \
         for (size_t r = 0; r < rows; ++r) { \
             TrillimValue value = {.f = sums[r][0]}; \
             store_result(task->output, (batch * p->m + row + r) * p->n + column, p->out_dtype, value); \
@@ -515,15 +424,6 @@ static TrillimStatus project_ordered(void *opaque, size_t tile, size_t worker) {
                     sums[r][0] = fmaf(input[j], w0[j], sums[r][0]);
                     sums[r][1] = fmaf(input[j], w1[j], sums[r][1]);
                 }
-            }
-        }
-        for (; k < p->k; ++k) {
-            float w0 = trillim_read_float(task->weight, b0 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
-            float w1 = trillim_read_float(task->weight, b1 + k, p->b_dtype, p->b_storage_rows, p->b_storage_columns);
-            for (size_t r = 0; r < rows; ++r) {
-                float x = trillim_load(task->input, a_base + (row + r) * p->a_row_stride + k, p->a_dtype).f;
-                sums[r][0] = fmaf(x, w0, sums[r][0]);
-                sums[r][1] = fmaf(x, w1, sums[r][1]);
             }
         }
         for (size_t r = 0; r < rows; ++r) {
