@@ -143,14 +143,14 @@ def compare(
     correct = bool(np.allclose(actual, expected, rtol=2e-4, atol=2e-4))
     if not correct:
         raise ValueError(f"encoder differs from reference: max {maximum}, RMS {rms}")
-    return dict(
-        maximum_absolute_error=maximum,
-        rms_error=rms,
-        normalized_rms_error=rms / scale,
-        allclose=correct,
-        comparison_rtol=2e-4,
-        comparison_atol=2e-4,
-    )
+    return {
+        "maximum_absolute_error": maximum,
+        "rms_error": rms,
+        "normalized_rms_error": rms / scale,
+        "allclose": correct,
+        "comparison_rtol": 2e-4,
+        "comparison_atol": 2e-4,
+    }
 
 
 def torch_reference(options: Options, features: Path) -> Path:
@@ -247,44 +247,44 @@ def benchmark(options: Options, config: WhisperConfig) -> dict[str, object]:
     config_digest = hashlib.sha256(
         (options.checkpoint / "config.json").read_bytes()
     ).hexdigest()
-    result: dict[str, object] = dict(
-        label=options.label,
-        checkpoint=str(options.checkpoint),
-        bundle=str(options.output),
-        model_type="whisper",
-        timing_scope="Runtime.run for the encoder only, including input binding, executor, native kernels and output copy; excludes model loading, compilation, audio preprocessing and decoder",
-        input_type="deterministic synthetic FP32 mel features, seed 1337, normal standard deviation 0.5",
-        input_shape=mel.shape,
-        output_shape=encoded.shape,
-        represented_audio_seconds=audio_seconds,
-        frames=frames,
-        encoder_positions=config.max_source_positions,
-        layers=config.encoder_layers,
-        hidden_size=config.d_model,
-        attention_heads=config.encoder_attention_heads,
-        ffn_size=config.encoder_ffn_dim,
-        threads=options.threads,
-        backend_registration="scalar",
-        activation_dtype="fp32",
-        compilation_depth="none",
-        host=platform.platform(),
-        python_version=platform.python_version(),
-        numpy_version=np.__version__,
-        warmup_seconds=warmups,
-        encoder_seconds=samples,
-        encoder_median_seconds=median,
-        encoder_real_time_factor=median / audio_seconds,
-        audio_seconds_per_encoder_second=audio_seconds / median,
-        output_sha256=hashes,
-        input_sha256=input_digest,
-        graph_sha256=graph_digest,
-        config_sha256=config_digest,
-        kernels=sorted({metadata.symbol for metadata in manifest.kernels.values()}),
-        kernel_call_counts=dict(counts),
-        neon_kernel_call_count=sum(
+    result: dict[str, object] = {
+        "label": options.label,
+        "checkpoint": str(options.checkpoint),
+        "bundle": str(options.output),
+        "model_type": "whisper",
+        "timing_scope": "Runtime.run for the encoder only, including input binding, executor, native kernels and output copy; excludes model loading, compilation, audio preprocessing and decoder",
+        "input_type": "deterministic synthetic FP32 mel features, seed 1337, normal standard deviation 0.5",
+        "input_shape": mel.shape,
+        "output_shape": encoded.shape,
+        "represented_audio_seconds": audio_seconds,
+        "frames": frames,
+        "encoder_positions": config.max_source_positions,
+        "layers": config.encoder_layers,
+        "hidden_size": config.d_model,
+        "attention_heads": config.encoder_attention_heads,
+        "ffn_size": config.encoder_ffn_dim,
+        "threads": options.threads,
+        "backend_registration": "scalar",
+        "activation_dtype": "fp32",
+        "compilation_depth": "none",
+        "host": platform.platform(),
+        "python_version": platform.python_version(),
+        "numpy_version": np.__version__,
+        "warmup_seconds": warmups,
+        "encoder_seconds": samples,
+        "encoder_median_seconds": median,
+        "encoder_real_time_factor": median / audio_seconds,
+        "audio_seconds_per_encoder_second": audio_seconds / median,
+        "output_sha256": hashes,
+        "input_sha256": input_digest,
+        "graph_sha256": graph_digest,
+        "config_sha256": config_digest,
+        "kernels": sorted({metadata.symbol for metadata in manifest.kernels.values()}),
+        "kernel_call_counts": dict(counts),
+        "neon_kernel_call_count": sum(
             count for name, count in counts.items() if name.startswith("trillim_neon_")
         ),
-    )
+    }
     if options.reference_bundle is not None:
         reference_metadata = ReferenceTiming.model_validate_json(
             options.reference_bundle.with_name(

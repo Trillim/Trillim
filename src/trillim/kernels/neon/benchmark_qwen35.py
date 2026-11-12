@@ -291,7 +291,7 @@ def run_reference(options: Qwen35Options) -> None:
     torch = cast(TorchAPI, importlib.import_module("torch"))
     transformers = importlib.import_module("transformers")
     factory = cast(
-        ModelFactory, getattr(transformers, "Qwen3_5ForConditionalGeneration")
+        ModelFactory, transformers.Qwen3_5ForConditionalGeneration
     )
     torch.set_num_threads(options.threads)
     torch.set_default_device("cpu")
@@ -336,12 +336,12 @@ def run_reference(options: Qwen35Options) -> None:
         ).hexdigest(),
         prompt_token_ids=prompt,
         generated_token_ids=generated,
-        transformers_version=str(getattr(transformers, "__version__")),
+        transformers_version=str(transformers.__version__),
         torch_version=torch.__version__,
         architecture_source=str(source_path),
         architecture_url=(
             "https://github.com/huggingface/transformers/blob/v"
-            + str(getattr(transformers, "__version__"))
+            + str(transformers.__version__)
             + "/src/transformers/models/qwen3_5/modeling_qwen3_5.py"
         ),
         architecture_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),

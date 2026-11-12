@@ -396,6 +396,8 @@ def main() -> None:
         ]
     requested_workloads = cast(list[str] | None, arguments.workloads)
     if requested_workloads is not None:
+        if "whisper" in requested_workloads:
+            workloads.append(("whisper", 1500, 1500, 6, 6, 64, 64, False, None, 1))
         unknown = set(requested_workloads) - {item[0] for item in workloads}
         if unknown:
             parser.error(f"unknown or excluded workloads: {', '.join(sorted(unknown))}")
