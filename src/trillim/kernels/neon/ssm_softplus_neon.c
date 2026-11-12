@@ -73,16 +73,30 @@ static float32x4_t exp4(float32x4_t x) {
 }
 
 
+static float32x4_t log_unit4(float32x4_t value) {
+    /* log(y) = 2 * atanh((y-1)/(y+1)); here 1 <= y <= 2. */
+    float32x4_t z = vdivq_f32(vsubq_f32(value, vdupq_n_f32(1.0f)),
+                              vaddq_f32(value, vdupq_n_f32(1.0f)));
+    float32x4_t square = vmulq_f32(z, z);
+    float32x4_t p = vdupq_n_f32(1.0f / 15.0f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 13.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 11.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 9.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 7.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 5.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 3.0f), p, square);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, square);
+    return vmulq_f32(vmulq_n_f32(z, 2.0f), p);
+}
+
 static float32x4_t apply4(float32x4_t value) {
-    float32x4_t e = exp4(vnegq_f32(vabsq_f32(value)));
-    float lanes[4];
-    vst1q_f32(lanes, vaddq_f32(e, vdupq_n_f32(1.0f)));
-    for (size_t lane = 0; lane < 4; ++lane) {
-        lanes[lane] = logf(lanes[lane]);
-    }
+    /* Beyond |x|=17, FP32 1+exp(-|x|) rounds to one. */
+    float32x4_t exponent = vmaxq_f32(vnegq_f32(vabsq_f32(value)), vdupq_n_f32(-17.0f));
+    float32x4_t e = exp4(exponent);
+    float32x4_t logarithm = log_unit4(vaddq_f32(e, vdupq_n_f32(1.0f)));
     float32x4_t positive = vbslq_f32(vcgeq_f32(value, vdupq_n_f32(0.0f)),
                                      value, vdupq_n_f32(0.0f));
-    return vaddq_f32(positive, vld1q_f32(lanes));
+    return vaddq_f32(positive, logarithm);
 }
 
 static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
