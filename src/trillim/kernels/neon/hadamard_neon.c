@@ -145,6 +145,15 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_hadamard(
     }
     Task task = {outputs[0], inputs[0], inputs[1], p, context};
     size_t count = p->rows * (p->width / p->block_size);
+    if (p->rows <= 4096 / p->width) {
+        for (size_t index = 0; index < count; ++index) {
+            TrillimStatus status = transform(&task, index, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
     return count == 1 ? transform(&task, 0, 0) :
         context->thread_pool->run(context->thread_pool->context, count, transform, &task);
 }
