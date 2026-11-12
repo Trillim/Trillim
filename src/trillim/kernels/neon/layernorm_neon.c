@@ -1,6 +1,12 @@
 #include "common.h"
 #include <arm_neon.h>
 #include <math.h>
+
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
 #if defined(__APPLE__) && defined(__aarch64__)
 /* AArch64 NEON is baseline; the macOS catalog does not read CPU feature flags. */
 #define TRILLIM_NEON_REQUIRED UINT64_C(0)
@@ -67,38 +73,31 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
     const Parameters *p = t->p;
     if (t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
     size_t offset = row * p->width;
-    float mean = 0.0f, variance = 0.0f;
-    float32x4_t center;
+    float mean = 0.0f;
+    size_t i = 0;
+    for (; i < p->width; ++i) {
+        if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
+        mean += trillim_load(t->input, offset + i, p->input_dtype).f;
+    }
+    /* Sum retains the input dtype before Mean promotes the division to FP32. */
+    if (p->input_dtype == TRILLIM_BF16) mean = trillim_bf16(trillim_to_bf16(mean));
+    if (p->input_dtype == TRILLIM_FP16) mean = trillim_fp16(trillim_to_fp16(mean));
+    mean /= (float)p->width;
+    float32x4_t center = vdupq_n_f32(mean);
+    float variance = 0.0f;
+    i = 0;
     if (p->output_dtype != TRILLIM_FP32) {
-        for (size_t i = 0; i < p->width; ++i) {
-            if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
-            mean += trillim_load(t->input, offset + i, p->input_dtype).f;
-        }
-        mean /= (float)p->width;
-        center = vdupq_n_f32(mean);
-        for (size_t i = 0; i < p->width; ++i) {
+        for (; i < p->width; ++i) {
             if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
             float value = trillim_load(t->input, offset + i, p->input_dtype).f - mean;
             variance += value * value;
         }
     } else {
-        float32x4_t total = vdupq_n_f32(0.0f);
-        size_t i = 0;
-        for (; p->width - i >= 4; i += 4) {
-            if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
-            total = vaddq_f32(total, load4(t->input, offset + i, p->input_dtype));
-        }
-        mean = vaddvq_f32(total);
-        for (; i < p->width; ++i)
-            mean += trillim_load(t->input, offset + i, p->input_dtype).f;
-        mean /= (float)p->width;
-        center = vdupq_n_f32(mean);
-        total = vdupq_n_f32(0.0f);
-        i = 0;
+        float32x4_t total = vdupq_n_f32(0);
         for (; p->width - i >= 4; i += 4) {
             if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
             float32x4_t v = vsubq_f32(load4(t->input, offset + i, p->input_dtype), center);
-            total = vfmaq_f32(total, v, v);
+            total = vaddq_f32(total, vmulq_f32(v, v));
         }
         variance = vaddvq_f32(total);
         for (; i < p->width; ++i) {
@@ -106,18 +105,17 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
             variance += v * v;
         }
     }
-    size_t i = 0;
-    float inv = 1.0f / sqrtf(variance / (float)p->width + p->eps);
-    float32x4_t inverse = vdupq_n_f32(inv);
+    float denominator = sqrtf(variance / (float)p->width + p->eps);
+    float32x4_t divisor = vdupq_n_f32(denominator);
     i = 0;
     for (; p->width - i >= 4; i += 4) {
         if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
-        float32x4_t v = vmulq_f32(vsubq_f32(load4(t->input, offset + i, p->input_dtype), center), inverse);
-        v = vfmaq_f32(load4(t->bias, i, p->bias_dtype), v, load4(t->weight, i, p->weight_dtype));
+        float32x4_t v = vdivq_f32(vsubq_f32(load4(t->input, offset + i, p->input_dtype), center), divisor);
+        v = vaddq_f32(vmulq_f32(v, load4(t->weight, i, p->weight_dtype)), load4(t->bias, i, p->bias_dtype));
         store4(t->output, offset + i, p->output_dtype, v);
     }
     for (; i < p->width; ++i) {
-        TrillimValue v = {.f = (trillim_load(t->input, offset + i, p->input_dtype).f - mean) * inv *
+        TrillimValue v = {.f = (trillim_load(t->input, offset + i, p->input_dtype).f - mean) / denominator *
                                    trillim_load(t->weight, i, p->weight_dtype).f +
                                trillim_load(t->bias, i, p->bias_dtype).f};
         trillim_store(t->output, offset + i, p->output_dtype, v);

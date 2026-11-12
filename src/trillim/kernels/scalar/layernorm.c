@@ -1,5 +1,12 @@
 #include "common.h"
 #include <math.h>
+
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+
 typedef struct {
     size_t rows, width;
     uint32_t input_dtype, weight_dtype, bias_dtype, output_dtype;
@@ -40,6 +47,11 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
             sum += trillim_load(task->input, offset + i, p->input_dtype).f;
         }
     }
+    if (p->input_dtype == TRILLIM_BF16) {
+        sum = trillim_bf16(trillim_to_bf16(sum));
+    } else if (p->input_dtype == TRILLIM_FP16) {
+        sum = trillim_fp16(trillim_to_fp16(sum));
+    }
     float mean = sum / (float)p->width;
     float variance = 0.0f;
     for (size_t begin = 0; begin < p->width; begin += 1024) {
@@ -52,7 +64,7 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
             variance += centered * centered;
         }
     }
-    float inverse = 1.0f / sqrtf(variance / (float)p->width + p->eps);
+    float denominator = sqrtf(variance / (float)p->width + p->eps);
     for (size_t begin = 0; begin < p->width; begin += 1024) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -62,7 +74,7 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
             float centered = trillim_load(task->input, offset + i, p->input_dtype).f - mean;
             float weight = trillim_load(task->weight, i, p->weight_dtype).f;
             float bias = trillim_load(task->bias, i, p->bias_dtype).f;
-            TrillimValue result = {.f = (centered * inverse) * weight + bias};
+            TrillimValue result = {.f = (centered / denominator) * weight + bias};
             trillim_store(task->output, offset + i, p->output_dtype, result);
         }
     }

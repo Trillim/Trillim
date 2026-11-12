@@ -91,6 +91,18 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
     if (t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
     size_t begin = tile * 4096, end = p->count - begin < 4096 ? p->count : begin + 4096;
     size_t i = begin;
+    if (p->input_dtype == TRILLIM_FP16) {
+        for (; i < end; ++i) {
+            float x = trillim_load(t->input, i, p->input_dtype).f;
+            float z = trillim_fp16(trillim_to_fp16(x * 0.70703125f));
+            float cdf = trillim_fp16(trillim_to_fp16(erff(z)));
+            float sum = trillim_fp16(trillim_to_fp16(cdf + 1.0f));
+            float half = trillim_fp16(trillim_to_fp16(x * 0.5f));
+            TrillimValue value = {.f = trillim_fp16(trillim_to_fp16(half * sum))};
+            trillim_store(t->output, i, p->output_dtype, value);
+        }
+        return TRILLIM_OK;
+    }
     if (p->output_dtype != TRILLIM_FP32) {
         for (; end - i >= 4; i += 4) {
             float lanes[4];
@@ -98,12 +110,18 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
             for (size_t lane = 0; lane < 4; ++lane) {
                 float x = lanes[lane];
                 lanes[lane] = 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
+                if (p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_FP16) {
+                    lanes[lane] = trillim_bf16(trillim_to_bf16(lanes[lane]));
+                }
             }
             store4(t->output, i, p->output_dtype, vld1q_f32(lanes));
         }
         for (; i < end; ++i) {
             float x = trillim_load(t->input, i, p->input_dtype).f;
             TrillimValue value = {.f = 0.5f * x * (1.0f + erff(x * 0.7071067811865476f))};
+            if (p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_FP16) {
+                value.f = trillim_bf16(trillim_to_bf16(value.f));
+            }
             trillim_store(t->output, i, p->output_dtype, value);
         }
         return TRILLIM_OK;
