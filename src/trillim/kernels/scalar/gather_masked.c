@@ -501,6 +501,25 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
     return TRILLIM_OK;
 }
 
+static inline size_t trillim_gather_batch_size(const TrillimIndexParameters *p) {
+    return p->slice_size != 0 && p->slice_size < 256 ? 256 / p->slice_size : 1;
+}
+
+static TrillimStatus trillim_gather_batch(void *opaque, size_t batch, size_t worker) {
+    const TrillimIndexTask *task = opaque;
+    const TrillimIndexParameters *p = task->parameters;
+    size_t size = trillim_gather_batch_size(p);
+    size_t begin = batch * size;
+    size_t end = p->items - begin < size ? p->items : begin + size;
+    for (size_t item = begin; item < end; ++item) {
+        TrillimStatus status = trillim_gather_task(opaque, item, worker);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     return trillim_index_requirements(parameters, inputs, outputs, scratch, false, true);
 }
@@ -514,7 +533,10 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather_masked(
     }
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {outputs[0], inputs, (float *)scratch, p, context};
-    TrillimStatus status = context->thread_pool->run(context->thread_pool->context, p->items, trillim_gather_task, &task);
+    size_t batch_size = trillim_gather_batch_size(p);
+    size_t batches = p->items / batch_size + (p->items % batch_size != 0);
+    TrillimStatus status = batches == 1 ? trillim_gather_batch(&task, 0, 0) :
+        context->thread_pool->run(context->thread_pool->context, batches, trillim_gather_batch, &task);
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return status;
     }
