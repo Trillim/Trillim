@@ -32,15 +32,18 @@ class RopeScaling(BaseModel):
     truncate: bool = True
 
 
-class DecoderConfig(BaseModel):
+class ModelMetadata(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
 
     model_type: str
     hidden_size: int
+    num_hidden_layers: int
+
+
+class DecoderConfig(ModelMetadata):
     intermediate_size: int
     num_attention_heads: int
     num_key_value_heads: int
-    num_hidden_layers: int
     head_dim: int | None = None
     vocab_size: int
     rms_norm_eps: float
@@ -126,7 +129,11 @@ def instruction_calls(program: list[InstructionSymbol]) -> Counter[str]:
 def graph_source(config: DecoderConfig, capacity: int) -> str:
     if config.model_type == "gpt_oss":
         return gptoss_graph_source(config, capacity)
-    if config.model_type == "bitnet":
+    if (
+        config.model_type == "bitnet"
+        or config.model_type == "llama"
+        and config.is_bitnet_config
+    ):
         return bitnet_graph_source(config, capacity)
     if config.model_type not in {"qwen3", "qwen2", "llama"} or config.is_bitnet_config:
         raise ValueError(
@@ -242,18 +249,26 @@ with Graph() as graph:
 
 
 def bitnet_graph_source(config: DecoderConfig, capacity: int) -> str:
+    microsoft = config.model_type == "bitnet"
+    activation = "ReluSquared" if microsoft else "Silu"
+    expected_activation = "relu2" if microsoft else "silu"
     if (
         config.attention_bias
         or config.rope_scaling is not None
-        or config.hidden_act != "relu2"
+        or config.hidden_act != expected_activation
     ):
         raise ValueError(
-            "BitNet benchmark requires bias-free attention, unscaled rotary and squared ReLU"
+            "BitNet benchmark requires bias-free attention, unscaled rotary and the model's expected activation"
         )
     head_dim = config.head_dim or config.hidden_size // config.num_attention_heads
     output_weight = (
         "model.embed_tokens.weight" if config.tie_word_embeddings else "lm_head.weight"
     )
+    attended = "MergeHeads(Attention(query, keys.read(), values.read()))"
+    expanded = f"Mul({activation}(gate), up)"
+    if microsoft:
+        attended = f'RMSNorm({attended}, weight=weights[prefix + "self_attn.attn_sub_norm.weight"], eps={config.rms_norm_eps!r})'
+        expanded = f'RMSNorm({expanded}, weight=weights[prefix + "mlp.ffn_sub_norm.weight"], eps={config.rms_norm_eps!r})'
     return f"""from trillim.tdl import *
 
 weights = Model("model")
@@ -275,14 +290,14 @@ with Graph() as graph:
         values = Cache(name=f"value_{{layer}}", shape=({capacity}, {config.num_key_value_heads}, {head_dim}), dtype="fp32", mode="append", axis=0)
         keys.append(key)
         values.append(value)
-        attended = RMSNorm(MergeHeads(Attention(query, keys.read(), values.read())), weight=weights[prefix + "self_attn.attn_sub_norm.weight"], eps={config.rms_norm_eps!r})
+        attended = {attended}
         hidden = Add(residual, BitLinear(attended, weights[prefix + "self_attn.o_proj.weight"]))
         residual = hidden
         normed = RMSNorm(hidden, weight=weights[prefix + "post_attention_layernorm.weight"], eps={config.rms_norm_eps!r})
         codes, scale = QuantizeInt8(normed)
         gate = QuantizedLinear(codes, weights[prefix + "mlp.gate_proj.weight"], scale)
         up = QuantizedLinear(codes, weights[prefix + "mlp.up_proj.weight"], scale)
-        expanded = RMSNorm(Mul(ReluSquared(gate), up), weight=weights[prefix + "mlp.ffn_sub_norm.weight"], eps={config.rms_norm_eps!r})
+        expanded = {expanded}
         hidden = Add(residual, BitLinear(expanded, weights[prefix + "mlp.down_proj.weight"]))
     hidden = RMSNorm(hidden, weight=weights["model.norm.weight"], eps={config.rms_norm_eps!r})
     last = Slice(hidden, axis=0, start=-1, rank=2)
@@ -314,12 +329,15 @@ def compile_bundle(options: Options) -> None:
     _compile_model(request, progress=lambda message: print(message, flush=True))
 
 
-def benchmark(options: Options) -> dict[str, object]:
+def benchmark(
+    options: Options, *, config: ModelMetadata | None = None
+) -> dict[str, object]:
     if options.prompt + options.decode > options.cache:
         raise ValueError("cache must fit prompt and measured decode")
-    config = DecoderConfig.model_validate_json(
-        (options.checkpoint / "config.json").read_bytes()
-    )
+    if config is None:
+        config = ModelMetadata.model_validate_json(
+            (options.checkpoint / "config.json").read_bytes()
+        )
     prompt = np.array(
         [9707, 11, 358, 1097, 264, 1646, 13, 576, 4871, 374, 220, 17, 10, 17, 28, 220],
         dtype=np.int64,
