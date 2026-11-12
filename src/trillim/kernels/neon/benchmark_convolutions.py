@@ -206,23 +206,23 @@ def _measure(
     w = rng.normal(0, 0.2, weight_shape).astype(np.float32)
     b = rng.normal(0, 0.2, (outputs,)).astype(np.float32)
     dtype_id = {"fp16": 9, "bf16": 10, "fp32": 11}[dtype]
-    parameters: dict[str, _ConcreteParameter] = dict(
-        dimensions=dimensions,
-        channels=channels,
-        outputs=outputs,
-        groups=groups,
-        input_shape=shape,
-        output_shape=result_shape,
-        kernel=kernel,
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-        output_padding=extra,
-        input_dtype=dtype_id,
-        weight_dtype=dtype_id,
-        bias_dtype=dtype_id,
-        output_dtype=dtype_id,
-    )
+    parameters: dict[str, _ConcreteParameter] = {
+        "dimensions": dimensions,
+        "channels": channels,
+        "outputs": outputs,
+        "groups": groups,
+        "input_shape": shape,
+        "output_shape": result_shape,
+        "kernel": kernel,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "output_padding": extra,
+        "input_dtype": dtype_id,
+        "weight_dtype": dtype_id,
+        "bias_dtype": dtype_id,
+        "output_dtype": dtype_id,
+    }
     payloads = tuple(
         _encode(value, dtype)[0].tobytes() for value in (x, w, b)[: 3 if biased else 2]
     )
@@ -274,23 +274,23 @@ def _measure(
             )
     scalar_time = median(scalar_samples)
     neon_time = median(neon_samples)
-    record = dict(
-        name=name,
-        transpose=transpose,
-        bias=biased,
-        dtype=dtype,
-        parameters=parameters,
-        threads=threads,
-        allocated_bytes=allocated,
-        scalar_samples_s=scalar_samples,
-        neon_samples_s=neon_samples,
-        scalar_median_s=scalar_time,
-        neon_median_s=neon_time,
-        speedup=scalar_time / neon_time,
-        maximum_error=error,
-        bitwise_equal=bool(np.array_equal(scalar, neon)),
-        numpy_maximum_error=reference_error,
-    )
+    record = {
+        "name": name,
+        "transpose": transpose,
+        "bias": biased,
+        "dtype": dtype,
+        "parameters": parameters,
+        "threads": threads,
+        "allocated_bytes": allocated,
+        "scalar_samples_s": scalar_samples,
+        "neon_samples_s": neon_samples,
+        "scalar_median_s": scalar_time,
+        "neon_median_s": neon_time,
+        "speedup": scalar_time / neon_time,
+        "maximum_error": error,
+        "bitwise_equal": bool(np.array_equal(scalar, neon)),
+        "numpy_maximum_error": reference_error,
+    }
     if blas and not transpose and dtype == "fp32":
         candidate = replace(
             invocation,
@@ -404,23 +404,23 @@ def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
                         env=environment,
                         check=True,
                     )
-                parameters: dict[str, _ConcreteParameter] = dict(
-                    dimensions=1,
-                    channels=4,
-                    outputs=6,
-                    groups=2,
-                    input_shape=(9,),
-                    output_shape=result_shape[1:],
-                    kernel=(3,),
-                    stride=(2,),
-                    padding=(1,),
-                    dilation=(1,),
-                    output_padding=(0,),
-                    input_dtype=dtype_id,
-                    weight_dtype=dtype_id,
-                    bias_dtype=dtype_id,
-                    output_dtype=dtype_id,
-                )
+                parameters: dict[str, _ConcreteParameter] = {
+                    "dimensions": 1,
+                    "channels": 4,
+                    "outputs": 6,
+                    "groups": 2,
+                    "input_shape": (9,),
+                    "output_shape": result_shape[1:],
+                    "kernel": (3,),
+                    "stride": (2,),
+                    "padding": (1,),
+                    "dilation": (1,),
+                    "output_padding": (0,),
+                    "input_dtype": dtype_id,
+                    "weight_dtype": dtype_id,
+                    "bias_dtype": dtype_id,
+                    "output_dtype": dtype_id,
+                }
                 suffix = "conv_transpose_nd" if transpose else "conv_nd"
                 if biased:
                     suffix += "_bias"
@@ -431,7 +431,7 @@ def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
                         x = rng.normal(0, 0.4, (4, 9)).astype(np.float32)
                         w = rng.normal(0, 0.4, weight_shape).astype(np.float32)
                         b = rng.normal(0, 0.4, (6,)).astype(np.float32)
-                        inputs = dict(x=x, weight=w)
+                        inputs = {"x": x, "weight": w}
                         if biased:
                             inputs["bias"] = b
                         expected = runtime.run(inputs)["output"].astype(np.float32)
@@ -461,9 +461,9 @@ def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
                                     f"{name}: {backend} primitive mismatch, error {error}"
                                 )
                 records.append(
-                    dict(
-                        name=name, maximum_error=maximum, bitwise_equal=equal, inputs=8
-                    )
+                    {
+                        "name": name, "maximum_error": maximum, "bitwise_equal": equal, "inputs": 8
+                    }
                 )
                 print(f"{name}: primitive oracle maximum error {maximum}", flush=True)
     (options.directory / "primitive-oracle-results.json").write_text(
