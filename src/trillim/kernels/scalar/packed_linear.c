@@ -238,7 +238,7 @@ TRILLIM_PACKED_PROJECT(fp16, load_fp16)
 
 #undef TRILLIM_PACKED_PROJECT
 
-TRILLIM_KERNEL TrillimStatus trillim_scalar_packed_linear(
+TRILLIM_KERNEL TrillimStatus trillim_scalar_block_linear(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -273,7 +273,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_packed_linear(
                             : context->thread_pool->run(context->thread_pool->context, rows * tiles, project, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_scalar_packed_linear_tdl(void) {
+TRILLIM_KERNEL const char *trillim_scalar_block_linear_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _linear, _contiguous_strides\n"
            "def bind(context):\n"
@@ -291,7 +291,7 @@ TRILLIM_KERNEL const char *trillim_scalar_packed_linear_tdl(void) {
            "    return (Linear(x, weight),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_packed_linear_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_block_linear_parameters(void) {
     static const TrillimParameter fields[] = {
         {"tokens", "size_t", offsetof(Parameters, tokens), NULL},
         {"width", "size_t", offsetof(Parameters, width), NULL},
@@ -308,7 +308,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_packed_linear_parame
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_packed_linear_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_block_linear_capabilities(void) {
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
     return &capabilities;
 }
