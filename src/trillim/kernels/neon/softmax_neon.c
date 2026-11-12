@@ -206,7 +206,7 @@ static TrillimStatus softmax(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_softmax(
+TRILLIM_KERNEL TrillimStatus trillim_neon_normalize_softmax(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -222,7 +222,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_softmax(
                                      softmax, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_softmax_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_normalize_softmax_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _contiguous_strides, _native_dtype, _product\n"
            "def bind(context):\n"
@@ -244,7 +244,7 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return output == 0 && input == 0;
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_softmax_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_normalize_softmax_parameters(void) {
     static const TrillimParameter fields[] = {
         {"rows", "size_t", offsetof(Parameters, rows), NULL},
         {"width", "size_t", offsetof(Parameters, width), NULL},
@@ -258,7 +258,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_softmax_parameters(voi
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_softmax_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_normalize_softmax_capabilities(void) {
     static const TrillimCapabilities capabilities = {
         TRILLIM_KERNEL_ABI_VERSION,
 #if defined(__APPLE__) && defined(__aarch64__)

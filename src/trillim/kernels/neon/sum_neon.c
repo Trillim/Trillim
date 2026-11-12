@@ -185,7 +185,7 @@ static TrillimStatus sum_columns(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_sum(
+TRILLIM_KERNEL TrillimStatus trillim_neon_reduce_sum(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -209,14 +209,14 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_sum(
         context->thread_pool->run(context->thread_pool->context, p->outputs, sum_float, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_sum_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_reduce_sum_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _bind_reduction as bind\n"
            "def pattern(x: Tensor, *, axes: tuple[int, ...], keepdims: bool = False) -> tuple[Tensor, ...]:\n"
            "    return (Sum(x, axes=axes, keepdims=keepdims),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sum_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_reduce_sum_parameters(void) {
     static const TrillimParameter fields[] = {
         {"outputs", "size_t", offsetof(TrillimReductionParameters, outputs), NULL},
         {"output_rank", "size_t", offsetof(TrillimReductionParameters, output_rank), NULL},
@@ -241,7 +241,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sum_parameters(void) {
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_sum_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_reduce_sum_capabilities(void) {
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION,
 #if defined(__APPLE__) && defined(__aarch64__)
         /* AArch64 NEON is baseline; macOS catalog hardware flags are unavailable. */
