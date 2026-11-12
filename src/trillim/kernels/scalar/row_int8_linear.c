@@ -39,9 +39,16 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     float multiplier = 1.0f / task->scales[row];
     for (size_t column = begin; column < end; ++column) {
         int64_t sum = 0;
-        for (size_t k = 0; k < p->width; ++k) {
-            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-            sum += (int32_t)task->input[row * p->width + k] * task->weight[column * p->width + k];
+        for (size_t begin = 0; begin < p->width; begin += 1024) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t end = p->width - begin < 1024 ? p->width : begin + 1024;
+            int32_t partial = 0;
+            for (size_t k = begin; k < end; ++k) {
+                partial += (int32_t)task->input[row * p->width + k] * task->weight[column * p->width + k];
+            }
+            sum += partial;
         }
         uint16_t bits;
         memcpy(&bits, (const uint8_t *)task->weight + p->outputs * p->width + column * 2, sizeof(bits));

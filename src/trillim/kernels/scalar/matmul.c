@@ -153,6 +153,12 @@ static inline float trillim_read_float(
     return (float)((code - 32) * subscale) * scale;
 }
 
+static inline float trillim_load_fp32(const void *data, size_t index) {
+    float value;
+    memcpy(&value, (const uint8_t *)data + index * sizeof(float), sizeof(value));
+    return value;
+}
+
 typedef struct {
     void *output;
     const void *a;
@@ -213,11 +219,62 @@ static inline TrillimStatus trillim_matmul_task(void *opaque, size_t index, size
     (void)worker;
     const TrillimMatmulTask *task = (const TrillimMatmulTask *)opaque;
     const TrillimMatmulParameters *p = task->p;
-    size_t batch = index / p->m;
-    size_t row = index % p->m;
+    size_t tiles = p->n / 32 + (p->n % 32 != 0);
+    size_t matrix_row = index / tiles;
+    size_t batch = matrix_row / p->m;
+    size_t row = matrix_row % p->m;
+    size_t first = index % tiles * 32;
+    size_t last = p->n - first < 32 ? p->n : first + 32;
     size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides) + row * p->a_row_stride;
     size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
-    for (size_t column = 0; column < p->n; ++column) {
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
+        p->out_dtype == TRILLIM_FP32 && p->b_col_stride == 1) {
+        float sums[32] = {0};
+
+        for (size_t start = 0; start < p->k; start += 256) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t end = p->k - start < 256 ? p->k : start + 256;
+            for (size_t k = start; k < end; ++k) {
+                float value = trillim_load_fp32(task->a, a_base + k * p->a_col_stride);
+                size_t offset = b_base + k * p->b_row_stride + first;
+                for (size_t column = 0; column < last - first; ++column) {
+                    sums[column] += value * trillim_load_fp32(task->b, offset + column);
+                }
+            }
+        }
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        memcpy((uint8_t *)task->output + ((batch * p->m + row) * p->n + first) * sizeof(float),
+               sums, (last - first) * sizeof(float));
+        return TRILLIM_OK;
+    }
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
+        trillim_float(p->out_dtype)) {
+
+        for (size_t column = first; column < last; ++column) {
+            float sum = 0.0f;
+            for (size_t start = 0; start < p->k; start += 1024) {
+                if (task->context->is_cancelled(task->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                size_t end = p->k - start < 1024 ? p->k : start + 1024;
+                for (size_t k = start; k < end; ++k) {
+                    sum += trillim_load_fp32(task->a, a_base + k * p->a_col_stride) *
+                           trillim_load_fp32(task->b, b_base + k * p->b_row_stride + column * p->b_col_stride);
+                }
+            }
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            TrillimValue result = {.f = sum};
+            trillim_store(task->output, (batch * p->m + row) * p->n + column, p->out_dtype, result);
+        }
+        return TRILLIM_OK;
+    }
+    for (size_t column = first; column < last; ++column) {
         TrillimValue sum;
         if (trillim_float(p->out_dtype)) {
             sum.f = 0.0f;
@@ -258,7 +315,13 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_matmul(
     (void)scratch;
     const TrillimMatmulParameters *p = (const TrillimMatmulParameters *)parameters;
     TrillimMatmulTask task = {outputs[0], inputs[0], inputs[1], p, context};
-    return context->thread_pool->run(context->thread_pool->context, p->batches * p->m, trillim_matmul_task, &task);
+    if (context->is_cancelled(context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t tiles = p->n / 32 + (p->n % 32 != 0);
+    size_t tasks = p->batches * p->m * tiles;
+    return tasks == 1 ? trillim_matmul_task(&task, 0, 0)
+                      : context->thread_pool->run(context->thread_pool->context, tasks, trillim_matmul_task, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_scalar_matmul_tdl(void) {
