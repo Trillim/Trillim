@@ -265,9 +265,96 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
     return decode_typed_tile(t, a_base, b_base, output, first, last, p->a_dtype, p->b_dtype);
 }
 
+static inline __attribute__((always_inline)) float32x4x4_t ordered_weights(const Task *t, size_t base, size_t column, size_t k, uint32_t dtype) {
+    size_t stride = t->p->b_col_stride;
+    float32x4_t w0 = load4(t->b, base + column * stride + k, dtype);
+    float32x4_t w1 = load4(t->b, base + (column + 1) * stride + k, dtype);
+    float32x4_t w2 = load4(t->b, base + (column + 2) * stride + k, dtype);
+    float32x4_t w3 = load4(t->b, base + (column + 3) * stride + k, dtype);
+    float32x4x2_t even = vtrnq_f32(w0, w1);
+    float32x4x2_t odd = vtrnq_f32(w2, w3);
+    float32x4x4_t result = {{
+        vcombine_f32(vget_low_f32(even.val[0]), vget_low_f32(odd.val[0])),
+        vcombine_f32(vget_low_f32(even.val[1]), vget_low_f32(odd.val[1])),
+        vcombine_f32(vget_high_f32(even.val[0]), vget_high_f32(odd.val[0])),
+        vcombine_f32(vget_high_f32(even.val[1]), vget_high_f32(odd.val[1]))
+    }};
+    return result;
+}
+
+static inline __attribute__((always_inline)) TrillimStatus ordered_decode16_typed(const Task *t, size_t a_base, size_t b_base, size_t output, size_t column, uint32_t a_dtype, uint32_t b_dtype) {
+    const Parameters *p = t->p;
+    float32x4_t s0 = vdupq_n_f32(0), s1 = s0, s2 = s0, s3 = s0;
+    size_t k = 0;
+    for (; p->k - k >= 4; k += 4) {
+        if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t x = load4(t->a, a_base + k, a_dtype);
+        float32x4x4_t w0 = ordered_weights(t, b_base, column + 0, k, b_dtype);
+        float32x4x4_t w1 = ordered_weights(t, b_base, column + 4, k, b_dtype);
+        float32x4x4_t w2 = ordered_weights(t, b_base, column + 8, k, b_dtype);
+        float32x4x4_t w3 = ordered_weights(t, b_base, column + 12, k, b_dtype);
+        s0 = vfmaq_laneq_f32(s0, w0.val[0], x, 0);
+        s1 = vfmaq_laneq_f32(s1, w1.val[0], x, 0);
+        s2 = vfmaq_laneq_f32(s2, w2.val[0], x, 0);
+        s3 = vfmaq_laneq_f32(s3, w3.val[0], x, 0);
+        s0 = vfmaq_laneq_f32(s0, w0.val[1], x, 1);
+        s1 = vfmaq_laneq_f32(s1, w1.val[1], x, 1);
+        s2 = vfmaq_laneq_f32(s2, w2.val[1], x, 1);
+        s3 = vfmaq_laneq_f32(s3, w3.val[1], x, 1);
+        s0 = vfmaq_laneq_f32(s0, w0.val[2], x, 2);
+        s1 = vfmaq_laneq_f32(s1, w1.val[2], x, 2);
+        s2 = vfmaq_laneq_f32(s2, w2.val[2], x, 2);
+        s3 = vfmaq_laneq_f32(s3, w3.val[2], x, 2);
+        s0 = vfmaq_laneq_f32(s0, w0.val[3], x, 3);
+        s1 = vfmaq_laneq_f32(s1, w1.val[3], x, 3);
+        s2 = vfmaq_laneq_f32(s2, w2.val[3], x, 3);
+        s3 = vfmaq_laneq_f32(s3, w3.val[3], x, 3);
+    }
+    float32x4_t sums[4] = {s0, s1, s2, s3};
+    for (; k < p->k; ++k) {
+        float x = trillim_load(t->a, a_base + k, a_dtype).f;
+        for (size_t group = 0; group < 4; ++group) {
+            float weights[4];
+            for (size_t lane = 0; lane < 4; ++lane) {
+                weights[lane] = trillim_load(t->b, b_base + (column + group * 4 + lane) * p->b_col_stride + k, b_dtype).f;
+            }
+            sums[group] = vfmaq_n_f32(sums[group], vld1q_f32(weights), x);
+        }
+    }
+    for (size_t group = 0; group < 4; ++group) {
+        float values[4];
+        vst1q_f32(values, sums[group]);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            store(t, output + column + group * 4 + lane, values[lane]);
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus ordered_decode16(const Task *t, size_t a_base, size_t b_base, size_t output, size_t column) {
+    const Parameters *p = t->p;
+    if (p->a_dtype == TRILLIM_FP16 && p->b_dtype == TRILLIM_FP16) {
+        return ordered_decode16_typed(t, a_base, b_base, output, column, TRILLIM_FP16, TRILLIM_FP16);
+    }
+    if (p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16) {
+        return ordered_decode16_typed(t, a_base, b_base, output, column, TRILLIM_BF16, TRILLIM_BF16);
+    }
+    return ordered_decode16_typed(t, a_base, b_base, output, column, p->a_dtype, p->b_dtype);
+}
+
 static TrillimStatus ordered_dot_tile(const Task *t, size_t a_base, size_t b_base,
                                       size_t output, size_t rows, size_t first, size_t last) {
     const Parameters *p = t->p;
+    if (rows == 1) {
+        for (; last - first >= 16; first += 16) {
+            TrillimStatus status = ordered_decode16(t, a_base, b_base, output, first);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+    }
     for (size_t column = first; column < last; column += 4) {
         size_t columns = last - column < 4 ? last - column : 4;
         size_t b0 = b_base + column * p->b_col_stride;
