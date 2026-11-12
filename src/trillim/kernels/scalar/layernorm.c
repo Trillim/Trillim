@@ -16,7 +16,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[0] = inputs[1] = inputs[2] = outputs[0] = *scratch = 0;
     uint32_t types[] = {p->input_dtype, p->weight_dtype, p->bias_dtype, p->output_dtype};
     for (size_t i = 0; i < 4; ++i)
-        if (types[i] != TRILLIM_BF16 && types[i] != TRILLIM_FP32) return TRILLIM_ERROR;
+        if (!trillim_float(types[i])) return TRILLIM_ERROR;
     if (!p->width || p->width > SIZE_MAX / 4 || p->rows > SIZE_MAX / 4 / p->width || !isfinite(p->eps) || p->eps < 0)
         return TRILLIM_ERROR;
     inputs[0] = p->rows * p->width * trillim_itemsize(p->input_dtype);
@@ -83,11 +83,18 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_layernorm(void *const *outputs, cons
 }
 TRILLIM_KERNEL const char *trillim_scalar_layernorm_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _layernorm as bind\n"
-           "def pattern(x: Tensor, weight: Tensor, bias: Tensor, *, axes: tuple[int, ...] = (-1,), eps: float = 1e-5, "
-           "dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
-           "    return (LayerNorm(x, weight=weight, bias=bias, axes=axes, eps=eps) if dtype is None else "
-           "Cast(LayerNorm(x, weight=weight, bias=bias, axes=axes, eps=eps), dtype),)\n";
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _product, _DTYPE_IDS, _rmsnorm\n"
+           "def bind(c):\n"
+           "    x, bias = c.inputs['x'], c.inputs['bias']\n"
+           "    if c.attrs.get('axes', (-1,)) != (-1,) or bias.shape != x.shape[-1:]:\n"
+           "        raise ValueError('LayerNorm requires a matching channel bias and final axis')\n"
+           "    for value in (*c.inputs.values(), *c.outputs):\n"
+           "        if value.dtype not in {'fp16', 'bf16', 'fp32'} or (value.strides or _contiguous_strides(value.shape)) != _contiguous_strides(value.shape):\n"
+           "            raise ValueError('kernel requires contiguous floating tensors')\n"
+           "    p = _rmsnorm(c)\n"
+           "    return {key: value for key, value in p.items() if key not in {'storage_rows', 'storage_columns', 'weight_offset'}} | {'bias_dtype': _DTYPE_IDS[bias.dtype]}\n"
+           "def pattern(x: Tensor, weight: Tensor, bias: Tensor, *, axes: tuple[int, ...] = (-1,), eps: float = 1e-5, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
+           "    return (LayerNorm(x, weight=weight, bias=bias, axes=axes, eps=eps) if dtype is None else Cast(LayerNorm(x, weight=weight, bias=bias, axes=axes, eps=eps), dtype),)\n";
 }
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_layernorm_parameters(void) {
     static const TrillimParameter fields[] = {

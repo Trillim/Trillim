@@ -159,6 +159,18 @@ static inline float trillim_load_fp32(const void *data, size_t index) {
     return value;
 }
 
+static inline float trillim_load_bf16(const void *data, size_t index) {
+    uint16_t value;
+    memcpy(&value, (const uint8_t *)data + index * sizeof(value), sizeof(value));
+    return trillim_bf16(value);
+}
+
+static inline float trillim_load_fp16(const void *data, size_t index) {
+    uint16_t value;
+    memcpy(&value, (const uint8_t *)data + index * sizeof(value), sizeof(value));
+    return trillim_fp16(value);
+}
+
 typedef struct {
     void *output;
     const void *a;
@@ -166,6 +178,93 @@ typedef struct {
     const TrillimMatmulParameters *p;
     const TrillimKernelContext *context;
 } TrillimMatmulTask;
+
+#define TRILLIM_NATIVE_PROJECTION(NAME, LOAD_A, LOAD_B) \
+static TrillimStatus trillim_native_##NAME( \
+    const TrillimMatmulTask *task, size_t a_base, size_t b_base, \
+    size_t output, size_t first, size_t last \
+) { \
+    const TrillimMatmulParameters *p = task->p; \
+    if (p->b_col_stride == 1) { \
+        float sums[32] = {0}; \
+        for (size_t start = 0; start < p->k; start += 256) { \
+            if (task->context->is_cancelled(task->context->cancellation_context)) { \
+                return TRILLIM_CANCELLED; \
+            } \
+            size_t end = p->k - start < 256 ? p->k : start + 256; \
+            for (size_t k = start; k < end; ++k) { \
+                float value = LOAD_A(task->a, a_base + k * p->a_col_stride); \
+                size_t offset = b_base + k * p->b_row_stride + first; \
+                for (size_t column = 0; column < last - first; ++column) { \
+                    sums[column] += value * LOAD_B(task->b, offset + column); \
+                } \
+            } \
+        } \
+        if (task->context->is_cancelled(task->context->cancellation_context)) { \
+            return TRILLIM_CANCELLED; \
+        } \
+        for (size_t column = first; column < last; ++column) { \
+            TrillimValue result = {.f = sums[column - first]}; \
+            trillim_store(task->output, output + column, p->out_dtype, result); \
+        } \
+        return TRILLIM_OK; \
+    } \
+    size_t column = first; \
+    for (; last - column >= 4; column += 4) { \
+        float sums[4] = {0}; \
+        for (size_t start = 0; start < p->k; start += 1024) { \
+            if (task->context->is_cancelled(task->context->cancellation_context)) { \
+                return TRILLIM_CANCELLED; \
+            } \
+            size_t end = p->k - start < 1024 ? p->k : start + 1024; \
+            for (size_t k = start; k < end; ++k) { \
+                float value = LOAD_A(task->a, a_base + k * p->a_col_stride); \
+                size_t offset = b_base + k * p->b_row_stride + column * p->b_col_stride; \
+                sums[0] += value * LOAD_B(task->b, offset); \
+                sums[1] += value * LOAD_B(task->b, offset + p->b_col_stride); \
+                sums[2] += value * LOAD_B(task->b, offset + 2 * p->b_col_stride); \
+                sums[3] += value * LOAD_B(task->b, offset + 3 * p->b_col_stride); \
+            } \
+        } \
+        if (task->context->is_cancelled(task->context->cancellation_context)) { \
+            return TRILLIM_CANCELLED; \
+        } \
+        for (size_t i = 0; i < 4; ++i) { \
+            TrillimValue result = {.f = sums[i]}; \
+            trillim_store(task->output, output + column + i, p->out_dtype, result); \
+        } \
+    } \
+    for (; column < last; ++column) { \
+        float sum = 0.0f; \
+        for (size_t start = 0; start < p->k; start += 1024) { \
+            if (task->context->is_cancelled(task->context->cancellation_context)) { \
+                return TRILLIM_CANCELLED; \
+            } \
+            size_t end = p->k - start < 1024 ? p->k : start + 1024; \
+            for (size_t k = start; k < end; ++k) { \
+                sum += LOAD_A(task->a, a_base + k * p->a_col_stride) * \
+                       LOAD_B(task->b, b_base + k * p->b_row_stride + column * p->b_col_stride); \
+            } \
+        } \
+        if (task->context->is_cancelled(task->context->cancellation_context)) { \
+            return TRILLIM_CANCELLED; \
+        } \
+        TrillimValue result = {.f = sum}; \
+        trillim_store(task->output, output + column, p->out_dtype, result); \
+    } \
+    return TRILLIM_OK; \
+}
+
+TRILLIM_NATIVE_PROJECTION(fp32_bf16, trillim_load_fp32, trillim_load_bf16)
+TRILLIM_NATIVE_PROJECTION(fp32_fp16, trillim_load_fp32, trillim_load_fp16)
+TRILLIM_NATIVE_PROJECTION(bf16_fp32, trillim_load_bf16, trillim_load_fp32)
+TRILLIM_NATIVE_PROJECTION(bf16_bf16, trillim_load_bf16, trillim_load_bf16)
+TRILLIM_NATIVE_PROJECTION(bf16_fp16, trillim_load_bf16, trillim_load_fp16)
+TRILLIM_NATIVE_PROJECTION(fp16_fp32, trillim_load_fp16, trillim_load_fp32)
+TRILLIM_NATIVE_PROJECTION(fp16_bf16, trillim_load_fp16, trillim_load_bf16)
+TRILLIM_NATIVE_PROJECTION(fp16_fp16, trillim_load_fp16, trillim_load_fp16)
+
+#undef TRILLIM_NATIVE_PROJECTION
 
 static inline bool trillim_matrix_span(size_t base, size_t rows, size_t columns, size_t row_stride, size_t col_stride, size_t capacity) {
     if (rows == 0 || columns == 0) {
@@ -230,7 +329,6 @@ static inline TrillimStatus trillim_matmul_task(void *opaque, size_t index, size
     if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
         p->out_dtype == TRILLIM_FP32 && p->b_col_stride == 1) {
         float sums[32] = {0};
-
         for (size_t start = 0; start < p->k; start += 256) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -253,7 +351,6 @@ static inline TrillimStatus trillim_matmul_task(void *opaque, size_t index, size
     }
     if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
         trillim_float(p->out_dtype)) {
-
         for (size_t column = first; column < last; ++column) {
             float sum = 0.0f;
             for (size_t start = 0; start < p->k; start += 1024) {
@@ -273,6 +370,43 @@ static inline TrillimStatus trillim_matmul_task(void *opaque, size_t index, size
             trillim_store(task->output, (batch * p->m + row) * p->n + column, p->out_dtype, result);
         }
         return TRILLIM_OK;
+    }
+    if (trillim_float(p->a_dtype) && trillim_float(p->b_dtype) && trillim_float(p->out_dtype)) {
+        size_t output = (batch * p->m + row) * p->n;
+        switch (p->a_dtype) {
+        case TRILLIM_FP32:
+            switch (p->b_dtype) {
+            case TRILLIM_BF16:
+                return trillim_native_fp32_bf16(task, a_base, b_base, output, first, last);
+            case TRILLIM_FP16:
+                return trillim_native_fp32_fp16(task, a_base, b_base, output, first, last);
+            default: break;
+            }
+            break;
+        case TRILLIM_BF16:
+            switch (p->b_dtype) {
+            case TRILLIM_FP32:
+                return trillim_native_bf16_fp32(task, a_base, b_base, output, first, last);
+            case TRILLIM_BF16:
+                return trillim_native_bf16_bf16(task, a_base, b_base, output, first, last);
+            case TRILLIM_FP16:
+                return trillim_native_bf16_fp16(task, a_base, b_base, output, first, last);
+            default: break;
+            }
+            break;
+        case TRILLIM_FP16:
+            switch (p->b_dtype) {
+            case TRILLIM_FP32:
+                return trillim_native_fp16_fp32(task, a_base, b_base, output, first, last);
+            case TRILLIM_BF16:
+                return trillim_native_fp16_bf16(task, a_base, b_base, output, first, last);
+            case TRILLIM_FP16:
+                return trillim_native_fp16_fp16(task, a_base, b_base, output, first, last);
+            default: break;
+            }
+            break;
+        default: break;
+        }
     }
     for (size_t column = first; column < last; ++column) {
         TrillimValue sum;
