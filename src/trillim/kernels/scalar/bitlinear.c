@@ -50,12 +50,13 @@ static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dt
 }
 
 static inline float trillim_round_even(float value) {
-    float lower = floorf(value);
-    float fraction = value - lower;
-    if (fraction < 0.5f || (fraction == 0.5f && fmodf(lower, 2.0f) == 0.0f)) {
-        return lower;
+    float magnitude = fabsf(value);
+    int32_t code = (int32_t)magnitude;
+    float fraction = magnitude - (float)code;
+    if (fraction > 0.5f || (fraction == 0.5f && (code & 1))) {
+        ++code;
     }
-    return lower + 1.0f;
+    return value < 0.0f ? -(float)code : (float)code;
 }
 
 typedef struct {
@@ -140,7 +141,29 @@ static inline TrillimStatus trillim_bitlinear_project_scalar(void *opaque, size_
     memcpy(&gamma, task->weight + p->outputs * packed_row, sizeof(gamma));
     for (size_t column = begin; column < end; ++column) {
         int64_t sum = 0;
-        for (size_t k = 0; k < p->width; ++k) {
+        size_t k = 0;
+        for (; p->width - k >= 128; k += 128) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const uint8_t *weight = task->weight + column * packed_row + (k / 128) * 32;
+            const int8_t *codes = input + k;
+            int32_t partial = 0;
+            uint32_t invalid = 0;
+            for (size_t i = 0; i < 32; ++i) {
+                uint32_t packed = weight[i];
+                invalid |= packed & (packed >> 1) & UINT32_C(0x55);
+                partial += (int32_t)codes[i] * ((int32_t)(packed >> 6) - 1);
+                partial += (int32_t)codes[i + 32] * ((int32_t)((packed >> 4) & 3) - 1);
+                partial += (int32_t)codes[i + 64] * ((int32_t)((packed >> 2) & 3) - 1);
+                partial += (int32_t)codes[i + 96] * ((int32_t)(packed & 3) - 1);
+            }
+            if (invalid != 0) {
+                return TRILLIM_ERROR;
+            }
+            sum += partial;
+        }
+        for (; k < p->width; ++k) {
             if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
