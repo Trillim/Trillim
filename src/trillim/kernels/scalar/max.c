@@ -174,26 +174,57 @@ typedef struct {
     const void *input;
     const TrillimReductionParameters *parameters;
     const TrillimKernelContext *context;
-    uint32_t operation;
+    bool contiguous;
+    size_t count;
+    size_t block;
 } TrillimReductionTask;
 
-enum { TRILLIM_SUM, TRILLIM_MAX, TRILLIM_ARGMAX };
+static bool shape_product(size_t rank, const size_t *shape, size_t *product) {
+    if (rank && !shape) {
+        return false;
+    }
+    for (size_t axis = 0; axis < rank; ++axis) {
+        if (!shape[axis]) {
+            *product = 0;
+            return true;
+        }
+    }
+    size_t result = 1;
+    for (size_t axis = 0; axis < rank; ++axis) {
+        if (result > SIZE_MAX / shape[axis]) {
+            return false;
+        }
+        result *= shape[axis];
+    }
+    *product = result;
+    return true;
+}
 
 static inline TrillimStatus trillim_reduction_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
-    const TrillimReductionParameters *p = (const TrillimReductionParameters *)parameters;
-    inputs[0] = 0;
-    outputs[0] = 0;
-    *scratch = 0;
+    const TrillimReductionParameters *p = parameters;
+    inputs[0] = outputs[0] = *scratch = 0;
     size_t bytes = trillim_itemsize(p->output_dtype);
-    size_t outer_span, inner_span;
-    if (bytes == 0 || !trillim_span(p->output_rank, p->output_shape, p->output_strides, &outer_span) ||
-        !trillim_span(p->reduce_rank, p->reduce_shape, p->reduce_strides, &inner_span) ||
+    size_t output_count, reduce_count;
+    if (!bytes || p->input_dtype > TRILLIM_MXFP4 ||
+        (p->output_rank && !p->output_strides) || (p->reduce_rank && !p->reduce_strides) ||
+        !shape_product(p->output_rank, p->output_shape, &output_count) ||
+        !shape_product(p->reduce_rank, p->reduce_shape, &reduce_count) ||
+        output_count != p->outputs || reduce_count != p->reduce_count ||
         p->outputs > SIZE_MAX / bytes) {
         return TRILLIM_ERROR;
     }
-    if (p->outputs != 0) {
-        outputs[0] = p->outputs * bytes;
-        if (p->reduce_count != 0 && !trillim_payload_size(p->storage_rows, p->storage_columns, p->input_dtype, &inputs[0])) {
+    outputs[0] = p->outputs * bytes;
+    if (p->outputs && p->reduce_count) {
+        size_t outer_span, inner_span;
+        if ((p->storage_columns && p->storage_rows > SIZE_MAX / p->storage_columns) ||
+            !trillim_span(p->output_rank, p->output_shape, p->output_strides, &outer_span) ||
+            !trillim_span(p->reduce_rank, p->reduce_shape, p->reduce_strides, &inner_span)) {
+            return TRILLIM_ERROR;
+        }
+        size_t capacity = p->storage_rows * p->storage_columns;
+        if (!outer_span || !inner_span || outer_span - 1 > SIZE_MAX - inner_span ||
+            outer_span - 1 + inner_span > capacity ||
+            !trillim_payload_size(p->storage_rows, p->storage_columns, p->input_dtype, &inputs[0])) {
             return TRILLIM_ERROR;
         }
     }
@@ -207,6 +238,18 @@ static inline bool trillim_greater_equal(TrillimValue a, TrillimValue b, uint32_
     return trillim_unsigned(dtype) ? a.u >= b.u : a.i >= b.i;
 }
 
+static size_t effective_count(const TrillimReductionParameters *p) {
+    if (!p->reduce_count) {
+        return 0;
+    }
+    for (size_t axis = 0; axis < p->reduce_rank; ++axis) {
+        if (p->reduce_shape[axis] > 1 && p->reduce_strides[axis] != 0) {
+            return p->reduce_count;
+        }
+    }
+    return 1;
+}
+
 static inline TrillimStatus trillim_reduction_task(void *opaque, size_t output_index, size_t worker) {
     (void)worker;
     const TrillimReductionTask *task = (const TrillimReductionTask *)opaque;
@@ -217,14 +260,13 @@ static inline TrillimStatus trillim_reduction_task(void *opaque, size_t output_i
     if (trillim_float(p->output_dtype)) {
         accumulator.f = 0.0f;
     }
-    int64_t selected = INT64_MAX;
     bool valid = false;
     uint32_t compare_dtype = trillim_itemsize(p->input_dtype) == 0 ? TRILLIM_FP32 : p->input_dtype;
-    for (size_t start = 0; start < p->reduce_count; start += 1024) {
+    for (size_t start = 0; start < task->count;) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        size_t end = p->reduce_count - start < 1024 ? p->reduce_count : start + 1024;
+        size_t end = task->count - start < 1024 ? task->count : start + 1024;
         for (size_t index = start; index < end; ++index) {
             size_t source = base + trillim_offset(index, p->reduce_rank, p->reduce_shape, p->reduce_strides);
             TrillimValue value;
@@ -233,30 +275,17 @@ static inline TrillimStatus trillim_reduction_task(void *opaque, size_t output_i
             } else {
                 value = trillim_load(task->input, source, p->input_dtype);
             }
-            if (task->operation == TRILLIM_SUM) {
-                TrillimValue converted;
-                TrillimStatus status = trillim_convert(value, compare_dtype, p->output_dtype, &converted);
-                if (status != TRILLIM_OK) {
-                    return status;
-                }
-                if (trillim_float(p->output_dtype)) {
-                    accumulator.f += converted.f;
-                } else {
-                    accumulator.u += converted.u;
-                }
-            } else if (!valid || !trillim_greater_equal(accumulator, value, compare_dtype)) {
+            if (!valid || !trillim_greater_equal(accumulator, value, compare_dtype)) {
                 accumulator = value;
-                selected = (int64_t)index;
             }
             valid = true;
         }
+        start = end;
     }
     if (task->context->is_cancelled(task->context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
-    if (task->operation == TRILLIM_ARGMAX) {
-        accumulator.i = selected;
-    } else if (task->operation == TRILLIM_MAX && valid) {
+    if (valid) {
         TrillimValue converted;
         TrillimStatus status = trillim_convert(accumulator, compare_dtype, p->output_dtype, &converted);
         if (status != TRILLIM_OK) {
@@ -265,6 +294,153 @@ static inline TrillimStatus trillim_reduction_task(void *opaque, size_t output_i
         accumulator = converted;
     }
     trillim_store(task->output, output_index, p->output_dtype, accumulator);
+    return TRILLIM_OK;
+}
+
+static float native_float(const void *data, size_t index, uint32_t dtype) {
+    if (dtype == TRILLIM_FP32) {
+        float value;
+        memcpy(&value, (const uint8_t *)data + index * sizeof(value), sizeof(value));
+        return value;
+    }
+    uint16_t value;
+    memcpy(&value, (const uint8_t *)data + index * sizeof(value), sizeof(value));
+    if (dtype == TRILLIM_BF16) {
+        return trillim_bf16(value);
+    }
+#if defined(__aarch64__) && defined(__FLT16_MANT_DIG__)
+    if ((value & 0x7c00) != 0x7c00) {
+        __extension__ _Float16 half;
+        memcpy(&half, &value, sizeof(half));
+        return (float)half;
+    }
+#endif
+    return trillim_fp16(value);
+}
+
+static TrillimStatus max_sequence(const TrillimReductionTask *task, size_t index, size_t base) {
+    const TrillimReductionParameters *p = task->parameters;
+    float maximum = task->count ? native_float(task->input, base, p->input_dtype) : 0.0f;
+    for (size_t k = 1; k < task->count; ++k) {
+        if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t offset = task->contiguous ? k : (p->reduce_rank == 1 ? k * p->reduce_strides[0] :
+            trillim_offset(k, p->reduce_rank, p->reduce_shape, p->reduce_strides));
+        float value = native_float(task->input, base + offset, p->input_dtype);
+        maximum = maximum >= value ? maximum : value;
+    }
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    TrillimValue result = {.f = maximum};
+    trillim_store(task->output, index, p->output_dtype, result);
+    return TRILLIM_OK;
+}
+
+static TrillimStatus max_float(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const TrillimReductionTask *task = opaque;
+    const TrillimReductionParameters *p = task->parameters;
+    size_t base = trillim_offset(index, p->output_rank, p->output_shape, p->output_strides);
+    if (!task->contiguous || task->count < 4) {
+        return max_sequence(task, index, base);
+    }
+    float maxima[4];
+    unsigned has_nan = 0;
+    for (size_t lane = 0; lane < 4; ++lane) {
+        maxima[lane] = native_float(task->input, base + lane, p->input_dtype);
+        has_nan |= isnan(maxima[lane]);
+    }
+    size_t k = 4;
+    for (; task->count - k >= 4; k += 4) {
+        if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t lane = 0; lane < 4; ++lane) {
+            float value = native_float(task->input, base + k + lane, p->input_dtype);
+            has_nan |= isnan(value);
+            maxima[lane] = maxima[lane] >= value ? maxima[lane] : value;
+        }
+    }
+    float maximum = maxima[0];
+    for (size_t lane = 1; lane < 4; ++lane) {
+        maximum = maximum >= maxima[lane] ? maximum : maxima[lane];
+    }
+    for (; k < task->count; ++k) {
+        float value = native_float(task->input, base + k, p->input_dtype);
+        has_nan |= isnan(value);
+        maximum = maximum >= value ? maximum : value;
+    }
+    if (has_nan) {
+        return max_sequence(task, index, base);
+    }
+    if (maximum == 0.0f) {
+        for (size_t i = 0; i < task->count; ++i) {
+            if ((i & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float value = native_float(task->input, base + i, p->input_dtype);
+            if (value == 0.0f) {
+                maximum = value;
+                break;
+            }
+        }
+    }
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    TrillimValue result = {.f = maximum};
+    trillim_store(task->output, index, p->output_dtype, result);
+    return TRILLIM_OK;
+}
+
+static TrillimStatus max_columns(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimReductionTask *task = opaque;
+    const TrillimReductionParameters *p = task->parameters;
+    size_t columns = p->output_shape[p->output_rank - 1];
+    size_t tiles = columns / 64 + (columns % 64 != 0);
+    size_t first = tile % tiles * 64;
+    size_t count = columns - first < 64 ? columns - first : 64;
+    size_t output = tile / tiles * columns + first;
+    size_t base = trillim_offset(output, p->output_rank, p->output_shape, p->output_strides);
+    float maxima[64];
+    for (size_t lane = 0; lane < count; ++lane) {
+        maxima[lane] = task->count ? native_float(task->input, base + lane, p->input_dtype) : 0.0f;
+    }
+    for (size_t k = 1; k < task->count; ++k) {
+        if ((k & 127) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t offset = p->reduce_rank == 1 ? k * p->reduce_strides[0] :
+            trillim_offset(k, p->reduce_rank, p->reduce_shape, p->reduce_strides);
+        for (size_t lane = 0; lane < count; ++lane) {
+            float value = native_float(task->input, base + offset + lane, p->input_dtype);
+            maxima[lane] = maxima[lane] >= value ? maxima[lane] : value;
+        }
+    }
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    for (size_t lane = 0; lane < count; ++lane) {
+        TrillimValue result = {.f = maxima[lane]};
+        trillim_store(task->output, output + lane, p->output_dtype, result);
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus max_rows(void *opaque, size_t tile, size_t worker) {
+    const TrillimReductionTask *task = opaque;
+    const TrillimReductionParameters *p = task->parameters;
+    size_t first = tile * task->block;
+    size_t end = p->outputs - first < task->block ? p->outputs : first + task->block;
+    for (size_t row = first; row < end; ++row) {
+        TrillimStatus status = max_float(opaque, row, worker);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
     return TRILLIM_OK;
 }
 
@@ -277,8 +453,48 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_max(
         return TRILLIM_CANCELLED;
     }
     const TrillimReductionParameters *p = (const TrillimReductionParameters *)parameters;
-    TrillimReductionTask task = {outputs[0], inputs[0], p, context, TRILLIM_MAX};
-    return context->thread_pool->run(context->thread_pool->context, p->outputs, trillim_reduction_task, &task);
+    TrillimReductionTask task = {outputs[0], inputs[0], p, context,
+        trillim_contiguous(p->reduce_rank, p->reduce_shape, p->reduce_strides), effective_count(p), 1};
+    if (!p->outputs) {
+        return TRILLIM_OK;
+    }
+    bool small = !task.count || p->outputs <= 8192 / task.count;
+    TrillimTask function = trillim_reduction_task;
+    size_t tasks = p->outputs;
+    if (trillim_float(p->input_dtype) && trillim_float(p->output_dtype)) {
+        size_t block = task.count ? 16384 / task.count : 32;
+        size_t workers = context->thread_pool->worker_count;
+        size_t parallel = workers > 1 ? p->outputs / workers / 4 : 32;
+        if (block > 32) {
+            block = 32;
+        }
+        if (block > parallel) {
+            block = parallel;
+        }
+        if (!block) {
+            block = 1;
+        }
+        task.block = small ? p->outputs : block;
+        tasks = p->outputs / task.block + (p->outputs % task.block != 0);
+        function = max_rows;
+        if (p->output_rank && p->output_strides[p->output_rank - 1] == 1) {
+            size_t columns = p->output_shape[p->output_rank - 1];
+            size_t tiles = columns / 64 + (columns % 64 != 0);
+            tasks = p->outputs / columns * tiles;
+            function = max_columns;
+        }
+    }
+    if (small) {
+        for (size_t i = 0; i < tasks; ++i) {
+            TrillimStatus status = function(&task, i, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
+    return tasks == 1 ? function(&task, 0, 0)
+                      : context->thread_pool->run(context->thread_pool->context, tasks, function, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_scalar_max_tdl(void) {
@@ -314,6 +530,6 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_max_parameters(void)
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_scalar_max_capabilities(void) {
-    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, 0};
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
     return &capabilities;
 }
