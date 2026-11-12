@@ -18,7 +18,7 @@ __asm__(
 #define DOTPROD
 #define I8MM
 static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
-    __asm__(".inst 0x4e809400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
+    __asm__ volatile(".inst 0x4e809400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
         : "+w"(sum) : "w"(a), "w"(b));
     return sum;
 }
@@ -621,7 +621,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_bitlinear(
     if (status != TRILLIM_OK) {
         return status;
     }
-    size_t columns = p->outputs / workers / 4;
+    size_t columns = p->outputs / workers;
     columns = columns / 2 * 2;
     if (columns < 16) {
         columns = 16;

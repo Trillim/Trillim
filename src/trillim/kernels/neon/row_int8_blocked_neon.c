@@ -17,12 +17,12 @@ __asm__(
 #define DOTPROD
 #define I8MM
 static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
-    __asm__(".inst 0x4e809400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
+    __asm__ volatile(".inst 0x4e809400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
         : "+w"(sum) : "w"(a), "w"(b));
     return sum;
 }
 static inline int32x4_t matrix_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
-    __asm__(".inst 0x4e80a400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
+    __asm__ volatile(".inst 0x4e80a400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
         : "+w"(sum) : "w"(a), "w"(b));
     return sum;
 }
@@ -652,7 +652,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_row_int8_blocked(
     if (!workers) {
         return TRILLIM_ERROR;
     }
-    size_t columns = p->outputs / workers / 4;
+    size_t columns = p->outputs / workers;
     columns = columns / 32 * 32;
     if (columns < 32) {
         columns = 32;
