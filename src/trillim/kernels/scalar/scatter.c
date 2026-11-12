@@ -433,6 +433,109 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return output == 0 && input == 0 && (p == NULL || trillim_itemsize(p->dtype) != 0);
 }
 
+static bool raw_copy_dtype(uint32_t dtype) {
+    /* Bool and low precision stores canonicalize their encodings. */
+    return dtype > TRILLIM_BOOL && dtype != TRILLIM_FP16 && dtype != TRILLIM_BF16 &&
+        trillim_itemsize(dtype) != 0;
+}
+
+static TrillimStatus copy_run(void *output, size_t destination, const void *input,
+                             size_t source, size_t step, size_t count, uint32_t dtype,
+                             const TrillimKernelContext *context) {
+    size_t bytes = trillim_itemsize(dtype);
+    uint64_t pattern = 0;
+    if (!count) {
+        return TRILLIM_OK;
+    }
+    uintptr_t target_address = (uintptr_t)((uint8_t *)output + destination * bytes);
+    uintptr_t source_address = (uintptr_t)((const uint8_t *)input + source * bytes);
+    size_t target_bytes = count * bytes;
+    size_t source_bytes = step == 0 ? bytes : target_bytes;
+    bool disjoint = target_address <= source_address ?
+        source_address - target_address >= target_bytes :
+        target_address - source_address >= source_bytes;
+    bool bulk_copy = step == 1 && raw_copy_dtype(dtype) && disjoint;
+    bool broadcast = step == 0 && disjoint;
+    if (step == 1 && raw_copy_dtype(dtype) && target_address == source_address) {
+        return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+    }
+    if (broadcast) {
+        trillim_store(&pattern, 0, dtype, trillim_load(input, source, dtype));
+    }
+    for (size_t begin = 0; begin < count; begin += 4096) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t length = count - begin < 4096 ? count - begin : 4096;
+        uint8_t *target = (uint8_t *)output + (destination + begin) * bytes;
+        if (bulk_copy) {
+            memcpy(target, (const uint8_t *)input + (source + begin) * bytes, length * bytes);
+        } else if (broadcast) {
+            switch (bytes) {
+            case 1:
+                memset(target, ((const uint8_t *)&pattern)[0], length);
+                break;
+            case 2: {
+                uint16_t value;
+                memcpy(&value, &pattern, sizeof(value));
+                for (size_t i = 0; i < length; ++i) {
+                    memcpy(target + i * 2, &value, sizeof(value));
+                }
+                break;
+            }
+            case 4: {
+                uint32_t value;
+                memcpy(&value, &pattern, sizeof(value));
+                for (size_t i = 0; i < length; ++i) {
+                    memcpy(target + i * 4, &value, sizeof(value));
+                }
+                break;
+            }
+            case 8:
+                for (size_t i = 0; i < length; ++i) {
+                    memcpy(target + i * 8, &pattern, sizeof(pattern));
+                }
+                break;
+            default:
+                return TRILLIM_ERROR;
+            }
+        } else {
+            for (size_t i = 0; i < length; ++i) {
+                TrillimValue value = trillim_load(input, source + (begin + i) * step, dtype);
+                trillim_store(output, destination + begin + i, dtype, value);
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static bool initial_layout(const TrillimIndexParameters *p, bool *uniform) {
+    *uniform = true;
+    bool contiguous = trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides);
+    size_t count = p->slice_size;
+    for (size_t axis = 0; axis < p->slice_rank; ++axis) {
+        if (p->slice_shape[axis] > 1 && p->slice_strides[axis] != 0) {
+            *uniform = false;
+        }
+    }
+    for (size_t axis = p->coordinates; axis > 0; --axis) {
+        size_t i = axis - 1;
+        if (p->indexed_shape[i] > 1) {
+            if (p->indexed_strides[i] != 0) {
+                *uniform = false;
+            }
+            if (p->indexed_strides[i] != count) {
+                contiguous = false;
+            }
+        }
+        if (p->indexed_shape[i] && count > SIZE_MAX / p->indexed_shape[i]) {
+            return false;
+        }
+        count *= p->indexed_shape[i];
+    }
+    return count == p->count && (*uniform || contiguous);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -443,7 +546,15 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {inputs, p, context};
     TrillimStatus status;
-    if (outputs[0] != inputs[0] && p->slice_size != 0) {
+    bool uniform;
+    bool fast_initial = trillim_itemsize(p->dtype) != 0 && initial_layout(p, &uniform);
+    if (outputs[0] != inputs[0] && p->slice_size != 0 && fast_initial) {
+        status = copy_run(outputs[0], 0, inputs[0], 0, uniform ? 0 : 1,
+                          p->count, p->dtype, context);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    } else if (outputs[0] != inputs[0] && p->slice_size != 0) {
         for (size_t begin = 0; begin < p->count; begin += 1024) {
             if (context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -500,6 +611,33 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
                 slot = (slot + 1) & (table_capacity - 1);
             }
             table[slot] = key;
+        }
+        if (p->mode == 0 && trillim_itemsize(p->dtype) != 0) {
+            size_t first = item * p->slice_size;
+            if (trillim_contiguous(p->values_rank, p->values_shape, p->values_strides)) {
+                status = copy_run(outputs[0], destination, inputs[2], first, 1,
+                                  p->slice_size, p->dtype, context);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+                continue;
+            }
+            size_t width = p->values_rank ? p->values_shape[p->values_rank - 1] : 1;
+            size_t step = p->values_rank ? p->values_strides[p->values_rank - 1] : 0;
+            for (size_t i = 0; i < p->slice_size;) {
+                size_t length = width - (first + i) % width;
+                if (length > p->slice_size - i) {
+                    length = p->slice_size - i;
+                }
+                size_t index = trillim_offset(first + i, p->values_rank, p->values_shape, p->values_strides);
+                status = copy_run(outputs[0], destination + i, inputs[2], index, step,
+                                  length, p->dtype, context);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+                i += length;
+            }
+            continue;
         }
         for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
             if (context->is_cancelled(context->cancellation_context)) {
