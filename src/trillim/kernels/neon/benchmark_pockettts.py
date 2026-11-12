@@ -146,13 +146,13 @@ def compare(
     correct = bool(np.allclose(actual, expected, rtol=2e-4, atol=2e-4))
     if not correct:
         raise ValueError(f"flow head differs: maximum {maximum}, RMS {rms}")
-    return dict(
-        maximum_absolute_error=maximum,
-        rms_error=rms,
-        allclose=correct,
-        comparison_rtol=2e-4,
-        comparison_atol=2e-4,
-    )
+    return {
+        "maximum_absolute_error": maximum,
+        "rms_error": rms,
+        "allclose": correct,
+        "comparison_rtol": 2e-4,
+        "comparison_atol": 2e-4,
+    }
 
 
 def torch_reference(options: Options, features: Path) -> Path:
@@ -242,42 +242,42 @@ def benchmark(options: Options) -> dict[str, object]:
     ).hexdigest()
     graph_digest = hashlib.sha256(graph_source(options.batch).encode()).hexdigest()
     checkpoint_digest = file_hash(options.checkpoint)
-    result: dict[str, object] = dict(
-        label=options.label,
-        checkpoint=str(options.checkpoint),
-        bundle=str(options.output),
-        component="PocketTTS flow_lm.flow_net",
-        scope="Complete flow head only; excludes autoregressive backbone, flow solver, audio decoder and text processing",
-        activation_dtype="fp32",
-        native_weight_dtype="bf16",
-        native_weight_count=68,
-        native_weight_bytes=19518016,
-        residual_blocks=6,
-        hidden_size=512,
-        condition_size=1024,
-        latent_size=32,
-        time_conditions=2,
-        batch=options.batch,
-        threads=options.threads,
-        backend_registration="scalar",
-        compilation_depth="none",
-        input_description="Seed 1337 Gaussian FP32 c/x, fixed linspace s/t, native checkpoint BF16 frequency values",
-        input_sha256=input_digest,
-        graph_sha256=graph_digest,
-        checkpoint_sha256=checkpoint_digest,
-        benchmark_source_sha256=file_hash(Path(__file__)),
-        executable_sha256=file_hash(options.output / "executable.json"),
-        compiled_weights_sha256=file_hash(options.output / "weights.bin"),
-        compiled_constants_sha256=file_hash(options.output / "constants.bin"),
-        kernel_library_sha256={
+    result: dict[str, object] = {
+        "label": options.label,
+        "checkpoint": str(options.checkpoint),
+        "bundle": str(options.output),
+        "component": "PocketTTS flow_lm.flow_net",
+        "scope": "Complete flow head only; excludes autoregressive backbone, flow solver, audio decoder and text processing",
+        "activation_dtype": "fp32",
+        "native_weight_dtype": "bf16",
+        "native_weight_count": 68,
+        "native_weight_bytes": 19518016,
+        "residual_blocks": 6,
+        "hidden_size": 512,
+        "condition_size": 1024,
+        "latent_size": 32,
+        "time_conditions": 2,
+        "batch": options.batch,
+        "threads": options.threads,
+        "backend_registration": "scalar",
+        "compilation_depth": "none",
+        "input_description": "Seed 1337 Gaussian FP32 c/x, fixed linspace s/t, native checkpoint BF16 frequency values",
+        "input_sha256": input_digest,
+        "graph_sha256": graph_digest,
+        "checkpoint_sha256": checkpoint_digest,
+        "benchmark_source_sha256": file_hash(Path(__file__)),
+        "executable_sha256": file_hash(options.output / "executable.json"),
+        "compiled_weights_sha256": file_hash(options.output / "weights.bin"),
+        "compiled_constants_sha256": file_hash(options.output / "constants.bin"),
+        "kernel_library_sha256": {
             name: file_hash(options.output / name)
             for name in sorted({kernel.library for kernel in manifest.kernels.values()})
         },
-        output_sha256=hashlib.sha256(encoded.tobytes()).hexdigest(),
-        kernel_call_counts=dict(counts),
-        host=platform.platform(),
-        validation_only=options.validate_only,
-    )
+        "output_sha256": hashlib.sha256(encoded.tobytes()).hexdigest(),
+        "kernel_call_counts": dict(counts),
+        "host": platform.platform(),
+        "validation_only": options.validate_only,
+    }
     if samples:
         median = statistics.median(samples)
         result.update(
