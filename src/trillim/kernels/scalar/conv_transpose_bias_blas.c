@@ -61,23 +61,42 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     ) {
         return TRILLIM_ERROR;
     }
+    bool empty = false;
     for (size_t axis = 0; axis < p->dimensions; ++axis) {
         size_t input = p->input_shape[axis], output = p->output_shape[axis];
         size_t kernel = p->kernel[axis], stride = p->stride[axis], padding = p->padding[axis];
         size_t dilation = p->dilation[axis], extra = p->output_padding[axis], effective, spread;
-        if (!input || !output || !kernel || !stride || !dilation ||
+        if (!kernel || !stride || !dilation ||
             input > INT64_MAX || output > INT64_MAX || stride > INT64_MAX || dilation > INT64_MAX ||
             padding > INT64_MAX / 2 ||
             !product(kernel - 1, dilation, &effective) || effective >= INT64_MAX) {
             return TRILLIM_ERROR;
         }
         ++effective;
+        if (!output) {
+            empty = true;
+            continue;
+        }
+        if (!input) {
+            if (extra > INT64_MAX - effective) {
+                return TRILLIM_ERROR;
+            }
+            size_t extent = effective + extra;
+            if (stride > extent || 2 * padding > extent - stride ||
+                output != extent - stride - 2 * padding) {
+                return TRILLIM_ERROR;
+            }
+            continue;
+        }
         if (!product(input - 1, stride, &spread) || spread > INT64_MAX - effective ||
             extra > INT64_MAX - spread - effective || spread + effective + extra <= 2 * padding ||
             output != spread + effective + extra - 2 * padding ||
             output - 1 > INT64_MAX - padding) {
             return TRILLIM_ERROR;
         }
+    }
+    if (empty) {
+        return TRILLIM_OK;
     }
     size_t input_volume, output_volume, kernel_volume, count;
     if (!volume(p->dimensions, p->input_shape, &input_volume) ||
@@ -338,6 +357,11 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_conv_transpose_bias_blas(void *const
     const Parameters *p = parameters;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
+    }
+    for (size_t axis = 0; axis < p->dimensions; ++axis) {
+        if (!p->output_shape[axis]) {
+            return TRILLIM_OK;
+        }
     }
     if (!initialize_blas()) {
         return TRILLIM_ERROR;
