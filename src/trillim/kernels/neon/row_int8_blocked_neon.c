@@ -29,8 +29,13 @@ static inline int32x4_t matrix_product(int32x4_t sum, int8x16_t a, int8x16_t b) 
 #else
 /* Assembly is rebuilt with baseline flags after function target attributes vanish. */
 __asm__(".arch armv8.6-a+dotprod+i8mm");
+#if defined(__clang__)
 #define DOTPROD __attribute__((target("dotprod")))
 #define I8MM __attribute__((target("i8mm")))
+#else
+#define DOTPROD __attribute__((target("+dotprod")))
+#define I8MM __attribute__((target("+i8mm")))
+#endif
 DOTPROD static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
     return vdotq_s32(sum, a, b);
 }
@@ -102,11 +107,18 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     return TRILLIM_OK;
 }
 
-static void store(const Task *task, size_t row, size_t column, int32_t sum) {
+static inline __attribute__((always_inline)) void store(const Task *task, size_t row, size_t column, int32_t sum) {
     uint16_t bits;
     memcpy(&bits, (const uint8_t *)task->weight + task->p->outputs * task->p->width + column * 2, sizeof(bits));
     TrillimValue value = {.f = (float)sum * (trillim_bf16(bits) * (1.0f / task->scales[row]))};
-    trillim_store(task->output, row * task->p->outputs + column, task->p->output_dtype, value);
+    size_t index = row * task->p->outputs + column;
+    if (task->p->output_dtype == TRILLIM_FP32) {
+        memcpy((uint8_t *)task->output + index * 4, &value.f, sizeof(value.f));
+    } else {
+        uint16_t encoded = task->p->output_dtype == TRILLIM_BF16 ?
+            trillim_to_bf16(value.f) : trillim_to_fp16(value.f);
+        memcpy((uint8_t *)task->output + index * 2, &encoded, sizeof(encoded));
+    }
 }
 
 static int32x4_t multiply(int32x4_t sum, int8x16_t a, int8x16_t b) {
@@ -657,12 +669,27 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_row_int8_blocked(
         project = project_dotprod;
     }
     size_t rows = p->tokens / row_tile + (p->tokens % row_tile != 0);
+    if (p->width <= 65536 / (p->tokens * p->outputs)) {
+        task.columns = p->outputs;
+        for (size_t tile = 0; tile < rows; ++tile) {
+            TrillimStatus status = project(&task, tile, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
     return context->thread_pool->run(context->thread_pool->context, rows * tiles, project, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_row_int8_blocked_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _row_int8_blocked as bind\n"
+           "from trillim.compiler.kernels.bindings import _row_int8_blocked as _bind, _storage_shape\n"
+           "def bind(context):\n"
+           "    weight = context.inputs['weight']\n"
+           "    if _storage_shape(weight) != weight.shape:\n"
+           "        raise ValueError('projection requires a complete packed weight matrix')\n"
+           "    return _bind(context)\n"
            "packings = {'weight': 'row_int8_block32'}\n"
            "def pattern(x: Tensor, weight: Tensor, scale: Tensor, *, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
            "    return (QuantizedLinear(x, weight, scale, dtype=dtype),)\n";

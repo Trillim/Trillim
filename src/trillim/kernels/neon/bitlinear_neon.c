@@ -26,8 +26,13 @@ static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
 #else
 /* Assembly is rebuilt with baseline flags after function target attributes vanish. */
 __asm__(".arch armv8.6-a+dotprod+i8mm");
+#if defined(__clang__)
 #define DOTPROD __attribute__((target("dotprod")))
 #define I8MM __attribute__((target("i8mm")))
+#else
+#define DOTPROD __attribute__((target("+dotprod")))
+#define I8MM __attribute__((target("+i8mm")))
+#endif
 DOTPROD static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
     return vdotq_s32(sum, a, b);
 }
@@ -164,9 +169,16 @@ static TrillimStatus quantize(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
-static void store(const Task *task, size_t row, size_t column, int32_t sum) {
+static inline __attribute__((always_inline)) void store(const Task *task, size_t row, size_t column, int32_t sum) {
     TrillimValue value = {.f = ((float)sum * task->gamma) / task->scales[row]};
-    trillim_store(task->output, row * task->p->outputs + column, task->p->output_dtype, value);
+    size_t index = row * task->p->outputs + column;
+    if (task->p->output_dtype == TRILLIM_FP32) {
+        memcpy((uint8_t *)task->output + index * 4, &value.f, sizeof(value.f));
+    } else {
+        uint16_t encoded = task->p->output_dtype == TRILLIM_BF16 ?
+            trillim_to_bf16(value.f) : trillim_to_fp16(value.f);
+        memcpy((uint8_t *)task->output + index * 2, &encoded, sizeof(encoded));
+    }
 }
 
 static int32x4_t multiply(int32x4_t sum, int8x16_t a, int8x16_t b) {

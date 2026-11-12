@@ -267,6 +267,17 @@ static inline float trillim_read_float(
     return (float)((code - 32) * subscale) * scale;
 }
 
+static inline __attribute__((always_inline)) void store_result(
+    void *output, size_t index, uint32_t dtype, TrillimValue value
+) {
+    if (dtype == TRILLIM_FP32) {
+        memcpy((uint8_t *)output + index * 4, &value.f, sizeof(value.f));
+    } else {
+        uint16_t bits = dtype == TRILLIM_BF16 ? trillim_to_bf16(value.f) : trillim_to_fp16(value.f);
+        memcpy((uint8_t *)output + index * 2, &bits, sizeof(bits));
+    }
+}
+
 #define DEFINE_PROJECT(NAME, DTYPE) \
 static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
     (void)worker; \
@@ -325,10 +336,10 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
         } \
         for (size_t r = 0; r < rows; ++r) { \
             TrillimValue value = {.f = sums[r][0]}; \
-            trillim_store(task->output, (row + r) * p->outputs + column, p->output_dtype, value); \
+            store_result(task->output, (row + r) * p->outputs + column, p->output_dtype, value); \
             if (second != column) { \
                 value.f = sums[r][1]; \
-                trillim_store(task->output, (row + r) * p->outputs + second, p->output_dtype, value); \
+                store_result(task->output, (row + r) * p->outputs + second, p->output_dtype, value); \
             } \
         } \
     } \
@@ -412,10 +423,10 @@ static TrillimStatus project_ordered(void *opaque, size_t tile, size_t worker) {
         }
         for (size_t r = 0; r < rows; ++r) {
             TrillimValue value = {.f = sums[r][0]};
-            trillim_store(task->output, (row + r) * p->outputs + column, p->output_dtype, value);
+            store_result(task->output, (row + r) * p->outputs + column, p->output_dtype, value);
             if (second != column) {
                 value.f = sums[r][1];
-                trillim_store(task->output, (row + r) * p->outputs + second, p->output_dtype, value);
+                store_result(task->output, (row + r) * p->outputs + second, p->output_dtype, value);
             }
         }
     }
