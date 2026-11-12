@@ -501,8 +501,107 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
     return TRILLIM_OK;
 }
 
+static bool trillim_mxfp4_copyable(const TrillimIndexParameters *p) {
+    if (p->dtype != TRILLIM_MXFP4 || p->masked || p->coordinates != 1 ||
+        !p->storage_columns || p->storage_columns % 32 || p->output_columns % 32 ||
+        p->slice_size != p->storage_columns || p->indexed_shape[0] != p->storage_rows ||
+        p->indexed_strides[0] != p->storage_columns ||
+        !trillim_contiguous(p->index_rank, p->index_shape, p->index_strides) ||
+        !trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides) ||
+        p->items > SIZE_MAX / p->slice_size || p->items * p->slice_size != p->count ||
+        (p->output_columns && p->output_rows > SIZE_MAX / p->output_columns) ||
+        p->output_rows * p->output_columns != p->count) {
+        return false;
+    }
+    size_t items = 1;
+    for (size_t axis = 0; axis < p->index_rank; ++axis) {
+        if (p->index_shape[axis] && items > SIZE_MAX / p->index_shape[axis]) {
+            return false;
+        }
+        items *= p->index_shape[axis];
+    }
+    return items == p->items;
+}
+
+static TrillimStatus trillim_mxfp4_copy_slice(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimIndexTask *task = opaque;
+    const TrillimIndexParameters *p = task->parameters;
+    const uint8_t *input = task->inputs[0];
+    const uint8_t *indices = task->inputs[1];
+    uint8_t *output = task->output;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t groups = p->storage_columns / 32;
+    size_t tiles = groups / 4096 + (groups % 4096 != 0);
+    size_t item = tile / tiles;
+    size_t first = tile % tiles * 4096;
+    size_t count = groups - first < 4096 ? groups - first : 4096;
+    int64_t selected;
+    memcpy(&selected, indices + item * sizeof(selected), sizeof(selected));
+    size_t source = (size_t)selected * groups + first;
+    size_t destination = item * groups + first;
+    const uint8_t *scales = input + p->storage_rows * groups * 16 + source;
+    unsigned exceptional = 0;
+    for (size_t i = 0; i < count; ++i) {
+        exceptional |= scales[i] >= 253;
+    }
+    if (exceptional) {
+        for (size_t i = 0; i < count; ++i) {
+            if ((i & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            uint8_t exponent = scales[i];
+            if (exponent == 255) {
+                return TRILLIM_ERROR;
+            }
+            if (exponent < 253) {
+                continue;
+            }
+            uint8_t limit = exponent == 253 ? 6 : 4;
+            const uint8_t *codes = input + (source + i) * 16;
+            for (size_t j = 0; j < 16; ++j) {
+                if ((codes[j] & 7) >= limit || ((codes[j] >> 4) & 7) >= limit) {
+                    return TRILLIM_ERROR;
+                }
+            }
+        }
+    }
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    memcpy(output + destination * 16, input + source * 16, count * 16);
+    memcpy(output + p->items * groups * 16 + destination, scales, count);
+    return TRILLIM_OK;
+}
+
+static TrillimStatus trillim_mxfp4_gather(TrillimIndexTask *task) {
+    const TrillimIndexParameters *p = task->parameters;
+    for (size_t item = 0; item < p->items; ++item) {
+        if ((item & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        int64_t selected;
+        memcpy(&selected, (const uint8_t *)task->inputs[1] + item * sizeof(selected), sizeof(selected));
+        if (selected < 0 || (uint64_t)selected >= p->storage_rows) {
+            return TRILLIM_ERROR;
+        }
+    }
+    size_t groups = p->storage_columns / 32;
+    size_t tiles = groups / 4096 + (groups % 4096 != 0);
+    size_t tasks = p->items * tiles;
+    return tasks == 1 ? trillim_mxfp4_copy_slice(task, 0, 0)
+                      : task->context->thread_pool->run(task->context->thread_pool->context,
+                                                       tasks, trillim_mxfp4_copy_slice, task);
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
-    return trillim_index_requirements(parameters, inputs, outputs, scratch, false, false);
+    TrillimStatus status = trillim_index_requirements(parameters, inputs, outputs, scratch, false, false);
+    if (status == TRILLIM_OK && trillim_mxfp4_copyable(parameters)) {
+        *scratch = 0;
+    }
+    return status;
 }
 
 TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
@@ -514,6 +613,9 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
     }
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {outputs[0], inputs, (float *)scratch, p, context};
+    if (trillim_mxfp4_copyable(p)) {
+        return trillim_mxfp4_gather(&task);
+    }
     TrillimStatus status = context->thread_pool->run(context->thread_pool->context, p->items, trillim_gather_task, &task);
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return status;
