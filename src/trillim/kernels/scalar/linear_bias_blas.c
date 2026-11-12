@@ -131,7 +131,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
         return TRILLIM_ERROR;
     }
     size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
-    size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
+    size_t columns = p->n / 64 + (p->n % 64 != 0);
     size_t count = p->batches * rows * columns;
     *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
     return TRILLIM_OK;
