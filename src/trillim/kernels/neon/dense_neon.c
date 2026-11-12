@@ -82,8 +82,9 @@ static bool blas_shape(const Parameters *p, size_t workers) {
     bool column_major = p->a_row_stride == 1 && p->a_col_stride != 1;
     bool small_direct = column_major ? p->m >= 8 && (p->m >= 32 || workers <= 8) :
         (p->m >= 8 && workers == 1) || (p->m >= 16 && workers <= 8);
+    bool singleton_direct = p->m == 1 && workers == 1 && p->n >= 1024 && p->k >= 1024;
     bool direct = p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 && a_direct && b_direct &&
-        small_direct && p->k >= 256 && p->n > 262143 / p->k;
+        (small_direct || singleton_direct) && p->k >= 256 && p->n > 262143 / p->k;
     return large || medium || vocabulary || contiguous || direct;
 }
 
@@ -261,6 +262,12 @@ static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
     const Parameters *p = t->p;
     if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_BF16) {
         return decode_typed_tile(t, a_base, b_base, output, first, last, TRILLIM_FP32, TRILLIM_BF16);
+    }
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32) {
+        return decode_typed_tile(t, a_base, b_base, output, first, last, TRILLIM_FP32, TRILLIM_FP32);
+    }
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP16) {
+        return decode_typed_tile(t, a_base, b_base, output, first, last, TRILLIM_FP32, TRILLIM_FP16);
     }
     return decode_typed_tile(t, a_base, b_base, output, first, last, p->a_dtype, p->b_dtype);
 }
