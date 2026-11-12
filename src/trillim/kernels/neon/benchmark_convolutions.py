@@ -28,6 +28,8 @@ from trillim.compiler.bench.bench_dataclasses import (
 from trillim.compiler.bench.benchmark import _invoke
 from trillim.compiler.dtype import _decode, _encode
 from trillim.compiler.kernels.build import _build_cpu
+from trillim.compiler.kernels.kernel_pydantic_models import _KernelIndex
+from trillim.runtime import Runtime
 from trillim.tdl.core.types import DType
 
 type _Shape = tuple[int, ...]
@@ -40,6 +42,8 @@ class _Options(BaseModel):
     threads: int = Field(default=20, ge=1)
     directory: Path = Path.home() / ".trillim/convolution-validation"
     validation_only: bool = False
+    blas: bool = False
+    oracle_library: Path | None = None
 
 
 def _build(directory: Path) -> Path:
@@ -56,6 +60,9 @@ def _build(directory: Path) -> Path:
     )
     sources = [root / "scalar" / f"{name}.c" for name in names]
     sources.extend(root / "neon" / f"{name}_neon.c" for name in names)
+    sources.extend(
+        root / "scalar" / f"{name}.c" for name in ("conv_blas", "conv_bias_blas")
+    )
     subprocess.run(
         [
             "cc",
@@ -173,6 +180,7 @@ def _measure(
     dilation: _Shape | None = None,
     extra: _Shape | None = None,
     reference: bool = False,
+    blas: bool = False,
 ) -> dict[str, object]:
     name, transpose, channels, outputs, shape, kernel, stride, padding, groups = (
         specification
@@ -283,6 +291,38 @@ def _measure(
         bitwise_equal=bool(np.array_equal(scalar, neon)),
         numpy_maximum_error=reference_error,
     )
+    if blas and not transpose and dtype == "fp32":
+        candidate = replace(
+            invocation,
+            kernel="trillim_scalar_conv_bias_blas"
+            if biased
+            else "trillim_scalar_conv_blas",
+        )
+        try:
+            blas_samples, blas_bytes, blas_allocated = _invoke(
+                candidate, harness, 512 * 1024**2
+            )
+        except ValueError as error:
+            record["blas_rejected"] = str(error)
+        else:
+            actual = np.frombuffer(blas_bytes[0], dtype=np.float32)
+            expected = scalar.astype(np.float32).reshape(-1)
+            maximum = float(np.max(np.abs(actual - expected)))
+            if not np.allclose(actual, expected, rtol=2e-4, atol=2e-5):
+                raise RuntimeError(f"{name}: BLAS mismatch, maximum error {maximum}")
+            blas_time = median(blas_samples)
+            record.update(
+                blas_samples_s=blas_samples,
+                blas_median_s=blas_time,
+                blas_allocated_bytes=blas_allocated,
+                blas_maximum_error=maximum,
+                blas_speedup=scalar_time / blas_time,
+            )
+            print(
+                f"{name} {dtype}: BLAS {blas_time * 1000:.3f} ms, "
+                f"{scalar_time / blas_time:.2f}x scalar",
+                flush=True,
+            )
     print(
         f"{name} {dtype}: scalar {scalar_time * 1000:.3f} ms, "
         f"NEON {neon_time * 1000:.3f} ms, {scalar_time / neon_time:.2f}x",
@@ -291,14 +331,157 @@ def _measure(
     return record
 
 
+def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
+    baseline = options.oracle_library
+    if baseline is None:
+        return
+    baseline = baseline.resolve()
+    index = _KernelIndex.model_validate_json(
+        baseline.with_name("index.json").read_bytes()
+    )
+    if any("conv" in symbol for symbol in index.symbols):
+        raise ValueError("the primitive oracle library must omit convolution fusions")
+    oracle_home = options.directory / "oracle-home"
+    installed = oracle_home / "1.0.0/kernels/scalar"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    if installed.exists():
+        if installed.resolve() != baseline.parent:
+            raise ValueError("the oracle directory already uses a different baseline")
+    else:
+        installed.symlink_to(baseline.parent, target_is_directory=True)
+    sources = options.directory / "oracle-sources"
+    sources.mkdir(exist_ok=True)
+    environment = os.environ | {
+        "TRILLIM_HOME": str(oracle_home),
+        "TMPDIR": str(options.directory / "tmp"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    compile_command = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from trillim.compiler.compile import _compile_model\n"
+        "from trillim.compiler.compiler_pydantic_models import _CompileRequest\n"
+        "_compile_model(_CompileRequest(tdl_path=Path(sys.argv[1]),checkpoints={},"
+        "output=Path(sys.argv[2]),backend='scalar',depth='none',threads=4))\n"
+    )
+    rng = np.random.default_rng(1234)
+    records: list[dict[str, object]] = []
+    dtypes: tuple[tuple[DType, int], ...] = (("fp16", 9), ("bf16", 10), ("fp32", 11))
+    for transpose in (False, True):
+        for biased in (False, True):
+            for dtype, dtype_id in dtypes:
+                name = f"primitive-{transpose}-{biased}-{dtype}"
+                source = sources / f"{name}.tdl"
+                output = options.directory / name
+                weight_shape = (4, 3, 3) if transpose else (6, 2, 3)
+                result_shape = (6, 17) if transpose else (6, 5)
+                operation = "ConvTranspose" if transpose else "Conv"
+                text = (
+                    "from trillim.tdl import *\n"
+                    "with Graph() as graph:\n"
+                    f"    x=Input(name='x',shape=(4,9),dtype='{dtype}')\n"
+                    f"    w=Input(name='weight',shape={weight_shape!r},dtype='{dtype}')\n"
+                )
+                if biased:
+                    text += f"    b=Input(name='bias',shape=(6,),dtype='{dtype}')\n"
+                text += (
+                    f"    y={operation}(x,w,kernel=(3,),stride=2,padding=1,groups=2"
+                    + (",bias=b" if biased else "")
+                    + ")\n    Output(y,name='output')\n"
+                )
+                if source.exists() and source.read_text() != text:
+                    raise ValueError(f"oracle source changed: {source}")
+                source.write_text(text)
+                if not output.exists():
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            compile_command,
+                            str(source),
+                            str(output),
+                        ],
+                        env=environment,
+                        check=True,
+                    )
+                parameters: dict[str, _ConcreteParameter] = dict(
+                    dimensions=1,
+                    channels=4,
+                    outputs=6,
+                    groups=2,
+                    input_shape=(9,),
+                    output_shape=result_shape[1:],
+                    kernel=(3,),
+                    stride=(2,),
+                    padding=(1,),
+                    dilation=(1,),
+                    output_padding=(0,),
+                    input_dtype=dtype_id,
+                    weight_dtype=dtype_id,
+                    bias_dtype=dtype_id,
+                    output_dtype=dtype_id,
+                )
+                suffix = "conv_transpose_nd" if transpose else "conv_nd"
+                if biased:
+                    suffix += "_bias"
+                maximum = 0.0
+                equal = True
+                with Runtime(output, threads=4) as runtime:
+                    for _ in range(8):
+                        x = rng.normal(0, 0.4, (4, 9)).astype(np.float32)
+                        w = rng.normal(0, 0.4, weight_shape).astype(np.float32)
+                        b = rng.normal(0, 0.4, (6,)).astype(np.float32)
+                        inputs = dict(x=x, weight=w)
+                        if biased:
+                            inputs["bias"] = b
+                        expected = runtime.run(inputs)["output"].astype(np.float32)
+                        payloads = tuple(
+                            _encode(value, dtype)[0].tobytes()
+                            for value in (x, w, b)[: 3 if biased else 2]
+                        )
+                        for backend in ("scalar", "neon"):
+                            invocation = _Invocation(
+                                library,
+                                f"trillim_{backend}_{suffix}",
+                                parameters,
+                                payloads,
+                                (_BenchmarkOutput(dtype, result_shape),),
+                                threads=4,
+                            )
+                            _, values, _ = _invoke(invocation, harness, 512 * 1024**2)
+                            actual = _decode(
+                                (np.frombuffer(values[0], dtype=np.uint8), dtype),
+                                result_shape,
+                            ).astype(np.float32)
+                            error = float(np.max(np.abs(actual - expected)))
+                            maximum = max(maximum, error)
+                            equal = equal and bool(np.array_equal(actual, expected))
+                            if not np.allclose(actual, expected, rtol=2e-4, atol=2e-5):
+                                raise RuntimeError(
+                                    f"{name}: {backend} primitive mismatch, error {error}"
+                                )
+                records.append(
+                    dict(
+                        name=name, maximum_error=maximum, bitwise_equal=equal, inputs=8
+                    )
+                )
+                print(f"{name}: primitive oracle maximum error {maximum}", flush=True)
+    (options.directory / "primitive-oracle-results.json").write_text(
+        json.dumps(records, indent=2) + "\n"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--threads", type=int, default=20)
     parser.add_argument("--directory", type=Path, default=_Options().directory)
     parser.add_argument("--validation-only", action="store_true")
+    parser.add_argument("--blas", action="store_true")
+    parser.add_argument("--oracle-library", type=Path)
     options = _Options.model_validate(vars(parser.parse_args()))
     library = _build(options.directory)
     harness = _build_cpu()
+    _primitive_oracle(options, library, harness)
     records: list[dict[str, object]] = []
     cases: tuple[_Specification, ...] = (
         ("one-dimensional", False, 4, 6, (31,), (3,), (1,), (1,), 1),
@@ -334,6 +517,7 @@ def main() -> None:
                             biased=biased,
                             dtype=dtype,
                             reference=True,
+                            blas=options.blas,
                         )
                     )
     if not options.validation_only:
@@ -345,7 +529,9 @@ def main() -> None:
             ("image-vae", False, 128, 128, (64, 64), (3, 3), (1, 1), (1, 1), 1),
         )
         for workload in workloads:
-            records.append(_measure(workload, library, harness, options.threads))
+            records.append(
+                _measure(workload, library, harness, options.threads, blas=options.blas)
+            )
     destination = options.directory / "benchmark-results.json"
     destination.write_text(json.dumps(records, indent=2) + "\n")
     print(f"Wrote {len(records)} measurements to {destination}")
