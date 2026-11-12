@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from statistics import median
+from time import time_ns
 from typing import cast, get_args
 
 import numpy as np
@@ -47,8 +48,6 @@ _IDS = {name: index for index, name in enumerate(get_args(DType))}
 _ROLES = (
     "standard",
     "tiled",
-    "decode",
-    "bf16",
     "extended",
     "sinks",
     "mask",
@@ -56,21 +55,20 @@ _ROLES = (
 )
 
 
-def _compile_libraries() -> dict[tuple[str, str], Path]:
+def _compile_libraries(roles: tuple[str, ...]) -> dict[tuple[str, str], Path]:
     sources = Path(__file__).resolve().parent
-    temporary = _ROOT / "tmp"
+    build = _ROOT / f"build-{time_ns()}"
+    temporary = build / "tmp"
     temporary.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(temporary)
     libraries: dict[tuple[str, str], Path] = {}
-    for role in _ROLES:
+    for role in roles:
         for backend in (
-            ("neon",)
-            if role in {"standard", "tiled", "decode", "bf16"}
-            else ("scalar", "neon")
+            ("neon",) if role in {"standard", "tiled"} else ("scalar", "neon")
         ):
             suffix = "" if role == "standard" else f"_{role}"
             source = sources.parent / backend / f"attention{suffix}.c"
-            output = _ROOT / f"{backend}-attention{suffix}.so"
+            output = build / f"{backend}-attention{suffix}.so"
             assembly = output.with_suffix(".s")
             native_object = output.with_suffix(".o")
             flags = [
@@ -108,9 +106,11 @@ def _compile_libraries() -> dict[tuple[str, str], Path]:
     return libraries
 
 
-def _graph_matches(libraries: dict[tuple[str, str], Path]) -> dict[str, bool]:
+def _graph_matches(
+    libraries: dict[tuple[str, str], Path], roles: tuple[str, ...]
+) -> dict[str, bool]:
     matches: dict[str, bool] = {}
-    for role in _ROLES:
+    for role in roles:
         suffix = "" if role == "standard" else f"_{role}"
         name = f"trillim_neon_attention{suffix}"
         path = libraries["neon", role]
@@ -134,12 +134,9 @@ def _graph_matches(libraries: dict[tuple[str, str], Path]) -> dict[str, bool]:
         )
         graph = Graph()
         with graph:
-            queries = 1 if role == "decode" else 7
-            length = 2048 if role == "decode" else 19
-            dtype: DType = "bf16" if role == "bf16" else "fp16"
-            q = Input(name="q", shape=(queries, 12, 64), dtype=dtype)
-            k = Input(name="k", shape=(length, 3, 64), dtype=dtype)
-            v = Input(name="v", shape=(length, 3, 48), dtype=dtype)
+            q = Input(name="q", shape=(7, 12, 64), dtype="fp16")
+            k = Input(name="k", shape=(19, 3, 64), dtype="fp16")
+            v = Input(name="v", shape=(19, 3, 48), dtype="fp16")
             mask = (
                 Input(name="mask", shape=(1, 7, 19), dtype="fp32")
                 if "mask" in role
@@ -157,9 +154,7 @@ def _graph_matches(libraries: dict[tuple[str, str], Path]) -> dict[str, bool]:
                     v,
                     mask=mask,
                     sinks=sinks,
-                    softcap=3.0
-                    if role not in {"standard", "tiled", "decode", "bf16"}
-                    else None,
+                    softcap=3.0 if role not in {"standard", "tiled"} else None,
                     window=12,
                 ),
                 name="y",
@@ -232,6 +227,100 @@ def _reference(
     return result
 
 
+def _bf16_edges(
+    libraries: dict[tuple[str, str], Path], baseline: Path, harness: Path
+) -> list[dict[str, object]]:
+    if ("neon", "standard") not in libraries:
+        return []
+    parameters: dict[str, _ConcreteParameter] = {
+        "heads": 1,
+        "kv_heads": 1,
+        "queries": 1,
+        "length": 256,
+        "key_dim": 8,
+        "value_dim": 8,
+        "rank": 3,
+        "q_strides": (8, 8, 1),
+        "k_strides": (8, 8, 1),
+        "v_strides": (8, 8, 1),
+        "q_rows": 1,
+        "q_columns": 8,
+        "k_rows": 256,
+        "k_columns": 8,
+        "v_rows": 256,
+        "v_columns": 8,
+        "window": 0,
+        "output_dtype": 11,
+        "q_dtype": 10,
+        "k_dtype": 10,
+        "v_dtype": 10,
+        "causal": 0,
+        "windowed": 0,
+        "default_scale": 0,
+        "scale": 1.0,
+    }
+    output = (_BenchmarkOutput("fp32", (1, 1, 8)),)
+    patterns = (
+        (1, 0x7F7F),
+        (0x7F, 0x7F7F),
+        (0x80, 0x7F7F),
+        (0x7F7F, 1),
+        (0x7F7F, 0x80),
+        (0x7F80, 0),
+        (0x7FC1, 0x3F80),
+        (0x3F80, 0x7FC1),
+        (0x3F80, 0x7F80),
+        (0, 0x7F80),
+        (0x2F80, 0x2F80),
+        (0x4F7F, 0x4F7F),
+        (0x2F7F, 0x3F80),
+        (0x4F80, 0x3F80),
+    )
+    results: list[dict[str, object]] = []
+    for query_bits, key_bits in patterns:
+        query = np.zeros((1, 1, 8), np.uint16)
+        query[0, 0, 0] = query_bits
+        keys = np.zeros((256, 1, 8), np.uint16)
+        keys[0, 0, 0] = key_bits
+        values = np.zeros((256, 1, 8), np.uint16)
+        values[0, 0, :] = 0x3F80
+        inputs = (query.tobytes(), keys.tobytes(), values.tobytes())
+        reference = _Invocation(
+            baseline, "trillim_scalar_attention", parameters, inputs, output, 1
+        )
+        _, expected_bytes, _ = _invoke(reference, harness, 2**20)
+        expected = np.frombuffer(expected_bytes[0], np.float32)
+        role = "standard"
+        name = "trillim_neon_attention"
+        invocation = _Invocation(
+            libraries["neon", role], name, parameters, inputs, output, 1
+        )
+        _, actual_bytes, _ = _invoke(invocation, harness, 2**20)
+        actual = np.frombuffer(actual_bytes[0], np.float32)
+        correct = bool(
+            np.allclose(actual, expected, rtol=2e-4, atol=2e-5, equal_nan=True)
+        )
+        results.append(
+            {
+                "role": role,
+                "query_bits": query_bits,
+                "key_bits": key_bits,
+                "correct": correct,
+                "reference": [
+                    float(value) if np.isfinite(value) else str(value)
+                    for value in expected
+                ],
+                "actual": [
+                    float(value) if np.isfinite(value) else str(value)
+                    for value in actual
+                ],
+            }
+        )
+        if not correct:
+            raise RuntimeError(f"BF16 edge mismatch: {results[-1]}")
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -240,6 +329,9 @@ def main() -> None:
         default=Path.home() / ".trillim/1.0.0/kernels/scalar/kernels.so",
     )
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 8, 20])
+    parser.add_argument("--neon-library", type=Path)
+    parser.add_argument("--scalar-library", type=Path)
+    parser.add_argument("--roles", choices=_ROLES, nargs="+", default=list(_ROLES))
     parser.add_argument("--output", type=Path, default=_ROOT / "results.json")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
@@ -247,9 +339,24 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     output_dtype = cast(DType, arguments.output_dtype)
-    libraries = _compile_libraries()
-    graph_matches = _graph_matches(libraries)
+    roles = tuple(cast(list[str], arguments.roles))
+    neon_library = cast(Path | None, arguments.neon_library)
+    scalar_library = cast(Path | None, arguments.scalar_library)
+    if (neon_library is None) != (scalar_library is None):
+        parser.error("--neon-library and --scalar-library must be provided together")
+    if neon_library is not None and scalar_library is not None:
+        libraries = {
+            (backend, role): neon_library if backend == "neon" else scalar_library
+            for role in roles
+            for backend in (
+                ("neon",) if role in {"standard", "tiled"} else ("scalar", "neon")
+            )
+        }
+    else:
+        libraries = _compile_libraries(roles)
+    graph_matches = _graph_matches(libraries, roles)
     harness = _build_cpu()
+    bf16_edges = _bf16_edges(libraries, arguments.baseline_library, harness)
     rng = np.random.default_rng(829)
     workloads = [
         ("decode", 1, 2048, 32, 8, 128, 128, True, None, 1),
@@ -328,20 +435,12 @@ def main() -> None:
                 "default_scale": 1,
                 "scale": 1.0,
             }
-            for role in _ROLES:
+            for role in roles:
                 if output_dtype != "fp32" and role != "standard":
                     continue
-                if role in {"tiled", "decode", "bf16"} and (
-                    stride != 1 or output_dtype != "fp32"
-                ):
+                if role == "tiled" and stride != 1:
                     continue
-                if role == "decode" and (queries > 4 or length < 512):
-                    continue
-                if role == "bf16" and dtype != "bf16":
-                    continue
-                softcap = (
-                    None if role in {"standard", "tiled", "decode", "bf16"} else 3.0
-                )
+                softcap = None if role in {"standard", "tiled"} else 3.0
                 mask = (
                     rng.normal(-0.1, 0.3, (1, queries, length)).astype(np.float32)
                     if "mask" in role
@@ -371,14 +470,13 @@ def main() -> None:
                         mask,
                         sinks,
                         dtype
-                        if role not in {"standard", "tiled", "decode", "bf16"}
-                        and dtype != "fp32"
+                        if role not in {"standard", "tiled"} and dtype != "fp32"
                         else None,
                     ),
                     output_dtype,
                 )[1].ravel()
                 native_parameters = parameters
-                if role not in {"standard", "tiled", "decode", "bf16"}:
+                if role not in {"standard", "tiled"}:
                     native_parameters = {
                         **parameters,
                         "softcapped": 1,
@@ -391,14 +489,10 @@ def main() -> None:
                         "mask_dtype": 11,
                         "sink_dtype": 11,
                     }
-                suffix = (
-                    ""
-                    if role in {"standard", "tiled", "decode", "bf16"}
-                    else f"_{role}"
-                )
+                suffix = "" if role in {"standard", "tiled"} else f"_{role}"
                 baseline = _Invocation(
                     arguments.baseline_library
-                    if role in {"standard", "tiled", "decode", "bf16"}
+                    if role in {"standard", "tiled"}
                     else libraries["scalar", role],
                     f"trillim_scalar_attention{suffix}",
                     native_parameters,
@@ -500,7 +594,12 @@ def main() -> None:
         "machine": platform.machine(),
         "platform": platform.platform(),
         "seed": 829,
+        "roles": roles,
+        "build": "installed production kernels"
+        if neon_library is not None
+        else "cc -march=armv8-a -O3 via assembly",
         "graph_matches": graph_matches,
+        "bf16_edges": bf16_edges,
         "results": results,
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

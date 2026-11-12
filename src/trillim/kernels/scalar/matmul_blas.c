@@ -6,6 +6,10 @@
 #include <dlfcn.h>
 #endif
 
+#if defined(__FLT16_MANT_DIG__)
+__extension__ typedef _Float16 TrillimFloat16;
+#endif
+
 #define BLOCK_M 64
 #define BLOCK_N 128
 #define BLOCK_K 1024
@@ -220,7 +224,7 @@ static inline float load(const void *data, size_t index, uint32_t dtype) {
         return trillim_bf16(bits);
     }
 #if defined(__FLT16_MANT_DIG__)
-    _Float16 value;
+    TrillimFloat16 value;
     memcpy(&value, &bits, sizeof(value));
     return (float)value;
 #else
@@ -248,7 +252,7 @@ static TrillimStatus pack(const void *source, uint32_t dtype, size_t base,
 #if defined(__FLT16_MANT_DIG__)
         } else if (dtype == TRILLIM_FP16 && col_stride == 1) {
             for (size_t column = 0; column < columns; ++column) {
-                _Float16 value;
+                TrillimFloat16 value;
                 memcpy(&value, (const uint8_t *)source + (index + column) * sizeof(value), sizeof(value));
                 target[row * columns + column] = (float)value;
             }

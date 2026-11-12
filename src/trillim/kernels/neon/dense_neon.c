@@ -8,6 +8,10 @@
 #include <dlfcn.h>
 #endif
 
+#if defined(__FLT16_MANT_DIG__)
+__extension__ typedef _Float16 TrillimFloat16;
+#endif
+
 #define BLOCK_M 64
 #define BLOCK_N 128
 #define BLOCK_K 1024
@@ -63,7 +67,7 @@ static size_t tile_rows(const Parameters *p) {
     return !precise(p) && p->m >= 12 && p->a_col_stride == 1 && p->b_row_stride == 1 ? 6 : 4;
 }
 
-static bool use_blas(const Parameters *p) {
+static bool blas_shape(const Parameters *p) {
     if (precise(p) || p->n > INT32_MAX || p->n < 32 || p->k < 32) {
         return false;
     }
@@ -71,7 +75,11 @@ static bool use_blas(const Parameters *p) {
     bool medium = p->m >= 32 && p->n > 2097152 / p->k;
     bool vocabulary = p->m >= 16 && p->n >= 32768 && p->k >= 512;
     bool contiguous = p->b_col_stride == 1 && p->k >= 256 && p->n > 32767 / p->k;
-    return (large || medium || vocabulary || contiguous) && initialize_blas();
+    return large || medium || vocabulary || contiguous;
+}
+
+static bool use_blas(const Parameters *p) {
+    return blas_shape(p) && initialize_blas();
 }
 
 static bool matrix_span(size_t base, size_t rows, size_t columns,
@@ -129,7 +137,9 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
         inputs[1] = b_count * trillim_itemsize(p->b_dtype);
     }
     outputs[0] = p->batches * p->m * p->n * trillim_itemsize(p->out_dtype);
-    if (use_blas(p)) {
+    /* Reserve optional-library workspace independently of host availability. */
+    if (blas_shape(p)) {
+        (void)initialize_blas();
         size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
         size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
         size_t count = p->batches * rows * columns;
@@ -700,7 +710,7 @@ static inline float load(const void *data, size_t index, uint32_t dtype) {
         return trillim_bf16(bits);
     }
 #if defined(__FLT16_MANT_DIG__)
-    _Float16 value;
+    TrillimFloat16 value;
     memcpy(&value, &bits, sizeof(value));
     return (float)value;
 #else
@@ -728,7 +738,7 @@ static TrillimStatus pack(const void *source, uint32_t dtype, size_t base,
 #if defined(__FLT16_MANT_DIG__)
         } else if (dtype == TRILLIM_FP16 && col_stride == 1) {
             for (size_t column = 0; column < columns; ++column) {
-                _Float16 value;
+                TrillimFloat16 value;
                 memcpy(&value, (const uint8_t *)source + (index + column) * sizeof(value), sizeof(value));
                 target[row * columns + column] = (float)value;
             }
