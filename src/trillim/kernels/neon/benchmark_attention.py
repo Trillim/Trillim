@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes as c
+import hashlib
 import json
 import os
 import platform
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -228,7 +230,10 @@ def _reference(
 
 
 def _bf16_edges(
-    libraries: dict[tuple[str, str], Path], baseline: Path, harness: Path
+    libraries: dict[tuple[str, str], Path],
+    baseline: Path,
+    harness: Path,
+    baseline_kernel: str = "trillim_scalar_attention",
 ) -> list[dict[str, object]]:
     if ("neon", "standard") not in libraries:
         return []
@@ -286,7 +291,7 @@ def _bf16_edges(
         values[0, 0, :] = 0x3F80
         inputs = (query.tobytes(), keys.tobytes(), values.tobytes())
         reference = _Invocation(
-            baseline, "trillim_scalar_attention", parameters, inputs, output, 1
+            baseline, baseline_kernel, parameters, inputs, output, 1
         )
         _, expected_bytes, _ = _invoke(reference, harness, 2**20)
         expected = np.frombuffer(expected_bytes[0], np.float32)
@@ -329,6 +334,14 @@ def main() -> None:
         default=Path.home() / ".trillim/1.0.0/kernels/scalar/kernels.so",
     )
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 8, 20])
+    parser.add_argument("--baseline-kernel", default="trillim_scalar_attention")
+    parser.add_argument("--workloads", nargs="+")
+    parser.add_argument(
+        "--dtypes",
+        choices=("fp32", "fp16", "bf16"),
+        nargs="+",
+        default=["fp32", "fp16", "bf16"],
+    )
     parser.add_argument("--neon-library", type=Path)
     parser.add_argument("--scalar-library", type=Path)
     parser.add_argument("--roles", choices=_ROLES, nargs="+", default=list(_ROLES))
@@ -356,7 +369,9 @@ def main() -> None:
         libraries = _compile_libraries(roles)
     graph_matches = _graph_matches(libraries, roles)
     harness = _build_cpu()
-    bf16_edges = _bf16_edges(libraries, arguments.baseline_library, harness)
+    bf16_edges = _bf16_edges(
+        libraries, arguments.baseline_library, harness, arguments.baseline_kernel
+    )
     rng = np.random.default_rng(829)
     workloads = [
         ("decode", 1, 2048, 32, 8, 128, 128, True, None, 1),
@@ -379,7 +394,13 @@ def main() -> None:
             for item in workloads
             if item[0] not in {"prefill", "image", "decode_long"}
         ]
-    dtypes: tuple[DType, ...] = ("fp32", "fp16", "bf16")
+    requested_workloads = cast(list[str] | None, arguments.workloads)
+    if requested_workloads is not None:
+        unknown = set(requested_workloads) - {item[0] for item in workloads}
+        if unknown:
+            parser.error(f"unknown or excluded workloads: {', '.join(sorted(unknown))}")
+        workloads = [item for item in workloads if item[0] in requested_workloads]
+    dtypes = tuple(cast(list[DType], arguments.dtypes))
     results: list[dict[str, object]] = []
     for (
         label,
@@ -494,7 +515,9 @@ def main() -> None:
                     arguments.baseline_library
                     if role in {"standard", "tiled"}
                     else libraries["scalar", role],
-                    f"trillim_scalar_attention{suffix}",
+                    arguments.baseline_kernel
+                    if role in {"standard", "tiled"}
+                    else f"trillim_scalar_attention{suffix}",
                     native_parameters,
                     inputs,
                     (_BenchmarkOutput(output_dtype, (queries, heads, value_width)),),
@@ -580,6 +603,7 @@ def main() -> None:
                         "scalar_samples_seconds": old_times,
                         "neon_samples_seconds": times,
                         "scalar_library": str(baseline.library),
+                        "baseline_kernel": baseline.kernel,
                         "neon_library": str(invocation.library),
                         "speedup": median(old_times) / median(times),
                     }
@@ -590,11 +614,30 @@ def main() -> None:
                     )
                     if not correct:
                         raise RuntimeError(f"numerical mismatch: {item}")
+    library_paths = set(libraries.values())
+    if any(role in {"standard", "tiled"} for role in roles):
+        library_paths.add(arguments.baseline_library)
+    source_paths = {Path(__file__)}
+    for backend, role in libraries:
+        name = "attention.c" if role == "standard" else f"attention_{role}.c"
+        source_paths.add(Path(__file__).parent.parent / backend / name)
     report = {
         "machine": platform.machine(),
         "platform": platform.platform(),
         "seed": 829,
+        "command": sys.argv,
+        "threads": arguments.threads,
+        "dtypes": dtypes,
+        "workloads": [item[0] for item in workloads],
         "roles": roles,
+        "libraries": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(library_paths)
+        },
+        "current_sources": {
+            str(source): hashlib.sha256(source.read_bytes()).hexdigest()
+            for source in sorted(source_paths)
+        },
         "build": "installed production kernels"
         if neon_library is not None
         else "cc -march=armv8-a -O3 via assembly",

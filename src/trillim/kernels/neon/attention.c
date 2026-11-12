@@ -1218,6 +1218,13 @@ static bool initialize_blas(const TrillimKernelContext *context) {
 #endif
 }
 
+static size_t blas_first_key(const TrillimAttentionParameters *p) {
+    if (p->windowed && p->length >= p->queries && p->length - p->queries + 1 > p->window) {
+        return p->length - p->queries + 1 - p->window;
+    }
+    return 0;
+}
+
 static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const TrillimAttentionTask *task = opaque;
@@ -1229,7 +1236,8 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
         return TRILLIM_OK;
     }
     size_t queries = p->heads * p->queries;
-    size_t keys = p->kv_heads * p->length;
+    size_t first_key = blas_first_key(p);
+    size_t keys = p->kv_heads * (p->length - first_key);
     size_t total = queries + 2 * keys;
     size_t first = index * 128;
     size_t last = total - first < 128 ? total : first + 128;
@@ -1248,7 +1256,7 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
             bool values = row - queries >= keys;
             size_t key = row - queries - (values ? keys : 0);
             const size_t *strides = values ? p->v_strides : p->k_strides;
-            base = key / p->kv_heads * strides[1] + key % p->kv_heads * strides[0];
+            base = (key / p->kv_heads + first_key) * strides[1] + key % p->kv_heads * strides[0];
             data = values ? task->values : task->keys;
             channels = values ? p->value_dim : p->key_dim;
         }
@@ -1447,7 +1455,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
         p->k_strides[1] >= p->key_dim && p->v_strides[1] >= p->value_dim && p->q_strides[1] <= INT32_MAX &&
         p->k_strides[1] <= INT32_MAX && p->v_strides[1] <= INT32_MAX && blas_rows &&
         isfinite(scale) && fabsf(scale) <= 1 && initialize_blas(context)) {
-        size_t rows = p->heads * p->queries + 2 * p->kv_heads * p->length;
+        size_t rows = p->heads * p->queries + 2 * p->kv_heads * (p->length - blas_first_key(p));
         size_t groups = rows / 128 + (rows % 128 != 0);
         TrillimStatus status = context->thread_pool->run(context->thread_pool->context, groups, ordinary_inputs, &task);
         if (status != TRILLIM_OK) {
