@@ -8,6 +8,7 @@ executor and native kernels; model loading and session shutdown are excluded.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import platform
 import statistics
@@ -18,6 +19,7 @@ from threading import Timer
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
+from trillim.kernels.neon.benchmark_models import ManifestSymbols
 from trillim.runtime import CancelledError, Runtime
 
 
@@ -38,6 +40,8 @@ def request_cancellation(runtime: Runtime, requested: list[float]) -> None:
 
 
 def benchmark(options: Options) -> dict[str, object]:
+    executable = (options.bundle / "executable.json").read_bytes()
+    manifest = ManifestSymbols.model_validate_json(executable)
     tokens = np.resize(np.array([9707, 11, 358, 1097], dtype=np.int64), options.prompt)
     positions = np.arange(options.prompt, dtype=np.int64)
     samples: list[dict[str, float | bool | None]] = []
@@ -79,6 +83,11 @@ def benchmark(options: Options) -> dict[str, object]:
         "bundle": str(options.bundle),
         "host": platform.platform(),
         "threads": options.threads,
+        "executable_sha256": hashlib.sha256(executable).hexdigest(),
+        "kernel_library_sha256": {
+            name: hashlib.sha256((options.bundle / name).read_bytes()).hexdigest()
+            for name in sorted({value.library for value in manifest.kernels.values()})
+        },
         "prompt_tokens": options.prompt,
         "requested_delay_seconds": options.delay,
         "samples": samples,
@@ -106,6 +115,8 @@ def main() -> None:
     result = benchmark(options)
     options.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)
+    if result["all_cancelled"] is not True:
+        raise SystemExit("some runs completed before cancellation or did not cancel")
 
 
 if __name__ == "__main__":
