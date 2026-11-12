@@ -15,11 +15,11 @@ typedef struct {
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = outputs[0] = *scratch = 0;
-    if ((p->input_dtype != TRILLIM_FP32 && p->input_dtype != TRILLIM_BF16) ||
-        (p->output_dtype != TRILLIM_FP32 && p->output_dtype != TRILLIM_BF16))
+    if (!trillim_float(p->input_dtype) ||
+        !trillim_float(p->output_dtype))
         return TRILLIM_ERROR;
     inputs[1] = 0;
-    if ((p->bias_dtype != TRILLIM_FP32 && p->bias_dtype != TRILLIM_BF16) || !p->width || p->width > SIZE_MAX / 4 ||
+    if (!trillim_float(p->bias_dtype) || !p->width || p->width > SIZE_MAX / 4 ||
         p->rows > SIZE_MAX / 4 / p->width)
         return TRILLIM_ERROR;
     inputs[0] = p->rows * p->width * trillim_itemsize(p->input_dtype);
@@ -63,7 +63,15 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_bias_add(void *const *outputs, const
 }
 TRILLIM_KERNEL const char *trillim_scalar_bias_add_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _bias_add as bind\n"
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _product, _DTYPE_IDS, _rmsnorm\n"
+           "def bind(c):\n"
+           "    x, bias, output = c.inputs['a'], c.inputs['b'], c.outputs[0]\n"
+           "    if not x.shape or bias.shape != x.shape[-1:] or output.shape != x.shape:\n"
+           "        raise ValueError('bias must match the final channel axis')\n"
+           "    for value in (*c.inputs.values(), *c.outputs):\n"
+           "        if value.dtype not in {'fp16', 'bf16', 'fp32'} or (value.strides or _contiguous_strides(value.shape)) != _contiguous_strides(value.shape):\n"
+           "            raise ValueError('kernel requires contiguous floating tensors')\n"
+           "    return {'rows': _product(x.shape[:-1]), 'width': x.shape[-1], 'input_dtype': _DTYPE_IDS[x.dtype], 'bias_dtype': _DTYPE_IDS[bias.dtype], 'output_dtype': _DTYPE_IDS[output.dtype]}\n"
            "def pattern(a: Tensor, b: Tensor, *, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
            "    return (Add(a, b) if dtype is None else Cast(Add(a, b), dtype),)\n";
 }

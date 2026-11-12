@@ -14,7 +14,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[0] = inputs[1] = inputs[2] = outputs[0] = *scratch = 0;
     uint32_t types[] = {p->input_dtype, p->weight_dtype, p->bias_dtype, p->output_dtype};
     for (size_t i = 0; i < 4; ++i)
-        if (types[i] != TRILLIM_FP32 && types[i] != TRILLIM_BF16) return TRILLIM_ERROR;
+        if (!trillim_float(types[i])) return TRILLIM_ERROR;
     if ((p->stride != 1 && p->stride != 2) || !p->length || p->output_length != (p->length - 1) / p->stride + 1 ||
         p->channels > SIZE_MAX / 4 / p->length || p->channels > SIZE_MAX / 12 ||
         (p->channels && p->outputs > SIZE_MAX / 12 / p->channels) || p->outputs > SIZE_MAX / 4 / p->output_length)
@@ -74,12 +74,25 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_conv1d(void *const *outputs, const v
 }
 TRILLIM_KERNEL const char *trillim_scalar_conv1d_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _conv1d as bind\n"
-           "def pattern(x: Tensor, weight: Tensor, bias: Tensor, *, kernel: tuple[int, ...] = (3,), stride = 1, "
-           "padding = 1, dilation = 1, groups: int = 1, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
-           "    return (Conv(x, weight, bias=bias, kernel=kernel, stride=stride, padding=padding, dilation=dilation, "
-           "groups=groups) if dtype is None else Cast(Conv(x, weight, bias=bias, kernel=kernel, stride=stride, "
-           "padding=padding, dilation=dilation, groups=groups), dtype),)\n";
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _product, _DTYPE_IDS, _rmsnorm\n"
+           "def bind(c):\n"
+           "    x, weight, bias = (c.inputs[name] for name in ('x', 'weight', 'bias'))\n"
+           "    stride = c.attrs.get('stride', 1)\n"
+           "    if isinstance(stride, tuple) and len(stride) == 1:\n"
+           "        stride = stride[0]\n"
+           "    if (c.attrs.get('kernel') != (3,) or stride not in {1, 2}\n"
+           "        or c.attrs.get('padding', 1) not in (1, (1,))\n"
+           "        or c.attrs.get('dilation', 1) not in (1, (1,)) or c.attrs.get('groups', 1) != 1\n"
+           "        or len(x.shape) != 2 or len(weight.shape) != 3\n"
+           "        or weight.shape[1] != x.shape[0] or weight.shape[2].value != 3\n"
+           "        or bias.shape != weight.shape[:1]):\n"
+           "        raise ValueError('fused Conv1D requires padded width-three weights and stride 1 or 2')\n"
+           "    for value in (*c.inputs.values(), *c.outputs):\n"
+           "        if value.dtype not in {'fp16', 'bf16', 'fp32'} or (value.strides or _contiguous_strides(value.shape)) != _contiguous_strides(value.shape):\n"
+           "            raise ValueError('kernel requires contiguous floating tensors')\n"
+           "    return {'channels': x.shape[0], 'length': x.shape[1], 'outputs': weight.shape[0], 'stride': stride, 'output_length': c.outputs[0].shape[1], 'input_dtype': _DTYPE_IDS[x.dtype], 'weight_dtype': _DTYPE_IDS[weight.dtype], 'bias_dtype': _DTYPE_IDS[bias.dtype], 'output_dtype': _DTYPE_IDS[c.outputs[0].dtype]}\n"
+           "def pattern(x: Tensor, weight: Tensor, bias: Tensor, *, kernel: tuple[int, ...] = (3,), stride = 1, padding = 1, dilation = 1, groups: int = 1, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
+           "    return (Conv(x, weight, bias=bias, kernel=kernel, stride=stride, padding=padding, dilation=dilation, groups=groups) if dtype is None else Cast(Conv(x, weight, bias=bias, kernel=kernel, stride=stride, padding=padding, dilation=dilation, groups=groups), dtype),)\n";
 }
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_conv1d_parameters(void) {
     static const TrillimParameter fields[] = {

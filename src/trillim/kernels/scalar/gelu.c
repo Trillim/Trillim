@@ -15,8 +15,8 @@ typedef struct {
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = outputs[0] = *scratch = 0;
-    if ((p->input_dtype != TRILLIM_FP32 && p->input_dtype != TRILLIM_BF16) ||
-        (p->output_dtype != TRILLIM_FP32 && p->output_dtype != TRILLIM_BF16))
+    if (!trillim_float(p->input_dtype) ||
+        !trillim_float(p->output_dtype))
         return TRILLIM_ERROR;
     if (p->count > SIZE_MAX / 4) return TRILLIM_ERROR;
     inputs[0] = p->count * trillim_itemsize(p->input_dtype);
@@ -52,10 +52,17 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gelu(void *const *outputs, const voi
 }
 TRILLIM_KERNEL const char *trillim_scalar_gelu_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _gelu as bind\n"
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _product, _DTYPE_IDS, _rmsnorm\n"
+           "def bind(c):\n"
+           "    x, output = c.inputs['x'], c.outputs[0]\n"
+           "    if c.attrs.get('approximate', 'none') != 'none' or x.shape != output.shape:\n"
+           "        raise ValueError('fused GELU requires the erf definition and matching shapes')\n"
+           "    for value in (*c.inputs.values(), *c.outputs):\n"
+           "        if value.dtype not in {'fp16', 'bf16', 'fp32'} or (value.strides or _contiguous_strides(value.shape)) != _contiguous_strides(value.shape):\n"
+           "            raise ValueError('kernel requires contiguous floating tensors')\n"
+           "    return {'count': _product(x.shape), 'input_dtype': _DTYPE_IDS[x.dtype], 'output_dtype': _DTYPE_IDS[output.dtype]}\n"
            "def pattern(x: Tensor, *, approximate: str = 'none', dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
-           "    return (Gelu(x, approximate=approximate) if dtype is None else Cast(Gelu(x, approximate=approximate), "
-           "dtype),)\n";
+           "    return (Gelu(x, approximate=approximate) if dtype is None else Cast(Gelu(x, approximate=approximate), dtype),)\n";
 }
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_gelu_parameters(void) {
     static const TrillimParameter fields[] = {
