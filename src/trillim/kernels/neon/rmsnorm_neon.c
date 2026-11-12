@@ -183,6 +183,8 @@ static inline float32x4_t load_weight4(const void *data, size_t index, uint32_t 
 typedef struct {
     size_t rows;
     size_t width;
+    size_t row_stride;
+    size_t column_stride;
     size_t storage_rows;
     size_t storage_columns;
     uint32_t input_dtype;
@@ -200,25 +202,47 @@ typedef struct {
     const TrillimKernelContext *context;
 } TrillimRMSNormTask;
 
-static inline TrillimStatus trillim_rms_requirements(const void *parameters, size_t *inputs, size_t *outputs,
-                                                     size_t *scratch) {
-    const TrillimRMSNormParameters *p = (const TrillimRMSNormParameters *)parameters;
-    inputs[0] = 0;
-    inputs[1] = 0;
-    outputs[0] = 0;
-    *scratch = 0;
-    size_t bytes = trillim_itemsize(p->output_dtype);
-    if ((p->input_dtype != TRILLIM_FP16 && p->input_dtype != TRILLIM_BF16 && p->input_dtype != TRILLIM_FP32) ||
-        (p->output_dtype != TRILLIM_FP16 && p->output_dtype != TRILLIM_BF16 && p->output_dtype != TRILLIM_FP32)) {
+static inline TrillimStatus trillim_rms_requirements(
+    const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch
+) {
+    const TrillimRMSNormParameters *p = parameters;
+    inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
+    if (!trillim_float(p->output_dtype) || !trillim_float(p->input_dtype)) {
         return TRILLIM_ERROR;
     }
     if (p->rows == 0 || p->width == 0) {
         return TRILLIM_OK;
     }
-    if (p->rows > SIZE_MAX / p->width || p->rows * p->width > SIZE_MAX / bytes || p->storage_columns == 0 ||
-        p->storage_rows > SIZE_MAX / p->storage_columns || p->rows * p->width > p->storage_rows * p->storage_columns ||
-        !trillim_payload_size(p->storage_rows, p->storage_columns, p->input_dtype, &inputs[0])) {
+    if ((p->row_stride != p->width || p->column_stride != 1) &&
+        (p->input_dtype != TRILLIM_FP32 || p->weight_dtype != TRILLIM_FP32 ||
+         p->output_dtype != TRILLIM_FP32)) {
         return TRILLIM_ERROR;
+    }
+    size_t bytes = trillim_itemsize(p->output_dtype);
+    if (p->rows > SIZE_MAX / p->width || p->rows * p->width > SIZE_MAX / bytes) {
+        return TRILLIM_ERROR;
+    }
+    size_t span = 1;
+    if (p->row_stride != 0 && p->rows - 1 > (SIZE_MAX - span) / p->row_stride) {
+        return TRILLIM_ERROR;
+    }
+    span += (p->rows - 1) * p->row_stride;
+    if (p->column_stride != 0 && p->width - 1 > (SIZE_MAX - span) / p->column_stride) {
+        return TRILLIM_ERROR;
+    }
+    span += (p->width - 1) * p->column_stride;
+    size_t input_bytes = trillim_itemsize(p->input_dtype);
+    if (input_bytes != 0) {
+        if (span > SIZE_MAX / input_bytes) {
+            return TRILLIM_ERROR;
+        }
+        inputs[0] = span * input_bytes;
+    } else {
+        if (p->storage_columns == 0 || p->storage_rows > SIZE_MAX / p->storage_columns ||
+            span > p->storage_rows * p->storage_columns ||
+            !trillim_payload_size(p->storage_rows, p->storage_columns, p->input_dtype, &inputs[0])) {
+            return TRILLIM_ERROR;
+        }
     }
     if (!trillim_payload_size(1, p->width, p->weight_dtype, &inputs[1])) {
         return TRILLIM_ERROR;
@@ -227,22 +251,37 @@ static inline TrillimStatus trillim_rms_requirements(const void *parameters, siz
     return TRILLIM_OK;
 }
 
+static inline float32x4_t load_input4(const TrillimRMSNormTask *task, size_t start) {
+    const TrillimRMSNormParameters *p = task->parameters;
+    if (p->column_stride == 1) {
+        return load4(task->input, start, p->input_dtype);
+    }
+    float values[4];
+    for (size_t lane = 0; lane < 4; ++lane) {
+        values[lane] = trillim_load(
+            task->input, start + lane * p->column_stride, p->input_dtype
+        ).f;
+    }
+    return vld1q_f32(values);
+}
+
 static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
     (void)worker;
     const TrillimRMSNormTask *task = (const TrillimRMSNormTask *)opaque;
     const TrillimRMSNormParameters *p = task->parameters;
-    size_t start = row * p->width;
+    size_t start = row * p->row_stride;
+    size_t output_start = row * p->width;
     float sum = 0.0f;
     size_t column = 0;
     if (p->output_dtype != TRILLIM_FP32) {
         for (; p->width - column >= 4; column += 4) {
             if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
             float lanes[4];
-            vst1q_f32(lanes, load4(task->input, start + column, p->input_dtype));
+            vst1q_f32(lanes, load_input4(task, start + column * p->column_stride));
             for (size_t lane = 0; lane < 4; ++lane) sum += lanes[lane] * lanes[lane];
         }
         for (; column < p->width; ++column) {
-            float value = trillim_load(task->input, start + column, p->input_dtype).f;
+            float value = trillim_load(task->input, start + column * p->column_stride, p->input_dtype).f;
             sum += value * value;
         }
     } else {
@@ -255,10 +294,10 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
             if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            float32x4_t a = load4(task->input, start + column, p->input_dtype);
-            float32x4_t b = load4(task->input, start + column + 4, p->input_dtype);
-            float32x4_t c = load4(task->input, start + column + 8, p->input_dtype);
-            float32x4_t d = load4(task->input, start + column + 12, p->input_dtype);
+            float32x4_t a = load_input4(task, start + column * p->column_stride);
+            float32x4_t b = load_input4(task, start + (column + 4) * p->column_stride);
+            float32x4_t c = load_input4(task, start + (column + 8) * p->column_stride);
+            float32x4_t d = load_input4(task, start + (column + 12) * p->column_stride);
             sum0 = vaddq_f32(sum0, vmulq_f32(a, a));
             sum1 = vaddq_f32(sum1, vmulq_f32(b, b));
             sum2 = vaddq_f32(sum2, vmulq_f32(c, c));
@@ -266,7 +305,7 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
         }
         sum = vaddvq_f32(vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3)));
         for (; column < p->width; ++column) {
-            float value = trillim_load(task->input, start + column, p->input_dtype).f;
+            float value = trillim_load(task->input, start + column * p->column_stride, p->input_dtype).f;
             sum += value * value;
         }
     }
@@ -278,15 +317,77 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        float32x4_t value = vdivq_f32(load4(task->input, start + column, p->input_dtype), divisor);
+        float32x4_t value = vdivq_f32(load_input4(task, start + column * p->column_stride), divisor);
         float32x4_t weight = load_weight4(task->weight, column, p->weight_dtype, 1, p->width);
         value = vmulq_f32(value, vaddq_f32(weight, offset));
-        store4(task->output, start + column, p->output_dtype, value);
+        store4(task->output, output_start + column, p->output_dtype, value);
     }
     for (; column < p->width; ++column) {
         float weight = trillim_read_float(task->weight, column, p->weight_dtype, 1, p->width);
-        TrillimValue value = {.f = (trillim_load(task->input, start + column, p->input_dtype).f / denominator) * (weight + p->weight_offset)};
-        trillim_store(task->output, start + column, p->output_dtype, value);
+        TrillimValue value = {.f = (trillim_load(task->input, start + column * p->column_stride, p->input_dtype).f / denominator) * (weight + p->weight_offset)};
+        trillim_store(task->output, output_start + column, p->output_dtype, value);
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus normalize_transposed(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimRMSNormTask *task = opaque;
+    const TrillimRMSNormParameters *p = task->parameters;
+    size_t row = tile * 4;
+    if (p->rows - row < 4) {
+        for (; row < p->rows; ++row) {
+            TrillimStatus status = normalize(opaque, row, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
+    const float *input = task->input;
+    const float *weight = task->weight;
+    float *output = task->output;
+    float32x4_t sum = vdupq_n_f32(0);
+    for (size_t column = 0; column < p->width; ++column) {
+        if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t value = vld1q_f32(input + row + column * p->column_stride);
+        sum = vaddq_f32(sum, vmulq_f32(value, value));
+    }
+    float32x4_t mean = vdivq_f32(sum, vdupq_n_f32((float)p->width));
+    float32x4_t denominator = vsqrtq_f32(vaddq_f32(mean, vdupq_n_f32(p->eps)));
+    size_t column = 0;
+    for (; p->width - column >= 4; column += 4) {
+        if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float weights[4];
+        vst1q_f32(weights, vaddq_f32(vld1q_f32(weight + column), vdupq_n_f32(p->weight_offset)));
+        float32x4_t values[4];
+        for (size_t lane = 0; lane < 4; ++lane) {
+            float32x4_t input_rows = vld1q_f32(input + row + (column + lane) * p->column_stride);
+            values[lane] = vmulq_n_f32(vdivq_f32(input_rows, denominator), weights[lane]);
+        }
+        float32x4_t a = vtrn1q_f32(values[0], values[1]);
+        float32x4_t b = vtrn2q_f32(values[0], values[1]);
+        float32x4_t c = vtrn1q_f32(values[2], values[3]);
+        float32x4_t d = vtrn2q_f32(values[2], values[3]);
+        vst1q_f32(output + row * p->width + column, vcombine_f32(vget_low_f32(a), vget_low_f32(c)));
+        vst1q_f32(output + (row + 1) * p->width + column, vcombine_f32(vget_low_f32(b), vget_low_f32(d)));
+        vst1q_f32(output + (row + 2) * p->width + column, vcombine_f32(vget_high_f32(a), vget_high_f32(c)));
+        vst1q_f32(output + (row + 3) * p->width + column, vcombine_f32(vget_high_f32(b), vget_high_f32(d)));
+    }
+    for (; column < p->width; ++column) {
+        float32x4_t input_rows = vld1q_f32(input + row + column * p->column_stride);
+        float32x4_t value = vmulq_n_f32(
+            vdivq_f32(input_rows, denominator), weight[column] + p->weight_offset
+        );
+        float lanes[4];
+        vst1q_f32(lanes, value);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            output[(row + lane) * p->width + column] = lanes[lane];
+        }
     }
     return TRILLIM_OK;
 }
@@ -296,7 +397,8 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
         return output == 0 && input == 0;
     }
     const TrillimRMSNormParameters *p = parameters;
-    return output == 0 && input == 0 && p->input_dtype == p->output_dtype;
+    return output == 0 && input == 0 && p->input_dtype == p->output_dtype &&
+           p->column_stride == 1 && p->row_stride == p->width;
 }
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
@@ -309,13 +411,61 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
     }
     const TrillimRMSNormParameters *p = (const TrillimRMSNormParameters *)parameters;
     TrillimRMSNormTask task = {outputs[0], inputs[0], inputs[1], p, context};
-    return p->rows == 1 ? normalize(&task, 0, 0) :
-        context->thread_pool->run(context->thread_pool->context, p->rows, normalize, &task);
+    if (p->rows == 0 || p->width == 0) {
+        return TRILLIM_OK;
+    }
+    bool transposed = p->row_stride == 1 && p->column_stride != 1;
+    TrillimTask worker = transposed ? normalize_transposed : normalize;
+    size_t tasks = transposed ? p->rows / 4 + (p->rows % 4 != 0) : p->rows;
+    size_t serial_limit = p->output_dtype == TRILLIM_FP32 ? 4096 : 2048;
+    if (transposed) {
+        serial_limit = 8192;
+    }
+    if (p->rows == 1 || p->rows <= serial_limit / p->width) {
+        for (size_t tile = 0; tile < tasks; ++tile) {
+            TrillimStatus status = worker(&task, tile, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
+    return context->thread_pool->run(context->thread_pool->context, tasks, worker, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_rmsnorm_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _rmsnorm as bind\n"
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _product, _reshape_strides, _storage_shape, _DTYPE_IDS, _native_dtype\n"
+           "from trillim.compiler.passes.infer import _constant_expression, _expression\n"
+           "def bind(c):\n"
+           "    x, weight, output = c.inputs['x'], c.inputs['weight'], c.outputs[0]\n"
+           "    if not x.shape or weight.shape != x.shape[-1:]:\n"
+           "        raise ValueError('RMSNorm requires a matching channel vector')\n"
+           "    strides = x.strides or _contiguous_strides(x.shape)\n"
+           "    rows, width = _product(x.shape[:-1]), x.shape[-1]\n"
+           "    matrix = _reshape_strides(x.shape, strides, (rows, width))\n"
+           "    if matrix is None:\n"
+           "        axes = [(d, s) for d, s in zip(x.shape[:-1], strides[:-1]) if d.op != 'const' or d.value != 1]\n"
+           "        row_stride = axes[-1][1] if axes else width\n"
+           "        expected = row_stride\n"
+           "        for dimension, stride in reversed(axes):\n"
+           "            if stride != expected:\n"
+           "                raise ValueError('RMSNorm rows must flatten regularly')\n"
+           "            expected = _expression('mul', expected, dimension)\n"
+           "        matrix = (row_stride, strides[-1])\n"
+           "    canonical = matrix == (width, _constant_expression(1))\n"
+           "    if not canonical and any(v.dtype != 'fp32' for v in (x, weight, output)):\n"
+           "        raise ValueError('strided RMSNorm currently requires FP32 arithmetic')\n"
+           "    if (weight.strides or _contiguous_strides(weight.shape)) != _contiguous_strides(weight.shape):\n"
+           "        raise ValueError('RMSNorm weight must be contiguous')\n"
+           "    eps, offset = c.attrs.get('eps', 1e-6), c.attrs.get('weight_offset', 0.0)\n"
+           "    if not isinstance(eps, (int, float)) or not isinstance(offset, (int, float)):\n"
+           "        raise TypeError('RMSNorm parameters must be numeric')\n"
+           "    storage_rows, storage_columns = _storage_shape(x)\n"
+           "    return dict(rows=rows, width=width, row_stride=matrix[0], column_stride=matrix[1],\n"
+           "                storage_rows=storage_rows, storage_columns=storage_columns,\n"
+           "                input_dtype=_DTYPE_IDS[x.dtype], weight_dtype=_DTYPE_IDS[weight.dtype],\n"
+           "                output_dtype=_native_dtype(output.dtype), eps=float(eps), weight_offset=float(offset))\n"
            "def pattern(x: Tensor, weight: Tensor, *, eps: float = 1e-6, weight_offset: float = 0.0, dtype: DType | None = None) -> tuple[Tensor, ...]:\n"
            "    return (RMSNorm(x, weight=weight, eps=eps, weight_offset=weight_offset, dtype=dtype),)\n";
 }
@@ -324,6 +474,8 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_rmsnorm_parameters(voi
     static const TrillimParameter fields[] = {
         {"rows", "size_t", offsetof(TrillimRMSNormParameters, rows), NULL},
         {"width", "size_t", offsetof(TrillimRMSNormParameters, width), NULL},
+        {"row_stride", "size_t", offsetof(TrillimRMSNormParameters, row_stride), NULL},
+        {"column_stride", "size_t", offsetof(TrillimRMSNormParameters, column_stride), NULL},
         {"storage_rows", "size_t", offsetof(TrillimRMSNormParameters, storage_rows), NULL},
         {"storage_columns", "size_t", offsetof(TrillimRMSNormParameters, storage_columns), NULL},
         {"input_dtype", "uint32_t", offsetof(TrillimRMSNormParameters, input_dtype), NULL},
