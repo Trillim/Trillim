@@ -101,20 +101,30 @@ static inline __attribute__((always_inline)) void decode16(
         uint8x8_t packed = vld1_u8(values + block * 16 + offset / 2);
         uint8x8x2_t split = vzip_u8(vand_u8(packed, vdup_n_u8(15)), vshr_n_u8(packed, 4));
         uint8x16_t code = vcombine_u8(split.val[0], split.val[1]);
-        static const uint8_t magnitudes[16] = {0, 1, 2, 3, 4, 6, 8, 12};
-        uint8x16_t magnitude = vqtbl1q_u8(vld1q_u8(magnitudes), vandq_u8(code, vdupq_n_u8(7)));
+        /* Exact E2M1 values assembled from their two BF16 bytes. */
+        static const uint8_t low_bits[16] = {0, 0, 128, 192, 0, 64, 128, 192, 0, 0, 128, 192, 0, 64, 128, 192};
+        static const uint8_t high_bits[16] = {0, 63, 63, 63, 64, 64, 64, 64, 128, 191, 191, 191, 192, 192, 192, 192};
+        uint8x16_t low = vqtbl1q_u8(vld1q_u8(low_bits), code);
+        uint8x16_t high = vqtbl1q_u8(vld1q_u8(high_bits), code);
+        uint16x8_t a = vreinterpretq_u16_u8(vzip1q_u8(low, high));
+        uint16x8_t b = vreinterpretq_u16_u8(vzip2q_u8(low, high));
+        result[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16));
+        result[1] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(a), 16));
+        result[2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+        result[3] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16));
         uint8_t exponent = values[total * 16 + block];
-        uint32_t scale_bits = exponent == 255 ? UINT32_C(0x7fc00000) :
-            (exponent > 1 ? (uint32_t)(exponent - 1) << 23 : UINT32_C(0x00200000) << exponent);
+        if (exponent == 255) {
+            for (size_t i = 0; i < 4; ++i) {
+                uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(result[i]), vdupq_n_u32(UINT32_C(0x80000000)));
+                result[i] = vreinterpretq_f32_u32(vorrq_u32(sign, vdupq_n_u32(UINT32_C(0x7fc00000))));
+            }
+            return;
+        }
+        uint32_t scale_bits = exponent ? (uint32_t)exponent << 23 : UINT32_C(0x00400000);
         memcpy(&scale, &scale_bits, sizeof(scale));
-        int16x8_t low = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(magnitude)));
-        int16x8_t high = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(magnitude)));
-        uint16x8_t sign0 = vshlq_n_u16(vmovl_u8(vget_low_u8(vandq_u8(code, vdupq_n_u8(8)))), 12);
-        uint16x8_t sign1 = vshlq_n_u16(vmovl_u8(vget_high_u8(vandq_u8(code, vdupq_n_u8(8)))), 12);
-        result[0] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_low_s16(low), scale)), vshll_n_u16(vget_low_u16(sign0), 16)));
-        result[1] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_high_s16(low), scale)), vshll_n_u16(vget_high_u16(sign0), 16)));
-        result[2] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_low_s16(high), scale)), vshll_n_u16(vget_low_u16(sign1), 16)));
-        result[3] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_high_s16(high), scale)), vshll_n_u16(vget_high_u16(sign1), 16)));
+        for (size_t i = 0; i < 4; ++i) {
+            result[i] = vmulq_n_f32(result[i], scale);
+        }
         return;
     } else if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
         uint8x16_t packed = vld1q_u8(values + block * 32 + offset % 32);
