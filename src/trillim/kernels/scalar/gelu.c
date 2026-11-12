@@ -12,6 +12,16 @@ typedef struct {
     const TrillimKernelContext *context;
 } Task;
 
+static float round_native(float value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) {
+        return trillim_fp16(trillim_to_fp16(value));
+    }
+    if (dtype == TRILLIM_BF16) {
+        return trillim_bf16(trillim_to_bf16(value));
+    }
+    return value;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = outputs[0] = *scratch = 0;
@@ -31,7 +41,19 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
     size_t begin = tile * 1024, end = p->count - begin < 1024 ? p->count : begin + 1024;
     for (size_t i = begin; i < end; ++i) {
         float x = trillim_load(t->input, i, p->input_dtype).f;
-        TrillimValue value = {.f = 0.5f * x * (1.0f + erff(x * 0.7071067811865476f))};
+        TrillimValue value;
+        if (p->input_dtype == TRILLIM_FP16) {
+            float argument = round_native(x * round_native(0.7071067811865476f, TRILLIM_FP16), TRILLIM_FP16);
+            float cdf = round_native(erff(argument), TRILLIM_FP16);
+            float half = round_native(x * 0.5f, TRILLIM_FP16);
+            float shifted = round_native(cdf + 1.0f, TRILLIM_FP16);
+            value.f = round_native(half * shifted, TRILLIM_FP16);
+        } else {
+            value.f = 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
+            if (p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_FP16) {
+                value.f = round_native(value.f, TRILLIM_BF16);
+            }
+        }
         trillim_store(t->output, i, p->output_dtype, value);
     }
     return TRILLIM_OK;

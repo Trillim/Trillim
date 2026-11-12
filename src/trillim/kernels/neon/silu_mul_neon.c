@@ -75,6 +75,21 @@ static inline float32x4_t exp_negative(float32x4_t x) {
     return vbslq_f32(vceqq_f32(original, original), value, original);
 }
 
+static inline float32x4_t round4(float32x4_t value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) return vcvt_f32_f16(vcvt_f16_f32(value));
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    uint32x4_t upper = vshrq_n_u32(bits, 16);
+    uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+    uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+    uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+    rounded = vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(0x40)), rounded);
+    return vreinterpretq_f32_u32(vshlq_n_u32(rounded, 16));
+}
+
+static inline float round_scalar(float value, uint32_t dtype) {
+    return dtype == TRILLIM_FP16 ? trillim_fp16(trillim_to_fp16(value)) : trillim_bf16(trillim_to_bf16(value));
+}
+
 static inline uint32x4_t rounding_sensitive(float32x4_t value, uint32_t dtype) {
     uint32x4_t bits = vreinterpretq_u32_f32(value);
     if (dtype == TRILLIM_BF16) {
@@ -118,11 +133,30 @@ static inline TrillimStatus trillim_activation_task_neon(void *opaque, size_t ti
     for (; end - i >= 4; i += 4) {
         float32x4_t gate = load4(task->gate, i, task->parameters->input_dtype);
         float32x4_t e = exp_negative(vnegq_f32(vabsq_f32(gate)));
+        if (task->parameters->input_dtype != TRILLIM_FP32) {
+            uint32x4_t sensitive = rounding_sensitive(e, task->parameters->input_dtype);
+            if (vmaxvq_u32(sensitive) != 0) {
+                uint32_t mask[4];
+                float lanes[4], gates[4];
+                vst1q_u32(mask, sensitive);
+                vst1q_f32(lanes, e);
+                vst1q_f32(gates, gate);
+                for (size_t lane = 0; lane < 4; ++lane) {
+                    if (mask[lane]) lanes[lane] = expf(-fabsf(gates[lane]));
+                }
+                e = vld1q_f32(lanes);
+            }
+            e = round4(e, task->parameters->input_dtype);
+        }
         float32x4_t denominator = vaddq_f32(vdupq_n_f32(1.0f), e);
-        float32x4_t numerator = vbslq_f32(vcgeq_f32(gate, vdupq_n_f32(0)), vdupq_n_f32(1.0f), e);
-        float32x4_t value = vmulq_f32(gate, vdivq_f32(numerator, denominator));
+        if (task->parameters->input_dtype != TRILLIM_FP32) denominator = round4(denominator, task->parameters->input_dtype);
+        float32x4_t positive = vdivq_f32(vdupq_n_f32(1), denominator);
+        float32x4_t negative = vdivq_f32(e, denominator);
+        if (task->parameters->input_dtype != TRILLIM_FP32) negative = round4(negative, task->parameters->input_dtype);
+        float32x4_t probability = vbslq_f32(vcgeq_f32(gate, vdupq_n_f32(0)), positive, negative);
+        float32x4_t value = vmulq_f32(gate, probability);
         value = vmulq_f32(value, load4(task->up, i, task->parameters->input_dtype));
-        if (task->parameters->output_dtype != TRILLIM_FP32) {
+        if (task->parameters->input_dtype == TRILLIM_FP32 && task->parameters->output_dtype != TRILLIM_FP32) {
             uint32x4_t sensitive = rounding_sensitive(value, task->parameters->output_dtype);
             if (vmaxvq_u32(sensitive) != 0) {
                 /* Resolve near-ties with libm before rounding to a lower precision. */
@@ -146,7 +180,17 @@ static inline TrillimStatus trillim_activation_task_neon(void *opaque, size_t ti
     for (; i < end; ++i) {
         float gate = trillim_load(task->gate, i, task->parameters->input_dtype).f;
         float e = expf(-fabsf(gate));
-        float value = gate * (gate >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e));
+        float denominator;
+        float probability;
+        if (task->parameters->input_dtype != TRILLIM_FP32) {
+            e = round_scalar(e, task->parameters->input_dtype);
+            denominator = round_scalar(1.0f + e, task->parameters->input_dtype);
+            probability = gate >= 0.0f ? 1.0f / denominator : round_scalar(e / denominator, task->parameters->input_dtype);
+        } else {
+            denominator = 1.0f + e;
+            probability = gate >= 0.0f ? 1.0f / denominator : e / denominator;
+        }
+        float value = gate * probability;
         TrillimValue output = {.f = value * trillim_load(task->up, i, task->parameters->input_dtype).f};
         trillim_store(task->output, i, task->parameters->output_dtype, output);
     }

@@ -2,6 +2,13 @@
 #include <math.h>
 #include <arm_neon.h>
 
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+
+
 #if defined(__APPLE__) && defined(__aarch64__)
 #define TRILLIM_NEON_REQUIRED UINT64_C(0)
 #else
@@ -76,58 +83,48 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
     const Task *task = opaque;
     const Parameters *p = task->parameters;
     size_t offset = row * p->width;
-    float mean = 0.0f;
+    float total = 0.0f;
+    for (size_t begin = 0; begin < p->width; begin += 1024) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t end = p->width - begin < 1024 ? p->width : begin + 1024;
+        for (size_t i = begin; i < end; ++i) {
+            total += trillim_load(task->input, offset + i, p->input_dtype).f;
+        }
+    }
+    if (p->input_dtype == TRILLIM_BF16) {
+        total = trillim_bf16(trillim_to_bf16(total));
+    } else if (p->input_dtype == TRILLIM_FP16) {
+        total = trillim_fp16(trillim_to_fp16(total));
+    }
+    float mean = total / (float)p->width;
     float variance = 0.0f;
     if (p->output_dtype == TRILLIM_FP32) {
-        float32x4_t total = vdupq_n_f32(0.0f);
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        float32x4_t center = vdupq_n_f32(mean);
         size_t i = 0;
         for (; p->width - i >= 4; i += 4) {
             if ((i & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            total = vaddq_f32(total, load4(task->input, offset + i, p->input_dtype));
-        }
-        mean = vaddvq_f32(total);
-        for (; i < p->width; ++i) {
-            mean += trillim_load(task->input, offset + i, p->input_dtype).f;
-        }
-        mean /= (float)p->width;
-        float32x4_t center = vdupq_n_f32(mean);
-        total = vdupq_n_f32(0.0f);
-        i = 0;
-        for (; p->width - i >= 4; i += 4) {
-            if ((i & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
             float32x4_t value = vsubq_f32(load4(task->input, offset + i, p->input_dtype), center);
-            total = vfmaq_f32(total, value, value);
+            sum = vaddq_f32(sum, vmulq_f32(value, value));
         }
-        variance = vaddvq_f32(total);
+        variance = vaddvq_f32(sum);
         for (; i < p->width; ++i) {
             float value = trillim_load(task->input, offset + i, p->input_dtype).f - mean;
             variance += value * value;
         }
     } else {
-        float total = 0.0f;
         for (size_t begin = 0; begin < p->width; begin += 1024) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             size_t end = p->width - begin < 1024 ? p->width : begin + 1024;
             for (size_t i = begin; i < end; ++i) {
-                total += trillim_load(task->input, offset + i, p->input_dtype).f;
-            }
-        }
-        mean = total / (float)p->width;
-
-        for (size_t begin = 0; begin < p->width; begin += 1024) {
-            if (task->context->is_cancelled(task->context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
-            size_t end = p->width - begin < 1024 ? p->width : begin + 1024;
-            for (size_t i = begin; i < end; ++i) {
-                float centered = trillim_load(task->input, offset + i, p->input_dtype).f - mean;
-                variance += centered * centered;
+                float value = trillim_load(task->input, offset + i, p->input_dtype).f - mean;
+                variance += value * value;
             }
         }
     }

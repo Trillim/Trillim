@@ -12,6 +12,16 @@ typedef struct {
     const Parameters *p;
     const TrillimKernelContext *context;
 } Task;
+static float round_native(float value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) {
+        return trillim_fp16(trillim_to_fp16(value));
+    }
+    if (dtype == TRILLIM_BF16) {
+        return trillim_bf16(trillim_to_bf16(value));
+    }
+    return value;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = outputs[0] = *scratch = 0;
@@ -42,6 +52,8 @@ static TrillimStatus apply(void *opaque, size_t row, size_t worker) {
                 .f = trillim_load(task->input, offset + i, p->input_dtype).f +
                      trillim_load(task->bias, i, p->bias_dtype).f
             };
+            uint32_t sum_dtype = p->input_dtype == p->bias_dtype ? p->input_dtype : TRILLIM_FP32;
+            result.f = round_native(result.f, sum_dtype);
             trillim_store(task->output, offset + i, p->output_dtype, result);
         }
     }

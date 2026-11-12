@@ -50,6 +50,21 @@ static inline void store4(void *data, size_t index, uint32_t dtype, float32x4_t 
     vst1_u16((uint16_t *)data + index, vmovn_u32(rounded));
 }
 
+static inline float32x4_t round4(float32x4_t value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) return vcvt_f32_f16(vcvt_f16_f32(value));
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    uint32x4_t upper = vshrq_n_u32(bits, 16);
+    uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+    uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+    uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+    rounded = vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(0x40)), rounded);
+    return vreinterpretq_f32_u32(vshlq_n_u32(rounded, 16));
+}
+
+static inline float round_scalar(float value, uint32_t dtype) {
+    return dtype == TRILLIM_FP16 ? trillim_fp16(trillim_to_fp16(value)) : trillim_bf16(trillim_to_bf16(value));
+}
+
 static inline TrillimStatus trillim_activation_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const TrillimActivationParameters *p = (const TrillimActivationParameters *)parameters;
     inputs[0] = 0;
@@ -79,6 +94,7 @@ static inline TrillimStatus trillim_activation_task_neon(void *opaque, size_t ti
         float32x4_t gate = load4(task->gate, i, task->parameters->dtype);
         float32x4_t value = vbslq_f32(vcgeq_f32(gate, vdupq_n_f32(0)), gate, vdupq_n_f32(0));
         value = vmulq_f32(value, value);
+        if (task->parameters->dtype != TRILLIM_FP32) value = round4(value, task->parameters->dtype);
         store4(task->output, i, task->parameters->dtype, vmulq_f32(value, load4(task->up, i, task->parameters->dtype)));
     }
     for (; i < end; ++i) {
@@ -90,6 +106,7 @@ static inline TrillimStatus trillim_activation_task_neon(void *opaque, size_t ti
         } else {
             value = gate >= 0.0f ? gate : 0.0f;
             value *= value;
+            if (task->parameters->dtype != TRILLIM_FP32) value = round_scalar(value, task->parameters->dtype);
         }
         TrillimValue output = {.f = value * trillim_load(task->up, i, task->parameters->dtype).f};
         trillim_store(task->output, i, task->parameters->dtype, output);

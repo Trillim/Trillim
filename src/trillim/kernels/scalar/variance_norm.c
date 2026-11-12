@@ -1,6 +1,13 @@
 #include "common.h"
 #include <math.h>
 
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+
+
 typedef struct {
     size_t rows;
     size_t width;
@@ -49,6 +56,11 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
         for (size_t i = begin; i < end; ++i) {
             total += trillim_load(task->input, offset + i, p->input_dtype).f;
         }
+    }
+    if (p->input_dtype == TRILLIM_BF16) {
+        total = trillim_bf16(trillim_to_bf16(total));
+    } else if (p->input_dtype == TRILLIM_FP16) {
+        total = trillim_fp16(trillim_to_fp16(total));
     }
     float mean = total / (float)p->width;
     float variance = 0.0f;

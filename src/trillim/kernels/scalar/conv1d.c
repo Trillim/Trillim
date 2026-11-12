@@ -9,6 +9,16 @@ typedef struct {
     const Parameters *p;
     const TrillimKernelContext *context;
 } Task;
+static float round_native(float value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) {
+        return trillim_fp16(trillim_to_fp16(value));
+    }
+    if (dtype == TRILLIM_BF16) {
+        return trillim_bf16(trillim_to_bf16(value));
+    }
+    return value;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = inputs[2] = outputs[0] = *scratch = 0;
@@ -36,7 +46,7 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
     float sums[32];
     float bias = trillim_load(task->bias, output, p->bias_dtype).f;
     for (size_t i = 0; i < count; ++i) {
-        sums[i] = bias;
+        sums[i] = 0.0f;
     }
     for (size_t channel = 0; channel < p->channels; ++channel) {
         if ((channel & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
@@ -58,9 +68,12 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
     if (task->context->is_cancelled(task->context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
+    uint32_t dot_dtype = p->input_dtype == p->weight_dtype ? p->input_dtype : TRILLIM_FP32;
+    uint32_t affine_dtype = dot_dtype == p->bias_dtype ? dot_dtype : TRILLIM_FP32;
     for (size_t i = 0; i < count; ++i) {
-        TrillimValue result = {.f = sums[i]};
-        trillim_store(task->output, output * p->output_length + begin + i, p->output_dtype, result);
+        float result = round_native(sums[i], dot_dtype) + bias;
+        TrillimValue value = {.f = round_native(result, affine_dtype)};
+        trillim_store(task->output, output * p->output_length + begin + i, p->output_dtype, value);
     }
     return TRILLIM_OK;
 }

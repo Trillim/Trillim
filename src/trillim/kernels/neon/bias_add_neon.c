@@ -48,6 +48,17 @@ static inline void store4(void *data, size_t index, uint32_t dtype, float32x4_t 
     vst1_u16((uint16_t *)data + index, vmovn_u32(rounded));
 }
 
+static inline float32x4_t round4(float32x4_t value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) return vcvt_f32_f16(vcvt_f16_f32(value));
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    uint32x4_t upper = vshrq_n_u32(bits, 16);
+    uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+    uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+    uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+    rounded = vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(0x40)), rounded);
+    return vreinterpretq_f32_u32(vshlq_n_u32(rounded, 16));
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
@@ -69,14 +80,20 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
     const Parameters *p = t->p;
     if (t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
     size_t begin = tile * p->width, i = 0;
+    uint32_t add_dtype = p->input_dtype == p->bias_dtype ? p->input_dtype : TRILLIM_FP32;
+    bool round_sum = add_dtype != TRILLIM_FP32 && add_dtype != p->output_dtype;
     for (; p->width - i >= 4; i += 4) {
         if ((i & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) return TRILLIM_CANCELLED;
-        store4(t->output, begin + i, p->output_dtype,
-               vaddq_f32(load4(t->input, begin + i, p->input_dtype), load4(t->bias, i, p->bias_dtype)));
+        float32x4_t value = vaddq_f32(load4(t->input, begin + i, p->input_dtype), load4(t->bias, i, p->bias_dtype));
+        if (round_sum) value = round4(value, add_dtype);
+        store4(t->output, begin + i, p->output_dtype, value);
     }
     for (; i < p->width; ++i) {
         TrillimValue value = {.f = trillim_load(t->input, begin + i, p->input_dtype).f +
                                    trillim_load(t->bias, i, p->bias_dtype).f};
+        if (round_sum) {
+            value.f = add_dtype == TRILLIM_FP16 ? trillim_fp16(trillim_to_fp16(value.f)) : trillim_bf16(trillim_to_bf16(value.f));
+        }
         trillim_store(t->output, begin + i, p->output_dtype, value);
     }
     return TRILLIM_OK;
