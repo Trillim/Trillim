@@ -61,7 +61,13 @@ def _build(directory: Path) -> Path:
     sources = [root / "scalar" / f"{name}.c" for name in names]
     sources.extend(root / "neon" / f"{name}_neon.c" for name in names)
     sources.extend(
-        root / "scalar" / f"{name}.c" for name in ("conv_blas", "conv_bias_blas")
+        root / "scalar" / f"{name}.c"
+        for name in (
+            "conv_blas",
+            "conv_bias_blas",
+            "conv_transpose_blas",
+            "conv_transpose_bias_blas",
+        )
     )
     subprocess.run(
         [
@@ -291,12 +297,12 @@ def _measure(
         "bitwise_equal": bool(np.array_equal(scalar, neon)),
         "numpy_maximum_error": reference_error,
     }
-    if blas and not transpose and dtype == "fp32":
+    if blas and dtype == "fp32":
+        blas_name = "conv_transpose" if transpose else "conv"
+        blas_name += "_bias_blas" if biased else "_blas"
         candidate = replace(
             invocation,
-            kernel="trillim_scalar_conv_bias_blas"
-            if biased
-            else "trillim_scalar_conv_blas",
+            kernel=f"trillim_scalar_{blas_name}",
         )
         try:
             blas_samples, blas_bytes, blas_allocated = _invoke(
@@ -462,7 +468,10 @@ def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
                                 )
                 records.append(
                     {
-                        "name": name, "maximum_error": maximum, "bitwise_equal": equal, "inputs": 8
+                        "name": name,
+                        "maximum_error": maximum,
+                        "bitwise_equal": equal,
+                        "inputs": 8,
                     }
                 )
                 print(f"{name}: primitive oracle maximum error {maximum}", flush=True)

@@ -205,12 +205,12 @@ static float32x4_t round4(float32x4_t values, uint32_t dtype) {
 
 #endif
 
-static TrillimStatus convolve4(const Task *task, size_t output, size_t position, const size_t *out, size_t step) {
+static TrillimStatus convolve_vectors(const Task *task, size_t output, size_t position, const size_t *out, size_t step, size_t lanes) {
     const Parameters *p = task->p;
-    size_t input_group = p->channels / p->groups, offset[3], indices[4];
+    size_t input_group = p->channels / p->groups, offset[3], indices[16];
     size_t group_base = output / (p->outputs / p->groups) * input_group;
-    float32x4_t sum = vdupq_n_f32(0);
 #if TRANSPOSED
+    float32x4_t sum = vdupq_n_f32(0);
     uint32_t compute = p->input_dtype == p->weight_dtype ? p->input_dtype : TRILLIM_FP32;
     for (size_t kernel = 0; kernel < task->kernel_volume; ++kernel) {
         if ((kernel & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
@@ -247,14 +247,15 @@ static TrillimStatus convolve4(const Task *task, size_t output, size_t position,
         sum = round4(vaddq_f32(sum, partial), compute);
     }
 #else
-    size_t cached_indices[64][4];
+    float32x4_t sums[4] = {vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0)};
+    size_t cached_indices[64][16];
     unsigned cached_valid[64];
     bool cached = task->kernel_volume <= 64;
     if (cached) {
         for (size_t kernel = 0; kernel < task->kernel_volume; ++kernel) {
             coordinates(kernel, p->dimensions, p->kernel, offset);
             cached_valid[kernel] = 0;
-            for (size_t lane = 0; lane < 4; ++lane) {
+            for (size_t lane = 0; lane < lanes; ++lane) {
                 if (source_position(p, out, offset, lane * step, &cached_indices[kernel][lane])) {
                     cached_valid[kernel] |= 1u << lane;
                 }
@@ -277,7 +278,7 @@ static TrillimStatus convolve4(const Task *task, size_t output, size_t position,
                 }
                 coordinates(kernel, p->dimensions, p->kernel, offset);
                 valid = 0;
-                for (size_t lane = 0; lane < 4; ++lane) {
+                for (size_t lane = 0; lane < lanes; ++lane) {
                     if (source_position(p, out, offset, lane * step, &indices[lane])) {
                         valid |= 1u << lane;
                     }
@@ -285,26 +286,36 @@ static TrillimStatus convolve4(const Task *task, size_t output, size_t position,
                 source = indices;
             }
             size_t base = (group_base + channel) * task->input_volume;
-            float32x4_t values;
             size_t stride = p->stride[p->dimensions - 1];
-            if (valid == 15 && (stride == 1 || (stride == 2 && source[3] + 1 < task->input_volume))) {
-                values = load4(task->input, base + source[0], p->input_dtype, stride);
-            } else {
-                float lanes[4];
-                for (size_t lane = 0; lane < 4; ++lane) {
-                    lanes[lane] = (valid & (1u << lane)) ?
-                        trillim_load(task->input, base + source[lane], p->input_dtype).f : 0;
-                }
-                values = vld1q_f32(lanes);
-            }
             float weight = trillim_load(task->weight, weight_position(task, output, channel, kernel), p->weight_dtype).f;
-            sum = vfmaq_n_f32(sum, values, weight);
+            for (size_t vector = 0; vector < lanes / 4; ++vector) {
+                const size_t *indices = source + vector * 4;
+                unsigned mask = (valid >> (vector * 4)) & 15;
+                float32x4_t values;
+                if (mask == 15 && (stride == 1 || (stride == 2 && indices[3] + 1 < task->input_volume))) {
+                    values = load4(task->input, base + indices[0], p->input_dtype, stride);
+                } else {
+                    float values4[4];
+                    for (size_t lane = 0; lane < 4; ++lane) {
+                        values4[lane] = (mask & (1u << lane)) ?
+                            trillim_load(task->input, base + indices[lane], p->input_dtype).f : 0;
+                    }
+                    values = vld1q_f32(values4);
+                }
+                sums[vector] = vfmaq_n_f32(sums[vector], values, weight);
+            }
         }
     }
 #endif
-    float values[4];
+    float values[16];
+#if TRANSPOSED
     vst1q_f32(values, sum);
-    for (size_t lane = 0; lane < 4; ++lane) {
+#else
+    for (size_t vector = 0; vector < lanes / 4; ++vector) {
+        vst1q_f32(values + vector * 4, sums[vector]);
+    }
+#endif
+    for (size_t lane = 0; lane < lanes; ++lane) {
         store(task, output, position + lane * step, values[lane]);
     }
     return TRILLIM_OK;
@@ -398,7 +409,7 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
                 coordinates(position, p->dimensions, p->output_shape, out);
                 TrillimStatus status;
                 if ((row_end - position - 1) / step >= 3) {
-                    status = convolve4(task, output, position, out, step);
+                    status = convolve_vectors(task, output, position, out, step, 4);
                     position += 4 * step;
                 } else {
                     status = convolve1(task, output, position, out);
@@ -420,11 +431,13 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
         coordinates(position, p->dimensions, p->output_shape, out);
 #if USE_NEON
         if (end - position >= 4 && p->output_shape[p->dimensions - 1] - out[p->dimensions - 1] >= 4) {
-            TrillimStatus status = convolve4(task, output, position, out, 1);
+            size_t lanes = end - position >= 16 &&
+                p->output_shape[p->dimensions - 1] - out[p->dimensions - 1] >= 16 ? 16 : 4;
+            TrillimStatus status = convolve_vectors(task, output, position, out, 1, lanes);
             if (status != TRILLIM_OK) {
                 return status;
             }
-            position += 4;
+            position += lanes;
             continue;
         }
 #endif

@@ -7,11 +7,16 @@
 #include <dlfcn.h>
 #endif
 
-#define BLOCK_M 32
-#define BLOCK_N 128
-#define BLOCK_K 256
+#if defined(__FLT16_MANT_DIG__)
+__extension__ typedef _Float16 TrillimFloat16;
+#endif
+
+#define BLOCK_M 64
+#define BLOCK_N 256
+#define BLOCK_K 1024
 #define COLUMN_LIMIT (16 * 1024 * 1024)
 #define PACK_LANES 32
+#define PACK_POSITIONS 4096
 #define WORKSPACE_LIMIT (64 * 1024 * 1024)
 
 static bool initialize_blas(void);
@@ -27,7 +32,7 @@ typedef struct {
     const void *input, *weight, *bias;
     float *columns, *weights;
     const Parameters *p;
-    size_t input_volume, output_volume, kernel_volume, width, column_stride, lanes;
+    size_t input_volume, output_volume, kernel_volume, width, column_stride, lanes, pack_positions;
     const TrillimKernelContext *context;
 } Task;
 
@@ -49,19 +54,37 @@ static bool volume(size_t dimensions, const size_t *shape, size_t *result) {
     return true;
 }
 
+static bool pointwise(const Parameters *p) {
+    if (p->input_dtype != TRILLIM_FP32) {
+        return false;
+    }
+    for (size_t axis = 0; axis < p->dimensions; ++axis) {
+        if (p->kernel[axis] != 1 || p->stride[axis] != 1 || p->padding[axis] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool workspace(const Parameters *p, size_t width, size_t positions,
                       size_t *columns, size_t *weights, size_t *stride, size_t *lanes) {
     *weights = 0;
     if (p->weight_dtype != TRILLIM_FP32 && !product(p->outputs, width, weights)) {
         return false;
     }
-    if (*weights >= WORKSPACE_LIMIT || !product(p->groups, width, columns) ||
-        !product(*columns, positions, columns)) {
+    *columns = 0;
+    *stride = positions;
+    *lanes = 0;
+    if (*weights >= WORKSPACE_LIMIT) {
+        return false;
+    }
+    if (pointwise(p)) {
+        return true;
+    }
+    if (!product(p->groups, width, columns) || !product(*columns, positions, columns)) {
         return false;
     }
     size_t budget = WORKSPACE_LIMIT - *weights;
-    *stride = positions;
-    *lanes = 0;
     if (*columns <= COLUMN_LIMIT && *columns <= budget) {
         return true;
     }
@@ -86,6 +109,31 @@ static bool workspace(const Parameters *p, size_t width, size_t positions,
     return product(*lanes, per_lane, columns);
 }
 
+static size_t capped_product(size_t a, size_t b, size_t limit) {
+    return b != 0 && a > limit / b ? limit : a * b;
+}
+
+static size_t reserved_columns(const Parameters *p, size_t width, size_t positions, size_t weights) {
+    if (pointwise(p)) {
+        return 0;
+    }
+    size_t budget = WORKSPACE_LIMIT - weights;
+    size_t full_limit = budget < COLUMN_LIMIT ? budget : COLUMN_LIMIT;
+    size_t full = capped_product(p->groups, width, full_limit + 1);
+    full = capped_product(full, positions, full_limit + 1);
+    if (full <= full_limit) {
+        return full;
+    }
+    /* Smaller shapes can use more memory before packing switches to blocks. */
+    full = full_limit;
+    size_t stride = positions < BLOCK_N ? positions : BLOCK_N;
+    size_t tiles = positions / BLOCK_N + (positions % BLOCK_N != 0);
+    size_t lanes = capped_product(p->groups, tiles, PACK_LANES);
+    size_t blocked = capped_product(width, stride, budget);
+    blocked = capped_product(blocked, lanes, budget);
+    return full > blocked ? full : blocked;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
@@ -96,23 +144,31 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     ) {
         return TRILLIM_ERROR;
     }
+    bool empty = false;
     for (size_t axis = 0; axis < p->dimensions; ++axis) {
         size_t input = p->input_shape[axis], output = p->output_shape[axis];
         size_t kernel = p->kernel[axis], stride = p->stride[axis], padding = p->padding[axis];
         size_t dilation = p->dilation[axis], extra = p->output_padding[axis], effective, spread;
-        if (!input || !output || !kernel || !stride || !dilation ||
+        if (!kernel || !stride || !dilation ||
             input > INT64_MAX || output > INT64_MAX || stride > INT64_MAX || dilation > INT64_MAX ||
             padding > INT64_MAX / 2 ||
             !product(kernel - 1, dilation, &effective) || effective >= INT64_MAX) {
             return TRILLIM_ERROR;
         }
         ++effective;
+        if (!output) {
+            empty = true;
+            continue;
+        }
         (void)extra;
         if (input > INT64_MAX - 2 * padding || input + 2 * padding < effective ||
             output != (input + 2 * padding - effective) / stride + 1 ||
             !product(output - 1, stride, &spread) || spread > INT64_MAX - effective) {
             return TRILLIM_ERROR;
         }
+    }
+    if (empty) {
+        return TRILLIM_OK;
     }
     size_t input_volume, output_volume, kernel_volume, count;
     if (!volume(p->dimensions, p->input_shape, &input_volume) ||
@@ -131,7 +187,6 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     uint32_t compute = p->input_dtype == p->weight_dtype ? p->input_dtype : TRILLIM_FP32;
     if (compute != TRILLIM_FP32 || p->output_dtype != TRILLIM_FP32 ||
         !product(p->channels / p->groups, kernel_volume, &width) ||
-        width < 16 || p->outputs / p->groups < 4 || output_volume < 4 ||
         width > INT32_MAX || output_volume > INT32_MAX ||
         !workspace(p, width, output_volume, &count_columns, &count_weights, &column_stride, &lanes) ||
         count_columns > SIZE_MAX / sizeof(float) ||
@@ -139,13 +194,20 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
         !initialize_blas()) {
         return TRILLIM_ERROR;
     }
-    *scratch = (count_columns + count_weights) * sizeof(float);
+    size_t reservation = reserved_columns(p, width, output_volume, count_weights);
+    *scratch = (reservation + count_weights) * sizeof(float);
     return TRILLIM_OK;
 }
 
 typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
                       const float *, int, float, float *, int);
 static Sgemm sgemm;
+#ifdef __APPLE__
+typedef unsigned (*GetThreading)(void);
+typedef int (*SetThreading)(unsigned);
+static GetThreading get_threading;
+static SetThreading set_threading;
+#endif
 static atomic_uint blas_state = 0;
 
 static bool initialize_blas(void) {
@@ -164,6 +226,14 @@ static bool initialize_blas(void) {
                 if (address != NULL) {
                     _Static_assert(sizeof(sgemm) == sizeof(address), "function pointer size");
                     memcpy(&sgemm, &address, sizeof(sgemm));
+#ifdef __APPLE__
+                    void *getter = dlsym(library, "BLASGetThreading");
+                    void *setter = dlsym(library, "BLASSetThreading");
+                    if (getter != NULL && setter != NULL) {
+                        memcpy(&get_threading, &getter, sizeof(get_threading));
+                        memcpy(&set_threading, &setter, sizeof(set_threading));
+                    }
+#endif
                     break;
                 }
                 FreeLibrary(library);
@@ -182,6 +252,14 @@ static bool initialize_blas(void) {
                 if (address != NULL) {
                     _Static_assert(sizeof(sgemm) == sizeof(address), "function pointer size");
                     memcpy(&sgemm, &address, sizeof(sgemm));
+#ifdef __APPLE__
+                    void *getter = dlsym(library, "BLASGetThreading");
+                    void *setter = dlsym(library, "BLASSetThreading");
+                    if (getter != NULL && setter != NULL) {
+                        memcpy(&get_threading, &getter, sizeof(get_threading));
+                        memcpy(&set_threading, &setter, sizeof(set_threading));
+                    }
+#endif
                     break;
                 }
                 dlclose(library);
@@ -226,15 +304,68 @@ static bool source_position(const Parameters *p, const size_t *out, const size_t
     return true;
 }
 
-static float load(const void *data, size_t index, uint32_t dtype) {
+static void unpack(const void *data, uint32_t dtype, size_t index, size_t count,
+                   size_t stride, float *target) {
     if (dtype == TRILLIM_FP32) {
-        float value;
-        memcpy(&value, (const uint8_t *)data + index * sizeof(value), sizeof(value));
-        return value;
+        const float *source = (const float *)data + index;
+        if (stride == 1) {
+            memcpy(target, source, count * sizeof(float));
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                target[i] = source[i * stride];
+            }
+        }
+    } else if (dtype == TRILLIM_BF16) {
+        const uint16_t *source = (const uint16_t *)data + index;
+        for (size_t i = 0; i < count; ++i) {
+            target[i] = trillim_bf16(source[i * stride]);
+        }
+    } else {
+#if defined(__FLT16_MANT_DIG__)
+        const TrillimFloat16 *source = (const TrillimFloat16 *)data + index;
+        for (size_t i = 0; i < count; ++i) {
+            target[i] = (float)source[i * stride];
+        }
+#else
+        const uint16_t *source = (const uint16_t *)data + index;
+        for (size_t i = 0; i < count; ++i) {
+            target[i] = trillim_fp16(source[i * stride]);
+        }
+#endif
     }
-    uint16_t bits;
-    memcpy(&bits, (const uint8_t *)data + index * sizeof(bits), sizeof(bits));
-    return dtype == TRILLIM_BF16 ? trillim_bf16(bits) : trillim_fp16(bits);
+}
+
+static TrillimStatus pack_columns(const Task *task, size_t input, size_t kernel,
+                                  size_t first, size_t count, float *target) {
+    const Parameters *p = task->p;
+    size_t offset[3], end = first + count, axis = p->dimensions - 1;
+    coordinates(kernel, p->dimensions, p->kernel, offset);
+    for (size_t position = first; position < end;) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t out[3], index;
+        coordinates(position, p->dimensions, p->output_shape, out);
+        bool valid = source_position(p, out, offset, 0, &index);
+        if (valid) {
+            size_t length = end - position;
+            size_t row = p->output_shape[axis] - out[axis];
+            size_t available = (p->input_shape[axis] - 1 - index % p->input_shape[axis]) / p->stride[axis] + 1;
+            if (length > row) {
+                length = row;
+            }
+            if (length > available) {
+                length = available;
+            }
+            unpack(task->input, p->input_dtype, input * task->input_volume + index,
+                   length, p->stride[axis], target + position - first);
+            position += length;
+        } else {
+            target[position - first] = 0;
+            ++position;
+        }
+    }
+    return TRILLIM_OK;
 }
 
 static TrillimStatus pack_weight(void *opaque, size_t tile, size_t worker) {
@@ -242,11 +373,12 @@ static TrillimStatus pack_weight(void *opaque, size_t tile, size_t worker) {
     const Task *task = opaque;
     size_t first = tile * 1024, count = task->p->outputs * task->width;
     size_t end = count - first < 1024 ? count : first + 1024;
-    for (size_t index = first; index < end; ++index) {
-        if ((index & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+    for (size_t index = first; index < end; index += 256) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        task->weights[index] = load(task->weight, index, task->p->weight_dtype);
+        size_t length = end - index < 256 ? end - index : 256;
+        unpack(task->weight, task->p->weight_dtype, index, length, 1, task->weights + index);
     }
     return TRILLIM_OK;
 }
@@ -254,28 +386,17 @@ static TrillimStatus pack_weight(void *opaque, size_t tile, size_t worker) {
 static TrillimStatus im2col(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
-    const Parameters *p = task->p;
-    size_t tiles = task->output_volume / 256 + (task->output_volume % 256 != 0);
-    size_t row = tile / tiles, first = tile % tiles * 256;
-    size_t end = task->output_volume - first < 256 ? task->output_volume : first + 256;
+    size_t width = task->pack_positions;
+    size_t tiles = task->output_volume / width + (task->output_volume % width != 0);
+    size_t row = tile / tiles, first = tile % tiles * width;
+    size_t count = task->output_volume - first < width ? task->output_volume - first : width;
     size_t kernel = row % task->kernel_volume;
     size_t input = row / task->kernel_volume;
-    size_t offset[3];
-    coordinates(kernel, p->dimensions, p->kernel, offset);
-    for (size_t position = first; position < end; ++position) {
-        if ((position & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
-            return TRILLIM_CANCELLED;
-        }
-        size_t out[3], index;
-        coordinates(position, p->dimensions, p->output_shape, out);
-        bool valid = source_position(p, out, offset, 0, &index);
-        task->columns[row * task->output_volume + position] =
-            valid ? load(task->input, input * task->input_volume + index, p->input_dtype) : 0;
-    }
-    return TRILLIM_OK;
+    return pack_columns(task, input, kernel, first, count,
+                        task->columns + row * task->output_volume + first);
 }
 
-static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
+static TrillimStatus convolve_impl(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
     const Parameters *p = task->p;
@@ -294,6 +415,7 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
         n = BLOCK_N;
     }
     const float *weights = p->weight_dtype == TRILLIM_FP32 ? (const float *)task->weight : task->weights;
+    const float *values = pointwise(p) ? (const float *)task->input : task->columns;
     for (size_t first = 0; first < task->width; first += BLOCK_K) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -301,14 +423,14 @@ static TrillimStatus convolve(void *opaque, size_t tile, size_t worker) {
         size_t k = task->width - first < BLOCK_K ? task->width - first : BLOCK_K;
         sgemm(101, 111, 111, (int)m, (int)n, (int)k, 1.0f,
               weights + output * task->width + first, (int)task->width,
-              task->columns + (group * task->width + first) * task->output_volume + position,
+              values + (group * task->width + first) * task->output_volume + position,
               (int)task->output_volume, first == 0 ? 0.0f : 1.0f,
               (float *)task->output + output * task->output_volume + position, (int)task->output_volume);
     }
     return TRILLIM_OK;
 }
 
-static TrillimStatus convolve_blocked(void *opaque, size_t lane, size_t worker) {
+static TrillimStatus convolve_blocked_impl(void *opaque, size_t lane, size_t worker) {
     (void)worker;
     const Task *task = opaque;
     const Parameters *p = task->p;
@@ -321,18 +443,11 @@ static TrillimStatus convolve_blocked(void *opaque, size_t lane, size_t worker) 
         size_t group = tile / tiles, first = tile % tiles * stride;
         size_t n = task->output_volume - first < stride ? task->output_volume - first : stride;
         for (size_t row = 0; row < task->width; ++row) {
-            if (task->context->is_cancelled(task->context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
             size_t input = group * (p->channels / p->groups) + row / task->kernel_volume;
-            size_t offset[3];
-            coordinates(row % task->kernel_volume, p->dimensions, p->kernel, offset);
-            for (size_t position = 0; position < n; ++position) {
-                size_t out[3], index;
-                coordinates(first + position, p->dimensions, p->output_shape, out);
-                bool valid = source_position(p, out, offset, 0, &index);
-                columns[row * stride + position] =
-                    valid ? load(task->input, input * task->input_volume + index, p->input_dtype) : 0;
+            TrillimStatus status = pack_columns(task, input, row % task->kernel_volume,
+                                               first, n, columns + row * stride);
+            if (status != TRILLIM_OK) {
+                return status;
             }
         }
         for (size_t row = 0; row < group_outputs; row += BLOCK_M) {
@@ -353,6 +468,34 @@ static TrillimStatus convolve_blocked(void *opaque, size_t lane, size_t worker) 
     return TRILLIM_OK;
 }
 
+static TrillimStatus convolve(void *opaque, size_t index, size_t worker) {
+#ifdef __APPLE__
+    if (get_threading != NULL && set_threading != NULL) {
+        unsigned previous = get_threading();
+        if (previous != 1 && set_threading(1) == 0) {
+            TrillimStatus status = convolve_impl(opaque, index, worker);
+            (void)set_threading(previous);
+            return status;
+        }
+    }
+#endif
+    return convolve_impl(opaque, index, worker);
+}
+
+static TrillimStatus convolve_blocked(void *opaque, size_t index, size_t worker) {
+#ifdef __APPLE__
+    if (get_threading != NULL && set_threading != NULL) {
+        unsigned previous = get_threading();
+        if (previous != 1 && set_threading(1) == 0) {
+            TrillimStatus status = convolve_blocked_impl(opaque, index, worker);
+            (void)set_threading(previous);
+            return status;
+        }
+    }
+#endif
+    return convolve_blocked_impl(opaque, index, worker);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_conv_blas(void *const *outputs, const void *const *inputs, void *scratch,
                                                   const void *parameters, const TrillimKernelContext *context) {
     const Parameters *p = parameters;
@@ -362,10 +505,15 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_conv_blas(void *const *outputs, cons
     if (!p->outputs) {
         return TRILLIM_OK;
     }
+    for (size_t axis = 0; axis < p->dimensions; ++axis) {
+        if (!p->output_shape[axis]) {
+            return TRILLIM_OK;
+        }
+    }
     if (!initialize_blas()) {
         return TRILLIM_ERROR;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], NULL, (float *)scratch, NULL, p, 0, 0, 0, 0, 0, 0, context};
+    Task task = {outputs[0], inputs[0], inputs[1], NULL, (float *)scratch, NULL, p, 0, 0, 0, 0, 0, 0, 0, context};
     if (!volume(p->dimensions, p->input_shape, &task.input_volume) ||
         !volume(p->dimensions, p->output_shape, &task.output_volume) ||
         !volume(p->dimensions, p->kernel, &task.kernel_volume) ||
@@ -377,7 +525,8 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_conv_blas(void *const *outputs, cons
                    &task.column_stride, &task.lanes)) {
         return TRILLIM_ERROR;
     }
-    task.weights = task.columns + column_count;
+    task.weights = column_count ? task.columns + column_count : task.columns;
+    task.pack_positions = p->channels * task.kernel_volume / 4 >= context->thread_pool->worker_count ? PACK_POSITIONS : 256;
     TrillimStatus status;
     if (p->weight_dtype != TRILLIM_FP32) {
         size_t tiles = weight_count / 1024 + (weight_count % 1024 != 0);
@@ -389,10 +538,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_conv_blas(void *const *outputs, cons
     if (task.lanes) {
         status = context->thread_pool->run(context->thread_pool->context, task.lanes, convolve_blocked, &task);
     } else {
-        size_t positions = task.output_volume / 256 + (task.output_volume % 256 != 0);
-        status = context->thread_pool->run(context->thread_pool->context, p->channels * task.kernel_volume * positions, im2col, &task);
-        if (status != TRILLIM_OK) {
-            return status;
+        if (!pointwise(p)) {
+            size_t positions = task.output_volume / task.pack_positions + (task.output_volume % task.pack_positions != 0);
+            status = context->thread_pool->run(context->thread_pool->context, p->channels * task.kernel_volume * positions, im2col, &task);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
         }
         size_t columns = task.output_volume / BLOCK_N + (task.output_volume % BLOCK_N != 0);
         size_t outputs_per_group = p->outputs / p->groups;
@@ -433,6 +584,19 @@ TRILLIM_KERNEL const char *trillim_scalar_conv_blas_tdl(void) {
            "    out=w.shape[0]\n"
            "    if w.shape[1]!=_constant_expression(x.shape[0].value//g) or o.shape[0]!=out or out.op!='const' or out.value is None or out.value%g:\n"
            "        raise ValueError('convolution channel shapes differ')\n"
+           "    width=x.shape[0].value//g\n"
+           "    for item in k:\n"
+           "        width*=item\n"
+           "    group_outputs=out.value//g\n"
+           "    if width<16 or group_outputs<4:\n"
+           "        raise ValueError('BLAS convolution requires sufficiently large fixed channels')\n"
+           "    if all(v.op=='const' for v in o.shape[1:]):\n"
+           "        positions=1\n"
+           "        for v in o.shape[1:]:\n"
+           "            positions*=v.value\n"
+           "        direct=x.dtype=='fp32' and all(v==1 for v in k+s) and all(v==0 for v in p)\n"
+           "        if positions<4 or (not direct and ((positions<128 and group_outputs<512) or (group_outputs<16 and positions<512))):\n"
+           "            raise ValueError('BLAS convolution requires a larger fixed output')\n"
            "    for t in (*c.inputs.values(),o):\n"
            "        if t.dtype not in ('fp16','bf16','fp32') or (t.strides or _contiguous_strides(t.shape))!=_contiguous_strides(t.shape):\n"
            "            raise ValueError('convolution requires contiguous floating tensors')\n"
@@ -457,7 +621,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_conv_blas_parameters
         {"bias_dtype", "uint32_t", offsetof(Parameters, bias_dtype), NULL},
         {"output_dtype", "uint32_t", offsetof(Parameters, output_dtype), NULL},
     };
-    static const size_t inputs[] = {1, 4, 1}, outputs[] = {4};
+    static const size_t inputs[] = {4, 4, 1}, outputs[] = {4};
     static const TrillimParameterSchema schema = {
         sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), sizeof(fields) / sizeof(fields[0]), fields,
         2, 1, requirements, NULL, inputs, outputs, 4
