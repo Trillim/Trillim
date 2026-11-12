@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from trillim.compiler.compile import _compile_model
 from trillim.compiler.compiler_pydantic_models import _CompileRequest
+from trillim.compiler.weights.reader import _load_checkpoint
 from trillim.runtime import Runtime
 
 
@@ -85,6 +86,7 @@ class KernelSymbol(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
 
     symbol: str
+    library: str
 
 
 class InstructionSymbol(BaseModel):
@@ -317,6 +319,10 @@ def compile_bundle(options: Options) -> None:
     source_path.write_text(source)
     if options.output.exists():
         return
+    checkpoint = _load_checkpoint("model", options.checkpoint)
+    files = {value.path: value.file_size for value in checkpoint.tensors.values()}
+    if sum(files.values()) > 32_000_000_000:
+        raise ValueError("checkpoint weights exceed the 32 GB size limit")
     request = _CompileRequest(
         tdl_path=source_path,
         checkpoints={"model": options.checkpoint},
@@ -387,9 +393,8 @@ def benchmark(
             f"repeat {repeat + 1}: prefill {prefill[-1]:.6f}s, decode {1 / statistics.median(decode[-options.decode :]):.3f} token/s",
             flush=True,
         )
-    manifest = ManifestSymbols.model_validate_json(
-        (options.output / "executable.json").read_bytes()
-    )
+    executable_bytes = (options.output / "executable.json").read_bytes()
+    manifest = ManifestSymbols.model_validate_json(executable_bytes)
     symbols = sorted({metadata.symbol for metadata in manifest.kernels.values()})
     counts = instruction_calls(manifest.program)
     result: dict[str, object] = {
@@ -412,7 +417,7 @@ def benchmark(
         "activation_dtype": "fp32",
         "kv_dtype": "fp32",
         "backend": "scalar",
-        "timing_scope": "Runtime.run including binding, Python executor, native kernels, and output copy; excludes tokenization, model loading, and compilation",
+        "timing_scope": "Runtime.run including binding, Python executor, native kernels, and output copy; excludes tokenization, greedy token selection, model loading, and compilation",
         "prefill_seconds": prefill,
         "prefill_median_seconds": statistics.median(prefill),
         "prefill_tokens_per_second": options.prompt / statistics.median(prefill),
@@ -424,6 +429,11 @@ def benchmark(
         "prefill_logit_min": min(logits_first),
         "prefill_logit_max": max(logits_first),
         "kernels": symbols,
+        "executable_sha256": hashlib.sha256(executable_bytes).hexdigest(),
+        "kernel_library_sha256": {
+            name: hashlib.sha256((options.output / name).read_bytes()).hexdigest()
+            for name in sorted({value.library for value in manifest.kernels.values()})
+        },
         "kernel_call_counts": dict(counts),
         "kernel_call_count_scope": "static explicit native call instructions, including nested loop/branch/reduction programs; each body counted once",
         "neon_kernel_call_count": sum(
