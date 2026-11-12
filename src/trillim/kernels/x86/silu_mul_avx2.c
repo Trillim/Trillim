@@ -19,6 +19,21 @@ typedef struct {
 
 TRILLIM_AVX2 static __m256 load8(const void *data, size_t index, uint32_t dtype) {
     if (dtype == TRILLIM_FP32) return _mm256_loadu_ps((const float *)data + index);
+    if (dtype == TRILLIM_FP16) {
+        __m128i raw = _mm_loadu_si128((const __m128i *)((const uint16_t *)data + index));
+        __m256i h = _mm256_cvtepu16_epi32(raw);
+        __m256i fraction = _mm256_and_si256(h, _mm256_set1_epi32(1023));
+        __m256i exponent = _mm256_and_si256(h, _mm256_set1_epi32(0x7c00));
+        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, _mm256_set1_epi32(0x8000)), 16);
+        __m256i normal = _mm256_add_epi32(_mm256_slli_epi32(_mm256_and_si256(h, _mm256_set1_epi32(0x7fff)), 13),
+                                          _mm256_set1_epi32(112 << 23));
+        __m256 subnormal = _mm256_mul_ps(_mm256_cvtepi32_ps(fraction), _mm256_set1_ps(0x1p-24f));
+        normal = _mm256_blendv_epi8(normal, _mm256_castps_si256(subnormal),
+                                    _mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
+        __m256i special = _mm256_or_si256(_mm256_set1_epi32(0x7f800000), _mm256_slli_epi32(fraction, 13));
+        normal = _mm256_blendv_epi8(normal, special, _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(0x7c00)));
+        return _mm256_castsi256_ps(_mm256_or_si256(normal, sign));
+    }
     __m128i raw = _mm_loadu_si128((const __m128i *)((const uint16_t *)data + index));
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
 }
@@ -26,6 +41,15 @@ TRILLIM_AVX2 static __m256 load8(const void *data, size_t index, uint32_t dtype)
 TRILLIM_AVX2 static void store8(void *data, size_t index, uint32_t dtype, __m256 value) {
     if (dtype == TRILLIM_FP32) {
         _mm256_storeu_ps((float *)data + index, value);
+        return;
+    }
+    if (dtype == TRILLIM_FP16) {
+        float lanes[8];
+        _mm256_storeu_ps(lanes, value);
+        for (size_t lane = 0; lane < 8; ++lane) {
+            TrillimValue item = {.f = lanes[lane]};
+            trillim_store(data, index + lane, dtype, item);
+        }
         return;
     }
     __m256i bits = _mm256_castps_si256(value);
@@ -49,9 +73,9 @@ static inline TrillimStatus trillim_activation_requirements(const void *paramete
     outputs[0] = 0;
     *scratch = 0;
     size_t bytes = trillim_itemsize(p->input_dtype), output_bytes = trillim_itemsize(p->output_dtype);
-    if ((p->input_dtype != TRILLIM_FP32 && p->input_dtype != TRILLIM_BF16) ||
-        (p->output_dtype != TRILLIM_FP32 && p->output_dtype != TRILLIM_BF16) || p->count > SIZE_MAX / bytes ||
-        p->count > SIZE_MAX / output_bytes) {
+    if ((p->input_dtype != TRILLIM_FP32 && p->input_dtype != TRILLIM_BF16 && p->input_dtype != TRILLIM_FP16) ||
+        (p->output_dtype != TRILLIM_FP32 && p->output_dtype != TRILLIM_BF16 && p->output_dtype != TRILLIM_FP16) ||
+        p->count > SIZE_MAX / bytes || p->count > SIZE_MAX / output_bytes) {
         return TRILLIM_ERROR;
     }
     inputs[0] = p->count * bytes;
@@ -112,8 +136,22 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_silu_mul_avx2(void *const *outputs, con
 
 TRILLIM_KERNEL const char *trillim_x86_silu_mul_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _silu_mul as bind\n"
-           "def pattern(a: Tensor, b: Tensor, *, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
+           "from trillim.compiler.kernels.bindings import _silu_mul, _product, "
+           "_contiguous_strides, _DTYPE_IDS\n"
+           "def bind(c):\n"
+           "    if c.inputs['a'].dtype != 'fp16': return _silu_mul(c)\n"
+           "    a, b = c.inputs['a'], c.inputs['b']\n"
+           "    o = c.outputs[0]\n"
+           "    if b.dtype != 'fp16' or a.shape != b.shape or a.shape != o.shape "
+           "or o.dtype not in ('fp16', 'bf16', 'fp32'): raise "
+           "ValueError('incompatible floating gate tensors')\n"
+           "    if any((v.strides or _contiguous_strides(v.shape)) != "
+           "_contiguous_strides(v.shape) for v in (a,b,o)): raise "
+           "ValueError('gate requires contiguous tensors')\n"
+           "    return dict(count=_product(o.shape), "
+           "input_dtype=_DTYPE_IDS[a.dtype], output_dtype=_DTYPE_IDS[o.dtype])\n"
+           "def pattern(a: Tensor, b: Tensor, *, dtype: DType = 'fp32') -> "
+           "tuple[Tensor, ...]:\n"
            "    return (SiluMul(a, b, dtype=dtype),)\n";
 }
 
