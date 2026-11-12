@@ -194,8 +194,8 @@ static inline __attribute__((always_inline)) void decode16(
         memcpy(&scale, &scale_bits, sizeof(scale));
         int16x8_t low = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(magnitude)));
         int16x8_t high = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(magnitude)));
-        uint16x8_t sign0 = vshll_n_u8(vget_low_u8(vandq_u8(code, vdupq_n_u8(8))), 12);
-        uint16x8_t sign1 = vshll_n_u8(vget_high_u8(vandq_u8(code, vdupq_n_u8(8))), 12);
+        uint16x8_t sign0 = vshlq_n_u16(vmovl_u8(vget_low_u8(vandq_u8(code, vdupq_n_u8(8)))), 12);
+        uint16x8_t sign1 = vshlq_n_u16(vmovl_u8(vget_high_u8(vandq_u8(code, vdupq_n_u8(8)))), 12);
         result[0] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_low_s16(low), scale)), vshll_n_u16(vget_low_u16(sign0), 16)));
         result[1] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_high_s16(low), scale)), vshll_n_u16(vget_high_u16(sign0), 16)));
         result[2] = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(convert4(vget_low_s16(high), scale)), vshll_n_u16(vget_low_u16(sign1), 16)));
