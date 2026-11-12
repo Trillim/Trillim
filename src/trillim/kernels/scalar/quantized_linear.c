@@ -57,7 +57,29 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     float scale = task->scales[row];
     for (size_t column = begin; column < end; ++column) {
         int64_t sum = 0;
-        for (size_t k = 0; k < p->width; ++k) {
+        size_t k = 0;
+        for (; p->width - k >= 128; k += 128) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const uint8_t *weight = task->weight + column * packed_row + (k / 128) * 32;
+            const int8_t *input = task->codes + row * p->width + k;
+            int32_t partial = 0;
+            uint32_t invalid = 0;
+            for (size_t i = 0; i < 32; ++i) {
+                uint32_t packed = weight[i];
+                invalid |= packed & (packed >> 1) & UINT32_C(0x55);
+                partial += (int32_t)input[i] * ((int32_t)(packed >> 6) - 1);
+                partial += (int32_t)input[i + 32] * ((int32_t)((packed >> 4) & 3) - 1);
+                partial += (int32_t)input[i + 64] * ((int32_t)((packed >> 2) & 3) - 1);
+                partial += (int32_t)input[i + 96] * ((int32_t)(packed & 3) - 1);
+            }
+            if (invalid != 0) {
+                return TRILLIM_ERROR;
+            }
+            sum += partial;
+        }
+        for (; k < p->width; ++k) {
             if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
