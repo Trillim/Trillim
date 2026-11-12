@@ -81,6 +81,17 @@ static bool blas_shape(const Parameters *p) {
     return large || medium || vocabulary || contiguous;
 }
 
+static bool reserve_blas(const Parameters *p) {
+    if (precise(p) || p->n < 32 || p->k < 32) {
+        return false;
+    }
+    bool large = p->m >= 64 && p->n > 65535 / p->k;
+    bool medium = p->m >= 32 && p->n > 2097152 / p->k;
+    bool vocabulary = p->m >= 16 && p->n >= 32768 && p->k >= 512;
+    bool possibly_contiguous = p->k >= 256 && p->n > 32767 / p->k;
+    return large || medium || vocabulary || possibly_contiguous;
+}
+
 static bool use_blas(const Parameters *p) {
     return blas_shape(p) && initialize_blas();
 }
@@ -146,10 +157,10 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     inputs[2] = p->n * trillim_itemsize(p->bias_dtype);
     outputs[0] = p->batches * p->m * p->n * trillim_itemsize(p->out_dtype);
     /* Reserve optional-library workspace independently of host availability. */
-    if (blas_shape(p)) {
+    if (reserve_blas(p)) {
         (void)initialize_blas();
         size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
-        size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
+        size_t columns = p->n / 64 + (p->n % 64 != 0);
         size_t count = p->batches * rows * columns;
         *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
     }
