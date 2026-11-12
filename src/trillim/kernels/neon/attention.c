@@ -39,8 +39,7 @@ BF16 static inline float32x4_t dot_bf16(float32x4_t sum, uint16x8_t a, uint16x8_
 #include <dlfcn.h>
 #endif
 
-#define BLAS_QUERIES 64
-#define BLAS_KEYS 128
+#define BLAS_MAX_QUERIES 128
 
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
     size_t itemsize = trillim_itemsize(dtype);
@@ -232,6 +231,8 @@ typedef struct {
     const TrillimKernelContext *context;
     bool use_bf16;
     atomic_bool *ordinary;
+    size_t blas_queries;
+    size_t blas_keys;
 } TrillimAttentionTask;
 
 static inline bool trillim_attention_span(const size_t *shape, const size_t *strides, size_t rows, size_t columns) {
@@ -327,16 +328,20 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         if (p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 && p->v_dtype == TRILLIM_FP32 &&
             p->queries >= 32 && p->length >= 64) {
             /* Library availability and smaller execution shapes cannot reduce this envelope. */
-            size_t blas_groups = p->queries / BLAS_QUERIES + (p->queries % BLAS_QUERIES != 0);
-            size_t blas_slots = p->heads * blas_groups < 128 ? p->heads * blas_groups : 128;
+            static const size_t blas_tiles[][2] = {{64, 128}, {64, 256}, {128, 256}};
             size_t blas_value_dim = p->value_dim < 256 ? p->value_dim : 256;
-            size_t bytes = blas_slots * BLAS_QUERIES * (blas_value_dim + BLAS_KEYS) * sizeof(float);
-            if (bytes > SIZE_MAX - fallback_bytes) {
-                return TRILLIM_ERROR;
-            }
-            bytes += fallback_bytes;
-            if (bytes > *scratch) {
-                *scratch = bytes;
+            for (size_t tile = 0; tile < sizeof(blas_tiles) / sizeof(blas_tiles[0]); ++tile) {
+                size_t queries = blas_tiles[tile][0], keys = blas_tiles[tile][1];
+                size_t groups = p->queries / queries + (p->queries % queries != 0);
+                size_t slots = p->heads * groups < 128 ? p->heads * groups : 128;
+                size_t bytes = slots * queries * (blas_value_dim + keys) * sizeof(float);
+                if (bytes > SIZE_MAX - fallback_bytes) {
+                    return TRILLIM_ERROR;
+                }
+                bytes += fallback_bytes;
+                if (bytes > *scratch) {
+                    *scratch = bytes;
+                }
             }
         }
     }
@@ -1286,16 +1291,16 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
 static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, size_t slot) {
     const TrillimAttentionParameters *p = task->parameters;
     const TrillimKernelContext *context = task->context;
-    size_t groups = p->queries / BLAS_QUERIES + (p->queries % BLAS_QUERIES != 0);
+    size_t groups = p->queries / task->blas_queries + (p->queries % task->blas_queries != 0);
     size_t head = index / groups, kv_head = head / (p->heads / p->kv_heads);
-    size_t first = index % groups * BLAS_QUERIES;
-    size_t rows = p->queries - first < BLAS_QUERIES ? p->queries - first : BLAS_QUERIES;
+    size_t first = index % groups * task->blas_queries;
+    size_t rows = p->queries - first < task->blas_queries ? p->queries - first : task->blas_queries;
     size_t fallback_groups = p->queries / 16 + (p->queries % 16 != 0);
     size_t fallback_size = p->heads * fallback_groups * (p->value_dim + 64);
-    float *scores = task->scratch + fallback_size + slot * BLAS_QUERIES * (p->value_dim + BLAS_KEYS);
-    float *accumulator = scores + BLAS_QUERIES * BLAS_KEYS;
-    float maximum[BLAS_QUERIES], denominator[BLAS_QUERIES];
-    size_t begin[BLAS_QUERIES], end[BLAS_QUERIES];
+    float *scores = task->scratch + fallback_size + slot * task->blas_queries * (p->value_dim + task->blas_keys);
+    float *accumulator = scores + task->blas_queries * task->blas_keys;
+    float maximum[BLAS_MAX_QUERIES], denominator[BLAS_MAX_QUERIES];
+    size_t begin[BLAS_MAX_QUERIES], end[BLAS_MAX_QUERIES];
     size_t first_key = p->length, last_key = 0;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
     for (size_t row = 0; row < rows; ++row) {
@@ -1317,20 +1322,20 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
         }
     }
     const float *query = (const float *)task->query + head * p->q_strides[0] + first * p->q_strides[1];
-    for (size_t block = first_key; block < last_key; block += BLAS_KEYS) {
+    for (size_t block = first_key; block < last_key; block += task->blas_keys) {
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        size_t count = last_key - block < BLAS_KEYS ? last_key - block : BLAS_KEYS;
+        size_t count = last_key - block < task->blas_keys ? last_key - block : task->blas_keys;
         const float *keys = (const float *)task->keys + kv_head * p->k_strides[0] + block * p->k_strides[1];
         sgemm(101, 111, 112, (int)rows, (int)count, (int)p->key_dim, scale,
-              query, (int)p->q_strides[1], keys, (int)p->k_strides[1], 0, scores, BLAS_KEYS);
+              query, (int)p->q_strides[1], keys, (int)p->k_strides[1], 0, scores, task->blas_keys);
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
         for (size_t row = 0; row < rows; ++row) {
             float peak = -INFINITY;
-            float *probabilities = scores + row * BLAS_KEYS;
+            float *probabilities = scores + row * task->blas_keys;
             for (size_t key = 0; key < count; ++key) {
                 if (block + key < begin[row] || block + key >= end[row]) {
                     probabilities[key] = -INFINITY;
@@ -1365,7 +1370,7 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
         }
         const float *values = (const float *)task->values + kv_head * p->v_strides[0] + block * p->v_strides[1];
         sgemm(101, 111, 111, (int)rows, (int)p->value_dim, (int)count, 1,
-              scores, BLAS_KEYS, values, (int)p->v_strides[1], 1, accumulator, (int)p->value_dim);
+              scores, task->blas_keys, values, (int)p->v_strides[1], 1, accumulator, (int)p->value_dim);
     }
     for (size_t row = 0; row < rows; ++row) {
         if (context->is_cancelled(context->cancellation_context)) {
@@ -1388,10 +1393,10 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
 static TrillimStatus fallback_blas_tile(void *opaque, size_t index, size_t worker) {
     const TrillimAttentionTask *task = opaque;
     const TrillimAttentionParameters *p = task->parameters;
-    size_t groups = p->queries / BLAS_QUERIES + (p->queries % BLAS_QUERIES != 0);
+    size_t groups = p->queries / task->blas_queries + (p->queries % task->blas_queries != 0);
     size_t fallback_groups = p->queries / 16 + (p->queries % 16 != 0);
-    size_t head = index / groups, first = index % groups * BLAS_QUERIES;
-    size_t last = p->queries - first < BLAS_QUERIES ? p->queries : first + BLAS_QUERIES;
+    size_t head = index / groups, first = index % groups * task->blas_queries;
+    size_t last = p->queries - first < task->blas_queries ? p->queries : first + task->blas_queries;
     for (size_t query = first; query < last; query += 16) {
         TrillimStatus status = trillim_attention_task(opaque, head * fallback_groups + query / 16, worker);
         if (status != TRILLIM_OK) {
@@ -1404,7 +1409,7 @@ static TrillimStatus fallback_blas_tile(void *opaque, size_t index, size_t worke
 static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
     const TrillimAttentionTask *task = opaque;
     const TrillimAttentionParameters *p = task->parameters;
-    size_t groups = p->queries / BLAS_QUERIES + (p->queries % BLAS_QUERIES != 0);
+    size_t groups = p->queries / task->blas_queries + (p->queries % task->blas_queries != 0);
     size_t tiles = p->heads * groups;
     size_t slots = tiles < 128 ? tiles : 128;
     bool enabled = true;
@@ -1443,10 +1448,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     }
     atomic_bool ordinary = ATOMIC_VAR_INIT(true);
     TrillimAttentionTask task = {
-        outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context, false, &ordinary
+        outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context, false, &ordinary, 64, 128
     };
     bool optimized = optimized_layout(p);
     size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
+    task.blas_queries = p->queries >= 512 && visible >= 512 ? 128 : 64;
+    task.blas_keys = visible >= 256 ? 256 : 128;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
     bool blas_rows = !p->length || p->kv_heads <= (SIZE_MAX - p->heads * p->queries) / 2 / p->length;
     if (optimized && p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 && p->v_dtype == TRILLIM_FP32 &&
@@ -1462,7 +1469,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
             return status;
         }
         if (atomic_load_explicit(&ordinary, memory_order_relaxed)) {
-            size_t groups = p->queries / BLAS_QUERIES + (p->queries % BLAS_QUERIES != 0);
+            size_t groups = p->queries / task.blas_queries + (p->queries % task.blas_queries != 0);
             size_t slots = p->heads * groups < 128 ? p->heads * groups : 128;
             return context->thread_pool->run(context->thread_pool->context, slots, blas_task, &task);
         }
