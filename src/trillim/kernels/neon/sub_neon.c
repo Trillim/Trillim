@@ -118,7 +118,7 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return trillim_contiguous(p->rank, p->shape, input == 0 ? p->a_strides : p->b_strides);
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_sub(
+TRILLIM_KERNEL TrillimStatus trillim_neon_elementwise_sub(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -145,7 +145,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_sub(
     return context->thread_pool->run(context->thread_pool->context, tiles, apply, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_sub_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_elementwise_sub_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _binary\n"
            "def bind(c):\n"
@@ -157,7 +157,7 @@ TRILLIM_KERNEL const char *trillim_neon_sub_tdl(void) {
            "    return (Sub(a,b),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sub_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_elementwise_sub_parameters(void) {
     static const TrillimParameter fields[] = {
         {"count", "size_t", offsetof(Parameters, count), NULL},
         {"rank", "size_t", offsetof(Parameters, rank), NULL},
@@ -174,7 +174,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sub_parameters(void) {
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_sub_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_elementwise_sub_capabilities(void) {
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_NEON_REQUIRED};
     return &capabilities;
 }

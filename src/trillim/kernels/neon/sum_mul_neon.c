@@ -199,7 +199,7 @@ static TrillimStatus reduce_columns(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_sum_mul(
+TRILLIM_KERNEL TrillimStatus trillim_neon_reduce_sum_mul(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -217,7 +217,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_sum_mul(
         context->thread_pool->run(context->thread_pool->context, p->heads * tiles, reduce_columns, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_sum_mul_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_reduce_sum_mul_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _broadcast_strides, _native_dtype, _storage_shape\n"
            "from trillim.compiler.passes.infer import _constant_expression, _expression, _promote\n"
@@ -244,7 +244,7 @@ TRILLIM_KERNEL const char *trillim_neon_sum_mul_tdl(void) {
            "    return (Sum(Mul(a, b), axes=(-2,)),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sum_mul_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_reduce_sum_mul_parameters(void) {
     static const TrillimParameter fields[] = {
         {"heads", "size_t", offsetof(Parameters, heads), NULL},
         {"reduce", "size_t", offsetof(Parameters, reduce), NULL},
@@ -268,7 +268,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sum_mul_parameters(voi
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_sum_mul_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_reduce_sum_mul_capabilities(void) {
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION,
 #if defined(__APPLE__) && defined(__aarch64__)
         /* AArch64 NEON is baseline; macOS catalog hardware flags are unavailable. */

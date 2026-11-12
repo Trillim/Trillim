@@ -108,7 +108,7 @@ static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_sigmoid(
+TRILLIM_KERNEL TrillimStatus trillim_neon_activation_sigmoid(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -125,7 +125,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_sigmoid(
     return context->thread_pool->run(context->thread_pool->context, tiles, activate, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_sigmoid_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_activation_sigmoid_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _contiguous_strides, _native_dtype, _product\n"
            "\n"
@@ -146,7 +146,7 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return output == 0 && input == 0;
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sigmoid_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_activation_sigmoid_parameters(void) {
     static const TrillimParameter fields[] = {
         {"count", "size_t", offsetof(Parameters, count), NULL},
         {"dtype", "uint32_t", offsetof(Parameters, dtype), NULL}
@@ -159,7 +159,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_sigmoid_parameters(voi
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_sigmoid_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_activation_sigmoid_capabilities(void) {
     static const TrillimCapabilities capabilities = {
         TRILLIM_KERNEL_ABI_VERSION,
 #if defined(__APPLE__) && defined(__aarch64__)

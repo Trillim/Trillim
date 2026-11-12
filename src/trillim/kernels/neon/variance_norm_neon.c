@@ -163,7 +163,7 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return output == 0 && input == 0 && p->input_dtype == p->output_dtype;
 }
 
-TRILLIM_KERNEL TrillimStatus trillim_neon_variance_norm(
+TRILLIM_KERNEL TrillimStatus trillim_neon_normalize_variance(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
@@ -177,7 +177,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_variance_norm(
                         : context->thread_pool->run(context->thread_pool->context, p->rows, normalize, &task);
 }
 
-TRILLIM_KERNEL const char *trillim_neon_variance_norm_tdl(void) {
+TRILLIM_KERNEL const char *trillim_neon_normalize_variance_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _rmsnorm, _contiguous_strides\n"
            "def bind(c):\n"
@@ -197,7 +197,7 @@ TRILLIM_KERNEL const char *trillim_neon_variance_norm_tdl(void) {
            "    return (result if dtype is None else Cast(result, dtype),)\n";
 }
 
-TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_variance_norm_parameters(void) {
+TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_normalize_variance_parameters(void) {
     static const TrillimParameter fields[] = {
         {"rows", "size_t", offsetof(Parameters, rows), NULL},
         {"width", "size_t", offsetof(Parameters, width), NULL},
@@ -216,7 +216,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_variance_norm_paramete
     return &schema;
 }
 
-TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_variance_norm_capabilities(void) {
+TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_normalize_variance_capabilities(void) {
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_NEON_REQUIRED | TRILLIM_CAP_LIBM};
     return &capabilities;
 }
