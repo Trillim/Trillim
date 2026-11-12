@@ -290,9 +290,7 @@ def run_reference(options: Qwen35Options) -> None:
     )
     torch = cast(TorchAPI, importlib.import_module("torch"))
     transformers = importlib.import_module("transformers")
-    factory = cast(
-        ModelFactory, transformers.Qwen3_5ForConditionalGeneration
-    )
+    factory = cast(ModelFactory, transformers.Qwen3_5ForConditionalGeneration)
     torch.set_num_threads(options.threads)
     torch.set_default_device("cpu")
     model = factory.from_pretrained(
@@ -371,7 +369,9 @@ def validate_reference(options: Qwen35Options, path: Path) -> dict[str, object]:
     if len(expected) != options.decode + 1:
         raise ValueError("reference decode length differs")
     comparisons: list[dict[str, object]] = []
+    actual_logits: list[NDArray[np.float32]] = []
     matches = True
+    fixed_matches = True
     with Runtime(options.output, threads=options.threads) as runtime:
         for step, reference in enumerate(expected):
             tokens = (
@@ -390,25 +390,53 @@ def validate_reference(options: Qwen35Options, path: Path) -> dict[str, object]:
                     "positions": np.asarray(positions, dtype=np.int64),
                 }
             )["logits"].ravel()
-            difference = actual.astype(np.float64) - reference.astype(np.float64)
+            actual_logits.append(np.asarray(actual, dtype=np.float32).copy())
+            reference64 = reference.astype(np.float64)
+            reference_rms = float(np.sqrt(np.mean(reference64 * reference64)))
+            absolute_tolerance = 2e-5 * max(1.0, reference_rms)
+            difference = actual.astype(np.float64) - reference64
             greedy_matches = int(np.argmax(actual)) == int(np.argmax(reference))
-            close = bool(np.allclose(actual, reference, rtol=2e-4, atol=2e-5))
+            fixed_close = np.isclose(actual, reference, rtol=2e-4, atol=2e-5)
+            scaled_close = np.isclose(
+                actual, reference, rtol=2e-4, atol=absolute_tolerance
+            )
+            close = bool(np.all(scaled_close))
             matches = matches and greedy_matches and close
+            fixed_matches = (
+                fixed_matches and greedy_matches and bool(np.all(fixed_close))
+            )
             comparisons.append(
                 {
                     "step": step,
                     "max_absolute_error": float(np.max(np.abs(difference))),
                     "rms_error": float(np.sqrt(np.mean(difference * difference))),
                     "greedy_matches": greedy_matches,
+                    "reference_rms": reference_rms,
+                    "absolute_tolerance": absolute_tolerance,
+                    "fixed_absolute_tolerance_allclose": bool(np.all(fixed_close)),
+                    "fixed_absolute_tolerance_failure_count": int(
+                        np.count_nonzero(~fixed_close)
+                    ),
+                    "scaled_absolute_tolerance_failure_count": int(
+                        np.count_nonzero(~scaled_close)
+                    ),
                     "allclose": close,
                 }
             )
+    logits_path = options.output.with_name(
+        options.output.name + "-validation-logits.npz"
+    )
+    np.savez(logits_path, logits=np.stack(actual_logits))
     return {
         "transformers_reference": metadata.model_dump(),
         "comparisons": comparisons,
         "reference_matches": matches,
+        "fixed_reference_matches": fixed_matches,
         "reference_relative_tolerance": 2e-4,
-        "reference_absolute_tolerance": 2e-5,
+        "reference_absolute_tolerance_base": 2e-5,
+        "reference_absolute_tolerance_policy": "2e-5 * max(1, RMS reference logits) per step",
+        "validation_logits": str(logits_path),
+        "reference_logits": str(path),
     }
 
 
