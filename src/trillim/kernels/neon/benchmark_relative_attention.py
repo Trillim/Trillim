@@ -227,15 +227,15 @@ def main() -> None:
             neon_seconds = median(samples["neon"])
             speedup = median(samples["scalar"]) / neon_seconds if neon_seconds else None
             results.append(
-                dict(
-                    shape=[length, heads, width, value_width],
-                    stride=stride,
-                    threads=threads,
-                    correct=True,
-                    maximum_error=maximum_error,
-                    samples_seconds=samples,
-                    speedup=speedup,
-                )
+                {
+                    "shape": [length, heads, width, value_width],
+                    "stride": stride,
+                    "threads": threads,
+                    "correct": True,
+                    "maximum_error": maximum_error,
+                    "samples_seconds": samples,
+                    "speedup": speedup,
+                }
             )
             ratio = f"{speedup:.2f}" if speedup is not None else "below timer"
             print(
@@ -249,22 +249,22 @@ def main() -> None:
             for backend in libraries
         ),
     ]
-    report = dict(
-        command=sys.argv,
-        seed=20261112,
-        machine=platform.machine(),
-        platform=platform.platform(),
-        graph_matches=graph_matches,
-        libraries={
+    report = {
+        "command": sys.argv,
+        "seed": 20261112,
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+        "graph_matches": graph_matches,
+        "libraries": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in libraries.values()
         },
-        current_sources={
+        "current_sources": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in source_paths
         },
-        results=results,
-    )
+        "results": results,
+    }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Saved {len(results)} cases to {arguments.output}")
