@@ -2,7 +2,8 @@
 
 Original E2M1 nibbles and E8M0 exponent bytes are copied into the canonical
 Trillim layout. Activations are deterministic synthetic FP32; outputs are FP32.
-This measures individual expert Linear projections, not full MoE/model latency.
+This measures individual expert Linear or Matmul projections, not full MoE/model
+latency. Matmul mode also checks matching of the unchanged GPT-oss MoE graph.
 Kernel timing excludes checkpoint loading, packing, allocation and pool creation.
 """
 
@@ -15,10 +16,11 @@ import json
 import platform
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from statistics import median
-from typing import get_args
+from typing import cast, get_args
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,11 +33,20 @@ from trillim.compiler.bench.bench_dataclasses import (
 )
 from trillim.compiler.dtype import _decode, _import_mxfp4
 from trillim.compiler.kernels.build import _build_cpu
-from trillim.compiler.kernels.native import _read_schema
+from trillim.compiler.kernels.kernel_dataclasses import (
+    _Kernel,
+    _KernelBindingContext,
+    _ParameterValue,
+)
+from trillim.compiler.kernels.native import _read_capabilities, _read_schema
+from trillim.compiler.passes.infer import _infer
+from trillim.compiler.passes.match import _match
+from trillim.compiler.passes.optimize import _optimize
 from trillim.compiler.weights.reader import _load_checkpoint, _unchanged
 from trillim.compiler.weights.weights_dataclasses import _Checkpoint, _WeightSource
 from trillim.kernels.neon.benchmark_mxfp4_dataclasses import _Mxfp4Expert
 from trillim.kernels.neon.benchmark_weights import _compare, _measure, _sample_reference
+from trillim.tdl import GptOssMoE, Graph, Input, Output, Tensor
 from trillim.tdl.core.types import DType
 
 _ROOT = Path.home() / ".trillim/kernel-perf-20261112"
@@ -58,6 +69,7 @@ class _Arguments(argparse.Namespace):
     threads: int
     rounds: int
     prepare_only: bool
+    operation: str
 
 
 def _sources(
@@ -264,6 +276,50 @@ def _available(library: Path, kernel: str) -> bool:
     return library.is_file() and hasattr(c.CDLL(str(library)), kernel)
 
 
+def _moe_graph_matches(library: Path, name: str) -> dict[str, int]:
+    native = c.CDLL(str(library))
+    function = getattr(native, name + "_tdl")
+    function.restype = c.c_char_p
+    namespace: dict[str, object] = {}
+    exec(function().decode(), namespace)  # noqa: S102 - trusted kernel metadata
+    kernel = _Kernel(
+        name,
+        "neon" if "neon" in name else "scalar",
+        cast(Callable[..., tuple[Tensor, ...]], namespace["pattern"]),
+        _read_schema(native, name),
+        _read_capabilities(native, name),
+        cast(
+            Callable[[_KernelBindingContext], dict[str, _ParameterValue]],
+            namespace["bind"],
+        ),
+        library,
+    )
+    matches: dict[str, int] = {}
+    for tokens in (1, None):
+        with Graph() as graph:
+            x = Input(name="x", shape=(tokens, 48), dtype="fp32")
+            output = GptOssMoE(
+                x,
+                router=Input(name="router", shape=(4, 48), dtype="bf16"),
+                router_bias=Input(name="router_bias", shape=(4,), dtype="bf16"),
+                gate_up=Input(name="gate_up", shape=(4, 160, 48), dtype="mxfp4"),
+                down=Input(name="down", shape=(4, 48, 80), dtype="mxfp4"),
+                gate_up_bias=Input(name="up_bias", shape=(4, 160), dtype="bf16"),
+                down_bias=Input(name="down_bias", shape=(4, 48), dtype="bf16"),
+                top_k=2,
+            )
+            Output(output, name="output")
+        inference = _infer(graph, max_input_size=16)
+        if _optimize(graph, inference):
+            inference = _infer(graph, max_input_size=16)
+        result = _match(graph, (kernel,), inference)
+        count = sum(len(candidates) for candidates in result.candidates.values())
+        if count != 2:
+            raise ValueError(f"{name} matched {count} GPT-oss expert projections")
+        matches["dynamic_tokens" if tokens is None else "static_tokens"] = count
+    return matches
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -272,6 +328,7 @@ def main() -> None:
         default=Path.home() / "Trillim/models/arm-matrix/openai/gpt-oss-20b",
     )
     parser.add_argument("--baseline-library", type=Path)
+    parser.add_argument("--operation", choices=("linear", "matmul"), default="linear")
     parser.add_argument(
         "--scalar-library",
         type=Path,
@@ -333,13 +390,17 @@ def main() -> None:
     report: dict[str, object] = {
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platform": platform.platform(),
+        "benchmark_source_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
         "git_revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
-        "timing_scope": "native individual expert Linear, including pool dispatch; excludes Python setup, mapping, packing, allocation and pool creation",
+        "operation": options.operation,
+        "timing_scope": f"native individual expert {options.operation}, including pool dispatch; excludes Python setup, mapping, packing, allocation and pool creation",
         "interpretation": "projection microbenchmarks; not complete MoE, GPT-oss latency or token rate",
         "weights": "original checkpoint E2M1 nibbles/E8M0 exponents; layout copy only; no requantization",
-        "original_scalar_kernel": "trillim_scalar_linear",
+        "original_scalar_kernel": f"trillim_scalar_{options.operation}",
         "activations": "synthetic deterministic FP32 normal(mean=0,std=0.3), seeded by canonical payload SHA256 and token count",
         "outputs": "FP32",
         "cache": "warm repeated weights",
@@ -368,22 +429,33 @@ def main() -> None:
         print(f"Preserved {len(experts)} raw MXFP4 expert payloads. {options.output}")
         return
     candidates = [
-        (scalar_library, "trillim_scalar_block_linear"),
-        (neon_library, "trillim_neon_packed_linear"),
+        (scalar_library, f"trillim_scalar_block_{options.operation}"),
+        (neon_library, f"trillim_neon_packed_{options.operation}"),
     ]
     candidates = [
         (library, name) for library, name in candidates if _available(library, name)
     ]
     if not candidates:
         parser.error(
-            "no installed packed Linear candidates; build kernels or select compiled libraries"
+            f"no installed packed {options.operation} candidates; build kernels or select compiled libraries"
         )
+    if options.operation == "matmul":
+        report["unchanged_gptoss_moe_graph_matches"] = {
+            name: _moe_graph_matches(library, name) for library, name in candidates
+        }
+        report["graph_match_scope"] = (
+            "unchanged GptOssMoE, reduced dimensions; two expert projections at static and dynamic token counts"
+        )
+        save()
     harness = _build_cpu()
     for expert in experts:
         weights = _decode_independent(expert)
         codec = _codec_comparison(expert, weights)
         for tokens in options.tokens:
             generic, packed, inputs = _invocations(expert, tokens, options.threads)
+            if options.operation == "matmul":
+                generic = replace(generic, kernel="trillim_scalar_matmul")
+                packed = generic
             samples, expected = _measure(
                 replace(generic, library=baseline_library), harness, options.rounds
             )
@@ -394,6 +466,7 @@ def main() -> None:
                 record = {
                     **_metadata(expert),
                     "tokens": tokens,
+                    "operation": options.operation,
                     "kernel": name,
                     "library": str(library),
                     "parameters": candidate.parameters,
@@ -408,7 +481,7 @@ def main() -> None:
                         candidate.parameters
                     ):
                         raise ValueError(
-                            "packed candidate does not expose the six-field Linear schema"
+                            f"packed candidate does not expose the {options.operation} parameter schema"
                         )
                     measured, actual = _measure(candidate, harness, options.rounds)
                     timing = median(measured)
