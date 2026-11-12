@@ -89,6 +89,16 @@ class InstructionSymbol(BaseModel):
 
     op: str
     kernel: str | None = None
+    program: list[InstructionSymbol] = Field(default_factory=list)
+    body: ProgramBlock | None = None
+    condition: str | ProgramBlock | None = None
+    branches: list[ProgramBlock] = Field(default_factory=list)
+
+
+class ProgramBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    program: list[InstructionSymbol] = Field(default_factory=list)
 
 
 class ManifestSymbols(BaseModel):
@@ -96,6 +106,21 @@ class ManifestSymbols(BaseModel):
 
     kernels: dict[str, KernelSymbol]
     program: list[InstructionSymbol]
+
+
+def instruction_calls(program: list[InstructionSymbol]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for instruction in program:
+        if instruction.op == "call" and instruction.kernel is not None:
+            counts[instruction.kernel] += 1
+        counts.update(instruction_calls(instruction.program))
+        if instruction.body is not None:
+            counts.update(instruction_calls(instruction.body.program))
+        if isinstance(instruction.condition, ProgramBlock):
+            counts.update(instruction_calls(instruction.condition.program))
+        for branch in instruction.branches:
+            counts.update(instruction_calls(branch.program))
+    return counts
 
 
 def graph_source(config: DecoderConfig, capacity: int) -> str:
@@ -348,11 +373,7 @@ def benchmark(options: Options) -> dict[str, object]:
         (options.output / "executable.json").read_bytes()
     )
     symbols = sorted({metadata.symbol for metadata in manifest.kernels.values()})
-    counts = Counter(
-        instruction.kernel
-        for instruction in manifest.program
-        if instruction.op == "call" and instruction.kernel is not None
-    )
+    counts = instruction_calls(manifest.program)
     result: dict[str, object] = {
         "label": options.label,
         "checkpoint": str(options.checkpoint),
@@ -386,6 +407,7 @@ def benchmark(options: Options) -> dict[str, object]:
         "prefill_logit_max": max(logits_first),
         "kernels": symbols,
         "kernel_call_counts": dict(counts),
+        "kernel_call_count_scope": "static explicit native call instructions, including nested loop/branch/reduction programs; each body counted once",
         "neon_kernel_call_count": sum(
             count for name, count in counts.items() if name.startswith("trillim_neon_")
         ),
