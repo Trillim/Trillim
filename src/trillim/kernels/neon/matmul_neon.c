@@ -67,7 +67,7 @@ static size_t tile_rows(const Parameters *p) {
     return !precise(p) && p->m >= 12 && p->a_col_stride == 1 && p->b_row_stride == 1 ? 6 : 4;
 }
 
-static bool blas_shape(const Parameters *p) {
+static bool blas_shape(const Parameters *p, size_t workers) {
     if (precise(p) || p->n > INT32_MAX || p->n < 32 || p->k < 32) {
         return false;
     }
@@ -75,7 +75,16 @@ static bool blas_shape(const Parameters *p) {
     bool medium = p->m >= 32 && p->n > 2097152 / p->k;
     bool vocabulary = p->m >= 16 && p->n >= 32768 && p->k >= 512;
     bool contiguous = p->b_col_stride == 1 && p->k >= 256 && p->n > 32767 / p->k;
-    return large || medium || vocabulary || contiguous;
+    bool a_direct = (p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) ||
+        (p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX);
+    bool b_direct = (p->b_col_stride == 1 && p->b_row_stride >= p->n && p->b_row_stride <= INT32_MAX) ||
+        (p->b_row_stride == 1 && p->b_col_stride >= p->k && p->b_col_stride <= INT32_MAX);
+    bool column_major = p->a_row_stride == 1 && p->a_col_stride != 1;
+    bool small_direct = column_major ? p->m >= 8 && (p->m >= 32 || workers <= 8) :
+        (p->m >= 8 && workers == 1) || (p->m >= 16 && workers <= 8);
+    bool direct = p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 && a_direct && b_direct &&
+        small_direct && p->k >= 256 && p->n > 262143 / p->k;
+    return large || medium || vocabulary || contiguous || direct;
 }
 
 static bool reserve_blas(const Parameters *p) {
@@ -89,8 +98,8 @@ static bool reserve_blas(const Parameters *p) {
     return large || medium || vocabulary || possibly_contiguous;
 }
 
-static bool use_blas(const Parameters *p) {
-    return blas_shape(p) && initialize_blas();
+static bool use_blas(const Parameters *p, const TrillimKernelContext *context) {
+    return blas_shape(p, context->thread_pool->worker_count) && initialize_blas();
 }
 
 static bool matrix_span(size_t base, size_t rows, size_t columns,
@@ -590,6 +599,274 @@ static TrillimStatus outer_tile(const Task *t, size_t a_base, size_t b_base,
     return TRILLIM_OK;
 }
 
+static inline __attribute__((always_inline)) TrillimStatus row_vector_typed_tile(
+    const Task *t, size_t a_base, size_t b_base, size_t output, size_t rows,
+    size_t first, size_t last, uint32_t a_dtype, uint32_t b_dtype) {
+    const Parameters *p = t->p;
+    for (size_t column = first; column < last; column += 16) {
+        size_t columns = last - column < 16 ? last - column : 16;
+        float32x4_t s0 = vdupq_n_f32(0);
+        float32x4_t s1 = vdupq_n_f32(0);
+        float32x4_t s2 = vdupq_n_f32(0);
+        float32x4_t s3 = vdupq_n_f32(0);
+        float32x4_t s4 = vdupq_n_f32(0);
+        float32x4_t s5 = vdupq_n_f32(0);
+        float32x4_t s6 = vdupq_n_f32(0);
+        float32x4_t s7 = vdupq_n_f32(0);
+        float32x4_t s8 = vdupq_n_f32(0);
+        float32x4_t s9 = vdupq_n_f32(0);
+        float32x4_t s10 = vdupq_n_f32(0);
+        float32x4_t s11 = vdupq_n_f32(0);
+        float32x4_t s12 = vdupq_n_f32(0);
+        float32x4_t s13 = vdupq_n_f32(0);
+        float32x4_t s14 = vdupq_n_f32(0);
+        float32x4_t s15 = vdupq_n_f32(0);
+        size_t k = 0;
+        if (p->b_row_stride == 1) {
+            for (; p->k - k >= 4; k += 4) {
+                if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                float32x4_t x0;
+                if (rows == 4) {
+                    x0 = load4(t->a, a_base + (k + 0) * p->a_col_stride, a_dtype);
+                } else {
+                    float values[4] = {0};
+                    for (size_t r = 0; r < rows; ++r) {
+                        values[r] = trillim_load(t->a, a_base + (k + 0) * p->a_col_stride + r, a_dtype).f;
+                    }
+                    x0 = vld1q_f32(values);
+                }
+                float32x4_t x1;
+                if (rows == 4) {
+                    x1 = load4(t->a, a_base + (k + 1) * p->a_col_stride, a_dtype);
+                } else {
+                    float values[4] = {0};
+                    for (size_t r = 0; r < rows; ++r) {
+                        values[r] = trillim_load(t->a, a_base + (k + 1) * p->a_col_stride + r, a_dtype).f;
+                    }
+                    x1 = vld1q_f32(values);
+                }
+                float32x4_t x2;
+                if (rows == 4) {
+                    x2 = load4(t->a, a_base + (k + 2) * p->a_col_stride, a_dtype);
+                } else {
+                    float values[4] = {0};
+                    for (size_t r = 0; r < rows; ++r) {
+                        values[r] = trillim_load(t->a, a_base + (k + 2) * p->a_col_stride + r, a_dtype).f;
+                    }
+                    x2 = vld1q_f32(values);
+                }
+                float32x4_t x3;
+                if (rows == 4) {
+                    x3 = load4(t->a, a_base + (k + 3) * p->a_col_stride, a_dtype);
+                } else {
+                    float values[4] = {0};
+                    for (size_t r = 0; r < rows; ++r) {
+                        values[r] = trillim_load(t->a, a_base + (k + 3) * p->a_col_stride + r, a_dtype).f;
+                    }
+                    x3 = vld1q_f32(values);
+                }
+                {
+                    float32x4_t w0 = load4(t->b, b_base + k + (column + (columns > 0 ? 0 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w1 = load4(t->b, b_base + k + (column + (columns > 1 ? 1 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w2 = load4(t->b, b_base + k + (column + (columns > 2 ? 2 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w3 = load4(t->b, b_base + k + (column + (columns > 3 ? 3 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w4 = load4(t->b, b_base + k + (column + (columns > 4 ? 4 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w5 = load4(t->b, b_base + k + (column + (columns > 5 ? 5 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w6 = load4(t->b, b_base + k + (column + (columns > 6 ? 6 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w7 = load4(t->b, b_base + k + (column + (columns > 7 ? 7 : 0)) * p->b_col_stride, b_dtype);
+                    s0 = vfmaq_laneq_f32(s0, x0, w0, 0);
+                    s1 = vfmaq_laneq_f32(s1, x0, w1, 0);
+                    s2 = vfmaq_laneq_f32(s2, x0, w2, 0);
+                    s3 = vfmaq_laneq_f32(s3, x0, w3, 0);
+                    s4 = vfmaq_laneq_f32(s4, x0, w4, 0);
+                    s5 = vfmaq_laneq_f32(s5, x0, w5, 0);
+                    s6 = vfmaq_laneq_f32(s6, x0, w6, 0);
+                    s7 = vfmaq_laneq_f32(s7, x0, w7, 0);
+                    s0 = vfmaq_laneq_f32(s0, x1, w0, 1);
+                    s1 = vfmaq_laneq_f32(s1, x1, w1, 1);
+                    s2 = vfmaq_laneq_f32(s2, x1, w2, 1);
+                    s3 = vfmaq_laneq_f32(s3, x1, w3, 1);
+                    s4 = vfmaq_laneq_f32(s4, x1, w4, 1);
+                    s5 = vfmaq_laneq_f32(s5, x1, w5, 1);
+                    s6 = vfmaq_laneq_f32(s6, x1, w6, 1);
+                    s7 = vfmaq_laneq_f32(s7, x1, w7, 1);
+                    s0 = vfmaq_laneq_f32(s0, x2, w0, 2);
+                    s1 = vfmaq_laneq_f32(s1, x2, w1, 2);
+                    s2 = vfmaq_laneq_f32(s2, x2, w2, 2);
+                    s3 = vfmaq_laneq_f32(s3, x2, w3, 2);
+                    s4 = vfmaq_laneq_f32(s4, x2, w4, 2);
+                    s5 = vfmaq_laneq_f32(s5, x2, w5, 2);
+                    s6 = vfmaq_laneq_f32(s6, x2, w6, 2);
+                    s7 = vfmaq_laneq_f32(s7, x2, w7, 2);
+                    s0 = vfmaq_laneq_f32(s0, x3, w0, 3);
+                    s1 = vfmaq_laneq_f32(s1, x3, w1, 3);
+                    s2 = vfmaq_laneq_f32(s2, x3, w2, 3);
+                    s3 = vfmaq_laneq_f32(s3, x3, w3, 3);
+                    s4 = vfmaq_laneq_f32(s4, x3, w4, 3);
+                    s5 = vfmaq_laneq_f32(s5, x3, w5, 3);
+                    s6 = vfmaq_laneq_f32(s6, x3, w6, 3);
+                    s7 = vfmaq_laneq_f32(s7, x3, w7, 3);
+                }
+                {
+                    float32x4_t w0 = load4(t->b, b_base + k + (column + (columns > 8 ? 8 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w1 = load4(t->b, b_base + k + (column + (columns > 9 ? 9 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w2 = load4(t->b, b_base + k + (column + (columns > 10 ? 10 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w3 = load4(t->b, b_base + k + (column + (columns > 11 ? 11 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w4 = load4(t->b, b_base + k + (column + (columns > 12 ? 12 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w5 = load4(t->b, b_base + k + (column + (columns > 13 ? 13 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w6 = load4(t->b, b_base + k + (column + (columns > 14 ? 14 : 0)) * p->b_col_stride, b_dtype);
+                    float32x4_t w7 = load4(t->b, b_base + k + (column + (columns > 15 ? 15 : 0)) * p->b_col_stride, b_dtype);
+                    s8 = vfmaq_laneq_f32(s8, x0, w0, 0);
+                    s9 = vfmaq_laneq_f32(s9, x0, w1, 0);
+                    s10 = vfmaq_laneq_f32(s10, x0, w2, 0);
+                    s11 = vfmaq_laneq_f32(s11, x0, w3, 0);
+                    s12 = vfmaq_laneq_f32(s12, x0, w4, 0);
+                    s13 = vfmaq_laneq_f32(s13, x0, w5, 0);
+                    s14 = vfmaq_laneq_f32(s14, x0, w6, 0);
+                    s15 = vfmaq_laneq_f32(s15, x0, w7, 0);
+                    s8 = vfmaq_laneq_f32(s8, x1, w0, 1);
+                    s9 = vfmaq_laneq_f32(s9, x1, w1, 1);
+                    s10 = vfmaq_laneq_f32(s10, x1, w2, 1);
+                    s11 = vfmaq_laneq_f32(s11, x1, w3, 1);
+                    s12 = vfmaq_laneq_f32(s12, x1, w4, 1);
+                    s13 = vfmaq_laneq_f32(s13, x1, w5, 1);
+                    s14 = vfmaq_laneq_f32(s14, x1, w6, 1);
+                    s15 = vfmaq_laneq_f32(s15, x1, w7, 1);
+                    s8 = vfmaq_laneq_f32(s8, x2, w0, 2);
+                    s9 = vfmaq_laneq_f32(s9, x2, w1, 2);
+                    s10 = vfmaq_laneq_f32(s10, x2, w2, 2);
+                    s11 = vfmaq_laneq_f32(s11, x2, w3, 2);
+                    s12 = vfmaq_laneq_f32(s12, x2, w4, 2);
+                    s13 = vfmaq_laneq_f32(s13, x2, w5, 2);
+                    s14 = vfmaq_laneq_f32(s14, x2, w6, 2);
+                    s15 = vfmaq_laneq_f32(s15, x2, w7, 2);
+                    s8 = vfmaq_laneq_f32(s8, x3, w0, 3);
+                    s9 = vfmaq_laneq_f32(s9, x3, w1, 3);
+                    s10 = vfmaq_laneq_f32(s10, x3, w2, 3);
+                    s11 = vfmaq_laneq_f32(s11, x3, w3, 3);
+                    s12 = vfmaq_laneq_f32(s12, x3, w4, 3);
+                    s13 = vfmaq_laneq_f32(s13, x3, w5, 3);
+                    s14 = vfmaq_laneq_f32(s14, x3, w6, 3);
+                    s15 = vfmaq_laneq_f32(s15, x3, w7, 3);
+                }
+            }
+        }
+        for (; k < p->k; ++k) {
+            if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t x;
+            if (rows == 4) {
+                x = load4(t->a, a_base + k * p->a_col_stride, a_dtype);
+            } else {
+                float values[4] = {0};
+                for (size_t r = 0; r < rows; ++r) {
+                    values[r] = trillim_load(t->a, a_base + k * p->a_col_stride + r, a_dtype).f;
+                }
+                x = vld1q_f32(values);
+            }
+            if (columns > 0) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 0) * p->b_col_stride, b_dtype).f;
+                s0 = vfmaq_n_f32(s0, x, w);
+            }
+            if (columns > 1) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 1) * p->b_col_stride, b_dtype).f;
+                s1 = vfmaq_n_f32(s1, x, w);
+            }
+            if (columns > 2) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 2) * p->b_col_stride, b_dtype).f;
+                s2 = vfmaq_n_f32(s2, x, w);
+            }
+            if (columns > 3) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 3) * p->b_col_stride, b_dtype).f;
+                s3 = vfmaq_n_f32(s3, x, w);
+            }
+            if (columns > 4) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 4) * p->b_col_stride, b_dtype).f;
+                s4 = vfmaq_n_f32(s4, x, w);
+            }
+            if (columns > 5) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 5) * p->b_col_stride, b_dtype).f;
+                s5 = vfmaq_n_f32(s5, x, w);
+            }
+            if (columns > 6) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 6) * p->b_col_stride, b_dtype).f;
+                s6 = vfmaq_n_f32(s6, x, w);
+            }
+            if (columns > 7) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 7) * p->b_col_stride, b_dtype).f;
+                s7 = vfmaq_n_f32(s7, x, w);
+            }
+            if (columns > 8) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 8) * p->b_col_stride, b_dtype).f;
+                s8 = vfmaq_n_f32(s8, x, w);
+            }
+            if (columns > 9) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 9) * p->b_col_stride, b_dtype).f;
+                s9 = vfmaq_n_f32(s9, x, w);
+            }
+            if (columns > 10) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 10) * p->b_col_stride, b_dtype).f;
+                s10 = vfmaq_n_f32(s10, x, w);
+            }
+            if (columns > 11) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 11) * p->b_col_stride, b_dtype).f;
+                s11 = vfmaq_n_f32(s11, x, w);
+            }
+            if (columns > 12) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 12) * p->b_col_stride, b_dtype).f;
+                s12 = vfmaq_n_f32(s12, x, w);
+            }
+            if (columns > 13) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 13) * p->b_col_stride, b_dtype).f;
+                s13 = vfmaq_n_f32(s13, x, w);
+            }
+            if (columns > 14) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 14) * p->b_col_stride, b_dtype).f;
+                s14 = vfmaq_n_f32(s14, x, w);
+            }
+            if (columns > 15) {
+                float w = trillim_load(t->b, b_base + k * p->b_row_stride + (column + 15) * p->b_col_stride, b_dtype).f;
+                s15 = vfmaq_n_f32(s15, x, w);
+            }
+        }
+        float values[16][4];
+        vst1q_f32(values[0], s0);
+        vst1q_f32(values[1], s1);
+        vst1q_f32(values[2], s2);
+        vst1q_f32(values[3], s3);
+        vst1q_f32(values[4], s4);
+        vst1q_f32(values[5], s5);
+        vst1q_f32(values[6], s6);
+        vst1q_f32(values[7], s7);
+        vst1q_f32(values[8], s8);
+        vst1q_f32(values[9], s9);
+        vst1q_f32(values[10], s10);
+        vst1q_f32(values[11], s11);
+        vst1q_f32(values[12], s12);
+        vst1q_f32(values[13], s13);
+        vst1q_f32(values[14], s14);
+        vst1q_f32(values[15], s15);
+        for (size_t r = 0; r < rows; ++r) {
+            for (size_t c = 0; c < columns; ++c) {
+                store(t, output + r * p->n + column + c, values[c][r]);
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus row_vector_tile(const Task *t, size_t a_base, size_t b_base,
+                              size_t output, size_t rows, size_t first, size_t last) {
+    const Parameters *p = t->p;
+    if (p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32) {
+        return row_vector_typed_tile(t, a_base, b_base, output, rows, first, last, TRILLIM_FP32, TRILLIM_FP32);
+    }
+    return row_vector_typed_tile(t, a_base, b_base, output, rows, first, last, p->a_dtype, p->b_dtype);
+}
+
 static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const Task *t = opaque;
@@ -618,6 +895,9 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     }
     if (p->b_col_stride == 1) {
         return outer_tile(t, a_base, b_base, output, rows, first, last);
+    }
+    if (p->a_row_stride == 1 && rows <= 4) {
+        return row_vector_tile(t, a_base, b_base, output, rows, first, last);
     }
     for (size_t r = 0; r < rows; ++r) {
         for (size_t c = first; c < last; ++c) {
@@ -894,7 +1174,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_matmul(void *const *outputs, const voi
         return TRILLIM_OK;
     }
     Task task = {outputs[0], inputs[0], inputs[1], p, context};
-    if (use_blas(p)) {
+    if (use_blas(p, context)) {
         size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
         size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
         size_t count = p->batches * rows * columns;
