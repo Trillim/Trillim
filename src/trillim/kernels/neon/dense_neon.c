@@ -106,6 +106,78 @@ static inline void store(const Task *t, size_t index, float value) {
     trillim_store(t->output, index, t->p->out_dtype, result);
 }
 
+typedef struct {
+    float32x4_t low;
+    float32x4_t high;
+} VectorPair;
+
+static inline VectorPair load8(const void *data, size_t index, uint32_t dtype) {
+    if (dtype == TRILLIM_FP32) {
+        const float *p = (const float *)data + index;
+        VectorPair value = {vld1q_f32(p), vld1q_f32(p + 4)};
+        return value;
+    }
+    uint16x8_t bits = vld1q_u16((const uint16_t *)data + index);
+    if (dtype == TRILLIM_FP16) {
+        VectorPair value = {vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(bits))),
+                            vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(bits)))};
+        return value;
+    }
+    VectorPair value = {vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16)),
+                        vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bits), 16))};
+    return value;
+}
+
+static TrillimStatus decode_tile(const Task *t, size_t a_base, size_t b_base,
+                                 size_t output, size_t first, size_t last) {
+    const Parameters *p = t->p;
+    for (size_t column = first; column < last; column += 2) {
+        size_t columns = last - column < 2 ? last - column : 2;
+        float32x4_t s00 = vdupq_n_f32(0);
+        float32x4_t s01 = vdupq_n_f32(0);
+        float32x4_t s02 = vdupq_n_f32(0);
+        float32x4_t s03 = vdupq_n_f32(0);
+        float32x4_t s10 = vdupq_n_f32(0);
+        float32x4_t s11 = vdupq_n_f32(0);
+        float32x4_t s12 = vdupq_n_f32(0);
+        float32x4_t s13 = vdupq_n_f32(0);
+        size_t k = 0;
+        for (; p->k - k >= 16; k += 16) {
+            if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            VectorPair x0 = load8(t->a, a_base + k + 0, p->a_dtype);
+            VectorPair x1 = load8(t->a, a_base + k + 8, p->a_dtype);
+            size_t w0 = b_base + (column + (columns > 0 ? 0 : 0)) * p->b_col_stride + k;
+            VectorPair w0_0 = load8(t->b, w0 + 0, p->b_dtype);
+            s00 = vfmaq_f32(s00, x0.low, w0_0.low);
+            s01 = vfmaq_f32(s01, x0.high, w0_0.high);
+            VectorPair w0_1 = load8(t->b, w0 + 8, p->b_dtype);
+            s02 = vfmaq_f32(s02, x1.low, w0_1.low);
+            s03 = vfmaq_f32(s03, x1.high, w0_1.high);
+            size_t w1 = b_base + (column + (columns > 1 ? 1 : 0)) * p->b_col_stride + k;
+            VectorPair w1_0 = load8(t->b, w1 + 0, p->b_dtype);
+            s10 = vfmaq_f32(s10, x0.low, w1_0.low);
+            s11 = vfmaq_f32(s11, x0.high, w1_0.high);
+            VectorPair w1_1 = load8(t->b, w1 + 8, p->b_dtype);
+            s12 = vfmaq_f32(s12, x1.low, w1_1.low);
+            s13 = vfmaq_f32(s13, x1.high, w1_1.high);
+        }
+        float sums[2] = {vaddvq_f32(vaddq_f32(vaddq_f32(s00, s01), vaddq_f32(s02, s03))), vaddvq_f32(vaddq_f32(vaddq_f32(s10, s11), vaddq_f32(s12, s13)))};
+        for (; k < p->k; ++k) {
+            float x = trillim_load(t->a, a_base + k, p->a_dtype).f;
+            for (size_t c = 0; c < columns; ++c) {
+                float w = trillim_load(t->b, b_base + (column + c) * p->b_col_stride + k, p->b_dtype).f;
+                sums[c] = fmaf(x, w, sums[c]);
+            }
+        }
+        for (size_t c = 0; c < columns; ++c) {
+            store(t, output + column + c, sums[c]);
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus dot_tile(const Task *t, size_t a_base, size_t b_base,
                               size_t output, size_t rows, size_t first, size_t last) {
     const Parameters *p = t->p;
@@ -263,7 +335,9 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
     size_t output = (batch * p->m + row) * p->n;
     if (p->a_col_stride == 1 && p->b_row_stride == 1) {
-        return dot_tile(t, a_base, b_base, output, rows, first, last);
+        return rows == 1 && p->k >= 64 ?
+            decode_tile(t, a_base, b_base, output, first, last) :
+            dot_tile(t, a_base, b_base, output, rows, first, last);
     }
     if (p->b_col_stride == 1) {
         return outer_tile(t, a_base, b_base, output, rows, first, last);
