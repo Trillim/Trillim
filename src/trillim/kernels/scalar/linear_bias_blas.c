@@ -6,9 +6,9 @@
 #include <dlfcn.h>
 #endif
 
-#define BLOCK_M 32
+#define BLOCK_M 64
 #define BLOCK_N 128
-#define BLOCK_K 256
+#define BLOCK_K 1024
 #define LANES 32
 #define WORKSPACE (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N + BLOCK_M * BLOCK_N)
 
@@ -59,6 +59,14 @@ static bool matrix_span(size_t base, size_t rows, size_t columns,
     return col_stride == 0 || columns - 1 <= (capacity - 1 - base) / col_stride;
 }
 
+static size_t block_n(const Parameters *p) {
+    return p->n <= 1024 ? 64 : 128;
+}
+
+static size_t block_k(const Parameters *p) {
+    return p->m < 64 || p->n <= 1024 ? 1024 : 512;
+}
+
 static bool small(const Parameters *p) {
     return p->k == 0 || (p->n != 0 && p->m <= 4096 / p->n &&
                          p->m * p->n <= 4096 / p->k);
@@ -69,7 +77,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = inputs[2] = outputs[0] = *scratch = 0;
     if (!trillim_float(p->a_dtype) || !trillim_float(p->b_dtype) ||
-        !trillim_float(p->out_dtype) || !trillim_float(p->linear_dtype) ||
+        p->out_dtype != TRILLIM_FP32 || p->linear_dtype != TRILLIM_FP32 ||
         !trillim_float(p->bias_dtype)) {
         return TRILLIM_ERROR;
     }
@@ -119,7 +127,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
         return TRILLIM_ERROR;
     }
     size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
-    size_t columns = p->n / BLOCK_N + (p->n % BLOCK_N != 0);
+    size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
     size_t count = p->batches * rows * columns;
     *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
     return TRILLIM_OK;
@@ -128,6 +136,12 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
 typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
                       const float *, int, float, float *, int);
 static Sgemm sgemm;
+#ifdef __APPLE__
+typedef unsigned (*GetThreading)(void);
+typedef int (*SetThreading)(unsigned);
+static GetThreading get_threading;
+static SetThreading set_threading;
+#endif
 static atomic_uint blas_state = 0;
 
 static bool initialize_blas(void) {
@@ -146,6 +160,14 @@ static bool initialize_blas(void) {
                 if (address != NULL) {
                     _Static_assert(sizeof(sgemm) == sizeof(address), "function pointer size");
                     memcpy(&sgemm, &address, sizeof(sgemm));
+#ifdef __APPLE__
+                    void *getter = dlsym(library, "BLASGetThreading");
+                    void *setter = dlsym(library, "BLASSetThreading");
+                    if (getter != NULL && setter != NULL) {
+                        memcpy(&get_threading, &getter, sizeof(get_threading));
+                        memcpy(&set_threading, &setter, sizeof(set_threading));
+                    }
+#endif
                     break;
                 }
                 FreeLibrary(library);
@@ -160,10 +182,25 @@ static bool initialize_blas(void) {
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);
             if (library != NULL) {
+#ifdef __APPLE__
+                void *address = dlsym(library, "cblas_sgemm$NEWLAPACK");
+                if (address == NULL) {
+                    address = dlsym(library, "cblas_sgemm");
+                }
+#else
                 void *address = dlsym(library, "cblas_sgemm");
+#endif
                 if (address != NULL) {
                     _Static_assert(sizeof(sgemm) == sizeof(address), "function pointer size");
                     memcpy(&sgemm, &address, sizeof(sgemm));
+#ifdef __APPLE__
+                    void *getter = dlsym(library, "BLASGetThreading");
+                    void *setter = dlsym(library, "BLASSetThreading");
+                    if (getter != NULL && setter != NULL) {
+                        memcpy(&get_threading, &getter, sizeof(get_threading));
+                        memcpy(&set_threading, &setter, sizeof(set_threading));
+                    }
+#endif
                     break;
                 }
                 dlclose(library);
@@ -278,12 +315,14 @@ typedef struct {
     size_t lanes;
 } BlasTask;
 
-static TrillimStatus project(void *opaque, size_t index, size_t worker) {
+static TrillimStatus project_impl(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const BlasTask *job = opaque;
     const Task *t = &job->task;
     const Parameters *p = t->p;
-    size_t columns = p->n / BLOCK_N + (p->n % BLOCK_N != 0);
+    size_t width = block_n(p);
+    size_t depth = block_k(p);
+    size_t columns = p->n / width + (p->n % width != 0);
     size_t row_tiles = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
     float *a_pack = job->scratch + index * WORKSPACE;
     float *b_pack = a_pack + BLOCK_M * BLOCK_K;
@@ -294,9 +333,9 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
         }
         size_t batch = tile / columns / row_tiles;
         size_t row = tile / columns % row_tiles * BLOCK_M;
-        size_t column = tile % columns * BLOCK_N;
+        size_t column = tile % columns * width;
         size_t m = p->m - row < BLOCK_M ? p->m - row : BLOCK_M;
-        size_t n = p->n - column < BLOCK_N ? p->n - column : BLOCK_N;
+        size_t n = p->n - column < width ? p->n - column : width;
         size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides) + row * p->a_row_stride;
         size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides) + column * p->b_col_stride;
         size_t output = (batch * p->m + row) * p->n + column;
@@ -307,11 +346,11 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
                 memset(c + r * (size_t)ldc, 0, n * sizeof(float));
             }
         }
-        for (size_t first = 0; first < p->k; first += BLOCK_K) {
+        for (size_t first = 0; first < p->k; first += depth) {
             if (t->context->is_cancelled(t->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            size_t k = p->k - first < BLOCK_K ? p->k - first : BLOCK_K;
+            size_t k = p->k - first < depth ? p->k - first : depth;
             size_t a_index = a_base + first * p->a_col_stride;
             size_t b_index = b_base + first * p->b_row_stride;
             const float *a = a_pack;
@@ -364,6 +403,20 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     return t->context->is_cancelled(t->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+static TrillimStatus project(void *opaque, size_t index, size_t worker) {
+#ifdef __APPLE__
+    if (get_threading != NULL && set_threading != NULL) {
+        unsigned previous = get_threading();
+        if (previous != 1 && set_threading(1) == 0) {
+            TrillimStatus status = project_impl(opaque, index, worker);
+            (void)set_threading(previous);
+            return status;
+        }
+    }
+#endif
+    return project_impl(opaque, index, worker);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_linear_bias(void *const *outputs, const void *const *inputs,
                                   void *scratch, const void *parameters,
                                   const TrillimKernelContext *context) {
@@ -385,7 +438,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_linear_bias(void *const *output
         return TRILLIM_ERROR;
     }
     size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
-    size_t columns = p->n / BLOCK_N + (p->n % BLOCK_N != 0);
+    size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
     size_t count = p->batches * rows * columns;
     size_t lanes = count < LANES ? count : LANES;
     BlasTask task = {{outputs[0], inputs[0], inputs[1], inputs[2], p, context}, scratch, count, lanes};
