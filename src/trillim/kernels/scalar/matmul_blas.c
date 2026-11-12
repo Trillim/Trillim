@@ -295,14 +295,32 @@ static TrillimStatus small_project(void *opaque, size_t index, size_t worker) {
     return TRILLIM_OK;
 }
 
+static size_t row_reuse(const Parameters *p, const TrillimKernelContext *context) {
+    size_t workers = context->thread_pool->worker_count;
+    size_t minimum_rows = workers <= 8 ? 128 : 512;
+    if (p->m < minimum_rows || p->out_dtype != TRILLIM_FP32 || p->b_dtype == TRILLIM_FP32 || p->k == 0) {
+        return 1;
+    }
+    size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+    size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
+    if (columns == 0) {
+        return 1;
+    }
+    size_t target = workers == 0 ? 1 : (workers < LANES / 2 ? workers * 2 : LANES);
+    size_t groups = target / columns + (target % columns != 0);
+    size_t reuse = rows / groups;
+    return reuse < 2 ? 1 : (reuse < 8 ? reuse : 8);
+}
+
 typedef struct {
     Task task;
     float *scratch;
     size_t count;
     size_t lanes;
+    size_t row_reuse;
 } BlasTask;
 
-static TrillimStatus project_impl(void *opaque, size_t index, size_t worker) {
+static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const BlasTask *job = opaque;
     const Task *t = &job->task;
@@ -392,6 +410,86 @@ static TrillimStatus project_impl(void *opaque, size_t index, size_t worker) {
     return t->context->is_cancelled(t->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+static TrillimStatus grouped_project_impl(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const BlasTask *job = opaque;
+    const Task *t = &job->task;
+    const Parameters *p = t->p;
+    size_t width = block_n(p), depth = block_k(p);
+    size_t columns = p->n / width + (p->n % width != 0);
+    size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+    size_t groups = rows / job->row_reuse + (rows % job->row_reuse != 0);
+    float *a_pack = job->scratch + index * WORKSPACE;
+    float *b_pack = a_pack + BLOCK_M * BLOCK_K;
+    for (size_t tile = index; tile < job->count; tile += job->lanes) {
+        if (t->context->is_cancelled(t->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t batch = tile / columns / groups;
+        size_t group = tile / columns % groups;
+        size_t first_row = group * job->row_reuse;
+        size_t last_row = rows - first_row < job->row_reuse ? rows : first_row + job->row_reuse;
+        size_t column = tile % columns * width;
+        size_t n = p->n - column < width ? p->n - column : width;
+        size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
+        size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides) + column * p->b_col_stride;
+        for (size_t first = 0; first < p->k; first += depth) {
+            if (t->context->is_cancelled(t->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t k = p->k - first < depth ? p->k - first : depth;
+            /* Partial C stays in output while packed B is shared across row tiles. */
+            size_t b_index = b_base + first * p->b_row_stride;
+            int b_trans = 111, ldb = (int)n;
+            TrillimStatus status;
+            if (p->b_row_stride == 1) {
+                status = pack(t->b, p->b_dtype, b_index, n, k, p->b_col_stride, 1, b_pack, t->context);
+                b_trans = 112;
+                ldb = (int)k;
+            } else {
+                status = pack(t->b, p->b_dtype, b_index, k, n, p->b_row_stride, p->b_col_stride, b_pack, t->context);
+            }
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            for (size_t block = first_row; block < last_row; ++block) {
+                if (t->context->is_cancelled(t->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                size_t row = block * BLOCK_M;
+                size_t m = p->m - row < BLOCK_M ? p->m - row : BLOCK_M;
+                size_t a_index = a_base + row * p->a_row_stride + first * p->a_col_stride;
+                const float *a = a_pack;
+                int a_trans = 111, lda = (int)k;
+                if (p->a_dtype == TRILLIM_FP32 && p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
+                    a = (const float *)t->a + a_index;
+                    lda = (int)p->a_row_stride;
+                } else if (p->a_dtype == TRILLIM_FP32 && p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX) {
+                    a = (const float *)t->a + a_index;
+                    a_trans = 112;
+                    lda = (int)p->a_col_stride;
+                } else {
+                    status = pack(t->a, p->a_dtype, a_index, m, k, p->a_row_stride, p->a_col_stride, a_pack, t->context);
+                    if (status != TRILLIM_OK) {
+                        return status;
+                    }
+                }
+                size_t output = (batch * p->m + row) * p->n + column;
+                float *c = (float *)t->output + output;
+                sgemm(101, a_trans, b_trans, (int)m, (int)n, (int)k, 1.0f,
+                      a, lda, b_pack, ldb, first == 0 ? 0.0f : 1.0f, c, (int)p->n);
+            }
+        }
+    }
+    return t->context->is_cancelled(t->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+static TrillimStatus project_impl(void *opaque, size_t index, size_t worker) {
+    const BlasTask *job = opaque;
+    return job->row_reuse > 1 ? grouped_project_impl(opaque, index, worker) :
+        ungrouped_project_impl(opaque, index, worker);
+}
+
 static TrillimStatus project(void *opaque, size_t index, size_t worker) {
 #ifdef __APPLE__
     if (get_threading != NULL && set_threading != NULL) {
@@ -428,9 +526,11 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_matmul(void *const *outputs, co
     }
     size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
     size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
-    size_t count = p->batches * rows * columns;
+    size_t reuse = row_reuse(p, context);
+    size_t groups = rows / reuse + (rows % reuse != 0);
+    size_t count = p->batches * groups * columns;
     size_t lanes = count < LANES ? count : LANES;
-    BlasTask task = {{outputs[0], inputs[0], inputs[1], p, context}, scratch, count, lanes};
+    BlasTask task = {{outputs[0], inputs[0], inputs[1], p, context}, scratch, count, lanes, reuse};
     return context->thread_pool->run(context->thread_pool->context, lanes, project, &task);
 }
 
