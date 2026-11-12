@@ -368,7 +368,7 @@ def main() -> None:
         print(f"Preserved {len(experts)} raw MXFP4 expert payloads. {options.output}")
         return
     candidates = [
-        (scalar_library, "trillim_scalar_packed_linear"),
+        (scalar_library, "trillim_scalar_block_linear"),
         (neon_library, "trillim_neon_packed_linear"),
     ]
     candidates = [
