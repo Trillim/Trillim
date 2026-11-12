@@ -473,6 +473,10 @@ TRILLIM_KERNEL const char *trillim_neon_group_int8_tdl(void) {
            "    weight = context.inputs['weight']\n"
            "    if _storage_shape(weight) != weight.shape:\n"
            "        raise ValueError('projection requires a complete packed weight matrix')\n"
+           "    source = context.inputs['x']\n"
+           "    width = source.shape[-1].value if source.shape else None\n"
+           "    if width is None or width <= 0 or width % 32:\n"
+           "        raise ValueError('group INT8 projection requires a fixed positive width divisible by 32')\n"
            "    return _bind(context)\n"
            "def pattern(x: Tensor, weight: Tensor, scale: Tensor, *, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
            "    return (QuantizedLinear(x, weight, scale, dtype=dtype),)\n";
