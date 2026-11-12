@@ -46,7 +46,7 @@ class TextConfig(ModelMetadata):
     hidden_act: Literal["silu"]
     attention_bias: Literal[False] = False
     attn_output_gate: Literal[True] = True
-    tie_word_embeddings: bool
+    tie_word_embeddings: bool = False
     layer_types: list[Literal["linear_attention", "full_attention"]]
     linear_conv_kernel_dim: int = Field(gt=0)
     linear_key_head_dim: int = Field(gt=0)
