@@ -68,28 +68,60 @@ static float round_dtype(float value, uint32_t dtype) {
     return value;
 }
 
+static float32x4_t round4(float32x4_t value, uint32_t dtype) {
+    if (dtype == TRILLIM_FP16) {
+        return vcvt_f32_f16(vcvt_f16_f32(value));
+    }
+    if (dtype == TRILLIM_BF16) {
+        uint32x4_t bits = vreinterpretq_u32_f32(value);
+        uint32x4_t upper = vshrq_n_u32(bits, 16);
+        uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff),
+                                   vandq_u32(upper, vdupq_n_u32(1)));
+        uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+        uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)),
+                                  vdupq_n_u32(0x7f800000));
+        rounded = vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(0x40)), rounded);
+        return vreinterpretq_f32_u32(vshlq_n_u32(rounded, 16));
+    }
+    return value;
+}
+
 static TrillimStatus normalize_precise(void *opaque, size_t row, size_t worker) {
     (void)worker;
     const Task *task = opaque;
     const Parameters *p = task->p;
-    size_t start = row * p->width;
+    size_t start = row * p->width, column = 0;
     float sum = 0.0f;
-    for (size_t column = 0; column < p->width; ++column) {
+    for (; p->width - column >= 4; column += 4) {
         if ((column & 1023) == 0 &&
             task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
+        float32x4_t x = load4(task->input, start + column, p->dtype);
+        float32x4_t squared = round4(vmulq_f32(x, x), p->dtype);
+        sum += vgetq_lane_f32(squared, 0);
+        sum += vgetq_lane_f32(squared, 1);
+        sum += vgetq_lane_f32(squared, 2);
+        sum += vgetq_lane_f32(squared, 3);
+    }
+    for (; column < p->width; ++column) {
         float x = trillim_load(task->input, start + column, p->dtype).f;
         sum += round_dtype(x * x, p->dtype);
     }
     sum = round_dtype(sum, p->dtype);
     float added = round_dtype(sum + round_dtype(p->eps, p->dtype), p->dtype);
     float denominator = round_dtype(sqrtf(added), p->dtype);
-    for (size_t column = 0; column < p->width; ++column) {
+    float32x4_t denominator4 = vdupq_n_f32(denominator);
+    column = 0;
+    for (; p->width - column >= 4; column += 4) {
         if ((column & 1023) == 0 &&
             task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
+        store4(task->output, start + column, p->dtype,
+               vdivq_f32(load4(task->input, start + column, p->dtype), denominator4));
+    }
+    for (; column < p->width; ++column) {
         TrillimValue value = {
             .f = trillim_load(task->input, start + column, p->dtype).f / denominator
         };
@@ -98,13 +130,12 @@ static TrillimStatus normalize_precise(void *opaque, size_t row, size_t worker) 
     return TRILLIM_OK;
 }
 
-
 static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
     (void)worker;
     const Task *task = opaque;
     const Parameters *p = task->p;
     if (p->dtype != TRILLIM_FP32) {
-        /* Preserve low-precision rounding at scalar-reference boundaries. */
+        /* Preserve each primitive dtype boundary and its reduction order. */
         return normalize_precise(opaque, row, worker);
     }
     size_t start = row * p->width, column = 0;
