@@ -119,11 +119,24 @@ static TrillimStatus dot_pair(
     size_t channel = 0;
 #if USE_NEON
     if (p->k_strides[2] == 1 && p->r_strides[2] == 1) {
-        float32x4_t content_sum = vdupq_n_f32(0), position_sum = vdupq_n_f32(0);
-        for (; p->key_dim - channel >= 4; channel += 4) {
+        float32x4_t c0 = vdupq_n_f32(0), c1 = c0, c2 = c0, c3 = c0;
+        float32x4_t p0 = c0, p1 = c0, p2 = c0, p3 = c0;
+        for (; p->key_dim - channel >= 16; channel += 16) {
             if (p->key_dim > 256 && (channel & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
+            c0 = vfmaq_f32(c0, vld1q_f32(content_query + channel), vld1q_f32(task->keys + key + channel));
+            c1 = vfmaq_f32(c1, vld1q_f32(content_query + channel + 4), vld1q_f32(task->keys + key + channel + 4));
+            c2 = vfmaq_f32(c2, vld1q_f32(content_query + channel + 8), vld1q_f32(task->keys + key + channel + 8));
+            c3 = vfmaq_f32(c3, vld1q_f32(content_query + channel + 12), vld1q_f32(task->keys + key + channel + 12));
+            p0 = vfmaq_f32(p0, vld1q_f32(position_query + channel), vld1q_f32(task->relative + relative + channel));
+            p1 = vfmaq_f32(p1, vld1q_f32(position_query + channel + 4), vld1q_f32(task->relative + relative + channel + 4));
+            p2 = vfmaq_f32(p2, vld1q_f32(position_query + channel + 8), vld1q_f32(task->relative + relative + channel + 8));
+            p3 = vfmaq_f32(p3, vld1q_f32(position_query + channel + 12), vld1q_f32(task->relative + relative + channel + 12));
+        }
+        float32x4_t content_sum = vaddq_f32(vaddq_f32(c0, c1), vaddq_f32(c2, c3));
+        float32x4_t position_sum = vaddq_f32(vaddq_f32(p0, p1), vaddq_f32(p2, p3));
+        for (; p->key_dim - channel >= 4; channel += 4) {
             content_sum = vfmaq_f32(content_sum, vld1q_f32(content_query + channel), vld1q_f32(task->keys + key + channel));
             position_sum = vfmaq_f32(position_sum, vld1q_f32(position_query + channel), vld1q_f32(task->relative + relative + channel));
         }
