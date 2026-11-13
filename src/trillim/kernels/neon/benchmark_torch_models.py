@@ -136,11 +136,20 @@ class Mxfp4Factory(Protocol):
     def __call__(self, *, dequantize: bool) -> object: ...
 
 
+class ModuleAPI(Protocol):
+    def float(self, model: Model) -> Model: ...
+
+
+class NNAPI(Protocol):
+    Module: ModuleAPI
+
+
 class TorchAPI(Protocol):
     __version__: str
     float32: object
     bfloat16: object
     long: object
+    nn: NNAPI
 
     def set_num_threads(self, count: int) -> None: ...
 
@@ -445,8 +454,14 @@ def benchmark(options: Options) -> dict[str, object]:
         config.quantization_config is not None
         and config.quantization_config.get("quant_method") == "bitnet"
     )
-    if options.dtype == "float32" and not bitnet_quantized:
-        model = model.float()
+    casting_method = "none; native dtype loading"
+    if options.dtype == "float32":
+        if bitnet_quantized:
+            model = torch.nn.Module.float(model)
+            casting_method = "torch.nn.Module.float(model); floating parameters and buffers converted, packed integer tensors preserved"
+        else:
+            model = model.float()
+            casting_method = "model.float()"
     dtype_audit = audit_model(model, torch, require_fp32=options.dtype == "float32")
     model_class = type(model).__name__
     architecture = importlib.import_module(type(model).__module__)
@@ -590,6 +605,7 @@ def benchmark(options: Options) -> dict[str, object]:
         if options.cache_implementation == "static"
         else "logical bound; dynamic caches grow with context",
         "dtype_audit": dtype_audit,
+        "model_casting_method": casting_method,
         "dtype_policy": options.dtype,
         "activation_and_cache_dtype": "float32"
         if options.dtype == "float32"
