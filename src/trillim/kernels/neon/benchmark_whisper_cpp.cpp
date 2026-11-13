@@ -28,9 +28,10 @@ int main(int argc, char **argv) {
     std::ifstream mel_file(features, std::ios::binary | std::ios::ate);
     if (!mel_file) { throw std::runtime_error("mel file missing"); }
     const size_t mel_bytes = static_cast<size_t>(mel_file.tellg());
+    if (mel_bytes % sizeof(float) != 0) { throw std::runtime_error("mel byte size must be divisible by sizeof(float)"); }
     std::vector<float> mel(mel_bytes / sizeof(float));
     mel_file.seekg(0);
-    mel_file.read(reinterpret_cast<char *>(mel.data()), static_cast<std::streamsize>(mel_bytes));
+    if (!mel_file.read(reinterpret_cast<char *>(mel.data()), static_cast<std::streamsize>(mel_bytes))) { throw std::runtime_error("mel read failed"); }
     auto params = whisper_context_default_params();
     params.use_gpu = false;
     params.flash_attn = false;
