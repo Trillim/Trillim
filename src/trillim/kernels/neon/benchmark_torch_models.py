@@ -49,6 +49,8 @@ class Options(BaseModel):
     interop_threads: int = Field(default=1, ge=1)
     warmups: int = Field(default=2, ge=0)
     repeats: int = Field(default=3, ge=1)
+    dtype: Literal["float32", "native"] = "float32"
+    compile_mode: Literal["default", "max-autotune"] | None = None
     attention: Literal["auto", "sdpa", "eager"] = "auto"
     cache_implementation: Literal["dynamic", "static"] = "dynamic"
     save_full_logits: bool = False
@@ -60,6 +62,10 @@ class Options(BaseModel):
     def check_capacity(self) -> Self:
         if self.prompt + self.decode > self.cache:
             raise ValueError("cache must fit the prompt and every decode input")
+        if self.compile_mode is not None and self.warmups == 0:
+            raise ValueError(
+                "torch.compile requires at least one complete warmup session"
+            )
         if (
             not self.output.expanduser()
             .resolve()
@@ -151,6 +157,16 @@ class TorchAPI(Protocol):
     def tensor(self, data: list[list[int]], *, dtype: object) -> Tensor: ...
 
     def inference_mode(self) -> AbstractContextManager[object]: ...
+
+    def compile(
+        self,
+        model: Model,
+        *,
+        backend: str,
+        mode: str,
+        dynamic: bool,
+        fullgraph: bool,
+    ) -> Model: ...
 
 
 _FACTORIES = {
@@ -275,18 +291,26 @@ def read_tokens(path: Path, count: int, vocab_size: int | None) -> list[int]:
     return selected
 
 
-def audit_model(model: Model, torch: TorchAPI) -> dict[str, object]:
+def audit_model(
+    model: Model, torch: TorchAPI, *, require_fp32: bool
+) -> dict[str, object]:
     dtypes: Counter[str] = Counter()
     for name, tensor in (*model.named_parameters(), *model.named_buffers()):
         if tensor.device.type != "cpu":
             raise ValueError(f"{name} is on {tensor.device.type}; CPU is required")
         dtypes[str(tensor.dtype)] += 1
-        if tensor.is_floating_point() and tensor.dtype != torch.float32:
+        if (
+            require_fp32
+            and tensor.is_floating_point()
+            and tensor.dtype != torch.float32
+        ):
             raise ValueError(f"{name} has {tensor.dtype}; FP32 execution is required")
     return {"parameter_and_buffer_dtype_counts": dict(dtypes), "all_devices_cpu": True}
 
 
-def audit_cache(past: object, torch: TorchAPI) -> dict[str, object]:
+def audit_cache(
+    past: object, torch: TorchAPI, *, require_fp32: bool
+) -> dict[str, object]:
     layers = cast(list[object], getattr(past, "layers", []))
     dtypes: Counter[str] = Counter()
     for layer in layers:
@@ -297,7 +321,9 @@ def audit_cache(past: object, torch: TorchAPI) -> dict[str, object]:
                 if candidate is None:
                     continue
                 tensor = cast(Tensor, candidate)
-                if tensor.device.type != "cpu" or tensor.dtype != torch.float32:
+                if tensor.device.type != "cpu":
+                    raise ValueError(f"cache {name} must stay on CPU")
+                if require_fp32 and tensor.dtype != torch.float32:
                     raise ValueError(f"cache {name} must be FP32 on CPU")
                 dtypes[str(tensor.dtype)] += 1
     if not dtypes:
@@ -374,6 +400,15 @@ def benchmark(options: Options) -> dict[str, object]:
     os.environ.setdefault(
         "TORCH_HOME", str(Path.home() / ".trillim/cpu-compare-20261113/torch-cache")
     )
+    for variable, directory in (
+        ("TORCHINDUCTOR_CACHE_DIR", "torchinductor-cache"),
+        ("TORCH_EXTENSIONS_DIR", "torch-extensions"),
+        ("TRITON_CACHE_DIR", "triton-cache"),
+        ("TMPDIR", "tmp"),
+    ):
+        cache_directory = Path.home() / ".trillim/cpu-compare-20261113" / directory
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        os.environ[variable] = str(cache_directory)
     checkpoint = options.checkpoint.expanduser().resolve()
     output_path = options.output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,21 +429,40 @@ def benchmark(options: Options) -> dict[str, object]:
     torch.set_float32_matmul_precision("highest")
     factory = cast(ModelFactory, getattr(transformers, _FACTORIES[config.model_type]))
     load_kwargs: dict[str, object] = {
-        "dtype": torch.float32,
+        "dtype": torch.float32 if options.dtype == "float32" else "auto",
         "attn_implementation": attention_policy(options, config),
         "local_files_only": True,
         "trust_remote_code": False,
     }
     if config.model_type == "gpt_oss":
         # The CPU MXFP4 loader expands exact FP4 values through BF16 before FP32.
-        load_kwargs["dtype"] = torch.bfloat16
+        if options.dtype == "float32":
+            load_kwargs["dtype"] = torch.bfloat16
         mxfp4 = cast(Mxfp4Factory, transformers.Mxfp4Config)
         load_kwargs["quantization_config"] = mxfp4(dequantize=True)
-    model = factory.from_pretrained(checkpoint, **load_kwargs).float().eval()
-    dtype_audit = audit_model(model, torch)
+    model = factory.from_pretrained(checkpoint, **load_kwargs).eval()
+    bitnet_quantized = (
+        config.quantization_config is not None
+        and config.quantization_config.get("quant_method") == "bitnet"
+    )
+    if options.dtype == "float32" and not bitnet_quantized:
+        model = model.float()
+    dtype_audit = audit_model(model, torch, require_fp32=options.dtype == "float32")
+    model_class = type(model).__name__
     architecture = importlib.import_module(type(model).__module__)
     architecture_path = Path(architecture.__file__) if architecture.__file__ else None
     architecture_sha256 = sha256(architecture_path) if architecture_path else None
+    compile_wrapper_seconds = 0.0
+    if options.compile_mode is not None:
+        compile_started = time.perf_counter()
+        model = torch.compile(
+            model,
+            backend="inductor",
+            mode=options.compile_mode,
+            dynamic=True,
+            fullgraph=False,
+        )
+        compile_wrapper_seconds = time.perf_counter() - compile_started
     inputs = [torch.tensor([tokens[: options.prompt]], dtype=torch.long)]
     positions = [torch.tensor([list(range(options.prompt))], dtype=torch.long)]
     for step in range(options.decode):
@@ -423,8 +477,10 @@ def benchmark(options: Options) -> dict[str, object]:
     cache_audits: list[dict[str, object]] = []
     prefill_times: list[float] = []
     measured_decode_times: list[float] = []
+    warmup_wall_seconds: list[float] = []
     with torch.inference_mode():
         for trial in range(options.warmups + options.repeats):
+            trial_started = time.perf_counter()
             past: object | None = None
             if options.cache_implementation == "static":
                 past = static_cache(config=model.config, max_cache_len=options.cache)
@@ -456,7 +512,9 @@ def benchmark(options: Options) -> dict[str, object]:
                     saved_logits.append(last)
                 del output
             if trial >= options.warmups:
-                cache_audits.append(audit_cache(past, torch))
+                cache_audits.append(
+                    audit_cache(past, torch, require_fp32=options.dtype == "float32")
+                )
                 decode_times = latencies[1:]
                 prefill_times.append(latencies[0])
                 measured_decode_times.extend(decode_times)
@@ -473,6 +531,8 @@ def benchmark(options: Options) -> dict[str, object]:
                         "predicted_token_ids": predictions,
                     }
                 )
+            else:
+                warmup_wall_seconds.append(time.perf_counter() - trial_started)
             print(
                 f"{'warmup' if trial < options.warmups else 'measured'} session {trial} complete",
                 flush=True,
@@ -506,7 +566,8 @@ def benchmark(options: Options) -> dict[str, object]:
         "config_sha256": sha256(checkpoint / "config.json"),
         "checkpoint_weights": weights,
         "model_type": config.model_type,
-        "model_class": type(model).__name__,
+        "model_class": model_class,
+        "execution_model_class": type(model).__name__,
         "architecture_source": str(architecture_path) if architecture_path else None,
         "architecture_sha256": architecture_sha256,
         "benchmark_source_sha256": sha256(Path(__file__)),
@@ -529,8 +590,26 @@ def benchmark(options: Options) -> dict[str, object]:
         if options.cache_implementation == "static"
         else "logical bound; dynamic caches grow with context",
         "dtype_audit": dtype_audit,
-        "activation_and_cache_dtype": "float32",
-        "weight_representation": "native checkpoint values expanded to FP32 in RAM; no converted checkpoint saved",
+        "dtype_policy": options.dtype,
+        "activation_and_cache_dtype": "float32"
+        if options.dtype == "float32"
+        else "native model execution; actual cache tensor dtypes recorded in cache_audits",
+        "intermediate_dot_precision": "determined by PyTorch CPU kernels; parameter/cache dtypes do not prove intermediate arithmetic precision",
+        "weight_representation": "native checkpoint values expanded to FP32 in RAM; no converted checkpoint saved"
+        if options.dtype == "float32"
+        else "Transformers dtype=auto loading, with checkpoint quantization metadata retained; no float conversion or converted checkpoint saved",
+        "checkpoint_quantization": config.quantization_config,
+        "compilation": {
+            "enabled": options.compile_mode is not None,
+            "mode": options.compile_mode,
+            "backend": "inductor" if options.compile_mode is not None else None,
+            "dynamic": True if options.compile_mode is not None else None,
+            "fullgraph": False if options.compile_mode is not None else None,
+            "wrapper_setup_seconds": compile_wrapper_seconds,
+            "warmup_session_wall_seconds": warmup_wall_seconds,
+            "warmup_wall_seconds_total": sum(warmup_wall_seconds),
+            "timing_note": "Lazy compilation occurs in excluded complete warmup sessions. Any later recompilation remains included in measured call latency; no compilation cost is subtracted.",
+        },
         "teacher_file_sha256": sha256(options.tokens_file),
         "teacher_token_ids": tokens,
         "teacher_token_ids_sha256": hashlib.sha256(
@@ -590,6 +669,8 @@ def main() -> None:
     ):
         run.add_argument("--" + name, type=int, default=default)
     run.add_argument("--attention", choices=("auto", "sdpa", "eager"), default="auto")
+    run.add_argument("--dtype", choices=("float32", "native"), default="float32")
+    run.add_argument("--compile-mode", choices=("default", "max-autotune"))
     run.add_argument(
         "--cache-implementation", choices=("dynamic", "static"), default="dynamic"
     )
