@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import mmap
 import platform
+import resource
 import statistics
 import subprocess
 import time
@@ -29,6 +31,7 @@ class Options(BaseModel):
     threads: int = Field(default=20, ge=1)
     warmups: int = Field(default=2, ge=0)
     repeats: int = Field(default=3, ge=1)
+    prefault_weights: bool = True
 
     @model_validator(mode="after")
     def validate_capacity(self) -> Options:
@@ -39,6 +42,10 @@ class Options(BaseModel):
 
 class Session(BaseModel):
     warmup: bool
+    load_seconds: float
+    prefault_seconds: float
+    prefault_minor_faults: int
+    prefill_minor_faults: int
     prefill_seconds: float
     decode_seconds: list[float]
     predicted_ids: list[int]
@@ -81,14 +88,25 @@ def benchmark(options: Options) -> Results:
     sessions: list[Session] = []
     first_logits: list[np.ndarray[tuple[int, ...], np.dtype[np.float32]]] = []
     for repeat in range(options.warmups + options.repeats):
+        loading = time.perf_counter()
         with Runtime(options.bundle, threads=options.threads) as runtime:
+            load_seconds = time.perf_counter() - loading
+            faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
+            prefault_started = time.perf_counter()
+            if options.prefault_weights:
+                for mapping in runtime._backend.mapping_views:
+                    int(np.bitwise_or.reduce(mapping[:: mmap.PAGESIZE], initial=np.uint8(0)))
+            prefault_seconds = time.perf_counter() - prefault_started
+            prefault_faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt - faults
             prompt = teacher[: options.prompt]
             positions = np.arange(options.prompt, dtype=np.int64)
+            faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
             started = time.perf_counter()
             logits = runtime.run({"tokens": prompt, "positions": positions})[
                 "logits"
             ].ravel()
             prefill = time.perf_counter() - started
+            prefill_faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt - faults
             if not bool(np.isfinite(logits).all()):
                 raise ValueError("prefill logits must be finite")
             prefill_hash = hashlib.sha256(logits.tobytes()).hexdigest()
@@ -113,6 +131,10 @@ def benchmark(options: Options) -> Results:
             sessions.append(
                 Session(
                     warmup=repeat < options.warmups,
+                    load_seconds=load_seconds,
+                    prefault_seconds=prefault_seconds,
+                    prefault_minor_faults=prefault_faults,
+                    prefill_minor_faults=prefill_faults,
                     prefill_seconds=prefill,
                     decode_seconds=samples,
                     predicted_ids=predicted,
@@ -146,7 +168,7 @@ def benchmark(options: Options) -> Results:
         ),
         decode_median_tokens_per_second=1 / statistics.median(decode),
         decode_aggregate_tokens_per_second=len(decode) / sum(decode),
-        timing_scope="CPU Runtime.run including input binding, execution and owned output copy; excludes loading, tokenization, input array preparation, argmax and saving. Shared teacher stream; FP32 activations/cache and native checkpoint weight values. Cache option documents the compiled TDL capacity; this helper does not change it.",
+        timing_scope="CPU Runtime.run including input binding, execution and owned output copy; excludes loading, explicitly recorded VM weight prefault, tokenization, input array preparation, argmax and saving. Use --no-prefault-weights to retain mmap first-touch latency inside prefill. Shared teacher stream; FP32 activations/cache and native checkpoint weight values. Cache option documents the compiled TDL capacity; this helper does not change it.",
     )
 
 
@@ -161,6 +183,7 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--prefault-weights", action=argparse.BooleanOptionalAction, default=True)
     options = Options.model_validate(vars(parser.parse_args()))
     results = benchmark(options)
     options.output.with_suffix(".json").write_text(
