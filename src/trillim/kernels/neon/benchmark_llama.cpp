@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -27,6 +28,11 @@ int main(int argc, char **argv) {
     llama_token token;
     while (token_file >> token) { tokens.push_back(token); }
     if (tokens.size() < static_cast<size_t>(prompt + decode)) { throw std::runtime_error("insufficient teacher tokens"); }
+    llama_log_set([](ggml_log_level level, const char *message, void *) {
+        if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+            std::fputs(message, stderr);
+        }
+    }, nullptr);
     ggml_backend_load_all();
     llama_backend_init();
     auto mp = llama_model_default_params();
