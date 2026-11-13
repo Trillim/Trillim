@@ -1009,6 +1009,33 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus project_columns(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const Task *t = opaque;
+    const Parameters *p = t->p;
+    size_t columns = p->n / 16 + (p->n % 16 != 0);
+    size_t batch = index / columns;
+    size_t first = index % columns * 16;
+    size_t last = p->n - first < 16 ? p->n : first + 16;
+    size_t height = tile_rows(p);
+    size_t a_batch = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
+    size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
+    /* Reuse this weight tile in one worker before advancing to other columns. */
+    for (size_t row = 0; row < p->m;) {
+        if (t->context->is_cancelled(t->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t rows = p->m - row < height ? p->m - row : height;
+        TrillimStatus status = dot_tile6(t, a_batch + row * p->a_row_stride, b_base,
+                                        (batch * p->m + row) * p->n, rows, first, last);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        row += rows;
+    }
+    return TRILLIM_OK;
+}
+
 typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
                       const float *, int, float, float *, int);
 static Sgemm sgemm;
@@ -1379,6 +1406,11 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_dense(void *const *outputs, const void
     size_t height = tile_rows(p);
     size_t rows = p->m / height + (p->m % height != 0);
     size_t columns = p->n / 64 + (p->n % 64 != 0);
+    if (p->m >= 12 && p->m <= 32 && columns / 2 >= context->thread_pool->worker_count &&
+        height == 6 && p->a_col_stride == 1 && p->b_row_stride == 1) {
+        size_t tiles = p->n / 16 + (p->n % 16 != 0);
+        return context->thread_pool->run(context->thread_pool->context, p->batches * tiles, project_columns, &task);
+    }
     return context->thread_pool->run(context->thread_pool->context, p->batches * rows * columns, project, &task);
 }
 
