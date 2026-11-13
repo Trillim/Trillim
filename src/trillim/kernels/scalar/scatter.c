@@ -536,6 +536,87 @@ static bool initial_layout(const TrillimIndexParameters *p, bool *uniform) {
     return count == p->count && (*uniform || contiguous);
 }
 
+typedef struct {
+    void *output;
+    const TrillimIndexTask *task;
+} ReplaceTask;
+
+static bool disjoint(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
+    uintptr_t first = (uintptr_t)a, second = (uintptr_t)b;
+    return first <= second ? second - first >= a_bytes : first - second >= b_bytes;
+}
+
+static bool parallel_replace(const void *output, const TrillimIndexTask *task) {
+    const TrillimIndexParameters *p = task->parameters;
+    size_t bytes = trillim_itemsize(p->dtype), count = p->slice_size;
+    if (p->mode || !bytes || !p->items || !p->slice_size || p->count < 32768 ||
+        p->items > SIZE_MAX / p->slice_size) {
+        return false;
+    }
+    for (size_t axis = p->coordinates; axis-- > 0;) {
+        if (p->indexed_shape[axis] > 1 && p->output_indexed_strides[axis] != count) {
+            return false;
+        }
+        if (p->indexed_shape[axis] && count > SIZE_MAX / p->indexed_shape[axis]) {
+            return false;
+        }
+        count *= p->indexed_shape[axis];
+    }
+    size_t values, indices;
+    if (count != p->count || count > SIZE_MAX / bytes ||
+        !trillim_span(p->values_rank, p->values_shape, p->values_strides, &values) ||
+        values > SIZE_MAX / bytes ||
+        !trillim_span(p->index_rank, p->index_shape, p->index_strides, &indices)) {
+        return false;
+    }
+    if (p->coordinates) {
+        if (p->coordinate_stride && p->coordinates - 1 > (SIZE_MAX - indices) / p->coordinate_stride) {
+            return false;
+        }
+        indices += (p->coordinates - 1) * p->coordinate_stride;
+    } else {
+        indices = 0;
+    }
+    return indices <= SIZE_MAX / sizeof(int64_t) &&
+        disjoint(output, count * bytes, task->inputs[1], indices * sizeof(int64_t)) &&
+        disjoint(output, count * bytes, task->inputs[2], values * bytes);
+}
+
+static TrillimStatus replace_tile(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const ReplaceTask *copy = opaque;
+    const TrillimIndexTask *task = copy->task;
+    const TrillimIndexParameters *p = task->parameters;
+    size_t first = tile * 1024, count = p->items * p->slice_size;
+    size_t end = count - first < 1024 ? count : first + 1024;
+    size_t width = p->values_rank ? p->values_shape[p->values_rank - 1] : 1;
+    size_t step = p->values_rank ? p->values_strides[p->values_rank - 1] : 0;
+    while (first < end) {
+        size_t item = first / p->slice_size, offset = first % p->slice_size;
+        size_t source, destination, key;
+        bool active;
+        TrillimStatus status = trillim_coordinates(task, item, &source, &destination, &key, &active);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        size_t length = width - first % width;
+        if (length > end - first) {
+            length = end - first;
+        }
+        if (length > p->slice_size - offset) {
+            length = p->slice_size - offset;
+        }
+        source = trillim_offset(first, p->values_rank, p->values_shape, p->values_strides);
+        status = copy_run(copy->output, destination + offset, task->inputs[2], source,
+                          step, length, p->dtype, task->context);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        first += length;
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -582,6 +663,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
             memset(table + begin, 255, count * sizeof(size_t));
         }
     }
+    bool parallel = parallel_replace(outputs[0], &task);
     for (size_t item = 0; item < p->items; ++item) {
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -611,6 +693,9 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
                 slot = (slot + 1) & (table_capacity - 1);
             }
             table[slot] = key;
+        }
+        if (parallel) {
+            continue;
         }
         if (p->mode == 0 && trillim_itemsize(p->dtype) != 0) {
             size_t first = item * p->slice_size;
@@ -657,6 +742,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
                 trillim_store(outputs[0], destination + i, p->dtype, value);
             }
         }
+    }
+    if (parallel) {
+        size_t count = p->items * p->slice_size;
+        ReplaceTask copy = {outputs[0], &task};
+        return context->thread_pool->run(context->thread_pool->context,
+            count / 1024 + (count % 1024 != 0), replace_tile, &copy);
     }
     if (p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return TRILLIM_OK;
