@@ -72,6 +72,13 @@ static size_t block_k(const Parameters *p) {
 }
 
 static size_t block_m(const Parameters *p) {
+    bool direct_f32 = p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
+        p->out_dtype == TRILLIM_FP32 && p->m >= 1024 && p->n >= 512 && p->n <= 2048 &&
+        ((p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) ||
+         (p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX));
+    if (direct_f32) {
+        return 256;
+    }
     /* Direct A/C access permits taller tiles without larger packing buffers. */
     bool direct = p->a_dtype == TRILLIM_FP32 && p->out_dtype == TRILLIM_FP32 &&
         p->b_dtype != TRILLIM_FP32 && p->n >= 2560 &&
