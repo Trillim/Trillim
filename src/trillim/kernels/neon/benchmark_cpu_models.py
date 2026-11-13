@@ -96,6 +96,7 @@ def benchmark(options: Options) -> Results:
             if options.prefault_weights:
                 for mapping in runtime._backend.mapping_views:
                     int(np.bitwise_or.reduce(mapping[:: mmap.PAGESIZE], initial=np.uint8(0)))
+                    del mapping
             prefault_seconds = time.perf_counter() - prefault_started
             prefault_faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt - faults
             prompt = teacher[: options.prompt]
