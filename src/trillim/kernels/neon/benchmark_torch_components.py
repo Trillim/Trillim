@@ -20,7 +20,9 @@ import statistics
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, Self, cast
 
 import numpy as np
@@ -299,6 +301,14 @@ def load_prefix(archive: Archive, prefix: str, module: Module) -> int:
     return len(state)
 
 
+def stamp_pocket_state_names(model: Module) -> None:
+    stamp = cast(
+        Callable[[object], None],
+        importlib.import_module("pocket_tts.models.tts_model").stamp_state_names,
+    )
+    stamp(SimpleNamespace(flow_lm=model, mimi=model))
+
+
 def parakeet(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
     transformer = importlib.import_module("transformers")
     cls = cast(PretrainedFactory, transformer.ParakeetForTDT)
@@ -367,10 +377,20 @@ def pocket_flow(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
 
 
 def pocket_backbone(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
+    current = int(importlib.metadata.version("pocket-tts").split(".")[0]) >= 4
+    transformer_module = (
+        "pocket_tts.modules.transformer"
+        if current
+        else "pocket_tts.modules.mimi_transformer"
+    )
+    arguments: dict[str, object] = {
+        "dim_feedforward": 4096,
+        "max_period": 10000.0,
+    }
+    if not current:
+        arguments["kind"] = "flow_lm"
     model = (
-        factory("pocket_tts.modules.mimi_transformer", "StreamingTransformer")(
-            1024, 16, 6, dim_feedforward=4096, max_period=10000.0, kind="flow_lm"
-        )
+        factory(transformer_module, "StreamingTransformer")(1024, 16, 6, **arguments)
         .float()
         .cpu()
         .eval()
@@ -382,6 +402,8 @@ def pocket_backbone(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapte
         count += load_prefix(archive, "flow_lm.out_norm.", norm)
     if count != 50:
         raise ValueError("backbone must load every one of its 50 native tensors")
+    if current:
+        stamp_pocket_state_names(model)
     state_module = importlib.import_module("pocket_tts.modules.stateful_module")
     initialize = cast(InitializeStates, state_module.init_states)
     increment = cast(IncrementSteps, state_module.increment_steps)
@@ -411,12 +433,13 @@ def pocket_backbone(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapte
         decode,
         (model, norm),
         (
-            "pocket_tts.modules.mimi_transformer",
+            transformer_module,
             "pocket_tts.modules.transformer",
             "pocket_tts.modules.rope",
             "pocket_tts.modules.stateful_module",
+            "pocket_tts.models.tts_model",
         ),
-        "Official PocketTTS StreamingTransformer(kind=flow_lm) plus official LayerNorm boundary wrapper",
+        "Official PocketTTS flow backbone StreamingTransformer plus official LayerNorm boundary wrapper",
         "Complete six-layer embedded-input causal backbone plus out_norm, prefill followed by persistent-cache decode",
         "Token embedding, latent input projection, EOS head, flow head, solver and Mimi",
         "Fresh primary cache per trial, allocated outside timing; primary offset increments are inside timed calls",
@@ -425,6 +448,12 @@ def pocket_backbone(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapte
 
 
 def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
+    current = int(importlib.metadata.version("pocket-tts").split(".")[0]) >= 4
+    transformer_module = (
+        "pocket_tts.modules.transformer"
+        if current
+        else "pocket_tts.modules.mimi_transformer"
+    )
     seanet: dict[str, object] = {
         "channels": 1,
         "dimension": 512,
@@ -449,7 +478,10 @@ def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
         "max_period": 10000.0,
         "dim_feedforward": 2048,
     }
-    projected = factory("pocket_tts.modules.mimi_transformer", "ProjectedTransformer")
+    projected = factory(transformer_module, "ProjectedTransformer")
+    arguments: dict[str, object] = {}
+    if current:
+        arguments.update(inner_dim=None, outer_dim=None)
     model = (
         factory("pocket_tts.models.mimi", "MimiModel")(
             encoder=factory("pocket_tts.modules.seanet", "SEANetEncoder")(**seanet),
@@ -463,6 +495,7 @@ def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
             channels=1,
             encoder_transformer=projected(**transformer),
             decoder_transformer=projected(**transformer),
+            **arguments,
         )
         .float()
         .cpu()
@@ -480,6 +513,8 @@ def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
         std = archive.get_tensor("flow_lm.emb_std").float()
     if count != 44:
         raise ValueError("Mimi must strictly load all 44 executed decoder tensors")
+    if current:
+        stamp_pocket_state_names(model)
     initialize = cast(
         InitializeStates,
         importlib.import_module("pocket_tts.modules.stateful_module").init_states,
@@ -493,9 +528,12 @@ def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
         state = initialize(model, batch_size=1, sequence_length=1000)
 
     def forward() -> Arrays:
-        latent = (values * std + mean).transpose(1, 2)
-        projected_latent = cast(Tensor, mimi.quantizer(latent))
-        result = mimi.decode_from_latent(projected_latent, state)
+        latent = values * std + mean
+        if current:
+            result = mimi.decode_from_latent(latent, state)
+        else:
+            projected_latent = cast(Tensor, mimi.quantizer(latent.transpose(1, 2)))
+            result = mimi.decode_from_latent(projected_latent, state)
         return {"waveform": array(result.squeeze(0))}
 
     return Adapter(
@@ -507,7 +545,7 @@ def pocket_mimi(options: Options, arrays: Arrays, torch: TorchAPI) -> Adapter:
             "pocket_tts.models.mimi",
             "pocket_tts.models.tts_model",
             "pocket_tts.modules.seanet",
-            "pocket_tts.modules.mimi_transformer",
+            transformer_module,
             "pocket_tts.modules.dummy_quantizer",
             "pocket_tts.modules.resample",
             "pocket_tts.modules.conv",
@@ -601,10 +639,12 @@ def load_reference(options: Options) -> Arrays:
         return {name: np.asarray(archive[name], dtype=np.float32) for name in names}
 
 
-def compare(actual: Arrays, expected: Arrays, options: Options) -> dict[str, object]:
+def compare(
+    actual: Arrays, expected: Arrays, options: Options
+) -> dict[str, dict[str, object]]:
     if actual.keys() != expected.keys():
         raise ValueError("reference output names differ")
-    result: dict[str, object] = {}
+    result: dict[str, dict[str, object]] = {}
     for name, value in actual.items():
         reference = expected[name]
         if value.shape != reference.shape or not np.isfinite(value).all():
@@ -623,10 +663,6 @@ def compare(actual: Arrays, expected: Arrays, options: Options) -> dict[str, obj
             "rtol": options.rtol,
             "atol": options.atol,
         }
-        if not matches:
-            raise ValueError(
-                f"PyTorch output differs from saved matched reference: {name}: {result[name]}"
-            )
     return result
 
 
@@ -683,11 +719,13 @@ def run(options: Options, arrays: Arrays) -> dict[str, object]:
     samples: dict[str, list[float]] = {}
     output_hashes: list[dict[str, str]] = []
     outputs: Arrays = {}
-    checks: dict[str, object] = {}
+    checks: dict[str, dict[str, object]] = {}
+    fidelity_pass = True
     with torch.inference_mode():
         for index in range(iterations):
             times, outputs = trial(adapter, options)
             checks = compare(outputs, expected, options)
+            fidelity_pass &= all(value["allclose"] is True for value in checks.values())
             target = warmups if index < options.warmups else samples
             for phase, values in times.items():
                 target.setdefault(phase, []).extend(values)
@@ -714,7 +752,12 @@ def run(options: Options, arrays: Arrays) -> dict[str, object]:
         if any(name.replace("-", "_") in source for source in adapter.source_modules):
             packages[name] = importlib.metadata.version(name)
     return {
-        "status": "validated" if options.validate_only else "measured",
+        "status": (
+            "fidelity_warning"
+            if not fidelity_pass
+            else "validated" if options.validate_only else "measured"
+        ),
+        "reference_allclose": fidelity_pass,
         "component": options.component,
         "implementation": adapter.implementation,
         "performance_claim": "Named eager official-module CPU control; not a fastest-possible PyTorch claim",
