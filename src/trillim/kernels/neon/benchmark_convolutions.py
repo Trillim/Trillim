@@ -229,11 +229,10 @@ def _measure(
         "bias_dtype": dtype_id,
         "output_dtype": dtype_id,
     }
-    if transpose:
-        parameters["channel_stride"] = int(x.strides[0] // x.itemsize)
-        parameters["input_strides"] = tuple(
-            int(value // x.itemsize) for value in x.strides[1:]
-        )
+    parameters["channel_stride"] = int(x.strides[0] // x.itemsize)
+    parameters["input_strides"] = tuple(
+        int(value // x.itemsize) for value in x.strides[1:]
+    )
     payloads = tuple(
         _encode(value, dtype)[0].tobytes() for value in (x, w, b)[: 3 if biased else 2]
     )
@@ -309,11 +308,6 @@ def _measure(
         if transpose:
             del blas_parameters["channel_stride"]
             del blas_parameters["input_strides"]
-        else:
-            blas_parameters["channel_stride"] = int(x.strides[0] // x.itemsize)
-            blas_parameters["input_strides"] = tuple(
-                int(value // x.itemsize) for value in x.strides[1:]
-            )
         candidate = replace(
             invocation,
             kernel=f"trillim_scalar_{blas_name}",
@@ -442,9 +436,8 @@ def _primitive_oracle(options: _Options, library: Path, harness: Path) -> None:
                     "bias_dtype": dtype_id,
                     "output_dtype": dtype_id,
                 }
-                if transpose:
-                    parameters["channel_stride"] = 9
-                    parameters["input_strides"] = (1,)
+                parameters["channel_stride"] = 9
+                parameters["input_strides"] = (1,)
                 suffix = "conv_transpose_nd" if transpose else "conv_nd"
                 if biased:
                     suffix += "_bias"
