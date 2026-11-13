@@ -149,6 +149,11 @@ class Options(BaseModel):
         return self
 
 
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def decoder_graph_source(config: FullWhisperConfig) -> str:
     heads = config.decoder_attention_heads
     width = config.d_model // heads
@@ -312,6 +317,17 @@ def run(options: Options) -> None:
         return
     if options.output is None:
         raise ValueError("model inference requires --output")
+    input_files: dict[str, JsonValue] = {
+        str(path.resolve()): _file_sha256(path)
+        for path in (
+            options.checkpoint / "config.json",
+            options.features,
+            options.encoded,
+            options.teacher,
+            options.forced_token_file,
+        )
+        if path is not None
+    }
     prefix = _prefix(options, config)
     teacher = (
         _load_tokens(options.teacher, "generated")
@@ -387,6 +403,22 @@ def run(options: Options) -> None:
             position = end
         for step in range(options.steps):
             selected = _select(logits, config, step)
+            alternatives = logits.copy()
+            alternatives[selected] = -np.inf
+            runner_up = _select(alternatives, config, step)
+            calls[-1].update(
+                {
+                    "selected_token": selected,
+                    "selected_runner_up": runner_up,
+                    "selected_top_two_margin": (
+                        float(logits[selected] - logits[runner_up])
+                        if runner_up != selected
+                        and np.isfinite(logits[selected])
+                        and np.isfinite(logits[runner_up])
+                        else None
+                    ),
+                }
+            )
             generated.append(selected)
             if (
                 teacher is None and selected == config.eos_token_id
@@ -410,9 +442,29 @@ def run(options: Options) -> None:
     symbols = ManifestSymbols.model_validate_json(manifest.read_bytes())
     report: dict[str, JsonValue] = {
         "scope": "Correctness replay; elapsed times are diagnostic, not isolated performance",
+        "benchmark_source_sha256": _file_sha256(Path(__file__)),
         "command": [value for value in sys.argv],
         "options": options.model_dump(mode="json"),
+        "input_files_sha256": input_files,
+        "input_files_changed_during_run": [
+            path
+            for path, digest in input_files.items()
+            if _file_sha256(Path(path)) != digest
+        ],
         "encoder_seconds": encoder_seconds,
+        "encoder_manifest_sha256": (
+            _file_sha256(encoder / "executable.json")
+            if options.encoded is None
+            else None
+        ),
+        "encoder_kernel_libraries": (
+            {
+                str(path): _file_sha256(path)
+                for path in sorted((encoder / "kernels").glob("*.so"))
+            }
+            if options.encoded is None
+            else {}
+        ),
         "compiled_token_bound": maximum,
         "selection_policy": {
             "suppress_tokens": [value for value in config.suppress_tokens],
@@ -421,18 +473,23 @@ def run(options: Options) -> None:
             "timestamp_token_start": 50364,
             "eos_token_id": config.eos_token_id,
         },
-        "decoder_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        "compiled_payloads_sha256": {
+            str(bundle / name): _file_sha256(bundle / name)
+            for bundle in (
+                (encoder, decoder) if options.encoded is None else (decoder,)
+            )
+            for name in ("weights.bin", "constants.bin")
+        },
+        "decoder_manifest_sha256": _file_sha256(manifest),
         "selected_kernel_symbols": [
             value
             for value in sorted({kernel.symbol for kernel in symbols.kernels.values()})
         ],
         "kernel_libraries": {
-            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            str(path): _file_sha256(path)
             for path in sorted((decoder / "kernels").glob("*.so"))
         },
-        "config_sha256": hashlib.sha256(
-            (options.checkpoint / "config.json").read_bytes()
-        ).hexdigest(),
+        "config_sha256": _file_sha256(options.checkpoint / "config.json"),
         "encoded_sha256": hashlib.sha256(encoded.tobytes()).hexdigest(),
         "prefix": [int(value) for value in prefix],
         "generated": [value for value in generated],
