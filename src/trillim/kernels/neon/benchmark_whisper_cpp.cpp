@@ -1,5 +1,5 @@
 // CPU-only whisper.cpp comparison with prepared mel features and teacher tokens.
-// Arguments: model.bin mel.f32 teacher.txt output_prefix threads prompt decode warmups repeats
+// Arguments: model.bin mel.f32 teacher.txt output_prefix threads prompt decode warmups repeats [fa-off]
 #include "whisper.h"
 #include <algorithm>
 #include <chrono>
@@ -12,7 +12,7 @@
 #include <vector>
 
 int main(int argc, char **argv) {
-    if (argc != 10) {
+    if (argc != 10 && argc != 11) {
         std::cerr << "model.bin mel.f32 teacher.txt output_prefix threads prompt decode warmups repeats\n";
         return 2;
     }
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     if (!mel_file.read(reinterpret_cast<char *>(mel.data()), static_cast<std::streamsize>(mel_bytes))) { throw std::runtime_error("mel read failed"); }
     auto params = whisper_context_default_params();
     params.use_gpu = false;
-    params.flash_attn = false;
+    if (argc == 11 && std::string(argv[10]) == "fa-off") { params.flash_attn = false; }
     auto *ctx = whisper_init_from_file_with_params_no_state(model.c_str(), params);
     if (!ctx) { throw std::runtime_error("model loading failed"); }
     const int vocab = whisper_n_vocab(ctx), n_mels = whisper_model_n_mels(ctx);
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     std::vector<float> copied(static_cast<size_t>(vocab));
     std::ofstream logits_file(output + "-all-logits.bin", std::ios::binary);
     std::ofstream result(output + ".json");
-    result << std::setprecision(17) << "{\"engine\":\"whisper.cpp\",\"device\":\"cpu\",\"model_ftype\":" << whisper_model_ftype(ctx) << ",\"cache_dtype\":\"upstream default; see pinned source\",\"threads\":" << threads << ",\"vocab_size\":" << vocab << ",\"sessions\":[";
+    result << std::setprecision(17) << "{\"engine\":\"whisper.cpp\",\"device\":\"cpu\",\"model_ftype\":" << whisper_model_ftype(ctx) << ",\"flash_attention\":" << (params.flash_attn ? "true" : "false") << ",\"cache_dtype\":\"upstream default; see pinned source\",\"threads\":" << threads << ",\"vocab_size\":" << vocab << ",\"sessions\":[";
     for (int session = 0; session < warmups + repeats; ++session) {
         auto *state = whisper_init_state(ctx);
         if (!state) { throw std::runtime_error("state initialization failed"); }
