@@ -474,6 +474,20 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
     if (status != TRILLIM_OK) {
         return status;
     }
+    if (active && p->dtype > TRILLIM_BOOL && p->dtype != TRILLIM_FP16 &&
+        p->dtype != TRILLIM_BF16 && trillim_itemsize(p->dtype) &&
+        trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
+        size_t bytes = trillim_itemsize(p->dtype);
+        for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t count = p->slice_size - begin < 1024 ? p->slice_size - begin : 1024;
+            memcpy((uint8_t *)task->output + (item * p->slice_size + begin) * bytes,
+                   (const uint8_t *)task->inputs[0] + (source + begin) * bytes, count * bytes);
+        }
+        return TRILLIM_OK;
+    }
     for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -496,6 +510,24 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
                 }
                 trillim_store(task->output, output_index, p->dtype, value);
             }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static size_t gather_batch_size(const TrillimIndexParameters *p) {
+    return p->slice_size && p->slice_size < 1024 ? 1024 / p->slice_size : 1;
+}
+
+static TrillimStatus gather_batch(void *opaque, size_t batch, size_t worker) {
+    const TrillimIndexTask *task = opaque;
+    const TrillimIndexParameters *p = task->parameters;
+    size_t size = gather_batch_size(p), first = batch * size;
+    size_t end = p->items - first < size ? p->items : first + size;
+    for (size_t item = first; item < end; ++item) {
+        TrillimStatus status = trillim_gather_task(opaque, item, worker);
+        if (status != TRILLIM_OK) {
+            return status;
         }
     }
     return TRILLIM_OK;
@@ -616,7 +648,10 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
     if (trillim_mxfp4_copyable(p)) {
         return trillim_mxfp4_gather(&task);
     }
-    TrillimStatus status = context->thread_pool->run(context->thread_pool->context, p->items, trillim_gather_task, &task);
+    size_t size = gather_batch_size(p);
+    size_t batches = p->items / size + (p->items % size != 0);
+    TrillimStatus status = batches == 1 ? gather_batch(&task, 0, 0) :
+        context->thread_pool->run(context->thread_pool->context, batches, gather_batch, &task);
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return status;
     }
