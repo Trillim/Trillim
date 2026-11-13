@@ -154,15 +154,14 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     if (!p->heads || !p->queries) {
         return TRILLIM_OK;
     }
-    size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
-    if (p->queries < 32 || visible < 64 || p->queries > INT64_MAX || p->length > INT64_MAX ||
+    if (p->queries > INT64_MAX || p->length > INT64_MAX ||
         p->key_dim < 64 || p->key_dim > CHANNELS || p->value_dim < 64 || p->value_dim > CHANNELS ||
         p->q_strides[2] != 1 || p->k_strides[2] != 1 || p->v_strides[2] != 1 ||
         p->q_strides[1] < p->key_dim || p->k_strides[1] < p->key_dim || p->v_strides[1] < p->value_dim ||
         p->q_strides[1] > INT32_MAX || p->k_strides[1] > INT32_MAX || p->v_strides[1] > INT32_MAX ||
         p->heads > SIZE_MAX / p->queries ||
         p->heads * p->queries > SIZE_MAX / sizeof(float) / p->value_dim ||
-        p->kv_heads > (SIZE_MAX - p->heads * p->queries) / 2 / p->length) {
+        (p->length && p->kv_heads > (SIZE_MAX - p->heads * p->queries) / 2 / p->length)) {
         return TRILLIM_ERROR;
     }
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
@@ -440,7 +439,8 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_accelerated_attention(
     if (!p->heads || !p->queries) {
         return TRILLIM_OK;
     }
-    bool available = initialize_blas();
+    size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
+    bool available = visible >= 64 && (p->queries == 1 || p->queries >= 32) && initialize_blas();
     atomic_bool ordinary = ATOMIC_VAR_INIT(available);
     Task task = {outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context, &ordinary};
     size_t rows = p->heads * p->queries + 2 * p->kv_heads * (p->length - first_key(p));
@@ -463,8 +463,8 @@ TRILLIM_KERNEL const char *trillim_scalar_accelerated_attention_tdl(void) {
            "    return (Attention(q, k, v, causal=causal, scale=scale, window=window, dtype=dtype),)\n"
            "def bind(context):\n"
            "    tensors = (context.inputs[name] for name in ('q', 'k', 'v'))\n"
-           "    if context.outputs[0].dtype != 'fp32' or any(t.dtype != 'fp32' or any(d.op != 'const' for d in t.shape) for t in tensors):\n"
-           "        raise ValueError('accelerated attention requires fixed FP32 tensor shapes')\n"
+           "    if context.outputs[0].dtype != 'fp32' or any(t.dtype != 'fp32' or (len(t.shape) != 3 or any(t.shape[axis].op != 'const' for axis in (1, 2))) for t in tensors):\n"
+           "        raise ValueError('accelerated attention requires FP32 and fixed head/channel dimensions')\n"
            "    return _attention(context)\n";
 }
 
