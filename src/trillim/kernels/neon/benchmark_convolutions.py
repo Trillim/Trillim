@@ -300,9 +300,16 @@ def _measure(
     if blas and dtype == "fp32":
         blas_name = "conv_transpose" if transpose else "conv"
         blas_name += "_bias_blas" if biased else "_blas"
+        blas_parameters = dict(parameters)
+        if not transpose:
+            blas_parameters["channel_stride"] = int(x.strides[0] // x.itemsize)
+            blas_parameters["input_strides"] = tuple(
+                int(value // x.itemsize) for value in x.strides[1:]
+            )
         candidate = replace(
             invocation,
             kernel=f"trillim_scalar_{blas_name}",
+            parameters=blas_parameters,
         )
         try:
             blas_samples, blas_bytes, blas_allocated = _invoke(
