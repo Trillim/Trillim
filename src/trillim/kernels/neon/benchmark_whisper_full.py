@@ -9,8 +9,8 @@ Elapsed times are diagnostic unless the caller coordinates an isolated run.
 Download the pinned native FP32 checkpoint from a source checkout:
   HF_HOME=~/Trillim/models/hf-cache UV_CACHE_DIR=~/.trillim/uv-cache uv run --with huggingface_hub python -c 'from pathlib import Path; from huggingface_hub import snapshot_download; snapshot_download("openai/whisper-base", revision="e37978b90ca9030d5170a5c07aadb050351a65bb", local_dir=Path.home()/"Trillim/models/arm-matrix/openai/whisper-base", allow_patterns=["*.json", "merges.txt", "model.safetensors"])'
 
-From the source checkout, prepare separate catalogs using the supported CPU
-registration. Use distinct kernel homes:
+On macOS/AArch64, prepare separate catalogs using the current CPU registration.
+Use distinct kernel homes:
   TRILLIM_HOME=~/.trillim/whisper-scalar-home uv run trillim kernels --backend scalar
   TRILLIM_HOME=~/.trillim/whisper-arm-home uv run trillim kernels --backend scalar src/trillim/kernels/scalar/*.c src/trillim/kernels/neon/*.c
 
