@@ -24,8 +24,11 @@ Compilation writes complete encoder/decoder TDL and bundles below --directory.
 Finally run two separate processes with --label scalar/arm, the same --checkpoint,
 --directory, supplied --features mel.npy (FP32[80,3000]), and distinct --output
 paths. The resulting bundles include their kernels and need no installed catalog
-at execution time. Compare the first differing raw vector and its top-two margin
-before comparing generated text.
+at execution time. Compare the first differing full vector and the masked
+selected_top_two_margin before comparing generated text. Small FP32 differences
+can change a near-tied greedy choice even when the vectors pass tolerance.
+Replay --encoded first_run.npz on both decoders to separate encoder differences
+from decoder differences; each invocation must still use a fresh process.
 """
 
 from __future__ import annotations
