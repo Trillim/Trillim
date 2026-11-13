@@ -63,6 +63,16 @@ static size_t block_k(const Parameters *p) {
     return p->m < 64 || p->n <= 1024 ? 1024 : 512;
 }
 
+static size_t block_m(const Parameters *p) {
+    /* Direct A/C access permits taller tiles without larger packing buffers. */
+    bool direct = p->a_dtype == TRILLIM_FP32 && p->out_dtype == TRILLIM_FP32 &&
+        p->b_dtype != TRILLIM_FP32 && p->n >= 2560 &&
+        ((p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) ||
+         (p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX));
+    return direct && p->m >= 128 ? 256 : BLOCK_M;
+}
+
+
 static size_t tile_rows(const Parameters *p) {
     return !precise(p) && p->m >= 12 && p->a_col_stride == 1 && p->b_row_stride == 1 ? 6 : 4;
 }
@@ -161,7 +171,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     /* Reserve optional-library workspace independently of host availability. */
     if (reserve_blas(p)) {
         (void)initialize_blas();
-        size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+        size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
         size_t columns = p->n / 64 + (p->n % 64 != 0);
         size_t count = p->batches * rows * columns;
         *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
@@ -1175,11 +1185,11 @@ static TrillimStatus pack(const void *source, uint32_t dtype, size_t base,
 
 static size_t row_reuse(const Parameters *p, const TrillimKernelContext *context) {
     size_t workers = context->thread_pool->worker_count;
-    size_t minimum_rows = workers <= 8 ? 128 : 512;
+    size_t minimum_rows = workers <= 8 || p->n >= 2048 ? 128 : 512;
     if (p->m < minimum_rows || p->out_dtype != TRILLIM_FP32 || p->b_dtype == TRILLIM_FP32 || p->k == 0) {
         return 1;
     }
-    size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+    size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
     size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
     if (columns == 0) {
         return 1;
@@ -1206,7 +1216,7 @@ static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t w
     size_t width = block_n(p);
     size_t depth = block_k(p);
     size_t columns = p->n / width + (p->n % width != 0);
-    size_t row_tiles = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+    size_t row_tiles = p->m / block_m(p) + (p->m % block_m(p) != 0);
     float *a_pack = job->scratch + index * WORKSPACE;
     float *b_pack = a_pack + BLOCK_M * BLOCK_K;
     float *c_pack = b_pack + BLOCK_K * BLOCK_N;
@@ -1215,9 +1225,9 @@ static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t w
             return TRILLIM_CANCELLED;
         }
         size_t batch = tile / columns / row_tiles;
-        size_t row = tile / columns % row_tiles * BLOCK_M;
+        size_t row = tile / columns % row_tiles * block_m(p);
         size_t column = tile % columns * width;
-        size_t m = p->m - row < BLOCK_M ? p->m - row : BLOCK_M;
+        size_t m = p->m - row < block_m(p) ? p->m - row : block_m(p);
         size_t n = p->n - column < width ? p->n - column : width;
         size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides) + row * p->a_row_stride;
         size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides) + column * p->b_col_stride;
@@ -1295,7 +1305,7 @@ static TrillimStatus grouped_project_impl(void *opaque, size_t index, size_t wor
     const Parameters *p = t->p;
     size_t width = block_n(p), depth = block_k(p);
     size_t columns = p->n / width + (p->n % width != 0);
-    size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+    size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
     size_t groups = rows / job->row_reuse + (rows % job->row_reuse != 0);
     float *a_pack = job->scratch + index * WORKSPACE;
     float *b_pack = a_pack + BLOCK_M * BLOCK_K;
@@ -1334,8 +1344,8 @@ static TrillimStatus grouped_project_impl(void *opaque, size_t index, size_t wor
                 if (t->context->is_cancelled(t->context->cancellation_context)) {
                     return TRILLIM_CANCELLED;
                 }
-                size_t row = block * BLOCK_M;
-                size_t m = p->m - row < BLOCK_M ? p->m - row : BLOCK_M;
+                size_t row = block * block_m(p);
+                size_t m = p->m - row < block_m(p) ? p->m - row : block_m(p);
                 size_t a_index = a_base + row * p->a_row_stride + first * p->a_col_stride;
                 const float *a = a_pack;
                 int a_trans = 111, lda = (int)k;
@@ -1394,7 +1404,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_dense(void *const *outputs, const void
     }
     Task task = {outputs[0], inputs[0], inputs[1], p, context};
     if (use_blas(p, context)) {
-        size_t rows = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+        size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
         size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
         size_t reuse = row_reuse(p, context);
         size_t groups = rows / reuse + (rows % reuse != 0);
