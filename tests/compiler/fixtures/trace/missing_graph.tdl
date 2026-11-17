@@ -1,4 +1,0 @@
-from trillim.tdl import *
-
-with Graph() as model:
-    Output(Constant(1), name="value")

@@ -1,3 +1,0 @@
-from trillim.tdl import *
-
-graph = 42
