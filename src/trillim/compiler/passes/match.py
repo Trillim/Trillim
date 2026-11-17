@@ -355,8 +355,44 @@ def _arguments(
 ) -> dict[str, object] | None:
     actual = _fields(target)
     arguments: dict[str, object] = {}
+    tensor_count = sum(
+        annotation is Tensor or Tensor in get_args(annotation)
+        for _, _, annotation in signature
+    )
+    seeds = list(target.inputs)
+    if not isinstance(target.args, _ConstructArgs) and tensor_count > len(seeds):
+        expanded: set[_Operator] = set()
+        for _ in range(16):
+            if len(seeds) >= tensor_count:
+                break
+            for index, tensor in enumerate(seeds):
+                producer = tensor._producer
+                if (
+                    producer is not None
+                    and producer not in expanded
+                    and producer.inputs
+                    and not producer.regions
+                    and producer.op not in {"cache", "cache_assign", "cache_read"}
+                ):
+                    expanded.add(producer)
+                    seeds[index : index + 1] = producer.inputs
+                    break
+            else:
+                break
+        if len(seeds) >= tensor_count:
+            seeds.sort(
+                key=lambda tensor: (
+                    len(tensor.shape.dimensions) if tensor.shape is not None else 0
+                ),
+                reverse=True,
+            )
+            actual = {
+                name: value
+                for name, value in actual.items()
+                if not isinstance(value, Tensor)
+            }
     used = {value for value in actual.values() if isinstance(value, Tensor)}
-    candidates = iter(value for value in target.inputs if value not in used)
+    candidates = iter(value for value in seeds if value not in used)
     for name, parameter, annotation in signature:
         if parameter.kind == inspect.Parameter.VAR_KEYWORD:
             continue
@@ -377,7 +413,8 @@ def _arguments(
                 )
             arguments[name] = value
         elif annotation is Tensor or Tensor in get_args(annotation):
-            source = next(candidates, None)
+            # These values seed pattern shape inference; matching binds the actual leaves.
+            source = next(candidates, target.inputs[0] if target.inputs else None)
             if source is None:
                 return None
             arguments[name] = source
@@ -655,12 +692,6 @@ def _match(
                 continue
             if all(output in pattern.inputs for output in pattern.outputs):
                 continue
-            if isinstance(operator.args, _ConstructArgs) and not all(
-                output._producer is not None
-                and isinstance(output._producer.args, _ConstructArgs)
-                for output in pattern.outputs
-            ):
-                continue
             bindings: dict[str, Tensor] = {}
             covered: set[_Operator] = set()
             pairs: set[tuple[Tensor, Tensor]] = set()
@@ -702,21 +733,19 @@ def _match(
                     matched = False
             if not matched:
                 continue
-            boundary = internals
-            if mathematical:
-                # Replacing a region also removes its unused pure computations.
-                removed_nodes = {
-                    node
-                    for parent in covered
-                    for body in parent.regions
-                    for _, node in _walk(body)
-                }
-                boundary = internals | removed_nodes
-                covered.update(
-                    node
-                    for node in removed_nodes
-                    if not isinstance(node.args, (_ConstantArgs, _InputArgs))
-                )
+            # Replacing a region also removes its unused pure computations.
+            removed_nodes = {
+                node
+                for parent in covered
+                for body in parent.regions
+                for _, node in _walk(body)
+            }
+            boundary = internals | removed_nodes
+            covered.update(
+                node
+                for node in removed_nodes
+                if not isinstance(node.args, (_ConstantArgs, _InputArgs))
+            )
             # Metadata-only inputs can disappear when their shape is statically known.
             for name, value in arguments.items():
                 for path, tensor in _tensor_arguments(value, name).items():
