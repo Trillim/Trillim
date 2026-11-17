@@ -1,0 +1,106 @@
+{
+  "bitnet": {
+    "repository": "microsoft/bitnet-b1.58-2B-4T",
+    "revision": "04c3b9ad9361b824064a1f25ea60a8be9599b127",
+    "file": "model.safetensors",
+    "url": "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/04c3b9ad9361b824064a1f25ea60a8be9599b127/model.safetensors",
+    "tensors": {
+      "model.layers.0.self_attn.q_proj.weight": {
+        "original_shape": [
+          640,
+          2560
+        ],
+        "shape": [
+          2,
+          32
+        ],
+        "dtype": "U8",
+        "ranges": [
+          [
+            672931828,
+            32
+          ],
+          [
+            672934388,
+            32
+          ]
+        ],
+        "sha256": "228dc7bad84d371d0421d8317c4db1c577d0119928eb58264eb5171044d4c420"
+      },
+      "model.layers.0.self_attn.q_proj.weight_scale": {
+        "original_shape": [
+          1
+        ],
+        "shape": [
+          1
+        ],
+        "dtype": "BF16",
+        "ranges": [
+          [
+            656760922,
+            2
+          ]
+        ],
+        "sha256": "4c7c3a94d1299c90c0f9e17b4be24bfd30da38d5729b295274354c174667258d"
+      }
+    }
+  },
+  "gpt-oss": {
+    "repository": "openai/gpt-oss-20b",
+    "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
+    "file": "model-00000-of-00002.safetensors",
+    "url": "https://huggingface.co/openai/gpt-oss-20b/resolve/6cee5e81ee83917806bbde320786a8fb61efebee/model-00000-of-00002.safetensors",
+    "tensors": {
+      "model.layers.0.mlp.experts.down_proj_blocks": {
+        "original_shape": [
+          32,
+          2880,
+          90,
+          16
+        ],
+        "shape": [
+          1,
+          2,
+          1,
+          16
+        ],
+        "dtype": "U8",
+        "ranges": [
+          [
+            562128488,
+            16
+          ],
+          [
+            562129928,
+            16
+          ]
+        ],
+        "sha256": "8326cfadbeed21e1a14108e66c5fac28dbc33b5bc2aa8c5a4df92a5f1b28c3ad"
+      },
+      "model.layers.0.mlp.experts.down_proj_scales": {
+        "original_shape": [
+          32,
+          2880,
+          90
+        ],
+        "shape": [
+          1,
+          2,
+          1
+        ],
+        "dtype": "U8",
+        "ranges": [
+          [
+            694838888,
+            1
+          ],
+          [
+            694838978,
+            1
+          ]
+        ],
+        "sha256": "ef90d9c1ec76b1edc9edfaf2c0c05359c10ccc49ae8ecf7b7fd25ce9c02e86a4"
+      }
+    }
+  }
+}
