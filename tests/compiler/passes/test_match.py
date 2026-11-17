@@ -18,15 +18,19 @@ from trillim.tdl import (
     Cache,
     Cast,
     Construct,
+    Dim,
     Div,
     Exp,
+    Gelu,
     Graph,
     Input,
+    Linear,
     Matmul,
     Mul,
     Output,
     Permute,
     Silu,
+    SiluMul,
     Sub,
     Tensor,
     TensorShape,
@@ -439,3 +443,63 @@ def test_core_projection_bias_with_different_operand_ranks(
     candidates = _candidates(graph, kernels, result)
     assert candidates
     assert set(candidates[0].inputs) == {x, weight, bias}
+
+
+@pytest.mark.parametrize("activation", ("silu", "gelu", "glu"))
+def test_fused_projection_activation_finds_original_operands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, activation: str
+) -> None:
+    expression = (
+        "SiluMul(Linear(x, weight), Linear(x, bias))"
+        if activation == "glu"
+        else ("Gelu" if activation == "gelu" else "Silu")
+        + "(Linear(x,weight,bias=bias))"
+    )
+    kernels = _kernel(
+        tmp_path,
+        monkeypatch,
+        "def pattern(x: Tensor, weight: Tensor, bias: Tensor):\n    return ("
+        + expression
+        + ",)\n",
+        inputs=3,
+    )
+    with Graph() as graph:
+        x = Input(name="x", shape=TensorShape((3, 32)), dtype="fp32")
+        weight = Input(name="weight", shape=TensorShape((17, 32)), dtype="fp32")
+        bias = Input(
+            name="bias",
+            shape=TensorShape((17, 32) if activation == "glu" else (17,)),
+            dtype="fp32",
+        )
+        result = (
+            SiluMul(Linear(x, weight), Linear(x, bias))
+            if activation == "glu"
+            else (
+                Gelu(Linear(x, weight, bias=bias))
+                if activation == "gelu"
+                else Silu(Linear(x, weight, bias=bias))
+            )
+        )
+        Output(result, name="result")
+    candidates = _candidates(graph, kernels, result)
+    assert candidates
+    assert set(candidates[0].inputs) == {x, weight, bias}
+
+
+@pytest.mark.parametrize("shape", ((), (2, 3)))
+def test_repeated_operand_keeps_its_named_tensor_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...]
+) -> None:
+    kernels = _kernel(
+        tmp_path,
+        monkeypatch,
+        "def pattern(a: Tensor, b: Tensor):\n    return (Add(a, b),)\n",
+    )
+    with Graph() as graph:
+        source = Input(name="x", shape=TensorShape((2, 3)), dtype="fp32")
+        x = source if shape else Cast(Dim(source, 0), "fp32")
+        result = Add(x, x)
+        Output(result, name="result")
+    candidates = _candidates(graph, kernels, result)
+    assert candidates
+    assert candidates[0].inputs == (x, x)

@@ -352,6 +352,7 @@ def _signature(kernel: _Kernel) -> tuple[tuple[str, inspect.Parameter, object], 
 def _arguments(
     target: _Operator,
     signature: tuple[tuple[str, inspect.Parameter, object], ...],
+    state: _MatchingState,
 ) -> dict[str, object] | None:
     actual = _fields(target)
     arguments: dict[str, object] = {}
@@ -360,27 +361,40 @@ def _arguments(
         for _, _, annotation in signature
     )
     seeds = list(target.inputs)
-    if not isinstance(target.args, _ConstructArgs) and tensor_count > len(seeds):
-        expanded: set[_Operator] = set()
-        for _ in range(16):
-            if len(seeds) >= tensor_count:
-                break
-            for index, tensor in enumerate(seeds):
-                producer = tensor._producer
-                if (
-                    producer is not None
-                    and producer not in expanded
-                    and producer.inputs
-                    and not producer.regions
-                    and producer.op not in {"cache", "cache_assign", "cache_read"}
-                ):
-                    expanded.add(producer)
-                    seeds[index : index + 1] = producer.inputs
-                    break
-            else:
-                break
-        if len(seeds) >= tensor_count:
-            seeds.sort(
+    if tensor_count > len(seeds) and any(
+        name not in actual
+        for name, _, annotation in signature
+        if annotation is Tensor or Tensor in get_args(annotation)
+    ):
+        frontier: list[Tensor] = []
+        visited: set[Tensor] = set()
+        budget = 16
+
+        def visit(tensor: Tensor) -> None:
+            nonlocal budget
+            if tensor in visited:
+                return
+            visited.add(tensor)
+            producer = tensor._producer
+            if (
+                budget > 0
+                and producer is not None
+                and producer.op
+                not in {"cache", "cache_assign", "cache_read", "while", "if", "reduce"}
+                and all(_pure(body, state) for body in producer.regions)
+            ):
+                budget -= 1
+                if producer.inputs:
+                    for value in producer.inputs:
+                        visit(value)
+                    return
+            frontier.append(tensor)
+
+        for tensor in seeds:
+            visit(tensor)
+        if len(frontier) >= tensor_count:
+            seeds = sorted(
+                frontier,
                 key=lambda tensor: (
                     len(tensor.shape.dimensions) if tensor.shape is not None else 0
                 ),
@@ -389,7 +403,7 @@ def _arguments(
             actual = {
                 name: value
                 for name, value in actual.items()
-                if not isinstance(value, Tensor)
+                if not isinstance(value, (Tensor, Weight))
             }
     used = {value for value in actual.values() if isinstance(value, Tensor)}
     candidates = iter(value for value in seeds if value not in used)
@@ -645,7 +659,7 @@ def _match(
         for kernel in eligible:
             if kernel.parameter_schema.output_count != len(operator.outputs):
                 continue
-            arguments = _arguments(operator, signatures[id(kernel)])
+            arguments = _arguments(operator, signatures[id(kernel)], state)
             if arguments is None:
                 base = operator
                 while (
@@ -657,7 +671,7 @@ def _match(
                 ):
                     base = base.args.x._producer
                 if base is not operator:
-                    arguments = _arguments(base, signatures[id(kernel)])
+                    arguments = _arguments(base, signatures[id(kernel)], state)
                     if arguments is not None:
                         outer = _fields(operator)
                         for name in arguments:
@@ -678,7 +692,7 @@ def _match(
                     ):
                         continue
                     visited.add(upstream)
-                    arguments = _arguments(upstream, signatures[id(kernel)])
+                    arguments = _arguments(upstream, signatures[id(kernel)], state)
                     if arguments is not None or len(visited) >= 16:
                         break
                     pending.extend(upstream.inputs)
