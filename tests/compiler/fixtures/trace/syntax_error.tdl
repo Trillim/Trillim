@@ -1,4 +1,0 @@
-from trillim.tdl import *
-
-with Graph() as graph:
-    Output(
