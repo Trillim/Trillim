@@ -76,7 +76,7 @@ def _discover(backends: tuple[_Backend, ...] = ("scalar",)) -> tuple[_Kernel, ..
             tdl_function.argtypes, tdl_function.restype = [], c.c_char_p
             tdl = cast(bytes, tdl_function()).decode()
             namespace: dict[str, object] = {}
-            exec(compile(tdl, f"<{name}>", "exec"), namespace)  # noqa: S102 - trusted kernel metadata
+            exec(compile(tdl, f"<{name}>", "exec", dont_inherit=True), namespace)  # noqa: S102 - trusted kernel metadata
             pattern = cast(Callable[..., _TensorTuple], namespace["pattern"])
             binder = cast(
                 Callable[[_KernelBindingContext], dict[str, _ParameterValue]],
