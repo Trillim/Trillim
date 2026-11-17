@@ -31,22 +31,31 @@ bits 7:6,5:4,3:2,1:0. Code 3 is invalid. Decode with gamma*(code-1).
 ``grp_int8``: Groups of 32 signed bytes and one BF16 scale d=absmax/127.
 The quantizer emits [-127,127]. A zero group has d=0 and zero bytes.
 
-``grp_int4``: Groups of 32 signed values in [-8,7], d=absmax/8, code=q+8.
+``grp_int4``: Groups of 32 signed values in [-8,7], code=q+8.
+Choose d=max(max(x,0)/7,max(-x,0)/8), rounded to BF16 before quantization.
 Byte j holds code j in its low nibble and code j+16 in its high nibble.
 Two encoded zeros form 0x88.
 
-``grp_int5``: Groups of 32 signed values in [-16,15], d=absmax/16,
-code=q+16. Low nibbles pair like INT4. Four extra bytes hold the high bit
+``grp_int5``: Groups of 32 signed values in [-16,15], code=q+16.
+Choose d=max(max(x,0)/15,max(-x,0)/16), rounded to BF16 before quantization. Low nibbles pair like INT4. Four extra bytes hold the high bit
 of each code, LSB-first within each byte.
 
 ``dubgrp_int6``: Groups of 256 values have one BF16 master scale d and
 16 signed INT8 subscales, one per consecutive 16 values. Each ideal
-subscale is absmax/31; d=max(ideal_subscales)/127. Store q+32 as a 6-bit
+subscale is absmax/31; d=max(ideal_subscales)/127 rounded to BF16.
+Choose subscales by rounding ideal_subscale/d to the nearest integer. The
+largest subgroup retains subscale 127, anchoring the master on re-encoding.
+Already representable subgroups recover a divisor of their integer-valued
+products x/d when the nearest subscale would change values; choose the legal
+divisor closest to that initial subscale. This preserves decoded values
+without searching quantization candidates for fresh floating inputs.
+Store q+32 as a 6-bit
 code and decode with d*subscale*q. Each 128-value half pairs low nibbles
 at offsets 0/32 and 64/96. The high two bits of each of those four values
 occupy consecutive two-bit fields in one byte.
 
 ``grp_binary``: Groups of 128 values, d=mean(abs(values)) stored as BF16.
+The mean excludes row padding in the final group.
 Pack signs MSB-first, with bit 1 for +d and bit 0 for -d.
 
 ``grp_ternary``: Groups of 128 values, d=absmax stored as BF16. Divide
@@ -305,7 +314,8 @@ def _encode_mxfp4(tensor: NDArray[np.generic]) -> _Encoded:
 def _encode_grp_binary(tensor: NDArray[np.generic]) -> _Encoded:
     source = tensor.astype(np.float32, copy=False)
     blocks = _grouped(source, 128)
-    scale = np.mean(np.abs(blocks), axis=2, dtype=np.float32)
+    valid = np.minimum(128, source.shape[1] - np.arange(blocks.shape[1]) * 128)
+    scale = np.sum(np.abs(blocks), axis=2, dtype=np.float32) / valid.astype(np.float32)
     packed = np.packbits(blocks >= 0, axis=2, bitorder="big")
     return _pack("grp_binary", packed, _bf16_bits(scale))
 
@@ -327,11 +337,47 @@ def _encode_dubgrp_int6(tensor: NDArray[np.generic]) -> _Encoded:
     count = blocks.shape[1]
     chunks = blocks.reshape(rows, count, 16, 16)
     ideal = np.max(np.abs(chunks), axis=3) / 31
-    master = (np.max(ideal, axis=2) / 127).astype(np.float32)
+    master = _bf16_values(_bf16_bits((np.max(ideal, axis=2) / 127).astype(np.float32)))
     subscales = np.rint(ideal / np.where(master == 0, 1, master)[..., None])
     subscales = np.clip(subscales, 0, 127).astype(np.int8)
     effective = master[..., None] * subscales.astype(np.float32)
     quantized = _quantize(chunks, effective[..., None], 32)
+    reconstructed = (
+        quantized.astype(np.float32) * subscales[..., None] * master[..., None, None]
+    )
+    pending = np.flatnonzero(
+        np.any(np.abs(reconstructed - chunks) > 1e-5, axis=-1).reshape(-1)
+    )
+    anchors = np.zeros(ideal.shape, dtype=np.bool_)
+    np.put_along_axis(anchors, np.argmax(ideal, axis=-1)[..., None], True, axis=-1)
+    pending = pending[~anchors.reshape(-1)[pending]]
+    flat_chunks = chunks.reshape(-1, 16)
+    flat_master = np.broadcast_to(master[..., None], ideal.shape).reshape(-1)
+    flat_scales = subscales.reshape(-1)
+    flat_quantized = quantized.reshape(-1, 16)
+    candidates = np.arange(1, 128, dtype=np.int32)
+    for start in range(0, pending.size, 256):
+        indices = pending[start : start + 256]
+        values = flat_chunks[indices]
+        scales = flat_master[indices, None]
+        products = np.rint(values / np.where(scales == 0, 1, scales)).astype(np.int32)
+        on_lattice = np.all(
+            np.abs(products.astype(np.float32) * scales - values) <= 1e-5, axis=-1
+        )
+        indices = indices[on_lattice]
+        products = products[on_lattice]
+        common = np.gcd.reduce(np.abs(products), axis=-1)
+        valid = common[:, None] % candidates[None, :] == 0
+        valid &= np.min(products, axis=-1)[:, None] >= -32 * candidates[None, :]
+        valid &= np.max(products, axis=-1)[:, None] <= 31 * candidates[None, :]
+        recoverable = np.any(valid, axis=-1)
+        indices = indices[recoverable]
+        products = products[recoverable]
+        distance = np.abs(candidates[None, :] - flat_scales[indices, None])
+        best = np.argmin(np.where(valid[recoverable], distance, 128), axis=-1)
+        selected = candidates[best]
+        flat_scales[indices] = selected.astype(np.int8)
+        flat_quantized[indices] = products // selected[:, None]
     codes = (quantized + 32).astype(np.uint8).reshape(rows, count, 2, 128)
     g0, g1, g2, g3 = (
         codes[..., :32],
@@ -348,7 +394,14 @@ def _integer_groups(
     tensor: NDArray[np.generic], bound: int, divisor: int
 ) -> tuple[NDArray[np.int32], NDArray[np.uint16]]:
     blocks = _grouped(tensor.astype(np.float32, copy=False), 32)
-    ideal = (np.max(np.abs(blocks), axis=2) / np.float32(divisor)).astype(np.float32)
+    if bound == divisor:
+        positive = np.maximum(np.max(blocks, axis=2), 0) / (bound - 1)
+        negative = np.maximum(-np.min(blocks, axis=2), 0) / bound
+        ideal = _bf16_values(_bf16_bits(np.maximum(positive, negative)))
+    else:
+        ideal = (np.max(np.abs(blocks), axis=2) / np.float32(divisor)).astype(
+            np.float32
+        )
     return _quantize(blocks, ideal[..., None], bound), _bf16_bits(
         ideal.astype(np.float32)
     )
