@@ -13,10 +13,6 @@ _VERSION_ROOT = (
 def _main() -> None:
     from argparse import ArgumentParser
 
-    from .compiler.cli import _parse_args, _parse_kernel_args
-    from .compiler.compile import _compile_model
-    from .compiler.kernels.build import _build
-
     arguments = _sys.argv[1:]
     if not arguments or arguments[0] not in {"compile", "kernels", "run"}:
         parser = ArgumentParser(prog="trillim")
@@ -25,7 +21,14 @@ def _main() -> None:
         return
     try:
         if arguments[0] == "compile":
-            _compile_model(_parse_args(arguments[1:]), progress=print)
+            from .compiler.cli import _parse_args
+            from .compiler.compile import _compile_model
+
+            try:
+                _compile_model(_parse_args(arguments[1:]), progress=print)
+            except (OSError, ValueError, RuntimeError) as error:
+                print(f"Compilation failed: {error}", file=_sys.stderr)
+                raise SystemExit(1) from None
         elif arguments[0] == "run":
             from .runtime.cli import _run
             from .runtime.errors import CancelledError
@@ -39,6 +42,9 @@ def _main() -> None:
                 print(f"Execution failed: {error}", file=_sys.stderr)
                 raise SystemExit(1) from None
         else:
+            from .compiler.cli import _parse_kernel_args
+            from .compiler.kernels.build import _build
+
             try:
                 _build(_parse_kernel_args(arguments[1:]), progress=print)
             except (OSError, ValueError, RuntimeError) as error:
