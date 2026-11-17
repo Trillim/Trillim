@@ -98,6 +98,9 @@ def _schedule(
             and not isinstance(operator.args, _ConstructArgs)
         ):
             touch(operator.outputs, stop)
+            if isinstance(operator.args, _ReduceArgs):
+                # Reduction inputs and initial values are reread for each output.
+                touch(operator.inputs, stop)
         for body in operator.regions if call is None else ():
             touch(body.outputs, stop)
             # Captures must survive every iteration, even after their final textual use.

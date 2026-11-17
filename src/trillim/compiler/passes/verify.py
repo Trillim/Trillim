@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from graphlib import TopologicalSorter
+from itertools import pairwise
 from pathlib import Path
 
 from pydantic import JsonValue
@@ -86,12 +87,17 @@ def _program(
                 manifest.expressions,
                 dimensions,
             )
-            if buffer.storage != "alias" or buffer.source is None or dependencies is None:
+            if (
+                buffer.storage != "alias"
+                or buffer.source is None
+                or dependencies is None
+            ):
                 raise ValueError(f"unavailable tensor: {name}")
             resolving.add(name)
             require([buffer.source, *dependencies])
             resolving.remove(name)
             available.add(name)
+
     def define(values: list[str]) -> None:
         if not set(values) <= manifest.buffers.keys():
             raise ValueError("instruction defines an unknown tensor")
@@ -281,6 +287,11 @@ def _program(
                     len(initial) if name == "body" else 1
                 ):
                     raise ValueError("invalid loop result bindings")
+                if name == "condition" and (
+                    manifest.buffers[results[0]].dtype != "bool"
+                    or manifest.buffers[results[0]].maximum_shape
+                ):
+                    raise ValueError("loop condition must be scalar bool")
             define(outputs)
         elif op == "reduce":
             values, initial = (
@@ -336,6 +347,34 @@ def _verify_plan(
     constant_size: int,
 ) -> None:
     _expressions(manifest)
+    cache_spans: list[tuple[int, int]] = []
+    for name, cache_record in manifest.caches.items():
+        shape, dtype = cache_record.get("shape"), cache_record.get("dtype")
+        offset, size = cache_record.get("offset"), cache_record.get("size")
+        if (
+            not isinstance(shape, list)
+            or not all(
+                isinstance(dimension, int) and dimension >= 0 for dimension in shape
+            )
+            or not isinstance(dtype, str)
+            or not isinstance(offset, int)
+            or not isinstance(size, int)
+            or offset < 0
+            or offset % 64
+            or size < 0
+            or offset + size > manifest.cache_size
+        ):
+            raise ValueError(f"invalid cache allocation: {name}")
+        dimensions = tuple(
+            dimension for dimension in shape if isinstance(dimension, int)
+        )
+        if size != _byte_size(dtype, dimensions):
+            raise ValueError(f"cache size disagrees with its capacity: {name}")
+        if size:
+            cache_spans.append((offset, offset + size))
+    cache_spans.sort()
+    if any(left[1] > right[0] for left, right in pairwise(cache_spans)):
+        raise ValueError("cache allocations overlap")
     allocations = []
     for name, buffer in manifest.buffers.items():
         metadata: list[JsonValue] = [*buffer.shape, *buffer.strides, buffer.byte_offset]
