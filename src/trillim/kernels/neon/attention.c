@@ -1,3 +1,4 @@
+#define TRILLIM_ENABLE_PACKED_NEON
 #include "common.h"
 #include <arm_neon.h>
 #include <math.h>
@@ -40,135 +41,6 @@ BF16 static inline float32x4_t dot_bf16(float32x4_t sum, uint16x8_t a, uint16x8_
 #endif
 
 #define BLAS_MAX_QUERIES 128
-
-static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
-    size_t itemsize = trillim_itemsize(dtype);
-    if (columns != 0 && rows > SIZE_MAX / columns) {
-        return false;
-    }
-    size_t count = rows * columns;
-    if (itemsize != 0) {
-        if (count > SIZE_MAX / itemsize) {
-            return false;
-        }
-        *bytes = count * itemsize;
-        return true;
-    }
-    if (dtype == TRILLIM_ROW_INT8) {
-        if (rows > (SIZE_MAX - count) / 2) {
-            return false;
-        }
-        *bytes = count + rows * 2;
-        return true;
-    }
-    size_t group;
-    size_t record;
-    switch (dtype) {
-    case TRILLIM_MAT_TERNARY: group = 128; record = 32; break;
-    case TRILLIM_GRP_INT8: group = 32; record = 34; break;
-    case TRILLIM_GRP_INT4: group = 32; record = 18; break;
-    case TRILLIM_GRP_INT5: group = 32; record = 22; break;
-    case TRILLIM_DUBGRP_INT6: group = 256; record = 210; break;
-    case TRILLIM_GRP_BINARY: group = 128; record = 18; break;
-    case TRILLIM_GRP_TERNARY: group = 128; record = 34; break;
-    case TRILLIM_MXFP4: group = 32; record = 17; break;
-    default: return false;
-    }
-    size_t groups = columns / group + (columns % group != 0);
-    if (rows != 0 && groups > SIZE_MAX / record / rows) {
-        return false;
-    }
-    *bytes = rows * groups * record;
-    if (dtype == TRILLIM_MAT_TERNARY) {
-        if (*bytes > SIZE_MAX - sizeof(float)) {
-            return false;
-        }
-        *bytes += sizeof(float);
-    }
-    return true;
-}
-
-static inline float trillim_read_float(
-    const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
-) {
-    if (trillim_itemsize(dtype) != 0) {
-        TrillimValue value = trillim_load(data, index, dtype);
-        if (trillim_float(dtype)) {
-            return value.f;
-        }
-        return trillim_unsigned(dtype) ? (float)value.u : (float)value.i;
-    }
-    const uint8_t *values = (const uint8_t *)data;
-    size_t row = index / columns;
-    size_t column = index % columns;
-    if (dtype == TRILLIM_ROW_INT8) {
-        uint16_t bits;
-        int8_t code;
-        memcpy(&bits, values + rows * columns + row * 2, 2);
-        memcpy(&code, values + index, 1);
-        return (float)code * trillim_bf16(bits);
-    }
-    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 :
-        ((dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_BINARY ||
-          dtype == TRILLIM_GRP_TERNARY) ? 128 : 32);
-    size_t groups = columns / group + (columns % group != 0);
-    size_t total = rows * groups;
-    size_t block = row * groups + column / group;
-    size_t offset = column % group;
-    if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
-        size_t code = (values[block * 32 + offset % 32] >> (6 - (offset / 32) * 2)) & 3;
-        float scale;
-        if (dtype == TRILLIM_MAT_TERNARY) {
-            memcpy(&scale, values + total * 32, sizeof(scale));
-        } else {
-            uint16_t bits;
-            memcpy(&bits, values + total * 32 + block * 2, 2);
-            scale = trillim_bf16(bits);
-        }
-        return code == 3 ? NAN : (float)((int32_t)code - 1) * scale;
-    }
-    if (dtype == TRILLIM_MXFP4) {
-        static const float magnitudes[] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
-        uint8_t code = (values[block * 16 + offset / 2] >> ((offset % 2) * 4)) & 15;
-        uint8_t exponent = values[total * 16 + block];
-        float value = magnitudes[code & 7];
-        if ((code & 8) != 0) {
-            value = -value;
-        }
-        return exponent == 255 ? NAN : ldexpf(value, (int)exponent - 127);
-    }
-    size_t value_width = dtype == TRILLIM_GRP_INT8 ? 32 :
-        (dtype == TRILLIM_DUBGRP_INT6 ? 128 : 16);
-    size_t scale_start = total * value_width;
-    uint16_t bits;
-    memcpy(&bits, values + scale_start + block * 2, 2);
-    float scale = trillim_bf16(bits);
-    if (dtype == TRILLIM_GRP_INT8) {
-        int8_t code;
-        memcpy(&code, values + block * 32 + offset, 1);
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_BINARY) {
-        int32_t code = ((values[block * 16 + offset / 8] >> (7 - offset % 8)) & 1) ? 1 : -1;
-        return (float)code * scale;
-    }
-    if (dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5) {
-        int32_t code = (values[block * 16 + offset % 16] >> ((offset / 16) * 4)) & 15;
-        if (dtype == TRILLIM_GRP_INT5) {
-            code |= ((values[scale_start + total * 2 + block * 4 + offset / 8] >> (offset % 8)) & 1) << 4;
-        }
-        return (float)(code - (dtype == TRILLIM_GRP_INT4 ? 8 : 16)) * scale;
-    }
-    size_t half = offset / 128;
-    size_t lane = (offset % 128) / 32;
-    size_t low = block * 128 + half * 64 + (lane / 2) * 32 + offset % 32;
-    size_t high = scale_start + total * 2 + block * 64 + half * 32 + offset % 32;
-    int32_t code = (values[low] >> ((lane % 2) * 4)) & 15;
-    code |= ((values[high] >> (lane * 2)) & 3) << 4;
-    int8_t subscale;
-    memcpy(&subscale, values + scale_start + total * (2 + 64) + block * 16 + offset / 16, 1);
-    return (float)((code - 32) * subscale) * scale;
-}
 
 static inline float32x4_t exp_negative(float32x4_t original) {
     float32x4_t x = vmaxq_f32(vdupq_n_f32(-104.0f), vminq_f32(original, vdupq_n_f32(0.0f)));
@@ -283,13 +155,13 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
     size_t key_shape[] = {p->kv_heads, p->length, p->key_dim};
     size_t value_shape[] = {p->kv_heads, p->length, p->value_dim};
     if (!trillim_attention_span(query_shape, p->q_strides, p->q_rows, p->q_columns) ||
-        !trillim_payload_size(p->q_rows, p->q_columns, p->q_dtype, &inputs[0])) {
+        !trillim_packed_payload_size(p->q_rows, p->q_columns, p->q_dtype, &inputs[0])) {
         return TRILLIM_ERROR;
     }
     if (p->length != 0 && (!trillim_attention_span(key_shape, p->k_strides, p->k_rows, p->k_columns) ||
         !trillim_attention_span(value_shape, p->v_strides, p->v_rows, p->v_columns) ||
-        !trillim_payload_size(p->k_rows, p->k_columns, p->k_dtype, &inputs[1]) ||
-        !trillim_payload_size(p->v_rows, p->v_columns, p->v_dtype, &inputs[2]))) {
+        !trillim_packed_payload_size(p->k_rows, p->k_columns, p->k_dtype, &inputs[1]) ||
+        !trillim_packed_payload_size(p->v_rows, p->v_columns, p->v_dtype, &inputs[2]))) {
         return TRILLIM_ERROR;
     }
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
@@ -348,23 +220,33 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
     return TRILLIM_OK;
 }
 
-static inline float32x4_t trillim_neon_load4(
+static inline float32x4_t attention_load4(
     const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
 ) {
-    if (dtype == TRILLIM_FP32) {
-        return vld1q_f32((const float *)data + index);
-    }
-    if (dtype == TRILLIM_FP16) {
-        return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *)data + index)));
-    }
-    if (dtype == TRILLIM_BF16) {
-        return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)data + index), 16));
+    if (trillim_float(dtype)) {
+        return trillim_neon_load4(data, index, dtype);
     }
     float lanes[4];
     for (size_t i = 0; i < 4; ++i) {
-        lanes[i] = trillim_read_float(data, index + i, dtype, rows, columns);
+        lanes[i] = trillim_packed_read_float(data, index + i, dtype, rows, columns);
     }
     return vld1q_f32(lanes);
+}
+
+static inline void attention_load16(
+    const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns, float32x4_t values[4]
+) {
+    if (dtype >= TRILLIM_ROW_INT8 && columns != 0) {
+        size_t column = index % columns;
+        if (column % 16 == 0 && columns - column >= 16) {
+            TrillimPackedNeonRow row = trillim_packed_neon_row(data, dtype, index / columns, columns, rows);
+            trillim_packed_neon_decode16(&row, column, values);
+            return;
+        }
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        values[i] = attention_load4(data, index + i * 4, dtype, rows, columns);
+    }
 }
 
 static inline float scalar_float(
@@ -379,7 +261,7 @@ static inline float scalar_float(
     if (dtype == TRILLIM_BF16) {
         return trillim_bf16(((const uint16_t *)data)[index]);
     }
-    return trillim_read_float(data, index, dtype, rows, columns);
+    return trillim_packed_read_float(data, index, dtype, rows, columns);
 }
 
 static bool available_bf16(void) {
@@ -559,23 +441,18 @@ static inline TrillimStatus trillim_attention_score(
             if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            a = vfmaq_f32(a,
-                trillim_neon_load4(task->query, query + channel, p->q_dtype, p->q_rows, p->q_columns),
-                trillim_neon_load4(task->keys, key + channel, p->k_dtype, p->k_rows, p->k_columns));
-            b = vfmaq_f32(b,
-                trillim_neon_load4(task->query, query + channel + 4, p->q_dtype, p->q_rows, p->q_columns),
-                trillim_neon_load4(task->keys, key + channel + 4, p->k_dtype, p->k_rows, p->k_columns));
-            c = vfmaq_f32(c,
-                trillim_neon_load4(task->query, query + channel + 8, p->q_dtype, p->q_rows, p->q_columns),
-                trillim_neon_load4(task->keys, key + channel + 8, p->k_dtype, p->k_rows, p->k_columns));
-            d = vfmaq_f32(d,
-                trillim_neon_load4(task->query, query + channel + 12, p->q_dtype, p->q_rows, p->q_columns),
-                trillim_neon_load4(task->keys, key + channel + 12, p->k_dtype, p->k_rows, p->k_columns));
+            float32x4_t q[4], k[4];
+            attention_load16(task->query, query + channel, p->q_dtype, p->q_rows, p->q_columns, q);
+            attention_load16(task->keys, key + channel, p->k_dtype, p->k_rows, p->k_columns, k);
+            a = vfmaq_f32(a, q[0], k[0]);
+            b = vfmaq_f32(b, q[1], k[1]);
+            c = vfmaq_f32(c, q[2], k[2]);
+            d = vfmaq_f32(d, q[3], k[3]);
         }
         for (; p->key_dim - channel >= 4; channel += 4) {
             a = vfmaq_f32(a,
-                trillim_neon_load4(task->query, query + channel, p->q_dtype, p->q_rows, p->q_columns),
-                trillim_neon_load4(task->keys, key + channel, p->k_dtype, p->k_rows, p->k_columns));
+                attention_load4(task->query, query + channel, p->q_dtype, p->q_rows, p->q_columns),
+                attention_load4(task->keys, key + channel, p->k_dtype, p->k_rows, p->k_columns));
         }
     }
     float sum = vaddvq_f32(vaddq_f32(vaddq_f32(a, b), vaddq_f32(c, d)));
@@ -583,8 +460,8 @@ static inline TrillimStatus trillim_attention_score(
         if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        float q = trillim_read_float(task->query, query + channel * p->q_strides[2], p->q_dtype, p->q_rows, p->q_columns);
-        float k = trillim_read_float(task->keys, key + channel * p->k_strides[2], p->k_dtype, p->k_rows, p->k_columns);
+        float q = trillim_packed_read_float(task->query, query + channel * p->q_strides[2], p->q_dtype, p->q_rows, p->q_columns);
+        float k = trillim_packed_read_float(task->keys, key + channel * p->k_strides[2], p->k_dtype, p->k_rows, p->k_columns);
         sum += q * k;
     }
     *score = sum;
@@ -716,10 +593,12 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
                     float32x4_t d = vld1q_f32(accumulator + channel + 12);
                     for (size_t j = 0; j < count; ++j) {
                         size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel;
-                        a = vfmaq_n_f32(a, trillim_neon_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        b = vfmaq_n_f32(b, trillim_neon_load4(task->values, value + 4, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        c = vfmaq_n_f32(c, trillim_neon_load4(task->values, value + 8, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        d = vfmaq_n_f32(d, trillim_neon_load4(task->values, value + 12, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
+                        float32x4_t v[4];
+                        attention_load16(task->values, value, p->v_dtype, p->v_rows, p->v_columns, v);
+                        a = vfmaq_n_f32(a, v[0], scores[j]);
+                        b = vfmaq_n_f32(b, v[1], scores[j]);
+                        c = vfmaq_n_f32(c, v[2], scores[j]);
+                        d = vfmaq_n_f32(d, v[3], scores[j]);
                     }
                     vst1q_f32(accumulator + channel, a);
                     vst1q_f32(accumulator + channel + 4, b);
@@ -730,7 +609,7 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
                     float32x4_t a = vld1q_f32(accumulator + channel);
                     for (size_t j = 0; j < count; ++j) {
                         size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel;
-                        a = vfmaq_n_f32(a, trillim_neon_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
+                        a = vfmaq_n_f32(a, attention_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
                     }
                     vst1q_f32(accumulator + channel, a);
                 }
@@ -741,7 +620,7 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
                 }
                 for (size_t j = 0; j < count; ++j) {
                     size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel * p->v_strides[2];
-                    accumulator[channel] += scores[j] * trillim_read_float(task->values, value, p->v_dtype, p->v_rows, p->v_columns);
+                    accumulator[channel] += scores[j] * trillim_packed_read_float(task->values, value, p->v_dtype, p->v_rows, p->v_columns);
                 }
             }
         }
@@ -1073,10 +952,12 @@ static inline TrillimStatus trillim_attention_decode_task(void *opaque, size_t i
                     float32x4_t d = vld1q_f32(accumulator + channel + 12);
                     for (size_t j = 0; j < count; ++j) {
                         size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel;
-                        a = vfmaq_n_f32(a, trillim_neon_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        b = vfmaq_n_f32(b, trillim_neon_load4(task->values, value + 4, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        c = vfmaq_n_f32(c, trillim_neon_load4(task->values, value + 8, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
-                        d = vfmaq_n_f32(d, trillim_neon_load4(task->values, value + 12, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
+                        float32x4_t v[4];
+                        attention_load16(task->values, value, p->v_dtype, p->v_rows, p->v_columns, v);
+                        a = vfmaq_n_f32(a, v[0], scores[j]);
+                        b = vfmaq_n_f32(b, v[1], scores[j]);
+                        c = vfmaq_n_f32(c, v[2], scores[j]);
+                        d = vfmaq_n_f32(d, v[3], scores[j]);
                     }
                     vst1q_f32(accumulator + channel, a);
                     vst1q_f32(accumulator + channel + 4, b);
@@ -1087,7 +968,7 @@ static inline TrillimStatus trillim_attention_decode_task(void *opaque, size_t i
                     float32x4_t a = vld1q_f32(accumulator + channel);
                     for (size_t j = 0; j < count; ++j) {
                         size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel;
-                        a = vfmaq_n_f32(a, trillim_neon_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
+                        a = vfmaq_n_f32(a, attention_load4(task->values, value, p->v_dtype, p->v_rows, p->v_columns), scores[j]);
                     }
                     vst1q_f32(accumulator + channel, a);
                 }
@@ -1098,7 +979,7 @@ static inline TrillimStatus trillim_attention_decode_task(void *opaque, size_t i
                 }
                 for (size_t j = 0; j < count; ++j) {
                     size_t value = kv_head * p->v_strides[0] + (block + j) * p->v_strides[1] + channel * p->v_strides[2];
-                    accumulator[channel] += scores[j] * trillim_read_float(task->values, value, p->v_dtype, p->v_rows, p->v_columns);
+                    accumulator[channel] += scores[j] * trillim_packed_read_float(task->values, value, p->v_dtype, p->v_rows, p->v_columns);
                 }
             }
         }
