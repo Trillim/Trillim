@@ -1,0 +1,46 @@
+from trillim.tdl import *
+
+W = Model("checkpoint")
+CAPACITY = 512
+
+
+def norm(x: Tensor, name: str) -> Tensor:
+    return RMSNorm(x, weight=W[f"{name}.weight"], eps=1e-6)
+
+
+with Graph() as graph:
+    tokens = Input(name="tokens", shape=(None,), dtype="int32")
+    hidden = Input(name="hidden", shape=(None, 1024), dtype="fp32")
+    reset = Input(name="reset", shape=(), dtype="bool")
+    history = Cache(name="history", shape=(CAPACITY,), dtype="int32", mode="append", axis=0)
+    key = Cache(name="key", shape=(CAPACITY, 8, 128), dtype="fp32", mode="append", axis=0)
+    value = Cache(name="value", shape=(CAPACITY, 8, 128), dtype="fp32", mode="append", axis=0)
+    start = ReusePrefix(tokens, history, caches=(key, value), reset=reset)
+    x = Slice(hidden, axis=0, start=start, rank=2)
+    positions = Add(Iota(Dim(x, 0)), start)
+    history.append(Slice(tokens, axis=0, start=start, rank=1))
+
+    name = "model.layers.0"
+    attention = f"{name}.self_attn"
+    normalized = norm(x, f"{name}.input_layernorm")
+    q = SplitHeads(Linear(normalized, W[f"{attention}.q_proj.weight"]), heads=16)
+    k = SplitHeads(Linear(normalized, W[f"{attention}.k_proj.weight"]), heads=8)
+    v = SplitHeads(Linear(normalized, W[f"{attention}.v_proj.weight"]), heads=8)
+    q = Rotary(norm(q, f"{attention}.q_norm"), positions, dim=128, theta=1000000)
+    k = Rotary(norm(k, f"{attention}.k_norm"), positions, dim=128, theta=1000000)
+    key.append(k)
+    value.append(v)
+    context = MergeHeads(Attention(q, key.read(), value.read()))
+    x = Add(x, Linear(context, W[f"{attention}.o_proj.weight"]))
+    x = Add(
+        x,
+        FFN(
+            norm(x, f"{name}.post_attention_layernorm"),
+            gate=W[f"{name}.mlp.gate_proj.weight"],
+            up=W[f"{name}.mlp.up_proj.weight"],
+            down=W[f"{name}.mlp.down_proj.weight"],
+        ),
+    )
+    Output(x, name="hidden")
+    Output(start, name="reused")
+    Output(Dim(history.read(), 0), name="cache_length")

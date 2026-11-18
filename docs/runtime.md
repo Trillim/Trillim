@@ -27,3 +27,5 @@ Runtime verifies the manifest and selects a private backend from `backends/scala
 The backend prepares manifest arithmetic as Python functions and retains unchanged kernel parameter structs. Cache positions, tensor dimensions, pointers and footprint checks still update as execution proceeds.
 
 `Runtime.cancel()` can be called from another thread. During execution, native SIGINT/SIGTERM handlers signal cancellation directly so a long kernel can stop before returning to Python. Previous handlers are restored after the run. Cancellation and execution failures invalidate the session; close it and create another. `close()` requests cancellation before waiting for execution to finish and releases resources. V1 permits one active model execution per process.
+
+`tests/runtime` compiles one full-width Qwen3-0.6B decoder layer and checks cache reuse against fresh prefills, plus cancellation and worker shutdown within 250 ms. The layer's original weights and eight input embedding rows are stored in `tests/runtime/fixtures/qwen3-layer0.safetensors`, making the tests self-contained. They run on scalar and the host CPU backend; signal checks require POSIX.
