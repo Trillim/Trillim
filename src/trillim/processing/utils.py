@@ -167,9 +167,18 @@ def log_mel(
 
     if not 0 < window_length <= n_fft or hop_length <= 0 or mel_bins <= 0:
         raise ValueError("invalid mel feature dimensions")
+    if (
+        audio.samples.ndim != 1
+        or not np.isfinite(audio.samples).all()
+        or audio.sample_rate <= 0
+    ):
+        raise ValueError(
+            "audio must contain finite mono samples and a positive sample rate"
+        )
+    frames = audio.samples.size // hop_length
+    if frames < 2:
+        raise ValueError("audio must produce at least two feature frames")
     waveform = audio.samples.copy()
-    if waveform.size < n_fft:
-        raise ValueError("audio is too short for the configured FFT")
     waveform[1:] -= preemphasis * audio.samples[:-1]
     window = window_function(window_length, periodic=False, frame_length=n_fft)
     bank = mel_filter_bank(
@@ -189,14 +198,11 @@ def log_mel(
         fft_length=n_fft,
         power=2.0,
         center=True,
-        pad_mode="reflect",
+        pad_mode="constant",
     )
-    frames = waveform.size // hop_length
     mel = np.log(
         np.asarray(bank.T @ power[:, :frames], dtype=np.float32) + np.float32(2**-24)
     )
-    if frames < 2:
-        raise ValueError("audio must produce at least two feature frames")
     return np.asarray(
         (mel - mel.mean(axis=1, keepdims=True))
         / (mel.std(axis=1, ddof=1, keepdims=True) + 1e-5),
