@@ -4,6 +4,7 @@ import ctypes as c
 import math
 import mmap
 import sys
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from threading import Lock
@@ -20,13 +21,11 @@ from ...compiler.artifacts.parameters import _pack, _requirements
 from ...compiler.dtype import _NATIVE_DTYPES, _QUANTIZED_DTYPES, _decode, _encode
 from ...compiler.kernels.bindings import _DTYPE_IDS
 from ...compiler.kernels.build import _build_cpu
-from ...compiler.kernels.catalog import _available_capabilities
 from ...compiler.kernels.kernel_dataclasses import _ParameterSchema, _ParameterValue
 from ...compiler.kernels.native import _read_capabilities, _read_schema
-from ...compiler.passes.verify import _verify
 from ...compiler.weights.bundle import _read_manifest
+from .._errors import CancelledError, ExecutionError
 from .cpu_dataclasses import _Allocation, _BoundCall, _PreparedCall
-from .errors import CancelledError, ExecutionError
 
 
 def _object(value: JsonValue) -> dict[str, JsonValue]:
@@ -58,8 +57,10 @@ def _dtype(name: str) -> np.dtype[np.generic]:
     return np.dtype(names.get(name, name))
 
 
-class _CPU:
-    def __init__(self, directory: Path, threads: int | None) -> None:
+class _CPU(ABC):
+    def __init__(
+        self, directory: Path, manifest: _ExecutableManifest, threads: int | None
+    ) -> None:
         self._lifecycle = Lock()
         self.context: int | None = None
         self._finalizer: Callable[[], object] | None = None
@@ -71,20 +72,20 @@ class _CPU:
         self._expressions: dict[int, Callable[[], int]] = {}
         self._expression_values: dict[str, int] = {}
         try:
-            self._load(directory, threads)
+            self._load(directory, manifest, threads)
         except BaseException:
             self.close()
             raise
 
-    def _load(self, directory: Path, threads: int | None) -> None:
+    @abstractmethod
+    def _capabilities(self) -> int: ...
+
+    def _load(
+        self, directory: Path, manifest: _ExecutableManifest, threads: int | None
+    ) -> None:
         self.directory = directory
-        _verify(directory)
-        self.manifest = _ExecutableManifest.model_validate_json(
-            (directory / "executable.json").read_bytes()
-        )
+        self.manifest = manifest
         self.weights = _read_manifest(directory / self.manifest.weights)
-        if self.manifest.backend not in {"scalar", "x86"}:
-            raise ValueError(f"unsupported runtime backend: {self.manifest.backend}")
         if sys.byteorder != "little":
             raise ValueError("compiled models require a little-endian host")
         threads = self.manifest.threads if threads is None else threads
@@ -100,11 +101,7 @@ class _CPU:
         self.kernels: dict[str, tuple[c.CDLL, _ParameterSchema, int]] = {}
         libraries: dict[str, c.CDLL] = {}
         self.harness = c.CDLL(str(_build_cpu()))
-        self.harness.trillim_cpu_features.argtypes = []
-        self.harness.trillim_cpu_features.restype = c.c_uint64
-        available = _available_capabilities(self.manifest.backend)
-        if self.manifest.backend == "x86":
-            available |= int(self.harness.trillim_cpu_features())
+        available = self._capabilities()
         for name, metadata in self.manifest.kernels.items():
             filename = _text(metadata["library"])
             library = libraries.setdefault(
@@ -517,7 +514,9 @@ class _CPU:
         if call is None:
             source = (c.c_void_p * len(inputs))(*(address for address, _ in inputs))
             target = (c.c_void_p * len(outputs))(*(address for address, _ in outputs))
-            call = _BoundCall(kernel, pointer, source, target, scratch_address, prepared)
+            call = _BoundCall(
+                kernel, pointer, source, target, scratch_address, prepared
+            )
         else:
             for index, (address, _) in enumerate(inputs):
                 call.source[index] = address
@@ -813,7 +812,9 @@ class _CPU:
                 metadata = self.manifest.caches[cache]
                 shape = self.shape(source)
                 axis = metadata["axis"]
-                capacity_shape = tuple(_integer(item) for item in _list(metadata["shape"]))
+                capacity_shape = tuple(
+                    _integer(item) for item in _list(metadata["shape"])
+                )
                 kind = _text(metadata["dtype"])
                 if not instruction["metadata_only"]:
                     target = self.cache_array(cache, capacity=True)
