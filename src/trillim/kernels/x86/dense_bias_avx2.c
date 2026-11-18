@@ -24,6 +24,7 @@ typedef struct {
     const TrillimKernelContext *context;
     bool f16c;
     bool fma;
+    float *packed;
 } Task;
 
 static bool matrix_span(size_t base, size_t rows, size_t columns, size_t row_stride, size_t col_stride, size_t capacity) {
@@ -35,6 +36,13 @@ static bool matrix_span(size_t base, size_t rows, size_t columns, size_t row_str
     }
     base += (rows - 1) * row_stride;
     return !col_stride || columns - 1 <= (capacity - 1 - base) / col_stride;
+}
+
+static bool packed_fp32(const Parameters *p) {
+    return p->batches == 1 && p->rank == 0 && p->m >= 16 && p->n >= 16 && p->k >= 32 &&
+        p->a_col_stride == 1 && p->b_row_stride == 1 &&
+        p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
+        p->linear_dtype == TRILLIM_FP32 && p->bias_dtype == TRILLIM_FP32 && p->out_dtype == TRILLIM_FP32;
 }
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
@@ -96,6 +104,12 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[2] = p->n * trillim_itemsize(p->bias_dtype);
 #endif
     outputs[0] = p->batches * p->m * p->n * trillim_itemsize(p->out_dtype);
+    if (packed_fp32(p)) {
+        if (p->n > SIZE_MAX - 15 || p->k > SIZE_MAX / sizeof(float) / ((p->n + 15) / 16) / 16) {
+            return TRILLIM_ERROR;
+        }
+        *scratch = ((p->n + 15) / 16) * p->k * 16 * sizeof(float);
+    }
     return TRILLIM_OK;
 }
 
@@ -446,8 +460,91 @@ VECTOR static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+static TrillimStatus pack_columns(void *opaque, size_t block, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t first = block * 16;
+    size_t count = p->n - first < 16 ? p->n - first : 16;
+    float *target = task->packed + block * p->k * 16;
+    const float *weight = task->weight;
+    for (size_t k = 0; k < p->k; ++k) {
+        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t column = 0; column < 16; ++column) {
+            target[k * 16 + column] = column < count ? weight[(first + column) * p->b_col_stride + k] : 0;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+__attribute__((target("avx2,fma"))) static TrillimStatus packed_project(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t blocks = (p->n + 15) / 16;
+    size_t first = tile % blocks * 16;
+    size_t row = tile / blocks * 6;
+    size_t rows = p->m - row < 6 ? p->m - row : 6;
+    const float *input = (const float *)task->input + row * p->a_row_stride;
+    const float *a0 = input;
+    const float *a1 = input + (rows > 1 ? p->a_row_stride : 0);
+    const float *a2 = input + (rows > 2 ? 2 * p->a_row_stride : 0);
+    const float *a3 = input + (rows > 3 ? 3 * p->a_row_stride : 0);
+    const float *a4 = input + (rows > 4 ? 4 * p->a_row_stride : 0);
+    const float *a5 = input + (rows > 5 ? 5 * p->a_row_stride : 0);
+    const float *weights = task->packed + (tile % blocks) * p->k * 16;
+    __m256 s00 = _mm256_setzero_ps(), s01 = s00, s10 = s00, s11 = s00;
+    __m256 s20 = s00, s21 = s00, s30 = s00, s31 = s00;
+    __m256 s40 = s00, s41 = s00, s50 = s00, s51 = s00;
+    for (size_t k = 0; k < p->k; ++k) {
+        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        __m256 w0 = _mm256_loadu_ps(weights + k * 16);
+        __m256 w1 = _mm256_loadu_ps(weights + k * 16 + 8);
+        __m256 x = _mm256_broadcast_ss(a0 + k);
+        s00 = _mm256_fmadd_ps(x, w0, s00);
+        s01 = _mm256_fmadd_ps(x, w1, s01);
+        x = _mm256_broadcast_ss(a1 + k);
+        s10 = _mm256_fmadd_ps(x, w0, s10);
+        s11 = _mm256_fmadd_ps(x, w1, s11);
+        x = _mm256_broadcast_ss(a2 + k);
+        s20 = _mm256_fmadd_ps(x, w0, s20);
+        s21 = _mm256_fmadd_ps(x, w1, s21);
+        x = _mm256_broadcast_ss(a3 + k);
+        s30 = _mm256_fmadd_ps(x, w0, s30);
+        s31 = _mm256_fmadd_ps(x, w1, s31);
+        x = _mm256_broadcast_ss(a4 + k);
+        s40 = _mm256_fmadd_ps(x, w0, s40);
+        s41 = _mm256_fmadd_ps(x, w1, s41);
+        x = _mm256_broadcast_ss(a5 + k);
+        s50 = _mm256_fmadd_ps(x, w0, s50);
+        s51 = _mm256_fmadd_ps(x, w1, s51);
+    }
+    size_t count = p->n - first < 16 ? p->n - first : 16;
+    float bias[16] = {0};
+    memcpy(bias, (const float *)task->third + first, count * sizeof(float));
+    __m256 b0 = _mm256_loadu_ps(bias), b1 = _mm256_loadu_ps(bias + 8);
+    __m256 sums[6][2] = {{s00,s01},{s10,s11},{s20,s21},{s30,s31},{s40,s41},{s50,s51}};
+    for (size_t r = 0; r < rows; ++r) {
+        float *output = (float *)task->output + (row + r) * p->n + first;
+        __m256 low = _mm256_add_ps(sums[r][0], b0), high = _mm256_add_ps(sums[r][1], b1);
+        if (count == 16) {
+            _mm256_storeu_ps(output, low);
+            _mm256_storeu_ps(output + 8, high);
+        } else {
+            float tail[16];
+            _mm256_storeu_ps(tail, low);
+            _mm256_storeu_ps(tail + 8, high);
+            memcpy(output, tail, count * sizeof(float));
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_x86_dense_bias(void *const *outputs, const void *const *inputs, void *scratch, const void *parameters, const TrillimKernelContext *context) {
-    (void)scratch;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
@@ -460,7 +557,15 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_dense_bias(void *const *outputs, const 
     size_t rows = MODE == 3 ? 2 : 4;
     size_t count = p->batches * (p->m / rows + (p->m % rows != 0)) * (p->n / 32 + (p->n % 32 != 0));
     unsigned features = optional_features();
-    Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, context, (features & (1u << 29)) != 0, (features & (1u << 12)) != 0};
+    Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, context, (features & (1u << 29)) != 0, (features & (1u << 12)) != 0, scratch};
+    if (task.fma && packed_fp32(p)) {
+        size_t blocks = (p->n + 15) / 16;
+        status = context->thread_pool->run(context->thread_pool->context, blocks, pack_columns, &task);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        return context->thread_pool->run(context->thread_pool->context, ((p->m + 5) / 6) * blocks, packed_project, &task);
+    }
     return context->thread_pool->run(context->thread_pool->context, count, project, &task);
 }
 
