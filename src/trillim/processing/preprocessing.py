@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
-from threading import RLock
 from typing import cast
 
 import numpy as np
@@ -14,9 +13,7 @@ from pydantic import JsonValue
 
 from .processing_dataclasses import Audio, TensorInputs
 from .processing_pydantic_models import _AudioRequest, _ImageRequest, _TextRequest
-from .utils import _tokenizer, load_audio, log_mel, tokenize
-
-_WHISPER_LOCK = RLock()
+from .utils import _Tokenizer, load_audio, log_mel, tokenize
 
 
 def text(
@@ -64,6 +61,28 @@ def _whisper_features(directory: Path) -> object:
     )
 
 
+@lru_cache(maxsize=8)
+def _whisper_prefix(directory: Path, language: str, task: str) -> tuple[int, ...]:
+    from transformers import AutoTokenizer
+
+    # HF prompt construction mutates tokenizers; cache only the resulting IDs.
+    tokenizer = cast(
+        _Tokenizer,
+        AutoTokenizer.from_pretrained(
+            str(directory), local_files_only=True, trust_remote_code=False
+        ),
+    )
+    return (
+        tokenizer.convert_tokens_to_ids("<|startoftranscript|>"),
+        *(
+            token
+            for _, token in tokenizer.get_decoder_prompt_ids(
+                language=language, task=task, no_timestamps=True
+            )
+        ),
+    )
+
+
 def whisper(
     value: object, *, assets: Mapping[str, Path], options: Mapping[str, JsonValue]
 ) -> TensorInputs:
@@ -89,17 +108,11 @@ def whisper(
         ],
         dtype=np.float32,
     )[0]
-    tokenizer = _tokenizer(assets["tokenizer"])
-    prefix = [tokenizer.convert_tokens_to_ids("<|startoftranscript|>")]
-    with _WHISPER_LOCK:
-        prefix.extend(
-            token
-            for _, token in tokenizer.get_decoder_prompt_ids(
-                language="en" if isinstance(request, Audio) else request.language,
-                task="transcribe" if isinstance(request, Audio) else request.task,
-                no_timestamps=True,
-            )
-        )
+    prefix = _whisper_prefix(
+        assets["tokenizer"],
+        "en" if isinstance(request, Audio) else request.language,
+        "transcribe" if isinstance(request, Audio) else request.task,
+    )
     return {
         "mel": mel,
         "tokens": np.asarray(prefix, dtype=np.int32),
@@ -133,8 +146,12 @@ def pocket_tts(
         raise ValueError("PocketTTS requires nonempty plain text")
     prompt = " ".join(request.text.split())
     prompt = prompt[0].upper() + prompt[1:]
-    if prompt[-1] not in ".!?…":
-        prompt += "."
+    core = prompt.rstrip("\"'”’)]» ")
+    if core and core[-1] not in ".!?…":
+        if core[-1] in ",;:-–—":
+            prompt = core.rstrip(",;:-–— ") + "." + prompt[len(core) :]
+        else:
+            prompt += "."
     return {"tokens": tokenize(prompt, assets=assets["tokenizer"], chat=False)}
 
 
