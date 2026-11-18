@@ -47,6 +47,72 @@ static bool volume(size_t dimensions, const size_t *shape, size_t *result) {
     return true;
 }
 
+/* F(4,3): transform 6x6 input patches, multiply in blocks of six channels,
+   and reconstruct 4x4 output tiles. The sixteen tile lanes share each weight. */
+typedef struct {
+    size_t tile_rows, tile_columns, tiles, tile_capacity;
+    size_t input_channels, output_channels, padded_height, padded_width;
+    size_t weights, inputs, products, padded, count;
+} WinogradLayout;
+
+typedef struct {
+    const Task *task;
+    WinogradLayout layout;
+    float *weights, *inputs, *products, *padded;
+} WinogradTask;
+
+static bool winograd_layout(const Parameters *p, WinogradLayout *w) {
+    if (p->dimensions != 2 || p->groups != 1 ||
+        p->input_dtype != TRILLIM_FP32 || p->weight_dtype != TRILLIM_FP32 ||
+        p->bias_dtype != TRILLIM_FP32 || p->output_dtype != TRILLIM_FP32 ||
+        p->kernel[0] != 3 || p->kernel[1] != 3 ||
+        p->stride[0] != 1 || p->stride[1] != 1 ||
+        p->padding[0] != 1 || p->padding[1] != 1 ||
+        p->dilation[0] != 1 || p->dilation[1] != 1 ||
+        p->input_strides[0] != p->input_shape[1] || p->input_strides[1] != 1 ||
+        p->output_strides[0] != p->output_shape[1] || p->output_strides[1] != 1 ||
+        p->input_shape[0] > SIZE_MAX - 5 || p->input_shape[1] > SIZE_MAX - 5 ||
+        p->channels > SIZE_MAX - 7 || p->outputs > SIZE_MAX - 5 ||
+        p->channels < 3 || p->outputs < 16) {
+        return false;
+    }
+    size_t image;
+    if (!product(p->input_shape[0], p->input_shape[1], &image) ||
+        p->channel_stride != image || p->output_channel_stride != image || image < 64) {
+        return false;
+    }
+    w->tile_rows = (p->input_shape[0] + 3) / 4;
+    w->tile_columns = (p->input_shape[1] + 3) / 4;
+    if (!product(w->tile_rows, w->tile_columns, &w->tiles) || w->tiles > SIZE_MAX - 15) {
+        return false;
+    }
+    w->tile_capacity = (w->tiles + 15) / 16 * 16;
+    w->input_channels = (p->channels + 7) / 8 * 8;
+    w->output_channels = (p->outputs + 5) / 6 * 6;
+    w->padded_height = w->tile_rows * 4 + 2;
+    w->padded_width = w->tile_columns * 4 + 2;
+    size_t padded_image;
+    if (!product(w->input_channels, w->output_channels, &w->weights) ||
+        !product(w->weights, 36, &w->weights) ||
+        !product(w->input_channels, w->tile_capacity, &w->inputs) ||
+        !product(w->inputs, 36, &w->inputs) ||
+        !product(w->output_channels, w->tile_capacity, &w->products) ||
+        !product(w->products, 36, &w->products) ||
+        !product(w->padded_height, w->padded_width, &padded_image) || padded_image > INT32_MAX ||
+        !product(p->channels, padded_image, &w->padded)) {
+        return false;
+    }
+    w->count = w->weights;
+    const size_t pieces[] = {w->inputs, w->products, w->padded};
+    for (size_t i = 0; i < 3; ++i) {
+        if (pieces[i] > SIZE_MAX - w->count) {
+            return false;
+        }
+        w->count += pieces[i];
+    }
+    return w->count <= SIZE_MAX / sizeof(float);
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
@@ -140,7 +206,288 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
         return TRILLIM_ERROR;
     }
 #endif
+    WinogradLayout layout;
+    if (winograd_layout(p, &layout)) {
+        *scratch = layout.count * sizeof(float);
+    }
     return TRILLIM_OK;
+}
+
+static TrillimStatus winograd_pad(void *opaque, size_t channel, size_t worker) {
+    (void)worker;
+    const WinogradTask *w = opaque;
+    const Parameters *p = w->task->p;
+    size_t width = w->layout.padded_width, count = w->layout.padded_height * width;
+    float *destination = w->padded + channel * count;
+    for (size_t position = 0; position < count;) {
+        if (w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t chunk = count - position < 16384 ? count - position : 16384;
+        memset(destination + position, 0, chunk * sizeof(float));
+        position += chunk;
+    }
+    const float *source = (const float *)w->task->input + channel * p->channel_stride;
+    size_t copied = 0;
+    for (size_t row = 0; row < p->input_shape[0]; ++row) {
+        for (size_t column = 0; column < p->input_shape[1];) {
+            if (!copied && w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t chunk = p->input_shape[1] - column;
+            if (chunk > 16384 - copied) {
+                chunk = 16384 - copied;
+            }
+            memcpy(destination + (row + 1) * width + 1 + column,
+                   source + row * p->input_shape[1] + column, chunk * sizeof(float));
+            column += chunk;
+            copied = (copied + chunk) % 16384;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static void winograd_weight_line(float a, float b, float c, float out[6]) {
+    out[0] = a * 0.25f;
+    out[1] = -(a + b + c) * (1.0f / 6.0f);
+    out[2] = (-a + b - c) * (1.0f / 6.0f);
+    out[3] = (a + 2.0f * b + 4.0f * c) * (1.0f / 24.0f);
+    out[4] = (a - 2.0f * b + 4.0f * c) * (1.0f / 24.0f);
+    out[5] = c;
+}
+
+static TrillimStatus winograd_weights(void *opaque, size_t block, size_t worker) {
+    (void)worker;
+    const WinogradTask *w = opaque;
+    const Parameters *p = w->task->p;
+    size_t stride = w->layout.input_channels * w->layout.output_channels;
+    for (size_t input = 0; input < w->layout.input_channels; ++input) {
+        if ((input & 31) == 0 && w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t lane = 0; lane < 6; ++lane) {
+            size_t output = block * 6 + lane;
+            float *destination = w->weights + block * w->layout.input_channels * 6 + input * 6 + lane;
+            if (output >= p->outputs || input >= p->channels) {
+                for (size_t plane = 0; plane < 36; ++plane) {
+                    destination[plane * stride] = 0;
+                }
+                continue;
+            }
+            const float *source = (const float *)w->task->weight + (output * p->channels + input) * 9;
+            float rows[3][6];
+            for (size_t row = 0; row < 3; ++row) {
+                winograd_weight_line(source[row * 3], source[row * 3 + 1], source[row * 3 + 2], rows[row]);
+            }
+            for (size_t column = 0; column < 6; ++column) {
+                float values[6];
+                winograd_weight_line(rows[0][column], rows[1][column], rows[2][column], values);
+                for (size_t row = 0; row < 6; ++row) {
+                    destination[(row * 6 + column) * stride] = values[row];
+                }
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline void winograd_input_line(const float32x4_t d[6], float32x4_t out[6]) {
+    float32x4_t a = vmulq_f32(d[2], vdupq_n_f32(4));
+    float32x4_t b = vmulq_f32(d[1], vdupq_n_f32(4));
+    float32x4_t c = vmulq_f32(d[1], vdupq_n_f32(2));
+    float32x4_t e = vmulq_f32(d[3], vdupq_n_f32(2));
+    out[0] = vaddq_f32(vsubq_f32(vmulq_f32(d[0], vdupq_n_f32(4)), vmulq_f32(d[2], vdupq_n_f32(5))), d[4]);
+    out[1] = vaddq_f32(vsubq_f32(d[3], vaddq_f32(a, b)), d[4]);
+    out[2] = vaddq_f32(vsubq_f32(vsubq_f32(b, a), d[3]), d[4]);
+    out[3] = vaddq_f32(vsubq_f32(e, vaddq_f32(c, d[2])), d[4]);
+    out[4] = vaddq_f32(vsubq_f32(vsubq_f32(c, d[2]), e), d[4]);
+    out[5] = vaddq_f32(vsubq_f32(b, vmulq_f32(d[3], vdupq_n_f32(5))), d[5]);
+}
+
+static TrillimStatus winograd_inputs(void *opaque, size_t job, size_t worker) {
+    (void)worker;
+    const WinogradTask *w = opaque;
+    const WinogradLayout *l = &w->layout;
+    const Parameters *p = w->task->p;
+    size_t blocks = (l->tile_capacity + 63) / 64;
+    size_t channel = job / blocks, first = job % blocks * 64;
+    size_t end = l->tile_capacity - first < 64 ? l->tile_capacity : first + 64;
+    size_t stride = l->input_channels * l->tile_capacity;
+    if (w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    if (channel >= p->channels) {
+        for (size_t tile = first; tile < end; tile += 16) {
+            float *destination = w->inputs + tile / 16 * l->input_channels * 16 + channel * 16;
+            for (size_t plane = 0; plane < 36; ++plane) {
+                memset(destination + plane * stride, 0, 16 * sizeof(float));
+            }
+        }
+        return TRILLIM_OK;
+    }
+    const float *source = w->padded + channel * l->padded_height * l->padded_width;
+    for (size_t tile = first; tile < end; tile += 4) {
+        size_t indices[4];
+        for (size_t lane = 0; lane < 4; ++lane) {
+            size_t t = tile + lane < l->tiles ? tile + lane : 0;
+            indices[lane] = (t / l->tile_columns * l->padded_width + t % l->tile_columns) * 4;
+        }
+        float32x4_t rows[6][6];
+        for (size_t row = 0; row < 6; ++row) {
+            float32x4_t values[6];
+            for (size_t column = 0; column < 6; ++column) {
+                const float *base = source + row * l->padded_width + column;
+                float lanes[4] = {base[indices[0]], base[indices[1]], base[indices[2]], base[indices[3]]};
+                values[column] = vld1q_f32(lanes);
+            }
+            winograd_input_line(values, rows[row]);
+        }
+        float *destination = w->inputs + tile / 16 * l->input_channels * 16 + channel * 16 + tile % 16;
+        for (size_t column = 0; column < 6; ++column) {
+            float32x4_t values[6], result[6];
+            for (size_t row = 0; row < 6; ++row) {
+                values[row] = rows[row][column];
+            }
+            winograd_input_line(values, result);
+            for (size_t row = 0; row < 6; ++row) {
+                vst1q_f32(destination + (row * 6 + column) * stride, result[row]);
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline void winograd_multiply(const float *u, const float *v, float *m, size_t channels) {
+    for (size_t half = 0; half < 16; half += 8) {
+        float32x4_t a0 = vdupq_n_f32(0), a1 = a0, b0 = a0, b1 = a0, c0 = a0, c1 = a0;
+        float32x4_t d0 = a0, d1 = a0, e0 = a0, e1 = a0, f0 = a0, f1 = a0;
+        const float *weights = u, *inputs = v + half;
+        for (size_t input = 0; input < channels; ++input) {
+            float32x4_t x = vld1q_f32(inputs), y = vld1q_f32(inputs + 4);
+            a0 = vfmaq_n_f32(a0, x, weights[0]);
+            a1 = vfmaq_n_f32(a1, y, weights[0]);
+            b0 = vfmaq_n_f32(b0, x, weights[1]);
+            b1 = vfmaq_n_f32(b1, y, weights[1]);
+            c0 = vfmaq_n_f32(c0, x, weights[2]);
+            c1 = vfmaq_n_f32(c1, y, weights[2]);
+            d0 = vfmaq_n_f32(d0, x, weights[3]);
+            d1 = vfmaq_n_f32(d1, y, weights[3]);
+            e0 = vfmaq_n_f32(e0, x, weights[4]);
+            e1 = vfmaq_n_f32(e1, y, weights[4]);
+            f0 = vfmaq_n_f32(f0, x, weights[5]);
+            f1 = vfmaq_n_f32(f1, y, weights[5]);
+            inputs += 16;
+            weights += 6;
+        }
+        vst1q_f32(m + half + 0, a0);
+        vst1q_f32(m + half + 4, a1);
+        vst1q_f32(m + half + 16, b0);
+        vst1q_f32(m + half + 20, b1);
+        vst1q_f32(m + half + 32, c0);
+        vst1q_f32(m + half + 36, c1);
+        vst1q_f32(m + half + 48, d0);
+        vst1q_f32(m + half + 52, d1);
+        vst1q_f32(m + half + 64, e0);
+        vst1q_f32(m + half + 68, e1);
+        vst1q_f32(m + half + 80, f0);
+        vst1q_f32(m + half + 84, f1);
+    }
+}
+
+static TrillimStatus winograd_products(void *opaque, size_t job, size_t worker) {
+    (void)worker;
+    const WinogradTask *w = opaque;
+    const WinogradLayout *l = &w->layout;
+    size_t blocks = (l->tile_capacity + 63) / 64;
+    size_t plane = job / blocks, first = job % blocks * 64;
+    size_t end = l->tile_capacity - first < 64 ? l->tile_capacity : first + 64;
+    if (w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    for (size_t tile = first; tile < end; tile += 16) {
+        const float *input = w->inputs + plane * l->input_channels * l->tile_capacity + tile / 16 * l->input_channels * 16;
+        for (size_t output = 0; output < l->output_channels; output += 6) {
+            if (output % 48 == 0 && w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const float *weight = w->weights + plane * l->output_channels * l->input_channels + output * l->input_channels;
+            float *product = w->products + plane * l->output_channels * l->tile_capacity + tile / 16 * l->output_channels * 16 + output * 16;
+            winograd_multiply(weight, input, product, l->input_channels);
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline void winograd_output_line(const float32x4_t d[6], float32x4_t out[4]) {
+    float32x4_t a = vaddq_f32(d[1], d[2]), b = vsubq_f32(d[1], d[2]);
+    float32x4_t c = vaddq_f32(d[3], d[4]), e = vsubq_f32(d[3], d[4]);
+    out[0] = vaddq_f32(vaddq_f32(d[0], a), c);
+    out[1] = vfmaq_n_f32(b, e, 2);
+    out[2] = vfmaq_n_f32(a, c, 4);
+    out[3] = vaddq_f32(vfmaq_n_f32(b, e, 8), d[5]);
+}
+
+static TrillimStatus winograd_outputs(void *opaque, size_t job, size_t worker) {
+    (void)worker;
+    const WinogradTask *w = opaque;
+    const WinogradLayout *l = &w->layout;
+    const Parameters *p = w->task->p;
+    size_t blocks = (l->tiles + 63) / 64;
+    size_t output = job / blocks, first = job % blocks * 64;
+    size_t end = l->tiles - first < 64 ? l->tiles : first + 64;
+    size_t stride = l->output_channels * l->tile_capacity;
+    if (w->task->context->is_cancelled(w->task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    float bias = ((const float *)w->task->bias)[output];
+    float *destination = (float *)w->task->output + output * w->task->output_volume;
+    for (size_t tile = first; tile < end; tile += 4) {
+        float32x4_t rows[6][4];
+        const float *source = w->products + tile / 16 * l->output_channels * 16 + output * 16 + tile % 16;
+        for (size_t row = 0; row < 6; ++row) {
+            float32x4_t values[6];
+            for (size_t column = 0; column < 6; ++column) {
+                values[column] = vld1q_f32(source + (row * 6 + column) * stride);
+            }
+            winograd_output_line(values, rows[row]);
+        }
+        float values[4][4][4];
+        for (size_t column = 0; column < 4; ++column) {
+            float32x4_t input[6], result[4];
+            for (size_t row = 0; row < 6; ++row) {
+                input[row] = rows[row][column];
+            }
+            winograd_output_line(input, result);
+            for (size_t row = 0; row < 4; ++row) {
+                vst1q_f32(values[row][column], vaddq_f32(result[row], vdupq_n_f32(bias)));
+            }
+        }
+        size_t lanes = end - tile < 4 ? end - tile : 4;
+        for (size_t lane = 0; lane < lanes; ++lane) {
+            size_t y = (tile + lane) / l->tile_columns * 4, x = (tile + lane) % l->tile_columns * 4;
+            for (size_t row = 0; row < 4 && y + row < p->output_shape[0]; ++row) {
+                for (size_t column = 0; column < 4 && x + column < p->output_shape[1]; ++column) {
+                    destination[(y + row) * p->output_shape[1] + x + column] = values[row][column][lane];
+                }
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus winograd(const Task *task, void *scratch, const WinogradLayout *layout) {
+    WinogradTask w = {task, *layout, scratch, NULL, NULL, NULL};
+    w.inputs = w.weights + layout->weights;
+    w.products = w.inputs + layout->inputs;
+    w.padded = w.products + layout->products;
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    size_t blocks = (layout->tile_capacity + 63) / 64;
+    TrillimStatus status = pool->run(pool->context, task->p->channels, winograd_pad, &w);
+    if (status == TRILLIM_OK) status = pool->run(pool->context, layout->output_channels / 6, winograd_weights, &w);
+    if (status == TRILLIM_OK) status = pool->run(pool->context, layout->input_channels * blocks, winograd_inputs, &w);
+    if (status == TRILLIM_OK) status = pool->run(pool->context, 36 * blocks, winograd_products, &w);
+    if (status == TRILLIM_OK) status = pool->run(pool->context, task->p->outputs * ((layout->tiles + 63) / 64), winograd_outputs, &w);
+    return status;
 }
 
 static float rounded(float value, uint32_t dtype) {
@@ -573,7 +920,6 @@ static TrillimStatus depthwise_short(void *opaque, size_t tile, size_t worker) {
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_conv_nd_bias(void *const *outputs, const void *const *inputs, void *scratch,
                                                   const void *parameters, const TrillimKernelContext *context) {
-    (void)scratch;
     const Parameters *p = parameters;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
@@ -599,6 +945,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_conv_nd_bias(void *const *outputs, con
     }
     task.output_contiguous = task.output_contiguous &&
         (p->outputs <= 1 || p->output_channel_stride == output_spacing);
+    WinogradLayout layout;
+    if (winograd_layout(p, &layout)) {
+        return winograd(&task, scratch, &layout);
+    }
     task.spatial_contiguous = true;
     size_t spacing = 1;
     for (size_t axis = p->dimensions; axis-- > 0;) {

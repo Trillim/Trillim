@@ -52,7 +52,15 @@ typedef struct {
     const void *bias;
     const Parameters *p;
     const TrillimKernelContext *context;
+    float *packed;
 } Task;
+
+static bool packed_fp32(const Parameters *p) {
+    return p->batches == 1 && p->rank == 0 && p->m >= 16 && p->n >= 16 && p->k >= 32 &&
+        p->a_col_stride == 1 && p->b_row_stride == 1 &&
+        p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
+        p->linear_dtype == TRILLIM_FP32 && p->bias_dtype == TRILLIM_FP32 && p->out_dtype == TRILLIM_FP32;
+}
 
 static bool precise(const Parameters *p) {
     return p->out_dtype != TRILLIM_FP32 || p->linear_dtype != TRILLIM_FP32;
@@ -183,13 +191,22 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     }
     inputs[2] = p->n * trillim_itemsize(p->bias_dtype);
     outputs[0] = p->batches * p->m * p->n * trillim_itemsize(p->out_dtype);
+    if (packed_fp32(p)) {
+        if (p->n > SIZE_MAX - 7 || p->k > SIZE_MAX / sizeof(float) / ((p->n + 7) / 8) / 8) {
+            return TRILLIM_ERROR;
+        }
+        *scratch = ((p->n + 7) / 8) * p->k * 8 * sizeof(float);
+    }
     /* Reserve optional-library workspace independently of host availability. */
     if (reserve_blas(p)) {
         (void)initialize_blas();
         size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
         size_t columns = p->n / 64 + (p->n % 64 != 0);
         size_t count = p->batches * rows * columns;
-        *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
+        size_t workspace = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
+        if (workspace > *scratch) {
+            *scratch = workspace;
+        }
     }
     return TRILLIM_OK;
 }
@@ -1395,6 +1412,95 @@ static TrillimStatus blas_project(void *opaque, size_t index, size_t worker) {
     return blas_project_impl(opaque, index, worker);
 }
 
+static TrillimStatus pack_columns(void *opaque, size_t block, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t first = block * 8;
+    size_t count = p->n - first < 8 ? p->n - first : 8;
+    float *target = task->packed + block * p->k * 8;
+    const float *weight = task->b;
+    for (size_t k = 0; k < p->k; ++k) {
+        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t column = 0; column < 8; ++column) {
+            target[k * 8 + column] = column < count ? weight[(first + column) * p->b_col_stride + k] : 0;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus packed_project(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t blocks = (p->n + 7) / 8;
+    size_t first = tile % blocks * 8;
+    size_t row = tile / blocks * 6;
+    size_t rows = p->m - row < 6 ? p->m - row : 6;
+    const float *input = (const float *)task->a + row * p->a_row_stride;
+    const float *a0 = input;
+    const float *a1 = input + (rows > 1 ? 1 * p->a_row_stride : 0);
+    const float *a2 = input + (rows > 2 ? 2 * p->a_row_stride : 0);
+    const float *a3 = input + (rows > 3 ? 3 * p->a_row_stride : 0);
+    const float *a4 = input + (rows > 4 ? 4 * p->a_row_stride : 0);
+    const float *a5 = input + (rows > 5 ? 5 * p->a_row_stride : 0);
+    const float *weights = task->packed + (tile % blocks) * p->k * 8;
+    float32x4_t s00 = vdupq_n_f32(0), s01 = vdupq_n_f32(0);
+    float32x4_t s10 = vdupq_n_f32(0), s11 = vdupq_n_f32(0);
+    float32x4_t s20 = vdupq_n_f32(0), s21 = vdupq_n_f32(0);
+    float32x4_t s30 = vdupq_n_f32(0), s31 = vdupq_n_f32(0);
+    float32x4_t s40 = vdupq_n_f32(0), s41 = vdupq_n_f32(0);
+    float32x4_t s50 = vdupq_n_f32(0), s51 = vdupq_n_f32(0);
+    for (size_t k = 0; k < p->k; ++k) {
+        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t w0 = vld1q_f32(weights + k * 8 + 0);
+        float32x4_t w1 = vld1q_f32(weights + k * 8 + 4);
+        s00 = vfmaq_n_f32(s00, w0, a0[k]);
+        s01 = vfmaq_n_f32(s01, w1, a0[k]);
+        s10 = vfmaq_n_f32(s10, w0, a1[k]);
+        s11 = vfmaq_n_f32(s11, w1, a1[k]);
+        s20 = vfmaq_n_f32(s20, w0, a2[k]);
+        s21 = vfmaq_n_f32(s21, w1, a2[k]);
+        s30 = vfmaq_n_f32(s30, w0, a3[k]);
+        s31 = vfmaq_n_f32(s31, w1, a3[k]);
+        s40 = vfmaq_n_f32(s40, w0, a4[k]);
+        s41 = vfmaq_n_f32(s41, w1, a4[k]);
+        s50 = vfmaq_n_f32(s50, w0, a5[k]);
+        s51 = vfmaq_n_f32(s51, w1, a5[k]);
+    }
+    size_t count = p->n - first < 8 ? p->n - first : 8;
+    float bias[8] = {0};
+    memcpy(bias, (const float *)task->bias + first, count * sizeof(float));
+    float32x4_t biases[2] = {vld1q_f32(bias), vld1q_f32(bias + 4)};
+    float32x4_t sums[6][2] = {
+        {s00, s01},
+        {s10, s11},
+        {s20, s21},
+        {s30, s31},
+        {s40, s41},
+        {s50, s51},
+    };
+    for (size_t r = 0; r < rows; ++r) {
+        float *output = (float *)task->output + (row + r) * p->n + first;
+        if (count == 8) {
+            for (size_t c = 0; c < 2; ++c) {
+                vst1q_f32(output + c * 4, vaddq_f32(sums[r][c], biases[c]));
+            }
+        } else {
+            float tail[8];
+            for (size_t c = 0; c < 2; ++c) {
+                vst1q_f32(tail + c * 4, vaddq_f32(sums[r][c], biases[c]));
+            }
+            memcpy(output, tail, count * sizeof(float));
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_dense_bias(void *const *outputs, const void *const *inputs,
                                   void *scratch, const void *parameters,
                                   const TrillimKernelContext *context) {
@@ -1405,7 +1511,15 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_dense_bias(void *const *outputs, const
     if (p->batches == 0 || p->m == 0 || p->n == 0) {
         return TRILLIM_OK;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, context};
+    Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, context, scratch};
+    if (packed_fp32(p)) {
+        size_t blocks = (p->n + 7) / 8;
+        TrillimStatus status = context->thread_pool->run(context->thread_pool->context, blocks, pack_columns, &task);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        return context->thread_pool->run(context->thread_pool->context, ((p->m + 5) / 6) * blocks, packed_project, &task);
+    }
     if (use_blas(p, context)) {
         size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
         size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
