@@ -63,8 +63,8 @@ def payload(entry: _WeightEntry, dtype: str = "fp32") -> bytes:
 
 
 def golden_values(model: str = "Qwen3-0.6B") -> NDArray[np.float32]:
-    provenance = json.loads((FIXTURES / "provenance.json").read_text())
-    return np.asarray(provenance[model]["values"], dtype=np.float32)
+    expected = json.loads((FIXTURES / "expected.json").read_text())
+    return np.asarray(expected[model], dtype=np.float32)
 
 
 def bitnet_reference() -> tuple[NDArray[np.float32], np.float32]:
