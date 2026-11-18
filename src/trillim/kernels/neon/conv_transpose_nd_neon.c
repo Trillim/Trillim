@@ -15,6 +15,8 @@ typedef struct {
     uint32_t input_dtype, weight_dtype, bias_dtype, output_dtype;
     size_t channel_stride;
     const size_t *input_strides;
+    size_t output_channel_stride;
+    const size_t *output_strides;
 } Parameters;
 
 typedef struct {
@@ -23,6 +25,7 @@ typedef struct {
     const Parameters *p;
     size_t input_volume, output_volume, kernel_volume;
     const TrillimKernelContext *context;
+    bool output_contiguous;
 } Task;
 
 static bool product(size_t a, size_t b, size_t *result) {
@@ -51,7 +54,8 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
 #endif
     if (!p->dimensions || p->dimensions > 3 || !p->channels || !p->groups ||
         p->channels % p->groups || p->outputs % p->groups ||
-        !trillim_float(p->input_dtype) || !trillim_float(p->weight_dtype) ||
+        !trillim_float(p->input_dtype) || p->weight_dtype < TRILLIM_FP16 ||
+        p->weight_dtype > TRILLIM_MXFP4 ||
         !trillim_float(p->output_dtype)
 #if BIASED
         || !trillim_float(p->bias_dtype)
@@ -90,11 +94,14 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     if (!volume(p->dimensions, p->input_shape, &input_volume) ||
         !volume(p->dimensions, p->output_shape, &output_volume) ||
         !volume(p->dimensions, p->kernel, &kernel_volume) ||
-        !product(p->channels / p->groups, p->outputs, &count) ||
-        !product(count, kernel_volume, &count) ||
-        !product(count, trillim_itemsize(p->weight_dtype), &inputs[1]) ||
-        !product(p->outputs, output_volume, &count) ||
-        !product(count, trillim_itemsize(p->output_dtype), &outputs[0])) {
+#if TRANSPOSED
+        !product(p->outputs / p->groups, kernel_volume, &count) ||
+        !trillim_packed_payload_size(p->channels, count, p->weight_dtype, &inputs[1]) ||
+#else
+        !product(p->channels / p->groups, kernel_volume, &count) ||
+        !trillim_packed_payload_size(p->outputs, count, p->weight_dtype, &inputs[1]) ||
+#endif
+        !product(p->outputs, output_volume, &count)) {
         return TRILLIM_ERROR;
     }
     size_t span;
@@ -111,6 +118,22 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     }
     if (span == SIZE_MAX || !product(span + 1, trillim_itemsize(p->input_dtype), &inputs[0])) {
         return TRILLIM_ERROR;
+    }
+    size_t output_span = 0;
+    if (p->outputs) {
+        if (!product(p->outputs - 1, p->output_channel_stride, &output_span)) {
+            return TRILLIM_ERROR;
+        }
+        for (size_t axis = 0; axis < p->dimensions; ++axis) {
+            size_t extent;
+            if (!product(p->output_shape[axis] - 1, p->output_strides[axis], &extent) || extent > SIZE_MAX - output_span) {
+                return TRILLIM_ERROR;
+            }
+            output_span += extent;
+        }
+        if (output_span == SIZE_MAX || !product(output_span + 1, trillim_itemsize(p->output_dtype), &outputs[0])) {
+            return TRILLIM_ERROR;
+        }
     }
 #if BIASED
     if (!product(p->outputs, trillim_itemsize(p->bias_dtype), &inputs[2])) {
@@ -179,6 +202,19 @@ static size_t weight_position(const Task *task, size_t output, size_t channel, s
 #endif
 }
 
+static inline float weight_value(const Task *task, size_t index) {
+    const Parameters *p = task->p;
+    if (trillim_float(p->weight_dtype)) {
+        return trillim_load(task->weight, index, p->weight_dtype).f;
+    }
+#if TRANSPOSED
+    size_t rows = p->channels, columns = p->outputs / p->groups * task->kernel_volume;
+#else
+    size_t rows = p->outputs, columns = p->channels / p->groups * task->kernel_volume;
+#endif
+    return trillim_packed_read_float(task->weight, index, p->weight_dtype, rows, columns);
+}
+
 static void store(const Task *task, size_t output, size_t position, float sum) {
     const Parameters *p = task->p;
     uint32_t compute = p->input_dtype == p->weight_dtype ? p->input_dtype : TRILLIM_FP32;
@@ -188,7 +224,17 @@ static void store(const Task *task, size_t output, size_t position, float sum) {
     sum = rounded(sum, compute == p->bias_dtype ? compute : TRILLIM_FP32);
 #endif
     TrillimValue value = {.f = sum};
-    trillim_store(task->output, output * task->output_volume + position, p->output_dtype, value);
+    size_t index;
+    if (task->output_contiguous) {
+        index = output * task->output_volume + position;
+    } else {
+        index = output * p->output_channel_stride;
+        for (size_t axis = p->dimensions; axis-- > 0;) {
+            index += position % p->output_shape[axis] * p->output_strides[axis];
+            position /= p->output_shape[axis];
+        }
+    }
+    trillim_store(task->output, index, p->output_dtype, value);
 }
 
 #if USE_NEON
@@ -262,7 +308,7 @@ static TrillimStatus convolve4(const Task *task, size_t output, size_t position,
                 }
                 input = vld1q_f32(values);
             }
-            float weight = trillim_load(task->weight, weight_position(task, output, channel, kernel), p->weight_dtype).f;
+            float weight = weight_value(task, weight_position(task, output, channel, kernel));
             partial = vfmaq_n_f32(partial, input, weight);
         }
         partial = vbslq_f32(vld1q_u32(valid), round4(partial, compute), vdupq_n_f32(0));
@@ -319,7 +365,7 @@ static TrillimStatus convolve4(const Task *task, size_t output, size_t position,
                 }
                 values = vld1q_f32(lanes);
             }
-            float weight = trillim_load(task->weight, weight_position(task, output, channel, kernel), p->weight_dtype).f;
+            float weight = weight_value(task, weight_position(task, output, channel, kernel));
             sum = vfmaq_n_f32(sum, values, weight);
         }
     }
@@ -353,7 +399,7 @@ static TrillimStatus convolve1(const Task *task, size_t output, size_t position,
                 return TRILLIM_CANCELLED;
             }
             float input = trillim_load(task->input, (group_base + channel) * p->channel_stride + index, p->input_dtype).f;
-            float weight = trillim_load(task->weight, weight_position(task, output, channel, kernel), p->weight_dtype).f;
+            float weight = weight_value(task, weight_position(task, output, channel, kernel));
             partial += input * weight;
         }
         sum = rounded(sum + rounded(partial, compute), compute);
@@ -387,7 +433,7 @@ static TrillimStatus convolve1(const Task *task, size_t output, size_t position,
                 valid = source_position(p, out, offset, 0, &index);
             }
             float input = valid ? trillim_load(task->input, (group_base + channel) * p->channel_stride + index, p->input_dtype).f : 0;
-            float weight = trillim_load(task->weight, weight_position(task, output, channel, kernel), p->weight_dtype).f;
+            float weight = weight_value(task, weight_position(task, output, channel, kernel));
             sum += input * weight;
         }
     }
@@ -467,7 +513,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_conv_transpose_nd(void *const *outputs
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], NULL, p, 0, 0, 0, context};
+    Task task = {
+        .output = outputs[0], .input = inputs[0], .weight = inputs[1], .p = p,
+        .context = context, .output_contiguous = true
+    };
 #if BIASED
     task.bias = inputs[2];
 #endif
@@ -476,16 +525,25 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_conv_transpose_nd(void *const *outputs
         !volume(p->dimensions, p->kernel, &task.kernel_volume)) {
         return TRILLIM_ERROR;
     }
+    size_t output_spacing = 1;
+    for (size_t axis = p->dimensions; axis-- > 0;) {
+        if (p->output_shape[axis] > 1 && p->output_strides[axis] != output_spacing) {
+            task.output_contiguous = false;
+        }
+        output_spacing *= p->output_shape[axis];
+    }
+    task.output_contiguous = task.output_contiguous &&
+        (p->outputs <= 1 || p->output_channel_stride == output_spacing);
     size_t tiles = task.output_volume / 64 + (task.output_volume % 64 != 0);
     return context->thread_pool->run(context->thread_pool->context, p->outputs * tiles, convolve, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_conv_transpose_nd_tdl(void) {
     return            "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _contiguous_strides, _DTYPE_IDS\n"
+           "from trillim.compiler.kernels.bindings import _contiguous_strides, _DTYPE_IDS, _storage_shape, _product\n"
            "from trillim.compiler.passes.infer import _constant_expression, _expression\n"
            "def pattern(x: Tensor, weight: Tensor, *, kernel: tuple[int, ...] = (3,), stride=1, padding=0, dilation=1, groups: int=1, dtype: DType | None=None, output_padding=0) -> tuple[Tensor, ...]:\n"
-           "    result=ConvTranspose(x, weight, kernel=kernel, stride=stride, padding=padding, dilation=dilation, groups=groups, output_padding=0)\n"
+           "    result=ConvTranspose(x, weight, kernel=kernel, stride=stride, padding=padding, dilation=dilation, groups=groups, output_padding=output_padding)\n"
            "    return (result if dtype is None else Cast(result, dtype),)\n"
            "def bind(c):\n"
            "    x,w,o=c.inputs['x'],c.inputs['weight'],c.outputs[0]\n"
@@ -512,11 +570,15 @@ TRILLIM_KERNEL const char *trillim_neon_conv_transpose_nd_tdl(void) {
            "        raise ValueError('transposed convolution channel shapes differ')\n"
            "    if x.dtype not in ('fp16','bf16','fp32'):\n"
            "        raise ValueError('convolution requires floating input')\n"
-           "    for t in (w,o):\n"
-           "        if t.dtype not in ('fp16','bf16','fp32') or (t.strides or _contiguous_strides(t.shape))!=_contiguous_strides(t.shape):\n"
-           "            raise ValueError('convolution requires contiguous floating tensors')\n"
+           "    if _DTYPE_IDS[w.dtype]<_DTYPE_IDS['fp16'] or (w.strides or _contiguous_strides(w.shape))!=_contiguous_strides(w.shape):\n"
+           "        raise ValueError('convolution requires contiguous floating or packed weights')\n"
+           "    if _DTYPE_IDS[w.dtype]>=_DTYPE_IDS['row_int8'] and _storage_shape(w)!=(w.shape[0],_product(w.shape[1:])):\n"
+           "        raise ValueError('convolution requires a complete packed weight tensor')\n"
+           "    if o.dtype not in ('fp16','bf16','fp32'):\n"
+           "        raise ValueError('convolution requires floating output')\n"
            "    xs=x.strides or _contiguous_strides(x.shape)\n"
-           "    return dict(channel_stride=xs[0],input_strides=xs[1:],dimensions=n,channels=x.shape[0],outputs=out,groups=g,input_shape=x.shape[1:],output_shape=o.shape[1:],kernel=k,stride=s,padding=p,dilation=d,output_padding=e,input_dtype=_DTYPE_IDS[x.dtype],weight_dtype=_DTYPE_IDS[w.dtype],output_dtype=_DTYPE_IDS[o.dtype],bias_dtype=_DTYPE_IDS['fp32'])\n";
+           "    os=o.strides or _contiguous_strides(o.shape)\n"
+           "    return dict(output_channel_stride=os[0],output_strides=os[1:],channel_stride=xs[0],input_strides=xs[1:],dimensions=n,channels=x.shape[0],outputs=out,groups=g,input_shape=x.shape[1:],output_shape=o.shape[1:],kernel=k,stride=s,padding=p,dilation=d,output_padding=e,input_dtype=_DTYPE_IDS[x.dtype],weight_dtype=_DTYPE_IDS[w.dtype],output_dtype=_DTYPE_IDS[o.dtype],bias_dtype=_DTYPE_IDS['fp32'])\n";
 }
 
 TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_conv_transpose_nd_parameters(void) {
@@ -538,6 +600,8 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_conv_transpose_nd_para
         {"output_dtype", "uint32_t", offsetof(Parameters, output_dtype), NULL},
         {"channel_stride", "size_t", offsetof(Parameters, channel_stride), NULL},
         {"input_strides", "size_t", offsetof(Parameters, input_strides), "dimensions"},
+        {"output_channel_stride", "size_t", offsetof(Parameters, output_channel_stride), NULL},
+        {"output_strides", "size_t", offsetof(Parameters, output_strides), "dimensions"},
     };
     static const size_t inputs[] = {1, 1, 1}, outputs[] = {1};
     static const TrillimParameterSchema schema = {
