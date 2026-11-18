@@ -22,7 +22,7 @@ with Runtime("compiled/model", threads=4) as model:
 
 `Runtime.inputs` and `Runtime.outputs` describe logical dtypes, shapes and maximum shapes. Python inputs may be numeric NumPy arrays or JSON-compatible numeric values. The runtime checks names, ranks, fixed dimensions, upper bounds and integer ranges before executing. Returned arrays own their data and survive subsequent runs or closing the model. BF16 and packed numerical outputs decode to FP32 arrays.
 
-Scalar and x86 manifests share the CPU backend's allocator, mappings, interpreter and persistent native thread pool. Their compiled kernels and capability requirements select the actual implementations. Kernels run sequentially and can divide each invocation across the pool. The benchmark uses this same pool. Source installs build and cache the native helper on first use, using the kernel compiler hierarchy.
+Runtime verifies the manifest and selects a private backend from `backends/scalar`, `backends/x86` or `backends/arm`. The ARM backend handles the compiler's `neon` target on ARM64. Each backend checks its device capabilities and uses the shared allocator, mappings, Python interpreter and persistent native thread pool in `backends/cpu`. Kernels run sequentially and can divide each invocation across the pool. The benchmark uses this same pool. Source installs build and cache the native helper on first use, using the kernel compiler hierarchy.
 
 The backend prepares manifest arithmetic as Python functions and retains unchanged kernel parameter structs. Cache positions, tensor dimensions, pointers and footprint checks still update as execution proceeds.
 

@@ -10,7 +10,10 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import JsonValue
 
-from ..backends.cpu.executor import _CPU
+from ..backends.arm.executor import _ARM
+from ..backends.scalar.executor import _Scalar
+from ..backends.x86.executor import _X86
+from ..compiler.passes.verify import _verify
 from .runtime_dataclasses import TensorSpec
 from .runtime_pydantic_models import _RunRequest
 
@@ -25,7 +28,15 @@ class Runtime:
         request = _RunRequest(
             directory=Path(directory).expanduser().resolve(), threads=threads
         )
-        self._backend = _CPU(request.directory, request.threads)
+        manifest = _verify(request.directory)
+        backends: dict[str, type[_Scalar | _X86 | _ARM]] = {
+            "scalar": _Scalar,
+            "x86": _X86,
+            "neon": _ARM,
+        }
+        self._backend = backends[manifest.backend](
+            request.directory, manifest, request.threads
+        )
 
     @property
     def inputs(self) -> Mapping[str, TensorSpec]:
