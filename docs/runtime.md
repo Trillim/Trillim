@@ -1,15 +1,8 @@
 # Running compiled models
 
-`trillim run PATH --threads 4` loads the compiled model directory and reads one JSON object per line from standard input. Each object must provide exactly the inputs declared by TDL. Each response contains the declared outputs, preserving their array shapes. Diagnostics go to standard error.
+`trillim run PATH --threads 4` uses the public `Model` abstraction and reads one plain-text or JSON request per line. Model applies the processors declared in the executable manifest before and after Runtime. Text responses are printed directly; audio/image outputs are saved with `--output PATH`. See [processing.md](processing.md) for built-ins, TDL declarations and custom callbacks.
 
-For an LLM whose inputs are `tokens` and `reset`:
-
-```json
-{"tokens":[9707,11,358],"reset":true}
-{"tokens":[9707,11,358,1234],"reset":false}
-```
-
-The process retains caches between requests. The model's TDL defines reset and prefix-reuse behavior. Tokenization and output decoding belong to the caller.
+Python callers can use `with Model(...) as model` for processed inputs/outputs, or use Runtime directly for named tensors. The process retains caches between requests; model TDL defines reset and prefix reuse.
 
 ```python
 from trillim.runtime import Runtime

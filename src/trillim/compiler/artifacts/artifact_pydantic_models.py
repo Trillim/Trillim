@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from ...processing.processing_pydantic_models import _ProcessingSpec
 from ...tdl.core.types import DType
 from ..kernels.kernel_dataclasses import _Backend
 
@@ -46,6 +47,7 @@ class _ExecutableManifest(BaseModel):
     cache_size: int = Field(ge=0)
     weights: str = "weights.bin"
     constants: str = "constants.bin"
+    processing: _ProcessingSpec | None = None
     inputs: dict[str, str]
     outputs: dict[str, str]
     buffers: dict[str, _BufferRecord]

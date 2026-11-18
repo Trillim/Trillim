@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import ConfigDict, JsonValue, TypeAdapter
+
 from ...tdl.core import Graph
 from ..compiler_pydantic_models import _CompileRequest
 
@@ -22,4 +24,9 @@ def _trace(request: _CompileRequest) -> Graph:
         raise ValueError(
             f"{filename}: TDL graph must be completed using its context manager"
         )
+    processing = namespace.get("processing")
+    if processing is not None:
+        graph._processing = TypeAdapter(
+            dict[str, JsonValue], config=ConfigDict(strict=True)
+        ).validate_python(processing)
     return graph

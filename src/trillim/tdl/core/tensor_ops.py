@@ -27,10 +27,25 @@ from .types import DType
 
 
 def Input(
-    *, name: str, shape: TensorShape | tuple[int | None, ...], dtype: DType
+    *,
+    name: str,
+    shape: TensorShape | tuple[int | None, ...],
+    dtype: DType,
+    maximum_shape: tuple[int, ...] | None = None,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    multiple_of: int | None = None,
 ) -> Tensor:
     shape = shape if isinstance(shape, TensorShape) else TensorShape(shape)
-    args = _InputArgs(name=name, shape=shape, dtype=dtype)
+    args = _InputArgs(
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        maximum_shape=maximum_shape,
+        minimum=minimum,
+        maximum=maximum,
+        multiple_of=multiple_of,
+    )
     graph = _get_graph()
     if _get_scope() is not graph._root:
         raise ValueError("inputs must be declared in the outer graph")

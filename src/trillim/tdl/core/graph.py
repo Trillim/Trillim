@@ -5,7 +5,7 @@ from contextvars import ContextVar, Token
 from types import TracebackType
 from typing import TYPE_CHECKING, Self
 
-from pydantic import ConfigDict, TypeAdapter
+from pydantic import ConfigDict, JsonValue, TypeAdapter
 
 from .core_dataclasses import _CacheSpec, _Region, _Scope, _TensorTuple
 from .tensor import Tensor
@@ -30,6 +30,7 @@ class Graph:
 
     def __init__(self) -> None:
         self._inputs: dict[str, Tensor] = {}
+        self._processing: dict[str, JsonValue] | None = None
         self._outputs: dict[str, Tensor] = {}
         self._caches: dict[str, _CacheSpec] = {}
         self._region: _Region | None = None

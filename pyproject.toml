@@ -21,8 +21,14 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "jinja2==3.1.6",
     "numpy==2.5.3",
+    "pillow==13.0.0",
     "pydantic==2.13.5",
+    "scipy==1.18.1",
+    "sentencepiece==0.2.3",
+    "soundfile==0.14.0",
+    "transformers==5.23.0",
 ]
 
 [project.scripts]
