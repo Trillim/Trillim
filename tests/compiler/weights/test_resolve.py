@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import struct
 from pathlib import Path
 
@@ -28,9 +27,8 @@ from .helpers import (
 )
 def test_native_copy_and_conversion_against_source_values(model: str) -> None:
     entry = source(model)
-    golden = json.loads((FIXTURES / "provenance.json").read_text())[model]
     assert payload(entry, entry.dtype) == raw(entry)
-    expected = np.asarray(golden["values"], dtype="<f4").tobytes()
+    expected = golden_values(model).astype("<f4").tobytes()
     assert payload(entry) == expected
     assert (
         payload(entry, "fp16") == np.frombuffer(expected, "<f4").astype("<f2").tobytes()
@@ -39,10 +37,7 @@ def test_native_copy_and_conversion_against_source_values(model: str) -> None:
 
 def test_bitnet_absmean_preserves_pretrained_quantizer() -> None:
     entry = source("BitNet")
-    values = np.asarray(
-        json.loads((FIXTURES / "provenance.json").read_text())["BitNet"]["values"],
-        dtype=np.float32,
-    )
+    values = golden_values("BitNet")
     mean = np.float32(sum(abs(float(value)) for value in values) / len(values))
     inverse = np.float32(1) / mean
     gamma_bits = struct.unpack("<I", struct.pack("<f", np.float32(1) / inverse))[0]

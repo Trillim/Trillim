@@ -25,10 +25,10 @@ def test_original_packed_checkpoint_bytes(model: str, tmp_path: Path) -> None:
         else "GPT-oss-MXFP4.safetensors"
     )
     checkpoint = _load_checkpoint("checkpoint", FIXTURES / filename)
-    provenance = json.loads((FIXTURES / "quantized_sources.json").read_text())[model]
+    expected_hashes = json.loads((FIXTURES / "expected_hashes.json").read_text())[model]
     for name, source in checkpoint.tensors.items():
         data = _read_bytes(source, 0, source.size)
-        assert hashlib.sha256(data).hexdigest() == provenance["tensors"][name]["sha256"]
+        assert hashlib.sha256(data).hexdigest() == expected_hashes[name]
     if model == "bitnet":
         name = "model.layers.0.self_attn.q_proj.weight"
         config = _CheckpointConfig.model_validate(

@@ -1,0 +1,10 @@
+{
+  "bitnet": {
+    "model.layers.0.self_attn.q_proj.weight": "228dc7bad84d371d0421d8317c4db1c577d0119928eb58264eb5171044d4c420",
+    "model.layers.0.self_attn.q_proj.weight_scale": "4c7c3a94d1299c90c0f9e17b4be24bfd30da38d5729b295274354c174667258d"
+  },
+  "gpt-oss": {
+    "model.layers.0.mlp.experts.down_proj_blocks": "8326cfadbeed21e1a14108e66c5fac28dbc33b5bc2aa8c5a4df92a5f1b28c3ad",
+    "model.layers.0.mlp.experts.down_proj_scales": "ef90d9c1ec76b1edc9edfaf2c0c05359c10ccc49ae8ecf7b7fd25ce9c02e86a4"
+  }
+}
