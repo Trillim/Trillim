@@ -4,7 +4,7 @@
 
 Kernel libraries must already be installed. From a source checkout, run `trillim kernels` to rebuild the host and scalar backends, or `trillim kernels path/to/kernel.c --backend x86` to update individual kernels. See [kernel_standard.md](kernel_standard.md) for the build layout and compiler fallback order. Model compilation does not build kernels implicitly.
 
-The supported Python API is `trillim.tdl` and `trillim.tdl.core` for model authoring. Compilation is exposed through the command above; compiler functions, types and helpers are private.
+The public Python modules are `trillim.tdl` (including `core`), `trillim.processing` and `trillim.runtime`. Compilation is exposed through the command above; compiler functions, types and helpers are private.
 
 Generated files use `$TRILLIM_HOME/1.0.0/`, where `TRILLIM_HOME` defaults to `~/.trillim`. Only version 1.0.0 is read. `kernels/` holds backend builds, `bench/` holds the native benchmark helper, and `compiled/` holds model bundles. Benchmark timings are reused only within the current compilation; the executable records the measurements used for selection.
 
@@ -16,8 +16,11 @@ The compiler detects the host backend and writes to `~/.trillim/1.0.0/compiled/<
 - `--depth low` compares kernels for the operations in that plan at 1, 8, and 64 tokens.
 - `--depth high` also compares fusion choices and extends workloads through 512, 4096, and 32768 tokens.
 - `--threads N` overrides the detected CPU thread count.
-- `--max-input-size N` sets the maximum length of each variable input dimension, defaulting to 4096. Fixed dimensions and input values are unaffected; cache capacities remain defined in TDL.
-Each `NAME=PATH` must match a TDL `Model("NAME")` declaration. Checkpoint paths must exist, be files or directories, and be accessible; these checks run during argument validation before tracing TDL or creating output.
+- `--max-input-size N` sets the default maximum length of variable input dimensions, defaulting to 4096; explicit TDL `maximum_shape` bounds take precedence. Fixed dimensions and input values are unaffected; cache capacities remain defined in TDL.
+
+`Input` can declare scalar integer `minimum`, `maximum` and `multiple_of` constraints, plus per-input `maximum_shape` bounds for variable dimensions. Bounds guide allocation and remain runtime guards.
+
+Each `NAME=PATH` supplies a TDL `Model("NAME")` declaration or a processing asset binding. Checkpoint paths must exist, be files or directories, and be accessible; these checks run during argument validation before tracing TDL or creating output.
 
 The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compiler computes scratch and cache requirements without a user-supplied memory budget. Benchmark preparation has an internal memory limit, and individual benchmark workers have a timeout.
 
@@ -38,6 +41,7 @@ Normalization caches expressions and retains links to original tensors and opera
 `executable.json` is a compact single-line JSON object. All paths are relative to its directory.
 
 - `inputs` and `outputs` map public names to tensor buffers.
+- Optional `processing` records standard pre/post recipe identifiers, bundled asset paths and recipe options; see [processing.md](processing.md).
 - `buffers` describe dtype, shape, strides, capacity, and storage. Storage is an arena span, caller input, weight, constant, cache, or another tensor's view.
 - `arena_size` covers intermediate outputs and temporary workspace; their live intervals determine reuse. `cache_size` covers persistent state.
 - `caches` describe fixed capacities, initial values, update policies, and offsets. Append overflow is an error; sliding caches retain their newest values.

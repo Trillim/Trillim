@@ -120,6 +120,51 @@ class _InputArgs(_OperatorArgs):
     name: str = Field(min_length=1)
     shape: Shape
     dtype: DType
+    maximum_shape: tuple[int, ...] | None = None
+    minimum: int | None = None
+    maximum: int | None = None
+    multiple_of: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> _InputArgs:
+        if self.maximum_shape is not None and (
+            len(self.maximum_shape) != len(self.shape.dimensions)
+            or any(
+                limit < 0 or dimension is not None and dimension != limit
+                for dimension, limit in zip(
+                    self.shape.dimensions, self.maximum_shape, strict=True
+                )
+            )
+        ):
+            raise ValueError(
+                "maximum_shape must match fixed dimensions and bound each variable dimension"
+            )
+        if any(
+            value is not None
+            for value in (self.minimum, self.maximum, self.multiple_of)
+        ):
+            if self.shape.dimensions or not self.dtype.startswith(("int", "uint")):
+                raise ValueError("value bounds require a scalar integer input")
+            bits = int(
+                self.dtype.removeprefix("uint")
+                if self.dtype.startswith("uint")
+                else self.dtype.removeprefix("int")
+            )
+            low, high = (
+                (0, 2**bits - 1)
+                if self.dtype.startswith("uint")
+                else (-(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
+            )
+            minimum = low if self.minimum is None else self.minimum
+            maximum = high if self.maximum is None else self.maximum
+            if not low <= minimum <= maximum <= high:
+                raise ValueError("input bounds must be ordered and fit its dtype")
+            if (
+                self.multiple_of is not None
+                and -(-minimum // self.multiple_of) * self.multiple_of > maximum
+            ):
+                raise ValueError("input bounds contain no permitted multiple")
+        return self
 
 
 class _OutputArgs(_UnaryArgs):

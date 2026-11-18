@@ -715,11 +715,42 @@ def _input(state: _InferenceState, operator: _Operator, args: _InputArgs) -> Non
             tensor=tensor,
             axis=axis,
             minimum=0,
-            maximum=state.max_input_size,
+            maximum=args.maximum_shape[axis]
+            if args.maximum_shape is not None
+            else state.max_input_size,
         )
         for axis, dimension in enumerate(args.shape.dimensions)
     )
-    _store(state, tensor, shape, args.dtype)
+    limits = _type_range(args.dtype)
+    interval = (
+        None
+        if limits is None
+        else (
+            args.minimum if args.minimum is not None else limits[0],
+            args.maximum if args.maximum is not None else limits[1],
+        )
+    )
+    _store(state, tensor, shape, args.dtype, value_range=interval)
+    raw = _ShapeExpression("scalar", tensor=tensor, axis=0)
+    for bound, predicate in ((args.minimum, "ge"), (args.maximum, "le")):
+        if bound is not None:
+            _constraint(
+                state,
+                predicate,
+                raw,
+                _constant_expression(bound),
+                f"{args.name}: input value is outside its bounds",
+                True,
+            )
+    if args.multiple_of is not None:
+        _constraint(
+            state,
+            "divisible",
+            raw,
+            _constant_expression(args.multiple_of),
+            f"{args.name}: input value must be a multiple of {args.multiple_of}",
+            True,
+        )
 
 
 def _constant(state: _InferenceState, operator: _Operator, args: _ConstantArgs) -> None:

@@ -18,3 +18,4 @@ class TensorSpec:
 class _RunArguments(Namespace):
     directory: Path = field(init=False)
     threads: int | None = None
+    output: Path | None = None

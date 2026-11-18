@@ -18,6 +18,7 @@ from .passes.infer import _infer
 from .passes.match import _match
 from .passes.optimize import _optimize
 from .passes.packing import _set_packings
+from .passes.processing import _processing
 from .passes.schedule import _schedule
 from .passes.select import _select
 from .passes.trace import _trace
@@ -50,6 +51,7 @@ def _compile_model(
         report("Tracing and validating TDL")
         graph = _trace(request)
         _validate(graph)
+        processing = _processing(graph, request.checkpoints, temporary)
         report("Resolving checkpoint tensors")
         assert graph._region is not None
         _collect_checkpoints(graph._region, request.checkpoints)
@@ -236,6 +238,7 @@ def _compile_model(
             previous = point
         executable = executable.model_copy(
             update={
+                "processing": processing,
                 "workloads": tuning.workloads,
                 "workload": workload,
                 "plans": variants,

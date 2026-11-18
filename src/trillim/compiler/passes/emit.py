@@ -187,7 +187,7 @@ def _program(
             )
             result.append({"op": "views", "outputs": tensors(operator.outputs)})
         elif isinstance(args, (_InputArgs, _OutputArgs, _ConstantArgs, _CacheArgs)):
-            continue
+            pass
         elif isinstance(args, _IfArgs):
             result.append(
                 {

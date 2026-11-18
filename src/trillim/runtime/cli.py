@@ -6,35 +6,63 @@ import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
-from pydantic import ConfigDict, JsonValue, TypeAdapter
+import soundfile as sf  # type: ignore[import-untyped]
+from PIL import Image
+from pydantic import JsonValue, TypeAdapter
 
+from ..processing import Audio
+from .model import Model
 from .runtime_dataclasses import _RunArguments
-from .session import Runtime
 
-_INPUTS = TypeAdapter(dict[str, JsonValue], config=ConfigDict(strict=True))
+_INPUT = TypeAdapter[JsonValue](JsonValue)
 
 
 def _run(arguments: list[str]) -> None:
     parser = ArgumentParser(prog="trillim run")
     parser.add_argument("directory", type=Path)
     parser.add_argument("--threads", type=int)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="audio/image output path; numbered for multiple requests",
+    )
     options = _RunArguments()
     parser.parse_args(arguments, namespace=options)
 
     def terminate(signum: int, frame: object) -> None:
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, terminate)
-    with Runtime(options.directory, threads=options.threads) as runtime:
-        for line in sys.stdin:
-            if line.strip():
-                inputs = _INPUTS.validate_json(line)
-                outputs = runtime.run(inputs)
-                print(
-                    json.dumps(
-                        {name: value.tolist() for name, value in outputs.items()},
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ),
-                    flush=True,
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        with Model[object, object](options.directory, threads=options.threads) as model:
+            index = 0
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                value: object = (
+                    _INPUT.validate_json(line)
+                    if line.lstrip().startswith(("{", "[", '"'))
+                    else line.rstrip("\r\n")
                 )
+                result = model.run(value)
+                if isinstance(result, (Audio, Image.Image)):
+                    path = options.output or Path(
+                        "output.wav" if isinstance(result, Audio) else "output.png"
+                    )
+                    if index:
+                        path = path.with_stem(f"{path.stem}-{index}")
+                    if isinstance(result, Audio):
+                        sf.write(str(path), result.samples, result.sample_rate)
+                    else:
+                        result.save(path)
+                    print(path, flush=True)
+                elif isinstance(result, str):
+                    print(result, flush=True)
+                else:
+                    print(
+                        json.dumps(result, separators=(",", ":"), allow_nan=False),
+                        flush=True,
+                    )
+                index += 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
