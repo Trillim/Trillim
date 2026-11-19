@@ -781,10 +781,58 @@ static inline TrillimStatus trillim_attention_score(
     return TRILLIM_OK;
 }
 
+static inline TrillimStatus trillim_attention_scores4_bf16(
+    const TrillimAttentionTask *task, size_t query, size_t key, float *scores
+) {
+    const TrillimAttentionParameters *p = task->parameters;
+    const uint16_t *q = (const uint16_t *)task->query + query;
+    const uint16_t *k0 = (const uint16_t *)task->keys + key;
+    size_t stride = p->k_strides[1];
+    const uint16_t *k1 = k0 + stride;
+    const uint16_t *k2 = k1 + stride;
+    const uint16_t *k3 = k2 + stride;
+    float32x4_t sums = vdupq_n_f32(0.0f);
+    size_t channel = 0;
+    for (; p->key_dim - channel >= 4; channel += 4) {
+        if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint16x4_t a = vld1_u16(k0 + channel), b = vld1_u16(k1 + channel);
+        uint16x4_t c = vld1_u16(k2 + channel), d = vld1_u16(k3 + channel);
+        /* Transpose four contiguous loads while keeping each key's accumulation in channel order. */
+        uint32x2_t ab_even = vreinterpret_u32_u16(vtrn1_u16(a, b));
+        uint32x2_t ab_odd = vreinterpret_u32_u16(vtrn2_u16(a, b));
+        uint32x2_t cd_even = vreinterpret_u32_u16(vtrn1_u16(c, d));
+        uint32x2_t cd_odd = vreinterpret_u32_u16(vtrn2_u16(c, d));
+        uint16x4_t keys0 = vreinterpret_u16_u32(vtrn1_u32(ab_even, cd_even));
+        uint16x4_t keys1 = vreinterpret_u16_u32(vtrn1_u32(ab_odd, cd_odd));
+        uint16x4_t keys2 = vreinterpret_u16_u32(vtrn2_u32(ab_even, cd_even));
+        uint16x4_t keys3 = vreinterpret_u16_u32(vtrn2_u32(ab_odd, cd_odd));
+        float32x4_t queries = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(q + channel), 16));
+        sums = vfmaq_laneq_f32(sums, vreinterpretq_f32_u32(vshll_n_u16(keys0, 16)), queries, 0);
+        sums = vfmaq_laneq_f32(sums, vreinterpretq_f32_u32(vshll_n_u16(keys1, 16)), queries, 1);
+        sums = vfmaq_laneq_f32(sums, vreinterpretq_f32_u32(vshll_n_u16(keys2, 16)), queries, 2);
+        sums = vfmaq_laneq_f32(sums, vreinterpretq_f32_u32(vshll_n_u16(keys3, 16)), queries, 3);
+    }
+    for (; channel < p->key_dim; ++channel) {
+        if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint16x4_t keys = {k0[channel], k1[channel], k2[channel], k3[channel]};
+        sums = vfmaq_n_f32(sums, vreinterpretq_f32_u32(vshll_n_u16(keys, 16)), trillim_bf16(q[channel]));
+    }
+    vst1q_f32(scores, sums);
+    return TRILLIM_OK;
+}
+
 static inline TrillimStatus trillim_attention_scores4(
     const TrillimAttentionTask *task, size_t query, size_t key, float *scores
 ) {
     const TrillimAttentionParameters *p = task->parameters;
+    if (p->q_dtype == TRILLIM_BF16 && p->k_dtype == TRILLIM_BF16 &&
+        p->q_strides[2] == 1 && p->k_strides[2] == 1) {
+        return trillim_attention_scores4_bf16(task, query, key, scores);
+    }
     float32x4_t sums = vdupq_n_f32(0);
     for (size_t channel = 0; channel < p->key_dim; ++channel) {
         if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
