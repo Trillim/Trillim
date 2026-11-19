@@ -1,7 +1,166 @@
-#define TRILLIM_ENABLE_PACKED_NEON
 
 #include "common.h"
+#include <arm_neon.h>
 #include <math.h>
+
+typedef struct {
+    const uint8_t *data;
+    uint32_t dtype;
+    unsigned group_shift;
+    size_t first_element, first_block, blocks;
+    float row_scale;
+} TrillimPackedNeonRow;
+
+static inline TrillimPackedNeonRow trillim_packed_neon_row(
+    const void *weight, uint32_t dtype, size_t column, size_t width, size_t outputs
+) {
+    TrillimPackedNeonRow row = {.data = weight, .dtype = dtype, .first_element = column * width};
+    if (width == 0) {
+        return row;
+    }
+    if (dtype == TRILLIM_ROW_INT8) {
+        uint16_t bits;
+        memcpy(&bits, row.data + outputs * width + column * sizeof(bits), sizeof(bits));
+        row.row_scale = trillim_bf16(bits);
+    } else if (dtype >= TRILLIM_MAT_TERNARY && dtype <= TRILLIM_MXFP4) {
+        row.group_shift = 5;
+        if (dtype == TRILLIM_DUBGRP_INT6) {
+            row.group_shift = 8;
+        } else if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY || dtype == TRILLIM_GRP_BINARY) {
+            row.group_shift = 7;
+        }
+        size_t group = (size_t)1 << row.group_shift;
+        size_t groups = (width >> row.group_shift) + (width % group != 0);
+        row.first_block = column * groups;
+        row.blocks = outputs * groups;
+        if (dtype == TRILLIM_MAT_TERNARY) {
+            memcpy(&row.row_scale, row.data + row.blocks * 32, sizeof(row.row_scale));
+        }
+    }
+    return row;
+}
+
+static inline float32x4_t trillim_neon_load4(const void *data, size_t index, uint32_t dtype) {
+    const uint8_t *bytes = data;
+    if (dtype == TRILLIM_FP32) {
+        float32x4_t values;
+        memcpy(&values, bytes + index * sizeof(float), sizeof(values));
+        return values;
+    }
+    uint16x4_t bits;
+    memcpy(&bits, bytes + index * sizeof(uint16_t), sizeof(bits));
+    if (dtype == TRILLIM_BF16) {
+        return vreinterpretq_f32_u32(vshll_n_u16(bits, 16));
+    }
+    return vcvt_f32_f16(vreinterpret_f16_u16(bits));
+}
+
+static inline float32x4_t trillim_packed_neon_convert4(int16x4_t codes, float scale) {
+    return vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(codes)), scale);
+}
+
+/* k is sixteen-aligned and the read stays within the logical row. */
+static inline __attribute__((always_inline)) void trillim_packed_neon_decode16(
+    const TrillimPackedNeonRow *row, size_t k, float32x4_t result[4]
+) {
+    const uint8_t *values = row->data;
+    uint32_t dtype = row->dtype;
+    size_t total = row->blocks;
+    size_t block = row->first_block + (k >> row->group_shift);
+    size_t offset = k & (((size_t)1 << row->group_shift) - 1);
+    int8x16_t codes;
+    float scale;
+    if (dtype == TRILLIM_ROW_INT8) {
+        scale = row->row_scale;
+        codes = vld1q_s8((const int8_t *)values + row->first_element + k);
+    } else if (dtype == TRILLIM_MXFP4) {
+        uint8x8_t packed = vld1_u8(values + block * 16 + offset / 2);
+        uint8x8x2_t split = vzip_u8(vand_u8(packed, vdup_n_u8(15)), vshr_n_u8(packed, 4));
+        uint8x16_t code = vcombine_u8(split.val[0], split.val[1]);
+        /* Exact E2M1 values assembled from their two BF16 bytes. */
+        static const uint8_t low_bits[16] = {0, 0, 128, 192, 0, 64, 128, 192, 0, 0, 128, 192, 0, 64, 128, 192};
+        static const uint8_t high_bits[16] = {0, 63, 63, 63, 64, 64, 64, 64, 128, 191, 191, 191, 192, 192, 192, 192};
+        uint8x16_t low = vqtbl1q_u8(vld1q_u8(low_bits), code);
+        uint8x16_t high = vqtbl1q_u8(vld1q_u8(high_bits), code);
+        uint16x8_t a = vreinterpretq_u16_u8(vzip1q_u8(low, high));
+        uint16x8_t b = vreinterpretq_u16_u8(vzip2q_u8(low, high));
+        result[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16));
+        result[1] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(a), 16));
+        result[2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+        result[3] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16));
+        scale = trillim_mxfp4_scale(values[total * 16 + block]);
+        for (size_t i = 0; i < 4; ++i) {
+            result[i] = vmulq_n_f32(result[i], scale);
+        }
+        return;
+    } else if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
+        uint8x16_t packed = vld1q_u8(values + block * 32 + offset % 32);
+        uint8x16_t shifted = vshlq_u8(packed, vdupq_n_s8(-(int8_t)(6 - (offset / 32) * 2)));
+        codes = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(shifted, vdupq_n_u8(3))), vdupq_n_s8(1));
+        if (dtype == TRILLIM_MAT_TERNARY) {
+            scale = row->row_scale;
+        } else {
+            uint16_t bits;
+            memcpy(&bits, values + total * 32 + block * 2, 2);
+            scale = trillim_bf16(bits);
+        }
+    } else {
+        size_t value_width = dtype == TRILLIM_GRP_INT8 ? 32 : (dtype == TRILLIM_DUBGRP_INT6 ? 128 : 16);
+        size_t scale_start = total * value_width;
+        uint16_t bits;
+        memcpy(&bits, values + scale_start + block * 2, 2);
+        scale = trillim_bf16(bits);
+        if (dtype == TRILLIM_GRP_INT8) {
+            codes = vld1q_s8((const int8_t *)values + block * 32 + offset);
+        } else if (dtype == TRILLIM_GRP_BINARY) {
+            const uint8_t *packed = values + block * 16 + offset / 8;
+            uint8x16_t bytes = vcombine_u8(vdup_n_u8(packed[0]), vdup_n_u8(packed[1]));
+            static const int8_t shifts[16] = {-7, -6, -5, -4, -3, -2, -1, 0, -7, -6, -5, -4, -3, -2, -1, 0};
+            uint8x16_t code = vandq_u8(vshlq_u8(bytes, vld1q_s8(shifts)), vdupq_n_u8(1));
+            codes = vsubq_s8(vreinterpretq_s8_u8(vshlq_n_u8(code, 1)), vdupq_n_s8(1));
+        } else if (dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5) {
+            uint8x16_t packed = vld1q_u8(values + block * 16);
+            uint8x16_t code = vandq_u8(vshlq_u8(packed, vdupq_n_s8(-(int8_t)((offset / 16) * 4))), vdupq_n_u8(15));
+            if (dtype == TRILLIM_GRP_INT5) {
+                const uint8_t *high = values + scale_start + total * 2 + block * 4 + offset / 8;
+                uint8x16_t bytes = vcombine_u8(vdup_n_u8(high[0]), vdup_n_u8(high[1]));
+                static const int8_t shifts[16] = {0, -1, -2, -3, -4, -5, -6, -7, 0, -1, -2, -3, -4, -5, -6, -7};
+                uint8x16_t upper = vshlq_n_u8(vandq_u8(vshlq_u8(bytes, vld1q_s8(shifts)), vdupq_n_u8(1)), 4);
+                code = vorrq_u8(code, upper);
+            }
+            codes = vsubq_s8(vreinterpretq_s8_u8(code), vdupq_n_s8(dtype == TRILLIM_GRP_INT4 ? 8 : 16));
+        } else {
+            size_t half = offset / 128;
+            size_t lane = (offset % 128) / 32;
+            uint8x16_t packed = vld1q_u8(values + block * 128 + half * 64 + (lane / 2) * 32 + offset % 32);
+            uint8x16_t high = vld1q_u8(values + scale_start + total * 2 + block * 64 + half * 32 + offset % 32);
+            uint8x16_t low = vandq_u8(vshlq_u8(packed, vdupq_n_s8(-(int8_t)((lane % 2) * 4))), vdupq_n_u8(15));
+            uint8x16_t upper = vshlq_n_u8(vandq_u8(vshlq_u8(high, vdupq_n_s8(-(int8_t)(lane * 2))), vdupq_n_u8(3)), 4);
+            codes = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(low, upper)), vdupq_n_s8(32));
+            int8_t subscale;
+            memcpy(&subscale, values + scale_start + total * (2 + 64) + block * 16 + offset / 16, 1);
+            int16x8_t a = vmulq_n_s16(vmovl_s8(vget_low_s8(codes)), subscale);
+            int16x8_t b = vmulq_n_s16(vmovl_s8(vget_high_s8(codes)), subscale);
+            result[0] = trillim_packed_neon_convert4(vget_low_s16(a), scale);
+            result[1] = trillim_packed_neon_convert4(vget_high_s16(a), scale);
+            result[2] = trillim_packed_neon_convert4(vget_low_s16(b), scale);
+            result[3] = trillim_packed_neon_convert4(vget_high_s16(b), scale);
+            return;
+        }
+    }
+    int16x8_t low = vmovl_s8(vget_low_s8(codes)), high = vmovl_s8(vget_high_s8(codes));
+    result[0] = trillim_packed_neon_convert4(vget_low_s16(low), scale);
+    result[1] = trillim_packed_neon_convert4(vget_high_s16(low), scale);
+    result[2] = trillim_packed_neon_convert4(vget_low_s16(high), scale);
+    result[3] = trillim_packed_neon_convert4(vget_high_s16(high), scale);
+    if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
+        int32x4_t code[4] = {vmovl_s16(vget_low_s16(low)), vmovl_s16(vget_high_s16(low)),
+            vmovl_s16(vget_low_s16(high)), vmovl_s16(vget_high_s16(high))};
+        for (size_t i = 0; i < 4; ++i) {
+            result[i] = vbslq_f32(vceqq_s32(code[i], vdupq_n_s32(2)), vdupq_n_f32(NAN), result[i]);
+        }
+    }
+}
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
