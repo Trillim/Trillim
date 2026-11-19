@@ -184,6 +184,15 @@ static float load_bf16(const void *data, size_t index) {
     return read_bf16((const uint8_t *)data + index * sizeof(uint16_t));
 }
 
+static void mxfp4_palette(uint8_t exponent, float palette[16]) {
+    static const float magnitudes[] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float scale = trillim_mxfp4_scale(exponent);
+    for (size_t i = 0; i < 8; ++i) {
+        palette[i] = exponent == 255 ? NAN : magnitudes[i] * scale;
+        palette[i + 8] = exponent == 255 ? NAN : -palette[i];
+    }
+}
+
 static void decode_block(const Task *task, size_t column, size_t k, size_t count, float *decoded) {
     const TrillimMatmulParameters *p = task->p;
     const uint8_t *values = task->b;
@@ -215,16 +224,8 @@ static void decode_block(const Task *task, size_t column, size_t k, size_t count
         return;
     }
     if (dtype == TRILLIM_MXFP4) {
-        static const float magnitudes[] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-        uint8_t exponent = values[total * 16 + block];
-        uint32_t bits = exponent != 0 ? (uint32_t)exponent << 23 : UINT32_C(0x00400000);
-        float scale;
-        memcpy(&scale, &bits, sizeof(scale));
         float palette[16];
-        for (size_t i = 0; i < 8; ++i) {
-            palette[i] = exponent == 255 ? NAN : magnitudes[i] * scale;
-            palette[i + 8] = exponent == 255 ? NAN : -palette[i];
-        }
+        mxfp4_palette(values[total * 16 + block], palette);
         for (size_t i = 0; i < count; ++i) {
             uint8_t code = (values[block * 16 + (offset + i) / 2] >> (((offset + i) % 2) * 4)) & 15;
             decoded[i] = palette[code];
@@ -336,6 +337,66 @@ TRILLIM_PACKED_MATMUL(bf16, load_bf16)
 
 #undef TRILLIM_PACKED_MATMUL
 
+/* Group-aligned weight vectors can be addressed directly across storage rows. */
+#define TRILLIM_MXFP4_MATVEC(NAME, LOAD) \
+static TrillimStatus project_mxfp4_##NAME(void *opaque, size_t tile, size_t worker) { \
+    (void)worker; \
+    const Task *task = opaque; \
+    const TrillimMatmulParameters *p = task->p; \
+    size_t tiles = p->n / task->columns + (p->n % task->columns != 0); \
+    size_t batch = tile / tiles; \
+    size_t first = tile % tiles * task->columns; \
+    size_t end = p->n - first < task->columns ? p->n : first + task->columns; \
+    size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides); \
+    size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides) / 32; \
+    const uint8_t *scales = task->b + p->b_storage_rows * (p->b_storage_columns / 32) * 16; \
+    size_t groups = p->k / 32; \
+    for (size_t column = first; column < end; column += 4) { \
+        size_t count = end - column < 4 ? end - column : 4; \
+        size_t blocks[4]; \
+        float sums[4] = {0}; \
+        for (size_t j = 0; j < 4; ++j) { \
+            blocks[j] = b_base + (column + (j < count ? j : 0)) * groups; \
+        } \
+        for (size_t group = 0; group < groups; ++group) { \
+            if (task->context->is_cancelled(task->context->cancellation_context)) { \
+                return TRILLIM_CANCELLED; \
+            } \
+            float palette[4][16]; \
+            const uint8_t *codes[4]; \
+            for (size_t j = 0; j < 4; ++j) { \
+                size_t block = blocks[j] + group; \
+                codes[j] = task->b + block * 16; \
+                mxfp4_palette(scales[block], palette[j]); \
+            } \
+            size_t offset = a_base + group * 32; \
+            for (size_t i = 0; i < 16; ++i) { \
+                float even = LOAD(task->a, offset + i * 2); \
+                float odd = LOAD(task->a, offset + i * 2 + 1); \
+                for (size_t j = 0; j < 4; ++j) { \
+                    uint8_t code = codes[j][i]; \
+                    sums[j] = multiply_add(even, palette[j][code & 15], sums[j]); \
+                    sums[j] = multiply_add(odd, palette[j][code >> 4], sums[j]); \
+                } \
+            } \
+        } \
+        if (task->context->is_cancelled(task->context->cancellation_context)) { \
+            return TRILLIM_CANCELLED; \
+        } \
+        for (size_t j = 0; j < count; ++j) { \
+            TrillimValue result = {.f = sums[j]}; \
+            trillim_store(task->output, batch * p->n + column + j, p->out_dtype, result); \
+        } \
+    } \
+    return TRILLIM_OK; \
+}
+
+TRILLIM_MXFP4_MATVEC(fp32, load_fp32)
+TRILLIM_MXFP4_MATVEC(fp16, load_fp16)
+TRILLIM_MXFP4_MATVEC(bf16, load_bf16)
+
+#undef TRILLIM_MXFP4_MATVEC
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_block_matmul(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -360,11 +421,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_block_matmul(
     Task task = {outputs[0], inputs[0], inputs[1], p, columns, context};
     size_t rows = p->m / 4 + (p->m % 4 != 0);
     size_t tiles = p->n / columns + (p->n % columns != 0);
+    bool mxfp4_matvec = p->b_dtype == TRILLIM_MXFP4 && p->m == 1 && p->n >= 4 && p->k % 32 == 0;
     TrillimTask project;
     switch (p->a_dtype) {
-    case TRILLIM_FP32: project = project_fp32; break;
-    case TRILLIM_BF16: project = project_bf16; break;
-    case TRILLIM_FP16: project = project_fp16; break;
+    case TRILLIM_FP32: project = mxfp4_matvec ? project_mxfp4_fp32 : project_fp32; break;
+    case TRILLIM_BF16: project = mxfp4_matvec ? project_mxfp4_bf16 : project_bf16; break;
+    case TRILLIM_FP16: project = mxfp4_matvec ? project_mxfp4_fp16 : project_fp16; break;
     default: return TRILLIM_ERROR;
     }
     size_t tasks = p->batches * rows * tiles;
