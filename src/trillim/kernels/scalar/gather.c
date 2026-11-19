@@ -460,6 +460,27 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
     if (status != TRILLIM_OK) {
         return status;
     }
+    if (active && (p->dtype == TRILLIM_FP16 || p->dtype == TRILLIM_BF16) &&
+        trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
+        uint16_t infinity = p->dtype == TRILLIM_FP16 ? 0x7c00 : 0x7f80;
+        uint16_t quiet = p->dtype == TRILLIM_FP16 ? 0x0200 : 0x0040;
+        for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t count = p->slice_size - begin < 1024 ? p->slice_size - begin : 1024;
+            const uint8_t *input = (const uint8_t *)task->inputs[0] + (source + begin) * 2;
+            uint8_t *output = (uint8_t *)task->output + (item * p->slice_size + begin) * 2;
+            for (size_t i = 0; i < count; ++i) {
+                uint16_t bits;
+                memcpy(&bits, input + i * 2, sizeof(bits));
+                /* Native gather preserves payloads and quiets signaling NaNs. */
+                bits |= (bits & 0x7fff) > infinity ? quiet : 0;
+                memcpy(output + i * 2, &bits, sizeof(bits));
+            }
+        }
+        return TRILLIM_OK;
+    }
     if (active && p->dtype > TRILLIM_BOOL && p->dtype != TRILLIM_FP16 &&
         p->dtype != TRILLIM_BF16 && trillim_itemsize(p->dtype) &&
         trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
