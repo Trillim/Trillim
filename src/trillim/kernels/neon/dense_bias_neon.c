@@ -91,10 +91,6 @@ static size_t block_m(const Parameters *p) {
 }
 
 
-static size_t tile_rows(const Parameters *p) {
-    return !precise(p) && p->m >= 12 && p->a_col_stride == 1 && p->b_row_stride == 1 ? 6 : 4;
-}
-
 static bool blas_shape(const Parameters *p, size_t workers) {
     if (precise(p) || p->n > INT32_MAX || p->n < 32 || p->k < 32) {
         return false;
@@ -236,6 +232,8 @@ static inline void store(const Task *t, size_t index, float value) {
     trillim_store(t->output, index, t->p->out_dtype, result);
 }
 
+#include "ordered_matmul.h"
+
 typedef struct {
     float32x4_t low;
     float32x4_t high;
@@ -261,8 +259,14 @@ static inline VectorPair load8(const void *data, size_t index, uint32_t dtype) {
 static inline __attribute__((always_inline)) TrillimStatus decode_typed_tile(const Task *t, size_t a_base, size_t b_base,
                                  size_t output, size_t first, size_t last, uint32_t a_dtype, uint32_t b_dtype) {
     const Parameters *p = t->p;
+    const void *activation = t->a;
+    const void *weights = t->b;
+    size_t depth = p->k;
+    size_t stride = p->b_col_stride;
     for (size_t column = first; column < last; column += 2) {
         size_t columns = last - column < 2 ? last - column : 2;
+        size_t w0 = b_base + column * stride;
+        size_t w1 = columns == 2 ? w0 + stride : w0;
         float32x4_t s00 = vdupq_n_f32(0);
         float32x4_t s01 = vdupq_n_f32(0);
         float32x4_t s02 = vdupq_n_f32(0);
@@ -272,32 +276,30 @@ static inline __attribute__((always_inline)) TrillimStatus decode_typed_tile(con
         float32x4_t s12 = vdupq_n_f32(0);
         float32x4_t s13 = vdupq_n_f32(0);
         size_t k = 0;
-        for (; p->k - k >= 16; k += 16) {
+        for (; depth - k >= 16; k += 16) {
             if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            VectorPair x0 = load8(t->a, a_base + k + 0, a_dtype);
-            VectorPair x1 = load8(t->a, a_base + k + 8, a_dtype);
-            size_t w0 = b_base + (column + (columns > 0 ? 0 : 0)) * p->b_col_stride + k;
-            VectorPair w0_0 = load8(t->b, w0 + 0, b_dtype);
+            VectorPair x0 = load8(activation, a_base + k, a_dtype);
+            VectorPair x1 = load8(activation, a_base + k + 8, a_dtype);
+            VectorPair w0_0 = load8(weights, w0 + k, b_dtype);
             s00 = vfmaq_f32(s00, x0.low, w0_0.low);
             s01 = vfmaq_f32(s01, x0.high, w0_0.high);
-            VectorPair w0_1 = load8(t->b, w0 + 8, b_dtype);
+            VectorPair w0_1 = load8(weights, w0 + k + 8, b_dtype);
             s02 = vfmaq_f32(s02, x1.low, w0_1.low);
             s03 = vfmaq_f32(s03, x1.high, w0_1.high);
-            size_t w1 = b_base + (column + (columns > 1 ? 1 : 0)) * p->b_col_stride + k;
-            VectorPair w1_0 = load8(t->b, w1 + 0, b_dtype);
+            VectorPair w1_0 = load8(weights, w1 + k, b_dtype);
             s10 = vfmaq_f32(s10, x0.low, w1_0.low);
             s11 = vfmaq_f32(s11, x0.high, w1_0.high);
-            VectorPair w1_1 = load8(t->b, w1 + 8, b_dtype);
+            VectorPair w1_1 = load8(weights, w1 + k + 8, b_dtype);
             s12 = vfmaq_f32(s12, x1.low, w1_1.low);
             s13 = vfmaq_f32(s13, x1.high, w1_1.high);
         }
         float sums[2] = {vaddvq_f32(vaddq_f32(vaddq_f32(s00, s01), vaddq_f32(s02, s03))), vaddvq_f32(vaddq_f32(vaddq_f32(s10, s11), vaddq_f32(s12, s13)))};
-        for (; k < p->k; ++k) {
-            float x = trillim_load(t->a, a_base + k, a_dtype).f;
+        for (; k < depth; ++k) {
+            float x = trillim_load(activation, a_base + k, a_dtype).f;
             for (size_t c = 0; c < columns; ++c) {
-                float w = trillim_load(t->b, b_base + (column + c) * p->b_col_stride + k, b_dtype).f;
+                float w = trillim_load(weights, w0 + c * stride + k, b_dtype).f;
                 sums[c] = fmaf(x, w, sums[c]);
             }
         }
@@ -405,6 +407,16 @@ static TrillimStatus ordered_decode16(const Task *t, size_t a_base, size_t b_bas
 static TrillimStatus ordered_dot_tile(const Task *t, size_t a_base, size_t b_base,
                                       size_t output, size_t rows, size_t first, size_t last) {
     const Parameters *p = t->p;
+    if (rows >= 4 && ordered_narrow_shape(p)) {
+        size_t full_rows = rows == 8 ? 8 : 4;
+        TrillimStatus status = ordered_narrow_tile(t, a_base, b_base, output, first, last, full_rows);
+        if (status != TRILLIM_OK || rows == full_rows) {
+            return status;
+        }
+        a_base += full_rows * p->a_row_stride;
+        output += full_rows * p->n;
+        rows -= full_rows;
+    }
     if (rows == 1) {
         for (; last - first >= 16; first += 16) {
             TrillimStatus status = ordered_decode16(t, a_base, b_base, output, first);
@@ -1016,13 +1028,14 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const Task *t = opaque;
     const Parameters *p = t->p;
-    size_t columns = p->n / 64 + (p->n % 64 != 0);
-    size_t height = tile_rows(p);
+    size_t width = tile_columns(p, t->context->thread_pool->worker_count);
+    size_t columns = p->n / width + (p->n % width != 0);
+    size_t height = tile_rows(p, t->context->thread_pool->worker_count);
     size_t row_tiles = p->m / height + (p->m % height != 0);
     size_t batch = index / columns / row_tiles;
     size_t row = index / columns % row_tiles * height;
-    size_t first = index % columns * 64;
-    size_t last = p->n - first < 64 ? p->n : first + 64;
+    size_t first = index % columns * width;
+    size_t last = p->n - first < width ? p->n : first + width;
     size_t rows = p->m - row < height ? p->m - row : height;
     size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides) + row * p->a_row_stride;
     size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
@@ -1530,9 +1543,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_dense_bias(void *const *outputs, const
         BlasTask job = {task, scratch, count, lanes, reuse};
         return context->thread_pool->run(context->thread_pool->context, lanes, blas_project, &job);
     }
-    size_t height = tile_rows(p);
+    size_t height = tile_rows(p, context->thread_pool->worker_count);
     size_t rows = p->m / height + (p->m % height != 0);
-    size_t columns = p->n / 64 + (p->n % 64 != 0);
+    size_t width = tile_columns(p, context->thread_pool->worker_count);
+    size_t columns = p->n / width + (p->n % width != 0);
     return context->thread_pool->run(context->thread_pool->context, p->batches * rows * columns, project, &task);
 }
 
