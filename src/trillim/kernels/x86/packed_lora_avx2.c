@@ -1,6 +1,87 @@
-#define TRILLIM_ENABLE_PACKED_AVX2
 
 #include "common.h"
+#include <immintrin.h>
+
+static inline float trillim_packed_bf16(const uint8_t *data) {
+    uint16_t bits;
+    memcpy(&bits, data, sizeof(bits));
+    return trillim_bf16(bits);
+}
+
+/* An eight-lane read within one logical row. */
+__attribute__((target("avx2"))) static inline __m256 trillim_packed_decode8(const uint8_t *values, size_t rows, size_t columns, uint32_t dtype, size_t row, size_t k) {
+    if ((k & 7) != 0) {
+        float lane_values[8];
+        for (size_t i = 0; i < 8; ++i) {
+            lane_values[i] = trillim_packed_read_float(values, row * columns + k + i, dtype, rows, columns);
+        }
+        return _mm256_loadu_ps(lane_values);
+    }
+    __m256i ones = _mm256_set1_epi32(1), mask = _mm256_set1_epi32(15);
+    __m256i codes;
+    float scale;
+    if (dtype == TRILLIM_ROW_INT8) {
+        scale = trillim_packed_bf16(values + rows * columns + row * 2);
+        codes = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(values + row * columns + k)));
+        return _mm256_mul_ps(_mm256_cvtepi32_ps(codes), _mm256_set1_ps(scale));
+    }
+    size_t group = (dtype == TRILLIM_DUBGRP_INT6 ? 256 :
+        (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY || dtype == TRILLIM_GRP_BINARY ? 128 : 32)), groups = columns / group + (columns % group != 0);
+    size_t total = rows * groups, block = row * groups + k / group, offset = k % group;
+    if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
+        if (dtype == TRILLIM_MAT_TERNARY) {
+            memcpy(&scale, values + total * 32, sizeof(scale));
+        } else {
+            scale = trillim_packed_bf16(values + total * 32 + block * 2);
+        }
+        codes = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(values + block * 32 + offset % 32)));
+        codes = _mm256_and_si256(_mm256_srlv_epi32(codes, _mm256_set1_epi32((int)(6 - offset / 32 * 2))), _mm256_set1_epi32(3));
+        __m256 decoded = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(codes, ones)), _mm256_set1_ps(scale));
+        return _mm256_blendv_ps(decoded, _mm256_set1_ps(NAN), _mm256_castsi256_ps(_mm256_cmpeq_epi32(codes, _mm256_set1_epi32(3))));
+    }
+    if (dtype == TRILLIM_MXFP4) {
+        static const float palette[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -.5f, -1, -1.5f, -2, -3, -4, -6};
+        uint32_t bytes;
+        memcpy(&bytes, values + block * 16 + offset / 2, 4);
+        __m128i packed = _mm_cvtsi32_si128((int)bytes);
+        __m128i low = _mm_and_si128(packed, _mm_set1_epi8(15));
+        __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(15));
+        codes = _mm256_cvtepu8_epi32(_mm_unpacklo_epi8(low, high));
+        uint8_t exponent = values[total * 16 + block];
+        scale = trillim_mxfp4_scale(exponent);
+        return _mm256_mul_ps(_mm256_i32gather_ps(palette, codes, 4), _mm256_set1_ps(scale));
+    }
+    size_t width = dtype == TRILLIM_GRP_INT8 ? 32 : dtype == TRILLIM_DUBGRP_INT6 ? 128 : 16;
+    size_t scale_start = total * width;
+    scale = trillim_packed_bf16(values + scale_start + block * 2);
+    if (dtype == TRILLIM_GRP_INT8) {
+        codes = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(values + block * 32 + offset)));
+    } else if (dtype == TRILLIM_GRP_BINARY) {
+        codes = _mm256_srlv_epi32(_mm256_set1_epi32(values[block * 16 + offset / 8]), _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0));
+        codes = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_and_si256(codes, ones), 1), ones);
+    } else if (dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5) {
+        codes = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(values + block * 16 + offset % 16)));
+        codes = _mm256_and_si256(_mm256_srlv_epi32(codes, _mm256_set1_epi32((int)(offset / 16 * 4))), mask);
+        if (dtype == TRILLIM_GRP_INT5) {
+            __m256i high = _mm256_srlv_epi32(_mm256_set1_epi32(values[scale_start + total * 2 + block * 4 + offset / 8]), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+            codes = _mm256_or_si256(codes, _mm256_slli_epi32(_mm256_and_si256(high, ones), 4));
+        }
+        codes = _mm256_sub_epi32(codes, _mm256_set1_epi32(dtype == TRILLIM_GRP_INT4 ? 8 : 16));
+    } else {
+        size_t half = offset / 128, lane = offset % 128 / 32;
+        size_t low = block * 128 + half * 64 + lane / 2 * 32 + offset % 32;
+        size_t high = scale_start + total * 2 + block * 64 + half * 32 + offset % 32;
+        codes = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(values + low)));
+        codes = _mm256_and_si256(_mm256_srlv_epi32(codes, _mm256_set1_epi32((int)(lane % 2 * 4))), mask);
+        __m256i upper = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(values + high)));
+        upper = _mm256_and_si256(_mm256_srlv_epi32(upper, _mm256_set1_epi32((int)(lane * 2))), _mm256_set1_epi32(3));
+        codes = _mm256_sub_epi32(_mm256_or_si256(codes, _mm256_slli_epi32(upper, 4)), _mm256_set1_epi32(32));
+        int8_t subscale;
+        memcpy(&subscale, values + scale_start + total * 66 + block * 16 + offset / 16, 1);
+        codes = _mm256_mullo_epi32(codes, _mm256_set1_epi32(subscale));
+    }
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(codes), _mm256_set1_ps(scale));
+}
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
