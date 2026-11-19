@@ -14,6 +14,7 @@ typedef struct {
     float *scratch;
     const Parameters *p;
     const TrillimKernelContext *context;
+    size_t rows_per_task;
 } Task;
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs,
@@ -79,10 +80,13 @@ static void store4(void *data, size_t index, uint32_t dtype, float32x4_t value) 
 static float32x4_t exp4(float32x4_t x) {
     if (vminvq_u32(vandq_u32(vcgeq_f32(x, vdupq_n_f32(-87.0f)),
                               vcleq_f32(x, vdupq_n_f32(0.0f)))) != UINT32_MAX) {
+        if (vminvq_u32(vceqq_f32(x, vdupq_n_f32(-INFINITY))) == UINT32_MAX) {
+            return vdupq_n_f32(0.0f);
+        }
         float lanes[4];
         vst1q_f32(lanes, x);
         for (size_t lane = 0; lane < 4; ++lane) {
-            lanes[lane] = expf(lanes[lane]);
+            lanes[lane] = lanes[lane] == -INFINITY ? 0.0f : expf(lanes[lane]);
         }
         return vld1q_f32(lanes);
     }
@@ -113,9 +117,7 @@ static float round_dtype(float value, uint32_t dtype) {
     return value;
 }
 
-static TrillimStatus softmax_precise(void *opaque, size_t row, size_t worker) {
-    (void)worker;
-    const Task *task = opaque;
+static TrillimStatus softmax_precise(const Task *task, size_t row) {
     const Parameters *p = task->p;
     size_t start = row * p->width;
     float maximum = -INFINITY;
@@ -162,13 +164,11 @@ static TrillimStatus softmax_precise(void *opaque, size_t row, size_t worker) {
 }
 
 
-static TrillimStatus softmax(void *opaque, size_t row, size_t worker) {
-    (void)worker;
-    const Task *task = opaque;
+static TrillimStatus softmax_row(const Task *task, size_t row) {
     const Parameters *p = task->p;
     if (p->dtype != TRILLIM_FP32) {
         /* Preserve low-precision rounding at scalar-reference boundaries. */
-        return softmax_precise(opaque, row, worker);
+        return softmax_precise(task, row);
     }
     size_t start = row * p->width, column = 0;
     float32x4_t maximum4 = vdupq_n_f32(-INFINITY);
@@ -177,17 +177,16 @@ static TrillimStatus softmax(void *opaque, size_t row, size_t worker) {
             task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        float32x4_t value = load4(task->input, start + column, p->dtype);
-        if (vminvq_u32(vceqq_f32(value, value)) != UINT32_MAX) {
-            return softmax_precise(opaque, row, worker);
-        }
-        maximum4 = vmaxnmq_f32(maximum4, value);
+        maximum4 = vmaxq_f32(maximum4, load4(task->input, start + column, p->dtype));
     }
-    float maximum = vmaxnmvq_f32(maximum4);
+    float maximum = vmaxvq_f32(maximum4);
+    if (isnan(maximum)) {
+        return softmax_precise(task, row);
+    }
     for (; column < p->width; ++column) {
         float value = trillim_load(task->input, start + column, p->dtype).f;
         if (isnan(value)) {
-            return softmax_precise(opaque, row, worker);
+            return softmax_precise(task, row);
         }
         maximum = maximum >= value ? maximum : value;
     }
@@ -234,6 +233,23 @@ static TrillimStatus softmax(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus softmax_tile(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    size_t first = tile * task->rows_per_task;
+    size_t count = task->p->rows - first;
+    if (count > task->rows_per_task) {
+        count = task->rows_per_task;
+    }
+    for (size_t row = first; row < first + count; ++row) {
+        TrillimStatus status = softmax_row(task, row);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_normalize_softmax_sinks(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -242,12 +258,19 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_normalize_softmax_sinks(
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], scratch, p, context};
+    Task task = {outputs[0], inputs[0], inputs[1], scratch, p, context, 1};
     if (p->rows == 1) {
-        return softmax(&task, 0, 0);
+        return softmax_row(&task, 0);
     }
-    return context->thread_pool->run(context->thread_pool->context, p->rows,
-                                     softmax, &task);
+    /* Batch short rows while leaving enough tasks to occupy the thread pool. */
+    size_t rows_per_task = p->width <= 1024 ? 1024 / p->width : 1;
+    size_t rows_per_worker = p->rows / context->thread_pool->worker_count;
+    if (rows_per_worker != 0 && rows_per_worker < rows_per_task) {
+        rows_per_task = rows_per_worker;
+    }
+    task.rows_per_task = rows_per_task;
+    size_t tiles = p->rows / rows_per_task + (p->rows % rows_per_task != 0);
+    return context->thread_pool->run(context->thread_pool->context, tiles, softmax_tile, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_normalize_softmax_sinks_tdl(void) {
