@@ -165,6 +165,40 @@ static float32x4_t convert4(int16x4_t codes, float scale) {
     return vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(codes)), scale);
 }
 
+static inline uint8x16_t mxfp4_codes(const uint8_t *values) {
+    uint8x8_t packed = vld1_u8(values);
+    uint8x8x2_t split = vzip_u8(vand_u8(packed, vdup_n_u8(15)), vshr_n_u8(packed, 4));
+    return vcombine_u8(split.val[0], split.val[1]);
+}
+
+static inline void decode_mxfp4_16(const uint8_t *values, uint8_t exponent, float32x4_t result[4]) {
+    uint8x16_t code = mxfp4_codes(values);
+    /* Exact E2M1 values assembled from their two BF16 bytes. */
+    static const uint8_t low_bits[16] = {0, 0, 128, 192, 0, 64, 128, 192, 0, 0, 128, 192, 0, 64, 128, 192};
+    static const uint8_t high_bits[16] = {0, 63, 63, 63, 64, 64, 64, 64, 128, 191, 191, 191, 192, 192, 192, 192};
+    uint8x16_t low = vqtbl1q_u8(vld1q_u8(low_bits), code);
+    uint8x16_t high = vqtbl1q_u8(vld1q_u8(high_bits), code);
+    uint16x8_t a = vreinterpretq_u16_u8(vzip1q_u8(low, high));
+    uint16x8_t b = vreinterpretq_u16_u8(vzip2q_u8(low, high));
+    result[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16));
+    result[1] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(a), 16));
+    result[2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+    result[3] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16));
+    if (exponent == 255) {
+        for (size_t i = 0; i < 4; ++i) {
+            uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(result[i]), vdupq_n_u32(UINT32_C(0x80000000)));
+            result[i] = vreinterpretq_f32_u32(vorrq_u32(sign, vdupq_n_u32(UINT32_C(0x7fc00000))));
+        }
+        return;
+    }
+    uint32_t scale_bits = exponent ? (uint32_t)exponent << 23 : UINT32_C(0x00400000);
+    float scale;
+    memcpy(&scale, &scale_bits, sizeof(scale));
+    for (size_t i = 0; i < 4; ++i) {
+        result[i] = vmulq_n_f32(result[i], scale);
+    }
+}
+
 static inline __attribute__((always_inline)) void decode16(
     const Task *task, size_t column, size_t k, uint32_t dtype, float32x4_t result[4]
 ) {
@@ -183,33 +217,7 @@ static inline __attribute__((always_inline)) void decode16(
         scale = trillim_bf16(bits);
         codes = vld1q_s8((const int8_t *)values + column * p->b_storage_columns + k);
     } else if (dtype == TRILLIM_MXFP4) {
-        uint8x8_t packed = vld1_u8(values + block * 16 + offset / 2);
-        uint8x8x2_t split = vzip_u8(vand_u8(packed, vdup_n_u8(15)), vshr_n_u8(packed, 4));
-        uint8x16_t code = vcombine_u8(split.val[0], split.val[1]);
-        /* Exact E2M1 values assembled from their two BF16 bytes. */
-        static const uint8_t low_bits[16] = {0, 0, 128, 192, 0, 64, 128, 192, 0, 0, 128, 192, 0, 64, 128, 192};
-        static const uint8_t high_bits[16] = {0, 63, 63, 63, 64, 64, 64, 64, 128, 191, 191, 191, 192, 192, 192, 192};
-        uint8x16_t low = vqtbl1q_u8(vld1q_u8(low_bits), code);
-        uint8x16_t high = vqtbl1q_u8(vld1q_u8(high_bits), code);
-        uint16x8_t a = vreinterpretq_u16_u8(vzip1q_u8(low, high));
-        uint16x8_t b = vreinterpretq_u16_u8(vzip2q_u8(low, high));
-        result[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16));
-        result[1] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(a), 16));
-        result[2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
-        result[3] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16));
-        uint8_t exponent = values[total * 16 + block];
-        if (exponent == 255) {
-            for (size_t i = 0; i < 4; ++i) {
-                uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(result[i]), vdupq_n_u32(UINT32_C(0x80000000)));
-                result[i] = vreinterpretq_f32_u32(vorrq_u32(sign, vdupq_n_u32(UINT32_C(0x7fc00000))));
-            }
-            return;
-        }
-        uint32_t scale_bits = exponent ? (uint32_t)exponent << 23 : UINT32_C(0x00400000);
-        memcpy(&scale, &scale_bits, sizeof(scale));
-        for (size_t i = 0; i < 4; ++i) {
-            result[i] = vmulq_n_f32(result[i], scale);
-        }
+        decode_mxfp4_16(values + block * 16 + offset / 2, values[total * 16 + block], result);
         return;
     } else if (dtype == TRILLIM_MAT_TERNARY || dtype == TRILLIM_GRP_TERNARY) {
         uint8x16_t packed = vld1q_u8(values + block * 32 + offset % 32);
@@ -448,6 +456,108 @@ static TrillimStatus project_ordered(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus project_mxfp4_ordered(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t tiles = p->n / task->columns + (p->n % task->columns != 0);
+    size_t row_tiles = p->m / 4 + (p->m % 4 != 0);
+    size_t batch = tile / (tiles * row_tiles);
+    size_t local = tile % (tiles * row_tiles);
+    size_t row = local / tiles * 4, first = local % tiles * task->columns;
+    size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
+    size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
+    size_t rows = p->m - row < 4 ? p->m - row : 4;
+    size_t end = p->n - first < task->columns ? p->n : first + task->columns;
+    /* Aligned reduction vectors occupy whole, consecutive MXFP4 groups. */
+    size_t groups = p->k / 32;
+    const uint8_t *scales = task->weight + p->b_storage_rows * (p->b_storage_columns / 32) * 16;
+    for (size_t column = first; column < end; column += 4) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - column < 4 ? end - column : 4;
+        size_t first_block = b_base / 32 + column * groups;
+        size_t block[4];
+        for (size_t c = 0; c < 4; ++c) {
+            block[c] = first_block + (c < count ? c * groups : 0);
+        }
+        float32x4_t zero = vdupq_n_f32(0);
+        float32x4_t sums[4] = {zero, zero, zero, zero};
+        for (size_t k = 0; k < p->k; k += 16) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t weights[4][4];
+            for (size_t c = 0; c < 4; ++c) {
+                size_t g = block[c] + k / 32;
+                decode_mxfp4_16(task->weight + g * 16 + (k % 32) / 2, scales[g], weights[c]);
+            }
+            /* Each lane sums one output in reduction order. */
+            for (size_t j = 0; j < 4; ++j) {
+                float32x4_t a = vtrn1q_f32(weights[0][j], weights[1][j]);
+                float32x4_t b = vtrn2q_f32(weights[0][j], weights[1][j]);
+                float32x4_t c = vtrn1q_f32(weights[2][j], weights[3][j]);
+                float32x4_t d = vtrn2q_f32(weights[2][j], weights[3][j]);
+                float32x4_t w0 = vcombine_f32(vget_low_f32(a), vget_low_f32(c));
+                float32x4_t w1 = vcombine_f32(vget_low_f32(b), vget_low_f32(d));
+                float32x4_t w2 = vcombine_f32(vget_high_f32(a), vget_high_f32(c));
+                float32x4_t w3 = vcombine_f32(vget_high_f32(b), vget_high_f32(d));
+                for (size_t r = 0; r < rows; ++r) {
+                    float32x4_t x = load4(task->input, a_base + (row + r) * p->a_row_stride + k + j * 4, p->a_dtype);
+                    float32x4_t sum = sums[r];
+                    sum = vfmaq_laneq_f32(sum, w0, x, 0);
+                    sum = vfmaq_laneq_f32(sum, w1, x, 1);
+                    sum = vfmaq_laneq_f32(sum, w2, x, 2);
+                    sum = vfmaq_laneq_f32(sum, w3, x, 3);
+                    sums[r] = sum;
+                }
+            }
+        }
+        for (size_t r = 0; r < rows; ++r) {
+            float values[4];
+            vst1q_f32(values, sums[r]);
+            for (size_t c = 0; c < count; ++c) {
+                TrillimValue value = {.f = values[c]};
+                store_result(task->output, (batch * p->m + row + r) * p->n + column + c, p->out_dtype, value);
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+/* These scales keep every nonzero E2M1 magnitude normal in FP16. */
+#define MXFP4_HALF_MAGNITUDES(EXP, SIGN) \
+    (SIGN), 56 + (EXP) * 4 + (SIGN), 60 + (EXP) * 4 + (SIGN), 62 + (EXP) * 4 + (SIGN), \
+    64 + (EXP) * 4 + (SIGN), 66 + (EXP) * 4 + (SIGN), 68 + (EXP) * 4 + (SIGN), 70 + (EXP) * 4 + (SIGN)
+#define MXFP4_HALF_ENTRY(EXP) {MXFP4_HALF_MAGNITUDES(EXP, 0), MXFP4_HALF_MAGNITUDES(EXP, 128)}
+static const uint8_t mxfp4_half_bits[27][16] = {
+    MXFP4_HALF_ENTRY(-13), MXFP4_HALF_ENTRY(-12), MXFP4_HALF_ENTRY(-11), MXFP4_HALF_ENTRY(-10),
+    MXFP4_HALF_ENTRY(-9), MXFP4_HALF_ENTRY(-8), MXFP4_HALF_ENTRY(-7), MXFP4_HALF_ENTRY(-6),
+    MXFP4_HALF_ENTRY(-5), MXFP4_HALF_ENTRY(-4), MXFP4_HALF_ENTRY(-3), MXFP4_HALF_ENTRY(-2),
+    MXFP4_HALF_ENTRY(-1), MXFP4_HALF_ENTRY(0), MXFP4_HALF_ENTRY(1), MXFP4_HALF_ENTRY(2),
+    MXFP4_HALF_ENTRY(3), MXFP4_HALF_ENTRY(4), MXFP4_HALF_ENTRY(5), MXFP4_HALF_ENTRY(6),
+    MXFP4_HALF_ENTRY(7), MXFP4_HALF_ENTRY(8), MXFP4_HALF_ENTRY(9), MXFP4_HALF_ENTRY(10),
+    MXFP4_HALF_ENTRY(11), MXFP4_HALF_ENTRY(12), MXFP4_HALF_ENTRY(13),
+};
+#undef MXFP4_HALF_ENTRY
+#undef MXFP4_HALF_MAGNITUDES
+
+static inline void decode_mxfp4_16_half(const uint8_t *values, uint8_t exponent, float32x4_t result[4]) {
+    if (exponent < 114 || exponent > 140) {
+        decode_mxfp4_16(values, exponent, result);
+        return;
+    }
+    uint8x16_t table = vld1q_u8(mxfp4_half_bits[exponent - 114]);
+    uint8x16_t bits = vqtbl1q_u8(table, mxfp4_codes(values));
+    float16x8_t low = vreinterpretq_f16_u16(vshll_n_u8(vget_low_u8(bits), 8));
+    float16x8_t high = vreinterpretq_f16_u16(vshll_n_u8(vget_high_u8(bits), 8));
+    result[0] = vcvt_f32_f16(vget_low_f16(low));
+    result[1] = vcvt_f32_f16(vget_high_f16(low));
+    result[2] = vcvt_f32_f16(vget_low_f16(high));
+    result[3] = vcvt_f32_f16(vget_high_f16(high));
+}
+
 static TrillimStatus project_mxfp4_decode(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
@@ -457,6 +567,8 @@ static TrillimStatus project_mxfp4_decode(void *opaque, size_t tile, size_t work
     size_t end = p->n - first < task->columns ? p->n : first + task->columns;
     size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
     size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
+    size_t groups = p->b_storage_columns / 32 + (p->b_storage_columns % 32 != 0);
+    const uint8_t *scales = task->weight + p->b_storage_rows * groups * 16;
     for (size_t column = first; column < end; column += 4) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -464,25 +576,41 @@ static TrillimStatus project_mxfp4_decode(void *opaque, size_t tile, size_t work
         size_t count = end - column < 4 ? end - column : 4;
         size_t b0 = b_base + column * p->b_col_stride;
         size_t r0 = b0 / p->b_storage_columns, c0 = b0 % p->b_storage_columns;
+        size_t block0 = r0 * groups + c0 / 32;
+        size_t start0 = c0 % 32;
+        const uint8_t *codes0 = task->weight + block0 * 16 + start0 / 2;
+        const uint8_t *exp0 = scales + block0;
         size_t b1 = b_base + (column + (count > 1 ? 1 : 0)) * p->b_col_stride;
         size_t r1 = b1 / p->b_storage_columns, c1 = b1 % p->b_storage_columns;
+        size_t block1 = r1 * groups + c1 / 32;
+        size_t start1 = c1 % 32;
+        const uint8_t *codes1 = task->weight + block1 * 16 + start1 / 2;
+        const uint8_t *exp1 = scales + block1;
         size_t b2 = b_base + (column + (count > 2 ? 2 : 0)) * p->b_col_stride;
         size_t r2 = b2 / p->b_storage_columns, c2 = b2 % p->b_storage_columns;
+        size_t block2 = r2 * groups + c2 / 32;
+        size_t start2 = c2 % 32;
+        const uint8_t *codes2 = task->weight + block2 * 16 + start2 / 2;
+        const uint8_t *exp2 = scales + block2;
         size_t b3 = b_base + (column + (count > 3 ? 3 : 0)) * p->b_col_stride;
         size_t r3 = b3 / p->b_storage_columns, c3 = b3 % p->b_storage_columns;
+        size_t block3 = r3 * groups + c3 / 32;
+        size_t start3 = c3 % 32;
+        const uint8_t *codes3 = task->weight + block3 * 16 + start3 / 2;
+        const uint8_t *exp3 = scales + block3;
         float32x4_t s0 = vdupq_n_f32(0), s1 = s0, s2 = s0, s3 = s0;
         for (size_t k = 0; k < p->k; k += 16) {
             if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             float32x4_t w0[4];
-            decode16(task, r0, c0 + k, TRILLIM_MXFP4, w0);
+            decode_mxfp4_16_half(codes0 + k / 2, exp0[(start0 + k) / 32], w0);
             float32x4_t w1[4];
-            decode16(task, r1, c1 + k, TRILLIM_MXFP4, w1);
+            decode_mxfp4_16_half(codes1 + k / 2, exp1[(start1 + k) / 32], w1);
             float32x4_t w2[4];
-            decode16(task, r2, c2 + k, TRILLIM_MXFP4, w2);
+            decode_mxfp4_16_half(codes2 + k / 2, exp2[(start2 + k) / 32], w2);
             float32x4_t w3[4];
-            decode16(task, r3, c3 + k, TRILLIM_MXFP4, w3);
+            decode_mxfp4_16_half(codes3 + k / 2, exp3[(start3 + k) / 32], w3);
             for (size_t j = 0; j < 4; ++j) {
                 float32x4_t x = load4(task->input, a_base + k + j * 4, p->a_dtype);
                 s0 = vfmaq_f32(s0, x, w0[j]);
@@ -526,6 +654,8 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_matmul(
     if (p->out_dtype == TRILLIM_FP32) {
         operation = p->m == 1 && p->b_dtype == TRILLIM_MXFP4 ?
             project_mxfp4_decode : projection(p->b_dtype);
+    } else if (p->b_dtype == TRILLIM_MXFP4 && p->k % 32 == 0 && p->n >= 4) {
+        operation = project_mxfp4_ordered;
     }
     size_t rows = p->m / 4 + (p->m % 4 != 0);
     size_t tiles = p->n / columns + (p->n % columns != 0);
