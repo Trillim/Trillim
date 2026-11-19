@@ -196,8 +196,21 @@ def _mapped_view(tensor: Tensor, state: _TuningState) -> bool:
 def _indices(
     tensor: Tensor, candidate: _KernelMatch, point: int, state: _TuningState
 ) -> NDArray[np.generic] | None:
-    args = candidate.anchor.args
-    if not isinstance(args, (_GatherArgs, _ScatterArgs)) or tensor is not args.indices:
+    anchor = candidate.anchor.args
+    args: _GatherArgs | _ScatterArgs | None
+    if isinstance(anchor, (_GatherArgs, _ScatterArgs)) and tensor is anchor.indices:
+        args = anchor
+    else:
+        args = next(
+            (
+                operator.args
+                for operator in candidate.covered
+                if isinstance(operator.args, _GatherArgs)
+                and tensor is operator.args.indices
+            ),
+            None,
+        )
+    if args is None:
         return None
     shape = _shape(tensor, point, state)
     source = _shape(args.x, point, state)
