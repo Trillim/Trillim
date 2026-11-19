@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections import deque
 from typing import get_args
 
 import numpy as np
@@ -353,6 +354,8 @@ def _arguments(
     target: _Operator,
     signature: tuple[tuple[str, inspect.Parameter, object], ...],
     state: _MatchingState,
+    *,
+    shallow: bool = False,
 ) -> dict[str, object] | None:
     actual = _fields(target)
     arguments: dict[str, object] = {}
@@ -366,7 +369,16 @@ def _arguments(
         for name, _, annotation in signature
         if annotation is Tensor or Tensor in get_args(annotation)
     ):
-        frontier: list[Tensor] = []
+        fixed = {
+            value
+            for name, _, annotation in signature
+            if shallow
+            and (annotation is Tensor or Tensor in get_args(annotation))
+            and isinstance(value := actual.get(name), Tensor)
+        }
+        if shallow and not fixed:
+            return None
+        frontier: list[Tensor] = list(dict.fromkeys(seeds)) if shallow else []
         visited: set[Tensor] = set()
         budget = 16
 
@@ -390,21 +402,52 @@ def _arguments(
                     return
             frontier.append(tensor)
 
-        for tensor in seeds:
-            visit(tensor)
+        if shallow:
+            pending = deque(frontier)
+            while pending and budget > 0 and len(frontier) < tensor_count:
+                tensor = pending.popleft()
+                producer = tensor._producer
+                if (
+                    tensor in fixed
+                    or producer is None
+                    or not producer.inputs
+                    or producer.op
+                    in {"cache", "cache_assign", "cache_read", "while", "if", "reduce"}
+                    or any(not _pure(body, state) for body in producer.regions)
+                ):
+                    continue
+                budget -= 1
+                frontier.remove(tensor)
+                for value in producer.inputs:
+                    if value not in frontier:
+                        frontier.append(value)
+                        pending.append(value)
+        else:
+            for tensor in seeds:
+                visit(tensor)
         if len(frontier) >= tensor_count:
-            seeds = sorted(
-                frontier,
-                key=lambda tensor: (
-                    len(tensor.shape.dimensions) if tensor.shape is not None else 0
-                ),
-                reverse=True,
+            seeds = (
+                frontier
+                if shallow
+                else sorted(
+                    frontier,
+                    key=lambda tensor: (
+                        len(tensor.shape.dimensions) if tensor.shape is not None else 0
+                    ),
+                    reverse=True,
+                )
             )
             actual = {
                 name: value
                 for name, value in actual.items()
                 if not isinstance(value, (Tensor, Weight))
+                or isinstance(value, Tensor)
+                and value in fixed
             }
+        elif shallow:
+            return None
+    elif shallow:
+        return None
     used = {value for value in actual.values() if isinstance(value, Tensor)}
     candidates = iter(value for value in seeds if value not in used)
     for name, parameter, annotation in signature:
@@ -702,6 +745,18 @@ def _match(
             if key not in cache:
                 cache[key] = _pattern(kernel, arguments, inference)
             pattern = cache[key]
+            if pattern is None:
+                # Keep named input boundaries when deeper leaves cannot seed a fusion.
+                alternative = _arguments(
+                    operator, signatures[id(kernel)], state, shallow=True
+                )
+                if alternative is not None:
+                    alternate_key = (id(kernel), _key(alternative, inference))
+                    if alternate_key not in cache:
+                        cache[alternate_key] = _pattern(kernel, alternative, inference)
+                    pattern = cache[alternate_key]
+                    if pattern is not None:
+                        arguments = alternative
             if pattern is None or len(pattern.outputs) != len(operator.outputs):
                 continue
             if all(output in pattern.inputs for output in pattern.outputs):
