@@ -882,6 +882,150 @@ static inline TrillimStatus trillim_attention_scores4(
     return TRILLIM_OK;
 }
 
+
+static TrillimStatus attention_short_queries(
+    const TrillimAttentionTask *task, size_t head, size_t kv_head, size_t first, size_t last
+) {
+    const TrillimAttentionParameters *p = task->parameters;
+    const TrillimKernelContext *context = task->context;
+    size_t rows = last - first;
+    float scores[4][64];
+    float accumulator[4][256];
+    size_t ends[4], queries[4];
+    float denominator[4];
+    size_t common = p->length;
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    for (size_t row = 0; row < rows; ++row) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        int64_t position = (int64_t)p->length - (int64_t)p->queries + (int64_t)(first + row);
+        ends[row] = p->causal ? (position < 0 ? 0 : (size_t)position + 1) : p->length;
+        if (ends[row] < common) {
+            common = ends[row];
+        }
+        queries[row] = head * p->q_strides[0] + (first + row) * p->q_strides[1];
+    }
+    common -= common % 4;
+    for (size_t key = 0; key < common; key += 4) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const uint16_t *k0 = (const uint16_t *)task->keys + kv_head * p->k_strides[0] + key * p->k_strides[1];
+        const uint16_t *k1 = k0 + p->k_strides[1];
+        const uint16_t *k2 = k1 + p->k_strides[1];
+        const uint16_t *k3 = k2 + p->k_strides[1];
+        float32x4_t sums[4];
+        for (size_t row = 0; row < rows; ++row) {
+            sums[row] = vdupq_n_f32(0);
+        }
+        for (size_t channel = 0; channel < 256; channel += 4) {
+            uint16x4_t a = vld1_u16(k0 + channel), b = vld1_u16(k1 + channel);
+            uint16x4_t c = vld1_u16(k2 + channel), d = vld1_u16(k3 + channel);
+            uint32x2_t ab_even = vreinterpret_u32_u16(vtrn1_u16(a, b));
+            uint32x2_t ab_odd = vreinterpret_u32_u16(vtrn2_u16(a, b));
+            uint32x2_t cd_even = vreinterpret_u32_u16(vtrn1_u16(c, d));
+            uint32x2_t cd_odd = vreinterpret_u32_u16(vtrn2_u16(c, d));
+            float32x4_t keys0 = vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u32(vtrn1_u32(ab_even, cd_even)), 16));
+            float32x4_t keys1 = vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u32(vtrn1_u32(ab_odd, cd_odd)), 16));
+            float32x4_t keys2 = vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u32(vtrn2_u32(ab_even, cd_even)), 16));
+            float32x4_t keys3 = vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u32(vtrn2_u32(ab_odd, cd_odd)), 16));
+            for (size_t row = 0; row < rows; ++row) {
+                const uint16_t *q = (const uint16_t *)task->query + queries[row] + channel;
+                float32x4_t query = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(q), 16));
+                sums[row] = vfmaq_laneq_f32(sums[row], keys0, query, 0);
+                sums[row] = vfmaq_laneq_f32(sums[row], keys1, query, 1);
+                sums[row] = vfmaq_laneq_f32(sums[row], keys2, query, 2);
+                sums[row] = vfmaq_laneq_f32(sums[row], keys3, query, 3);
+            }
+        }
+        for (size_t row = 0; row < rows; ++row) {
+            vst1q_f32(scores[row] + key, sums[row]);
+        }
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t key = common; key < ends[row]; ++key) {
+            size_t base = kv_head * p->k_strides[0] + key * p->k_strides[1];
+            TrillimStatus status = TRILLIM_OK;
+            if (ends[row] - key / 4 * 4 >= 4) {
+                if (key % 4 == 0) {
+                    status = trillim_attention_scores4(task, queries[row], base, scores[row] + key);
+                }
+            } else {
+                status = trillim_attention_score(task, queries[row], base, &scores[row][key]);
+            }
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        float maximum = -INFINITY;
+        for (size_t key = 0; key < ends[row]; ++key) {
+            scores[row][key] *= scale;
+            maximum = fmaxf(maximum, scores[row][key]);
+        }
+        float peak = maximum == -INFINITY ? 0.0f : maximum;
+        float total = 0.0f;
+        for (size_t key = 0; key < ends[row]; ++key) {
+            scores[row][key] = expf(scores[row][key] - peak);
+            total += scores[row][key];
+        }
+        denominator[row] = total;
+        for (size_t channel = 0; channel < 256; ++channel) {
+            accumulator[row][channel] = 0.0f;
+        }
+    }
+    size_t max_end = ends[rows - 1];
+    uint32x4_t nan_flags = vdupq_n_u32(0);
+    for (size_t channel = 0; channel < 256; channel += 16) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t sums[4][4];
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t part = 0; part < 4; ++part) {
+                sums[row][part] = vdupq_n_f32(0.0f);
+            }
+        }
+        for (size_t key = 0; key < max_end; ++key) {
+            float32x4_t values[4];
+            size_t base = kv_head * p->v_strides[0] + key * p->v_strides[1] + channel;
+            attention_load16(task->values, base, p->v_dtype, p->v_rows, p->v_columns, values);
+            for (size_t row = 0; row < rows; ++row) {
+                if (key < ends[row]) {
+                    for (size_t part = 0; part < 4; ++part) {
+                        sums[row][part] = vfmaq_n_f32(sums[row][part], values[part], scores[row][key]);
+                    }
+                }
+            }
+        }
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t part = 0; part < 4; ++part) {
+                vst1q_f32(accumulator[row] + channel + 4 * part, sums[row][part]);
+                uint32x4_t magnitude = vandq_u32(vreinterpretq_u32_f32(sums[row][part]), vdupq_n_u32(0x7fffffff));
+                nan_flags = vorrq_u32(nan_flags, vcgtq_u32(magnitude, vdupq_n_u32(0x7f800000)));
+            }
+        }
+    }
+    if (vmaxvq_u32(nan_flags)) {
+        return TRILLIM_ERROR;
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t output = ((first + row) * p->heads + head) * 256;
+        for (size_t channel = 0; channel < 256; ++channel) {
+            TrillimValue value;
+            value.f = accumulator[row][channel] / (denominator[row] > 0.0f ? denominator[row] : 1.0f);
+            trillim_store(task->output, output + channel, p->output_dtype, value);
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const TrillimAttentionTask *task = (const TrillimAttentionTask *)opaque;
@@ -892,6 +1036,16 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
     size_t kv_head = head / (p->heads / p->kv_heads);
     size_t first = (index % tiles) * query_tile;
     size_t last = p->queries - first < query_tile ? p->queries : first + query_tile;
+    if (query_tile == 4 && last - first >= 2 && p->length <= 64 &&
+        p->key_dim == 256 && p->value_dim == 256 &&
+        p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->v_strides[2] == 1 &&
+        (!p->windowed || p->window >= p->length) &&
+        (((uintptr_t)task->query | (uintptr_t)task->keys | (uintptr_t)task->values) & 1) == 0) {
+        TrillimStatus status = attention_short_queries(task, head, kv_head, first, last);
+        if (status != TRILLIM_ERROR) {
+            return status;
+        }
+    }
     float *scores = task->scratch + index * (p->value_dim + 64);
     float *accumulator = scores + 64;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
