@@ -1979,6 +1979,13 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
         }
     }
     if (status == TRILLIM_OK) {
+        Task scheduled;
+        if (operation == project_int8_q6_sdot && workers > 1) {
+            scheduled = *task;
+            const size_t columns = p->outputs / workers + (p->outputs % workers != 0);
+            scheduled.columns = columns + (columns % 2 != 0);
+            task = &scheduled;
+        }
         Int8ProjectionTask int8 = {task, activation, gate, silu};
         const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
         if (p->width <= 65536 / p->outputs || workers == 1) {
