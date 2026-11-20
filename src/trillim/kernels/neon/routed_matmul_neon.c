@@ -1,5 +1,15 @@
 #include "common.h"
 #include <arm_neon.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
+typedef struct RoutedQ8 RoutedQ8;
 
 typedef struct {
     size_t tokens, routes, experts, n, k;
@@ -16,6 +26,7 @@ typedef struct {
     const TrillimKernelContext *context;
     const size_t *offsets, *tiles, *slots;
     size_t columns, column_tiles;
+    const RoutedQ8 *quantized;
 } Task;
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
@@ -173,25 +184,32 @@ static inline __attribute__((always_inline)) void decode16(const Task *task, siz
     weights[3] = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(b), 16));
 }
 
-static TrillimStatus validate_weights(const Task *task, size_t expert, size_t first, size_t end) {
+static TrillimStatus validate_weights(const Task *task, size_t expert, size_t first, size_t end, bool *bounded) {
     size_t groups = task->p->k / 32;
     size_t block = (expert * task->p->n + first) * groups;
     size_t count = (end - first) * groups;
     const uint8_t *scales = task->scales + block;
-    uint8x16_t maximum = vdupq_n_u8(0);
+    uint8x16_t maximum = vdupq_n_u8(0), minimum = vdupq_n_u8(255);
     size_t i = 0;
     for (; count - i >= 16; i += 16) {
         if ((i & 8191) == 0 && cancelled(task->context)) {
             return TRILLIM_CANCELLED;
         }
-        maximum = vmaxq_u8(maximum, vld1q_u8(scales + i));
+        uint8x16_t scale = vld1q_u8(scales + i);
+        maximum = vmaxq_u8(maximum, scale);
+        minimum = vminq_u8(minimum, scale);
     }
-    uint8_t bound = vmaxvq_u8(maximum);
+    uint8_t bound = vmaxvq_u8(maximum), lower = vminvq_u8(minimum);
     for (; i < count; ++i) {
+        if (scales[i] < lower) {
+            lower = scales[i];
+        }
         if (scales[i] > bound) {
             bound = scales[i];
         }
     }
+    /* Keep Q8 scales, MXFP4 scales, and their summed products within FP32 range. */
+    *bounded = lower >= 32 && bound <= 212;
     if (bound < 253) {
         return TRILLIM_OK;
     }
@@ -263,6 +281,153 @@ static inline __attribute__((always_inline)) TrillimStatus project_fp32(
     return TRILLIM_OK;
 }
 
+enum { Q8_GROUP = 32, Q8_MAX_WIDTH = 8192, Q8_MAX_BYTES = 8 * 1024 * 1024 };
+
+struct RoutedQ8 {
+    int8_t values[Q8_GROUP];
+    float scale;
+};
+
+__asm__(
+    ".irp reg,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n"
+    ".set trillim_routed_dot_v\\reg,\\reg\n"
+    ".endr\n"
+);
+
+static inline int32x4_t routed_dot(int32x4_t sum, int8x16_t a, int8x16_t b) {
+    __asm__(".inst 0x4e809400 | trillim_routed_dot_%0 | (trillim_routed_dot_%1 << 5) | (trillim_routed_dot_%2 << 16)"
+            : "+w"(sum) : "w"(a), "w"(b));
+    return sum;
+}
+
+static bool available_routed_dot(void) {
+    static atomic_int cached;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value != 0) {
+        return value == 2;
+    }
+    bool available = false;
+#if defined(__APPLE__)
+    int flag = 0;
+    size_t size = sizeof(flag);
+    available = sysctlbyname("hw.optional.arm.FEAT_DotProd", &flag, &size, NULL, 0) == 0 && flag != 0;
+#elif defined(__linux__) && defined(HWCAP_ASIMDDP)
+    available = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#endif
+    atomic_store_explicit(&cached, available ? 2 : 1, memory_order_relaxed);
+    return available;
+}
+
+static inline bool default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
+static inline int8x16_t quantize_16(float32x4x4_t x, float inverse) {
+    int32x4_t q0 = vcvtnq_s32_f32(vmulq_n_f32(x.val[0], inverse));
+    int32x4_t q1 = vcvtnq_s32_f32(vmulq_n_f32(x.val[1], inverse));
+    int32x4_t q2 = vcvtnq_s32_f32(vmulq_n_f32(x.val[2], inverse));
+    int32x4_t q3 = vcvtnq_s32_f32(vmulq_n_f32(x.val[3], inverse));
+    return vcombine_s8(vmovn_s16(vmovn_high_s32(vmovn_s32(q0), q1)),
+                       vmovn_s16(vmovn_high_s32(vmovn_s32(q2), q3)));
+}
+
+static bool quantize_q8_group(const uint8_t *a, size_t k, uint32_t dtype, RoutedQ8 *out) {
+    float32x4x4_t lo = load16(a, k, dtype);
+    float32x4x4_t hi = load16(a, k + 16, dtype);
+    float32x4_t max_vector = vdupq_n_f32(0);
+    for (size_t i = 0; i < 4; ++i) {
+        max_vector = vmaxq_f32(max_vector, vabsq_f32(lo.val[i]));
+        max_vector = vmaxq_f32(max_vector, vabsq_f32(hi.val[i]));
+    }
+    float maximum = vmaxvq_f32(max_vector);
+    float scale = maximum / 127.0f;
+    float inverse = scale != 0 ? 1.0f / scale : 0.0f;
+    if (!isfinite(maximum) || !isfinite(inverse) || scale > 65504.0f) {
+        return false;
+    }
+    uint16_t bits = trillim_to_fp16(scale);
+    if (bits == 0 && maximum != 0.0f) {
+        return false;
+    }
+    out->scale = trillim_fp16(bits);
+    int8x16_t x0 = quantize_16(lo, inverse), x1 = quantize_16(hi, inverse);
+    /* The packed bank stores even inputs in the low nibbles and odd inputs in the high nibbles. */
+    vst1q_s8(out->values, vuzp1q_s8(x0, x1));
+    vst1q_s8(out->values + 16, vuzp2q_s8(x0, x1));
+    return true;
+}
+
+static inline float32x4_t mxfp4_scales(const uint8_t *const scales[4], size_t g) {
+    uint8_t exponent[8] = {scales[0][g], scales[1][g], scales[2][g], scales[3][g]};
+    uint32x4_t wide = vmovl_u16(vget_low_u16(vmovl_u8(vld1_u8(exponent))));
+    /* The dot uses twice the E2M1 values. Its scale is therefore half the E8M0 scale. */
+    return vreinterpretq_f32_u32(vshlq_n_u32(vsubq_u32(wide, vdupq_n_u32(1)), 23));
+}
+
+static inline __attribute__((always_inline)) TrillimStatus project_int8(
+    const Task *task, size_t expert, size_t first, size_t end, const size_t *slots, size_t count, size_t rows
+) {
+    static const int8_t values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const int8x16_t palette = vld1q_s8(values);
+    const Parameters *p = task->p;
+    size_t groups = p->k / Q8_GROUP;
+    const RoutedQ8 *activation[ROUTES_PER_TILE];
+    size_t route_rows = p->a_route_stride == 0 ? 1 : p->routes;
+    for (size_t r = 0; r < count; ++r) {
+        size_t token = p->a_token_stride == 0 ? 0 : slots[r] / p->routes;
+        size_t route = p->a_route_stride == 0 ? 0 : slots[r] % p->routes;
+        activation[r] = task->quantized + (token * route_rows + route) * groups;
+    }
+    for (size_t r = count; r < rows; ++r) {
+        activation[r] = activation[0];
+    }
+    for (size_t column = first; column < end; column += 4) {
+        size_t width = end - column < 4 ? end - column : 4;
+        const uint8_t *codes[4], *scales[4];
+        for (size_t c = 0; c < 4; ++c) {
+            size_t block = (expert * p->n + column + (c < width ? c : 0)) * groups;
+            codes[c] = task->codes + block * 16;
+            scales[c] = task->scales + block;
+        }
+        float32x4_t sum[ROUTES_PER_TILE] = {0}, partial[ROUTES_PER_TILE] = {0};
+        for (size_t g = 0; g < groups; ++g) {
+            if ((g & 31) == 0 && cancelled(task->context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t weight_scale = mxfp4_scales(scales, g);
+            int8x16_t w0[4], w1[4];
+            for (size_t c = 0; c < 4; ++c) {
+                uint8x16_t block = vld1q_u8(codes[c] + g * 16);
+                w0[c] = vqtbl1q_s8(palette, vandq_u8(block, vdupq_n_u8(15)));
+                w1[c] = vqtbl1q_s8(palette, vshrq_n_u8(block, 4));
+            }
+            for (size_t r = 0; r < rows; ++r) {
+                const RoutedQ8 *x = activation[r] + g;
+                int8x16_t x0 = vld1q_s8(x->values), x1 = vld1q_s8(x->values + 16);
+                int32x4_t dot[4];
+                for (size_t c = 0; c < 4; ++c) {
+                    dot[c] = routed_dot(routed_dot(vdupq_n_s32(0), w0[c], x0), w1[c], x1);
+                }
+                int32x4_t reduced = vpaddq_s32(vpaddq_s32(dot[0], dot[1]), vpaddq_s32(dot[2], dot[3]));
+                float32x4_t scale = vmulq_n_f32(weight_scale, x->scale);
+                if ((g & 1) == 0) {
+                    partial[r] = vmulq_f32(vcvtq_f32_s32(reduced), scale);
+                } else {
+                    sum[r] = vaddq_f32(sum[r], vfmaq_f32(partial[r], vcvtq_f32_s32(reduced), scale));
+                }
+            }
+        }
+        for (size_t r = 0; r < count; ++r) {
+            float32x4_t result = groups % 2 == 0 ? sum[r] : vaddq_f32(sum[r], partial[r]);
+            size_t start = slots[r] * p->n + column;
+            memcpy((uint8_t *)task->output + start * sizeof(float), &result, width * sizeof(float));
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
@@ -295,9 +460,20 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     }
     size_t first = tile % task->column_tiles * task->columns;
     size_t end = p->n - first < task->columns ? p->n : first + task->columns;
-    TrillimStatus status = validate_weights(task, expert, first, end);
+    bool bounded;
+    TrillimStatus status = validate_weights(task, expert, first, end, &bounded);
     if (status != TRILLIM_OK) {
         return status;
+    }
+
+    if (task->quantized != NULL && bounded && default_fpcr()) {
+        if (count == 1) {
+            return project_int8(task, expert, first, end, slots, 1, 1);
+        }
+        if (count == 2) {
+            return project_int8(task, expert, first, end, slots, 2, 2);
+        }
+        return project_int8(task, expert, first, end, slots, count, ROUTES_PER_TILE);
     }
     if (count == 1) {
         return project_fp32(task, expert, first, end, slots, activation, 1, 1, 4);
@@ -306,6 +482,55 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
         return project_fp32(task, expert, first, end, slots, activation, 2, 2, 2);
     }
     return project_fp32(task, expert, first, end, slots, activation, count, ROUTES_PER_TILE, 2);
+}
+
+static __attribute__((noinline)) TrillimStatus try_routed_int8(Task *task, bool *handled) {
+    const Parameters *p = task->p;
+    size_t groups = p->k / Q8_GROUP;
+    size_t token_rows = p->a_token_stride == 0 ? 1 : p->tokens;
+    size_t route_rows = p->a_route_stride == 0 ? 1 : p->routes;
+    size_t max_groups = Q8_MAX_BYTES / sizeof(RoutedQ8);
+    if (token_rows > max_groups / route_rows / groups) {
+        return TRILLIM_OK;
+    }
+    size_t total = token_rows * route_rows * groups;
+    RoutedQ8 local[512];
+    RoutedQ8 *quantized = total <= sizeof(local) / sizeof(local[0]) ? local : malloc(total * sizeof(*quantized));
+    if (quantized == NULL) {
+        return TRILLIM_OK;
+    }
+    size_t a_size = trillim_itemsize(p->a_dtype);
+    TrillimStatus status = TRILLIM_OK;
+    bool valid = true;
+    for (size_t t = 0; t < token_rows && valid; ++t) {
+        for (size_t r = 0; r < route_rows && valid; ++r) {
+            size_t start = t * p->a_token_stride + r * p->a_route_stride;
+            const uint8_t *activation = task->activation + start * a_size;
+            RoutedQ8 *row = quantized + (t * route_rows + r) * groups;
+            for (size_t g = 0; g < groups; ++g) {
+                if ((g & 31) == 0 && cancelled(task->context)) {
+                    status = TRILLIM_CANCELLED;
+                    valid = false;
+                    break;
+                }
+                if (!quantize_q8_group(activation, g * Q8_GROUP, p->a_dtype, row + g)) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (valid) {
+        task->quantized = quantized;
+        *handled = true;
+        const TrillimThreadPool *pool = task->context->thread_pool;
+        status = pool->run(pool->context, task->tiles[p->experts] * task->column_tiles, project, task);
+        task->quantized = NULL;
+    }
+    if (quantized != local) {
+        free(quantized);
+    }
+    return status;
 }
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_routed_matmul(
@@ -337,7 +562,14 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_routed_matmul(
     size_t column_tiles = p->n / columns + (p->n % columns != 0);
     const uint8_t *codes = inputs[1];
     const uint8_t *scales = codes + p->experts * p->n * (p->k / 32) * 16;
-    Task task = {outputs[0], inputs[0], codes, scales, p, context, offsets, tiles, slots, columns, column_tiles};
+    Task task = {outputs[0], inputs[0], codes, scales, p, context, offsets, tiles, slots, columns, column_tiles, NULL};
+    if (p->n >= 16 && p->k <= Q8_MAX_WIDTH && available_routed_dot() && default_fpcr()) {
+        bool handled = false;
+        status = try_routed_int8(&task, &handled);
+        if (status != TRILLIM_OK || handled) {
+            return status;
+        }
+    }
     return context->thread_pool->run(context->thread_pool->context, tiles[p->experts] * column_tiles, project, &task);
 }
 
