@@ -1677,6 +1677,160 @@ static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
     return status;
 }
 
+static bool attention_default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
+static TrillimStatus trillim_attention_gqa4(const TrillimAttentionTask *task) {
+    const TrillimAttentionParameters *p = task->parameters;
+    const TrillimKernelContext *context = task->context;
+    const uint16_t *query[4];
+    float *scores[4], *accumulator[4];
+    float maximum[4], denominator[4];
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    for (size_t head = 0; head < 4; ++head) {
+        query[head] = (const uint16_t *)task->query + head * p->q_strides[0];
+        scores[head] = task->scratch + head * (p->value_dim + 64);
+        accumulator[head] = scores[head] + 64;
+        memset(accumulator[head], 0, p->value_dim * sizeof(float));
+        maximum[head] = -INFINITY;
+        denominator[head] = 0;
+    }
+    /* SIMD lanes are heads, preserving each dot product's channel order. */
+    float transposed[256 * 4];
+    for (size_t channel = 0; channel < 256; channel += 4) {
+        float32x4x4_t q = {{
+            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[0] + channel), 16)),
+            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[1] + channel), 16)),
+            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[2] + channel), 16)),
+            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[3] + channel), 16))
+        }};
+        vst4q_f32(transposed + channel * 4, q);
+    }
+    size_t begin = p->windowed && p->length > p->window ? p->length - p->window : 0;
+    for (size_t block = begin; block < p->length; block += 64) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = p->length - block < 64 ? p->length - block : 64;
+        size_t key = 0;
+        for (; count - key >= 4; key += 4) {
+            if (context->is_cancelled(context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const uint16_t *k0 = (const uint16_t *)task->keys + (block + key) * p->k_strides[1];
+            const uint16_t *k1 = k0 + p->k_strides[1];
+            const uint16_t *k2 = k1 + p->k_strides[1];
+            const uint16_t *k3 = k2 + p->k_strides[1];
+            float32x4_t sum0 = vdupq_n_f32(0), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+            for (size_t channel = 0; channel < 256; channel += 4) {
+                float32x4_t q0 = vld1q_f32(transposed + channel * 4);
+                float32x4_t q1 = vld1q_f32(transposed + channel * 4 + 4);
+                float32x4_t q2 = vld1q_f32(transposed + channel * 4 + 8);
+                float32x4_t q3 = vld1q_f32(transposed + channel * 4 + 12);
+                float32x4_t a = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(k0 + channel), 16));
+                float32x4_t b = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(k1 + channel), 16));
+                float32x4_t c = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(k2 + channel), 16));
+                float32x4_t d = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(k3 + channel), 16));
+#define UPDATE_KEY(S, K) \
+                S = vfmaq_laneq_f32(S, q0, K, 0); \
+                S = vfmaq_laneq_f32(S, q1, K, 1); \
+                S = vfmaq_laneq_f32(S, q2, K, 2); \
+                S = vfmaq_laneq_f32(S, q3, K, 3)
+                UPDATE_KEY(sum0, a);
+                UPDATE_KEY(sum1, b);
+                UPDATE_KEY(sum2, c);
+                UPDATE_KEY(sum3, d);
+#undef UPDATE_KEY
+            }
+            float32x4_t ab0 = vtrn1q_f32(sum0, sum1), ab1 = vtrn2q_f32(sum0, sum1);
+            float32x4_t cd0 = vtrn1q_f32(sum2, sum3), cd1 = vtrn2q_f32(sum2, sum3);
+            vst1q_f32(scores[0] + key, vcombine_f32(vget_low_f32(ab0), vget_low_f32(cd0)));
+            vst1q_f32(scores[1] + key, vcombine_f32(vget_low_f32(ab1), vget_low_f32(cd1)));
+            vst1q_f32(scores[2] + key, vcombine_f32(vget_high_f32(ab0), vget_high_f32(cd0)));
+            vst1q_f32(scores[3] + key, vcombine_f32(vget_high_f32(ab1), vget_high_f32(cd1)));
+        }
+        for (; key < count; ++key) {
+            for (size_t head = 0; head < 4; ++head) {
+                TrillimStatus status = trillim_attention_score(task, head * p->q_strides[0],
+                    (block + key) * p->k_strides[1], scores[head] + key);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+        }
+        for (size_t head = 0; head < 4; ++head) {
+            float peak = -INFINITY;
+            for (size_t key = 0; key < count; ++key) {
+                if (isnan(scores[head][key])) {
+                    return context->thread_pool->run(
+                        context->thread_pool->context, 4, trillim_attention_task, (void *)task
+                    );
+                }
+                scores[head][key] *= scale;
+                peak = fmaxf(peak, scores[head][key]);
+            }
+            float next = fmaxf(maximum[head], peak);
+            float normalizer = next == -INFINITY ? 0.0f : next;
+            float previous = maximum[head] == -INFINITY ? 0.0f : expf(maximum[head] - normalizer);
+            float sum = 0;
+            for (size_t key = 0; key < count; ++key) {
+                scores[head][key] = expf(scores[head][key] - normalizer);
+                sum += scores[head][key];
+            }
+            for (size_t channel = 0; channel < 256; ++channel) {
+                accumulator[head][channel] *= previous;
+            }
+            denominator[head] = denominator[head] * previous + sum;
+            maximum[head] = next;
+        }
+        for (size_t channel = 0; channel < 256; channel += 8) {
+            if (context->is_cancelled(context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t a0 = vld1q_f32(accumulator[0] + channel), b0 = vld1q_f32(accumulator[0] + channel + 4);
+            float32x4_t a1 = vld1q_f32(accumulator[1] + channel), b1 = vld1q_f32(accumulator[1] + channel + 4);
+            float32x4_t a2 = vld1q_f32(accumulator[2] + channel), b2 = vld1q_f32(accumulator[2] + channel + 4);
+            float32x4_t a3 = vld1q_f32(accumulator[3] + channel), b3 = vld1q_f32(accumulator[3] + channel + 4);
+            for (size_t key = 0; key < count; ++key) {
+                const uint16_t *value = (const uint16_t *)task->values + (block + key) * p->v_strides[1] + channel;
+                uint16x8_t bits = vld1q_u16(value);
+                float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16));
+                float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bits), 16));
+                a0 = vfmaq_n_f32(a0, v0, scores[0][key]);
+                b0 = vfmaq_n_f32(b0, v1, scores[0][key]);
+                a1 = vfmaq_n_f32(a1, v0, scores[1][key]);
+                b1 = vfmaq_n_f32(b1, v1, scores[1][key]);
+                a2 = vfmaq_n_f32(a2, v0, scores[2][key]);
+                b2 = vfmaq_n_f32(b2, v1, scores[2][key]);
+                a3 = vfmaq_n_f32(a3, v0, scores[3][key]);
+                b3 = vfmaq_n_f32(b3, v1, scores[3][key]);
+            }
+            vst1q_f32(accumulator[0] + channel, a0);
+            vst1q_f32(accumulator[0] + channel + 4, b0);
+            vst1q_f32(accumulator[1] + channel, a1);
+            vst1q_f32(accumulator[1] + channel + 4, b1);
+            vst1q_f32(accumulator[2] + channel, a2);
+            vst1q_f32(accumulator[2] + channel + 4, b2);
+            vst1q_f32(accumulator[3] + channel, a3);
+            vst1q_f32(accumulator[3] + channel + 4, b3);
+        }
+    }
+    for (size_t head = 0; head < 4; ++head) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        for (size_t channel = 0; channel < 256; ++channel) {
+            TrillimValue value = {.f = accumulator[head][channel] /
+                (denominator[head] > 0.0f ? denominator[head] : 1.0f)};
+            trillim_store(task->output, head * 256 + channel, TRILLIM_BF16, value);
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -1700,6 +1854,16 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
         size_t tiles = p->queries / 4 + (p->queries % 4 != 0);
         size_t count = p->heads * tiles < 64 ? p->heads * tiles : 64;
         return context->thread_pool->run(context->thread_pool->context, count, trillim_attention_blocks, &task);
+    }
+    if (p->queries == 1 && p->heads == 4 && p->kv_heads == 1 &&
+        p->key_dim == 256 && p->value_dim == 256 && p->length >= 8 && p->length <= 512 &&
+        (!p->windowed || p->window >= 8) &&
+        p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_BF16 &&
+        p->k_dtype == TRILLIM_BF16 && p->v_dtype == TRILLIM_BF16 &&
+        p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->v_strides[2] == 1 &&
+        (((uintptr_t)inputs[0] | (uintptr_t)inputs[1] | (uintptr_t)inputs[2]) & 1) == 0 &&
+        attention_default_fpcr()) {
+        return trillim_attention_gqa4(&task);
     }
     bool optimized = optimized_layout(p);
     size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
