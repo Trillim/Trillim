@@ -75,6 +75,24 @@ def _literal_equal(left: object, right: object) -> bool:
     return type(left) is type(right) and bool(left == right)
 
 
+def _unwrap_loop_construct(
+    tensor: Tensor,
+    inference: _Inference,
+    state: _MatchingState,
+    covered: set[_Operator] | None = None,
+) -> Tensor:
+    while (
+        (producer := tensor._producer) is not None
+        and isinstance(producer.args, _ConstructArgs)
+        and _structural_loop(producer, inference, state)
+    ):
+        if covered is not None:
+            covered.add(producer)
+        output = producer.regions[0].outputs[producer.outputs.index(tensor)]
+        tensor = _unwrapped(output, state, covered)
+    return tensor
+
+
 def _equivalent(
     pattern: Tensor,
     target: Tensor,
@@ -114,6 +132,11 @@ def _equivalent(
         return parameters[pattern] is target
     pattern = _unwrapped(pattern, state)
     target = _unwrapped(target, state, covered)
+    if not state.canonical:
+        loop_pattern = _unwrap_loop_construct(pattern, template.inference, state)
+        if loop_pattern is not pattern:
+            pattern = loop_pattern
+            target = _unwrap_loop_construct(target, state.inference, state, covered)
     pair = pattern, target
     if pair in pairs:
         return True
