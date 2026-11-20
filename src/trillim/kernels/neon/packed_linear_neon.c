@@ -1710,7 +1710,132 @@ DEFINE_INT8_PROJECTION(project_int8_q8_neon, true, TRILLIM_GRP_INT8)
 
 DEFINE_INT8_PROJECTION(project_int8_q4_sdot, false, TRILLIM_GRP_INT4)
 DEFINE_INT8_PROJECTION(project_int8_q5_sdot, false, TRILLIM_GRP_INT5)
-DEFINE_INT8_PROJECTION(project_int8_q6_sdot, false, TRILLIM_DUBGRP_INT6)
+enum { Q6_AQ_COLUMNS = 2 };
+
+#if defined(__clang__)
+#define Q6_AQ_UNROLL _Pragma("clang loop unroll(full)")
+#else
+#define Q6_AQ_UNROLL
+#endif
+
+static inline int8x16_t q6_signed4(uint8x16_t packed, uint8x16_t upper, bool high_nibble) {
+    const uint8x16_t lower = high_nibble
+        ? vshlq_n_u8(vshrq_n_u8(packed, 4), 2)
+        : vshlq_n_u8(packed, 2);
+    return vreinterpretq_s8_u8(vsliq_n_u8(lower, upper, 6));
+}
+
+static inline int32x4_t q6_aq_quarter(
+    const uint8_t *low, uint8x16x2_t upper, const int8x16x4_t activation
+) {
+    const uint8x16x2_t packed = vld1q_u8_x2(low);
+    const int32x4_t d0 = int8_sdot(q6_signed4(packed.val[0], upper.val[0], false), activation.val[0]);
+    const int32x4_t d1 = int8_sdot(q6_signed4(packed.val[1], upper.val[1], false), activation.val[1]);
+    const uint8x16_t h0 = vshrq_n_u8(upper.val[0], 2);
+    const uint8x16_t h1 = vshrq_n_u8(upper.val[1], 2);
+    const int32x4_t d2 = int8_sdot(q6_signed4(packed.val[0], h0, true), activation.val[2]);
+    const int32x4_t d3 = int8_sdot(q6_signed4(packed.val[1], h1, true), activation.val[3]);
+    return vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+}
+
+static void q6_aq_tile(
+    const Int8PackedWeight weight[Q6_AQ_COLUMNS], const Q8KActivationBlock *x, size_t groups,
+    float result[Q6_AQ_COLUMNS]
+) {
+    float sum[Q6_AQ_COLUMNS] = {0};
+    for (size_t g = 0; g < groups; ++g) {
+        const int8_t *input = x[g].values;
+        int32x4_t block_dot[Q6_AQ_COLUMNS] = {0};
+        for (size_t h = 0; h < 2; ++h) {
+            const int8x16x4_t x0 = vld1q_s8_x4(input + h * 128);
+            const int8x16x4_t x1 = vld1q_s8_x4(input + h * 128 + 64);
+            Q6_AQ_UNROLL
+            for (size_t c = 0; c < Q6_AQ_COLUMNS; ++c) {
+                const uint8_t *low = weight[c].low + g * 128 + h * 64;
+                uint8x16x2_t upper = vld1q_u8_x2(weight[c].high + g * 64 + h * 32);
+                /* Flip all four sign bits. Insert the selected two high bits at
+                   the top of each byte to get four times the centered code. */
+                upper.val[0] = veorq_u8(upper.val[0], vdupq_n_u8(0xaa));
+                upper.val[1] = veorq_u8(upper.val[1], vdupq_n_u8(0xaa));
+                const int32x4_t first = q6_aq_quarter(low, upper, x0);
+                upper.val[0] = vshrq_n_u8(upper.val[0], 4);
+                upper.val[1] = vshrq_n_u8(upper.val[1], 4);
+                const int32x4_t second = q6_aq_quarter(low + 32, upper, x1);
+                const int16x8_t scales = vmovl_s8(vld1_s8(weight[c].subscales + g * 16 + h * 8));
+                block_dot[c] = vmlaq_s32(block_dot[c], first, vmovl_s16(vget_low_s16(scales)));
+                block_dot[c] = vmlaq_s32(block_dot[c], second, vmovl_high_s16(scales));
+            }
+        }
+        Q6_AQ_UNROLL
+        for (size_t c = 0; c < Q6_AQ_COLUMNS; ++c) {
+            const int32_t dot = vaddvq_s32(vshrq_n_s32(block_dot[c], 2));
+            sum[c] += (int8_weight_scale(weight[c].scales, g) * x[g].scale) * dot;
+        }
+    }
+    Q6_AQ_UNROLL
+    for (size_t c = 0; c < Q6_AQ_COLUMNS; ++c) {
+        result[c] = sum[c];
+    }
+}
+
+static TrillimStatus project_int8_q6_sdot(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const Int8ProjectionTask *quantized = opaque;
+    const Task *task = quantized->projection;
+    const Parameters *p = task->p;
+    const size_t groups = p->width / 256;
+    const size_t total = groups * p->outputs;
+    const bool paired = quantized->gate != NULL;
+    const size_t stride = paired ? Q6_AQ_COLUMNS / 2 : Q6_AQ_COLUMNS;
+    const Int8PackedWeight weight = int8_packed_weight(task->weight, total, TRILLIM_DUBGRP_INT6);
+    const Int8PackedWeight gate = paired
+        ? int8_packed_weight(quantized->gate, total, TRILLIM_DUBGRP_INT6) : weight;
+    const size_t begin = index * task->columns;
+    const size_t end = p->outputs - begin < task->columns ? p->outputs : begin + task->columns;
+    for (size_t row = begin; row < end; row += stride) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const size_t count = end - row < stride ? end - row : stride;
+        Int8PackedWeight tile[Q6_AQ_COLUMNS];
+        for (size_t c = 0; c < Q6_AQ_COLUMNS; ++c) {
+            const bool use_gate = paired && (c & 1);
+            const Int8PackedWeight *operand = use_gate ? &gate : &weight;
+            const size_t position = paired ? c / 2 : c;
+            const size_t offset = (row + (position < count ? position : 0)) * groups;
+            tile[c] = (Int8PackedWeight){
+                operand->low + offset * 128, operand->scales + offset * 2,
+                operand->high + offset * 64, operand->subscales + offset * 16
+            };
+        }
+        float result[Q6_AQ_COLUMNS];
+        q6_aq_tile(tile, quantized->activation, groups, result);
+        for (size_t c = 0; c < count; ++c) {
+            float value = result[paired ? c * 2 : c];
+            if (!isfinite(value)) {
+                const TrillimStatus status = project_int8_nonfinite(task, task->weight, row + c, &value);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+            if (paired) {
+                float gate_value = result[c * 2 + 1];
+                if (!isfinite(gate_value)) {
+                    const TrillimStatus status = project_int8_nonfinite(task, quantized->gate, row + c, &gate_value);
+                    if (status != TRILLIM_OK) {
+                        return status;
+                    }
+                }
+                value *= quantized->silu(gate_value);
+            }
+            ((float *)task->output)[row + c] = value;
+        }
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+#undef Q6_AQ_UNROLL
+
 DEFINE_INT8_PROJECTION(project_int8_q8_sdot, false, TRILLIM_GRP_INT8)
 static TrillimTask int8_projection(uint32_t dtype) {
     const bool dotprod = available_dotprod();
