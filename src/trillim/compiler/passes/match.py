@@ -34,6 +34,12 @@ from ..kernels.catalog import _available_capabilities
 from ..kernels.kernel_dataclasses import _Kernel, _KernelBindingContext, _TensorBinding
 from .canonicalize import _canonical, _normal, _pure, _terms, _unwrapped
 from .infer import _infer
+from .loop_match import (
+    _loop_dimensions,
+    _rewrite_constraint,
+    _shape_rewriter,
+    _structural_loop,
+)
 from .optimize import _optimize
 from .passes_dataclasses import (
     _Canonical,
@@ -123,11 +129,14 @@ def _equivalent(
         t.regions
     ):
         return False
-    if t.op in {"cache", "cache_assign", "cache_read", "while", "if"}:
+    if t.op in {"cache", "cache_assign", "cache_read", "if"}:
         return False
     if p.regions and not (
         isinstance(p.args, _ReduceArgs)
         and all(_pure(body, state) for body in t.regions)
+        or not state.canonical
+        and _structural_loop(p, template.inference, state)
+        and _structural_loop(t, state.inference, state)
     ):
         return False
     p_fields, t_fields = _fields(p), _fields(t)
@@ -868,6 +877,10 @@ def _match(
             ):
                 continue
             try:
+                loop_dimensions = _loop_dimensions(covered, inference)
+                if loop_dimensions is None:
+                    continue
+                rewrite = _shape_rewriter(loop_dimensions) if loop_dimensions else None
                 attributes = {
                     **_fields(operator),
                     **{
@@ -889,8 +902,17 @@ def _match(
                 references = set().union(
                     *(_parameter_references(value) for value in parameters.values())
                 )
+                if rewrite is not None:
+                    for output in context.outputs:
+                        for dimension in output.shape:
+                            references.update(_parameter_references(rewrite(dimension)))
                 for owner in (*covered, None):
                     for constraint in constraints.get(owner, ()):
+                        if rewrite is not None:
+                            adjusted = _rewrite_constraint(constraint, rewrite)
+                            if adjusted is None:
+                                continue
+                            constraint = adjusted
                         references.update(
                             _parameter_references(constraint.left)
                             | _parameter_references(constraint.right)
@@ -943,6 +965,7 @@ def _match(
                     parameters,
                     attributes,
                     storage,
+                    loop_dimensions,
                 )
             )
         result.candidates[operator] = tuple(

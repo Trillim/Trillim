@@ -15,6 +15,7 @@ from .kernels.kernel_dataclasses import _Backend
 from .passes.allocate import _allocate
 from .passes.emit import _emit
 from .passes.infer import _infer
+from .passes.loop_match import _selected_loop_inference
 from .passes.match import _match
 from .passes.optimize import _optimize
 from .passes.packing import _set_packings
@@ -159,11 +160,12 @@ def _compile_model(
         selection = _set_packings(
             graph, matches, selection, weights, tuning.costs or None
         )
-        _schedule(graph, inference, selection)
+        selected_inference = _selected_loop_inference(inference, selection)
+        _schedule(graph, selected_inference, selection)
         report("Allocating intermediate and cache memory")
         layout = _allocate(
             graph,
-            inference,
+            selected_inference,
             selection,
             weights,
             manifest,
@@ -210,10 +212,11 @@ def _compile_model(
                 for operator, call in chosen.calls.items()
             )
             if costs and workload is not None and fingerprint != baseline:
-                _schedule(graph, inference, chosen)
+                chosen_inference = _selected_loop_inference(inference, chosen)
+                _schedule(graph, chosen_inference, chosen)
                 variant_layout = _allocate(
                     graph,
-                    inference,
+                    chosen_inference,
                     chosen,
                     weights,
                     manifest,

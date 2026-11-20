@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
-from ..compiler_dataclasses import _Inference
+from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..kernels.kernel_dataclasses import _Kernel, _ParameterValue, _TensorBinding
 
 
@@ -20,6 +20,9 @@ class _KernelMatch:
     parameters: dict[str, _ParameterValue]
     attributes: dict[str, object] = field(default_factory=dict)
     packings: dict[Tensor, str] = field(default_factory=dict)
+    loop_dimensions: dict[Tensor, tuple[_ShapeExpression, ...]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(slots=True)
