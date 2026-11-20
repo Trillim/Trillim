@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdatomic.h>
 #if defined(__APPLE__)
+#include <stdlib.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <sys/auxv.h>
@@ -19,6 +20,12 @@
 extern COMPONENT_API TrillimStatus trillim_neon_packed_linear(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
 );
+
+#if defined(__APPLE__)
+extern TrillimStatus trillim_neon_try_packed_linear_prefill(
+    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+);
+#endif
 
 #if defined(__apple_build_version__) && __clang_major__ <= 17
 /* Older Apple assemblers discard function feature directives. */
@@ -930,6 +937,77 @@ static TrillimStatus run_hidden(
     return tiles == 1 ? operation(task, 0, 0) : pool->run(pool->context, tiles, operation, task);
 }
 
+#if defined(__APPLE__)
+enum { PREFILL_ELEMENTS = 1 << 20, MIN_PREFILL_WEIGHTS = 1 << 21, GATE_TILE = 1024 };
+
+typedef struct {
+    float *hidden;
+    const float *gate;
+    size_t count;
+    const TrillimKernelContext *context;
+} PrefillGateTask;
+
+static TrillimStatus apply_prefill_gate(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const PrefillGateTask *task = opaque;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t start = tile * GATE_TILE;
+    size_t count = task->count - start < GATE_TILE ? task->count - start : GATE_TILE;
+    for (size_t i = start; i < start + count; ++i) {
+        task->hidden[i] *= silu(task->gate[i]);
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus try_prefill(
+    const Task *task, size_t scratch_size, bool *handled
+) {
+    const Parameters *p = task->p;
+    *handled = false;
+    if (p->tokens < 32 || p->width < 256 || p->width % 32 != 0 ||
+        p->hidden_width < 1024 || p->hidden_width % 32 != 0 || p->outputs < 1024 || p->outputs > INT32_MAX ||
+        p->tokens > PREFILL_ELEMENTS / p->width || p->tokens > PREFILL_ELEMENTS / p->hidden_width ||
+        p->width * p->hidden_width < MIN_PREFILL_WEIGHTS || p->hidden_width * p->outputs < MIN_PREFILL_WEIGHTS ||
+        p->output_dtype != TRILLIM_FP32 || (uintptr_t)task->output % _Alignof(float) != 0 ||
+        p->up_dtype != p->gate_dtype || p->up_dtype != p->down_dtype || !packed_group_dtype(p->up_dtype) ||
+        !default_fpcr()) {
+        return TRILLIM_OK;
+    }
+    /* The up projection uses the existing FP32 hidden scratch. */
+    float *gate = malloc(scratch_size);
+    if (gate == NULL) {
+        return TRILLIM_OK;
+    }
+    const TrillimKernelContext *context = task->context;
+    LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
+    bool projected;
+    TrillimStatus status = trillim_neon_try_packed_linear_prefill(
+        task->hidden, task->inputs[0], task->inputs[1], &expand, context, &projected
+    );
+    if (status == TRILLIM_OK && projected) {
+        status = trillim_neon_try_packed_linear_prefill(
+            gate, task->inputs[0], task->inputs[2], &expand, context, &projected
+        );
+    }
+    if (status == TRILLIM_OK && projected) {
+        PrefillGateTask product = {task->hidden, gate, p->tokens * p->hidden_width, context};
+        size_t tiles = product.count / GATE_TILE + (product.count % GATE_TILE != 0);
+        const TrillimThreadPool *pool = context->thread_pool;
+        status = pool->run(pool->context, tiles, apply_prefill_gate, &product);
+    }
+    free(gate);
+    if (status != TRILLIM_OK || !projected) {
+        return status;
+    }
+    LinearParameters down = {p->tokens, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
+    return trillim_neon_try_packed_linear_prefill(
+        task->output, task->hidden, task->inputs[3], &down, context, handled
+    );
+}
+#endif
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -944,6 +1022,13 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
     }
     const Parameters *p = parameters;
     Task task = {outputs[0], inputs, scratch, p, context, NULL};
+#if defined(__APPLE__)
+    bool prefill;
+    status = try_prefill(&task, scratch_size, &prefill);
+    if (status != TRILLIM_OK || prefill) {
+        return status;
+    }
+#endif
     if (scratch_size != 0) {
         size_t count = p->tokens * p->hidden_width;
         size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
