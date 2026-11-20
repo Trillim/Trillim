@@ -1,6 +1,7 @@
 
 #include "common.h"
 #include <arm_neon.h>
+#include <stdatomic.h>
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #endif
@@ -299,9 +300,15 @@ __attribute__((weak)) extern TrillimStatus trillim_neon_packed_linear(
 
 static TrillimKernel linked_projection(void) {
 #if defined(__APPLE__)
-    void *symbol = dlsym(RTLD_SELF, "trillim_neon_packed_linear");
-    TrillimKernel kernel;
-    memcpy(&kernel, &symbol, sizeof(kernel));
+    static _Atomic(TrillimKernel) cached;
+    TrillimKernel kernel = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (kernel == NULL) {
+        void *symbol = dlsym(RTLD_SELF, "trillim_neon_packed_linear");
+        memcpy(&kernel, &symbol, sizeof(kernel));
+        if (kernel != NULL) {
+            atomic_store_explicit(&cached, kernel, memory_order_relaxed);
+        }
+    }
     return kernel;
 #else
     return trillim_neon_packed_linear;
