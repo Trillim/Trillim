@@ -1,6 +1,27 @@
 #include "common.h"
 #include <arm_neon.h>
 #include <math.h>
+/* Apple Clang 17 crashes while optimizing the BFDOT loop. */
+#if !defined(__apple_build_version__) || __clang_major__ > 17
+#define TRILLIM_PACKED_BFDOT 1
+#include <stdatomic.h>
+/* Function targets disappear before the builder's separate assembly step. */
+__asm__(".arch armv8.6-a+bf16");
+#if defined(__clang__)
+#define BF16 __attribute__((target("bf16")))
+#else
+#define BF16 __attribute__((target("+bf16")))
+#endif
+BF16 static inline float32x4_t dot_bf16(float32x4_t sum, uint16x8_t a, uint16x8_t b) {
+    return vbfdotq_f32(sum, vreinterpretq_bf16_u16(a), vreinterpretq_bf16_u16(b));
+}
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+#endif
 
 typedef struct {
     size_t tokens, width, outputs;
@@ -290,7 +311,138 @@ static inline __attribute__((always_inline)) void store_result(
     }
 }
 
-#define DEFINE_PROJECT(NAME, DTYPE, MTILE) \
+typedef struct {
+    const uint8_t *codes;
+    const uint8_t *scales;
+    const uint8_t *high;
+    const uint8_t *subscales;
+} PackedGroupRow;
+
+static inline PackedGroupRow packed_group_row(
+    const uint8_t *data, size_t width, size_t outputs, size_t column, uint32_t dtype
+) {
+    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    size_t groups = width / group + (width % group != 0);
+    size_t block = column * groups, total = outputs * groups;
+    size_t code_bytes = dtype == TRILLIM_DUBGRP_INT6 ? 128 : (dtype == TRILLIM_GRP_INT8 ? 32 : 16);
+    PackedGroupRow row = {
+        .codes = data + block * code_bytes,
+        .scales = data + total * code_bytes + block * 2,
+        .high = NULL,
+        .subscales = NULL
+    };
+    if (dtype == TRILLIM_GRP_INT5) {
+        row.high = data + total * (16 + 2) + block * 4;
+    } else if (dtype == TRILLIM_DUBGRP_INT6) {
+        row.high = data + total * (128 + 2) + block * 64;
+        row.subscales = data + total * (128 + 2 + 64) + block * 16;
+    }
+    return row;
+}
+
+static inline float32x4_t packed_group_scaled(int16x4_t codes, float scale, bool factored) {
+    float32x4_t value = vcvtq_f32_s32(vmovl_s16(codes));
+    return factored ? value : vmulq_n_f32(value, scale);
+}
+
+static inline void packed_group_widen(
+    int8x16_t codes, bool scaled, int8_t subscale, float scale, bool factored, float32x4_t result[4]
+) {
+    int16x8_t low = vmovl_s8(vget_low_s8(codes));
+    int16x8_t high = vmovl_high_s8(codes);
+    if (scaled) {
+        low = vmulq_n_s16(low, subscale);
+        high = vmulq_n_s16(high, subscale);
+    }
+    result[0] = packed_group_scaled(vget_low_s16(low), scale, factored);
+    result[1] = packed_group_scaled(vget_high_s16(low), scale, factored);
+    result[2] = packed_group_scaled(vget_low_s16(high), scale, factored);
+    result[3] = packed_group_scaled(vget_high_s16(high), scale, factored);
+}
+
+static inline void packed_group_q4(uint8x16_t codes, float scale, bool factored, float32x4_t result[4]) {
+    /* The sixteen centered codes have zero low bytes in FP16. */
+    static const uint8_t fp16_high[16] = {
+        200, 199, 198, 197, 196, 194, 192, 188, 0, 60, 64, 66, 68, 69, 70, 71
+    };
+    uint8x16_t bits = vqtbl1q_u8(vld1q_u8(fp16_high), codes);
+    float16x8_t lo = vreinterpretq_f16_u16(vshll_n_u8(vget_low_u8(bits), 8));
+    float16x8_t hi = vreinterpretq_f16_u16(vshll_high_n_u8(bits, 8));
+    result[0] = vcvt_f32_f16(vget_low_f16(lo));
+    result[1] = vcvt_high_f32_f16(lo);
+    result[2] = vcvt_f32_f16(vget_low_f16(hi));
+    result[3] = vcvt_high_f32_f16(hi);
+    if (!factored) {
+        for (size_t j = 0; j < 4; ++j) {
+            result[j] = vmulq_n_f32(result[j], scale);
+        }
+    }
+}
+
+static inline uint8x16_t packed_group_q5_high(const uint8_t *high) {
+    static const uint8_t masks[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x16_t bytes = vcombine_u8(vdup_n_u8(high[0]), vdup_n_u8(high[1]));
+    return vandq_u8(vtstq_u8(bytes, vld1q_u8(masks)), vdupq_n_u8(16));
+}
+
+static inline __attribute__((always_inline)) uint8x16x2_t packed_group_codes(
+    const PackedGroupRow *row, size_t k, uint32_t dtype
+) {
+    if (dtype == TRILLIM_GRP_INT8) {
+        return vld1q_u8_x2(row->codes + k);
+    }
+    const uint8x16_t mask = vdupq_n_u8(15);
+    if (dtype == TRILLIM_DUBGRP_INT6) {
+        size_t block = k / 256, segment = (k % 256) / 32;
+        const uint8_t *codes = row->codes + block * 128 + segment / 4 * 64 + segment % 4 / 2 * 32;
+        const uint8_t *high = row->high + block * 64 + segment / 4 * 32;
+        uint8x16x2_t packed = vld1q_u8_x2(codes);
+        uint8x16x2_t upper = vld1q_u8_x2(high);
+        int8x16_t shift = vdupq_n_s8((int8_t)(4 - (int)(segment % 4) * 2));
+        for (size_t i = 0; i < 2; ++i) {
+            uint8x16_t lo = segment & 1 ? vshrq_n_u8(packed.val[i], 4) : vandq_u8(packed.val[i], mask);
+            uint8x16_t hi = vandq_u8(vshlq_u8(upper.val[i], shift), vdupq_n_u8(48));
+            packed.val[i] = vorrq_u8(lo, hi);
+        }
+        return packed;
+    }
+    uint8x16_t packed = vld1q_u8(row->codes + k / 2);
+    uint8x16x2_t result = {{vandq_u8(packed, mask), vshrq_n_u8(packed, 4)}};
+    if (dtype == TRILLIM_GRP_INT5) {
+        const uint8_t *high = row->high + k / 8;
+        result.val[0] = vorrq_u8(result.val[0], packed_group_q5_high(high));
+        result.val[1] = vorrq_u8(result.val[1], packed_group_q5_high(high + 2));
+    }
+    return result;
+}
+
+static inline float packed_group_scale(const PackedGroupRow *row, size_t k, uint32_t dtype) {
+    size_t index = dtype == TRILLIM_DUBGRP_INT6 ? k / 256 : k / 32;
+    uint16_t bits;
+    memcpy(&bits, row->scales + index * 2, sizeof(bits));
+    return trillim_bf16(bits);
+}
+
+static inline __attribute__((always_inline)) void packed_group_decode32(
+    const PackedGroupRow *row, size_t k, uint32_t dtype, bool factored, float32x4_t result[8]
+) {
+    uint8x16x2_t codes = packed_group_codes(row, k, dtype);
+    float scale = factored ? 0 : packed_group_scale(row, k, dtype);
+    if (dtype == TRILLIM_GRP_INT4) {
+        packed_group_q4(codes.val[0], scale, factored, result);
+        packed_group_q4(codes.val[1], scale, factored, result + 4);
+        return;
+    }
+    bool has_subscale = dtype == TRILLIM_DUBGRP_INT6;
+    uint8_t zero = has_subscale ? 32 : (dtype == TRILLIM_GRP_INT5 ? 16 : 0);
+    const int8_t *subscales = has_subscale ? (const int8_t *)row->subscales + k / 16 : NULL;
+    for (size_t i = 0; i < 2; ++i) {
+        int8x16_t centered = vreinterpretq_s8_u8(vsubq_u8(codes.val[i], vdupq_n_u8(zero)));
+        packed_group_widen(centered, has_subscale, has_subscale ? subscales[i] : 1, scale, factored, result + i * 4);
+    }
+}
+
+#define DEFINE_PROJECT(NAME, DTYPE, MTILE, KSTEP) \
 static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
     (void)worker; \
     const Task *task = opaque; \
@@ -308,15 +460,25 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
         float32x4_t s20 = s00, s21 = s00, s30 = s00, s31 = s00; \
         float32x4_t s40 = s00, s41 = s00, s50 = s00, s51 = s00; \
         float32x4_t s60 = s00, s61 = s00, s70 = s00, s71 = s00; \
+        PackedGroupRow group0, group1; \
+        if (KSTEP == 32) { \
+            group0 = packed_group_row(task->weight, p->width, p->outputs, column, DTYPE); \
+            group1 = packed_group_row(task->weight, p->width, p->outputs, second, DTYPE); \
+        } \
         size_t k = 0; \
-        for (; k + 16 <= p->width; k += 16) { \
+        for (; p->width - k >= KSTEP; k += KSTEP) { \
             if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) { \
                 return TRILLIM_CANCELLED; \
             } \
-            float32x4_t w0[4], w1[4]; \
-            decode16(task, column, k, DTYPE, w0); \
-            decode16(task, second, k, DTYPE, w1); \
-            for (size_t j = 0; j < 4; ++j) { \
+            float32x4_t w0[KSTEP / 4], w1[KSTEP / 4]; \
+            if (KSTEP == 32) { \
+                packed_group_decode32(&group0, k, DTYPE, false, w0); \
+                packed_group_decode32(&group1, k, DTYPE, false, w1); \
+            } else { \
+                decode16(task, column, k, DTYPE, w0); \
+                decode16(task, second, k, DTYPE, w1); \
+            } \
+            for (size_t j = 0; j < KSTEP / 4; ++j) { \
                 float32x4_t x = load4(task->input, row * p->width + k + j * 4, p->input_dtype); \
                 s00 = vfmaq_f32(s00, x, w0[j]); \
                 s01 = vfmaq_f32(s01, x, w1[j]); \
@@ -382,23 +544,328 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
     return TRILLIM_OK; \
 }
 
-DEFINE_PROJECT(project_row_int8_4, TRILLIM_ROW_INT8, 4)
-DEFINE_PROJECT(project_mat_ternary_4, TRILLIM_MAT_TERNARY, 4)
-DEFINE_PROJECT(project_grp_int8_4, TRILLIM_GRP_INT8, 4)
-DEFINE_PROJECT(project_grp_int4_4, TRILLIM_GRP_INT4, 4)
-DEFINE_PROJECT(project_grp_int5_4, TRILLIM_GRP_INT5, 4)
-DEFINE_PROJECT(project_dubgrp_int6_4, TRILLIM_DUBGRP_INT6, 4)
-DEFINE_PROJECT(project_grp_binary_4, TRILLIM_GRP_BINARY, 4)
-DEFINE_PROJECT(project_grp_ternary_4, TRILLIM_GRP_TERNARY, 4)
-DEFINE_PROJECT(project_mxfp4_4, TRILLIM_MXFP4, 4)
-DEFINE_PROJECT(project_mat_ternary_8, TRILLIM_MAT_TERNARY, 8)
-DEFINE_PROJECT(project_grp_int5_8, TRILLIM_GRP_INT5, 8)
-DEFINE_PROJECT(project_dubgrp_int6_8, TRILLIM_DUBGRP_INT6, 8)
-DEFINE_PROJECT(project_grp_binary_8, TRILLIM_GRP_BINARY, 8)
-DEFINE_PROJECT(project_grp_ternary_8, TRILLIM_GRP_TERNARY, 8)
-DEFINE_PROJECT(project_mxfp4_8, TRILLIM_MXFP4, 8)
+DEFINE_PROJECT(project_row_int8_4, TRILLIM_ROW_INT8, 4, 16)
+DEFINE_PROJECT(project_mat_ternary_4, TRILLIM_MAT_TERNARY, 4, 16)
+DEFINE_PROJECT(project_grp_int8_4, TRILLIM_GRP_INT8, 4, 16)
+DEFINE_PROJECT(project_grp_int4_4, TRILLIM_GRP_INT4, 4, 16)
+DEFINE_PROJECT(project_grp_int5_4, TRILLIM_GRP_INT5, 4, 16)
+DEFINE_PROJECT(project_dubgrp_int6_4, TRILLIM_DUBGRP_INT6, 4, 16)
+DEFINE_PROJECT(project_grp_binary_4, TRILLIM_GRP_BINARY, 4, 16)
+DEFINE_PROJECT(project_grp_ternary_4, TRILLIM_GRP_TERNARY, 4, 16)
+DEFINE_PROJECT(project_mxfp4_4, TRILLIM_MXFP4, 4, 16)
+DEFINE_PROJECT(project_mat_ternary_8, TRILLIM_MAT_TERNARY, 8, 16)
+DEFINE_PROJECT(project_grp_int5_8, TRILLIM_GRP_INT5, 8, 16)
+DEFINE_PROJECT(project_dubgrp_int6_8, TRILLIM_DUBGRP_INT6, 8, 16)
+DEFINE_PROJECT(project_grp_binary_8, TRILLIM_GRP_BINARY, 8, 16)
+DEFINE_PROJECT(project_grp_ternary_8, TRILLIM_GRP_TERNARY, 8, 16)
+DEFINE_PROJECT(project_mxfp4_8, TRILLIM_MXFP4, 8, 16)
+
+DEFINE_PROJECT(project_grp_int4_group, TRILLIM_GRP_INT4, 4, 32)
+DEFINE_PROJECT(project_grp_int5_group, TRILLIM_GRP_INT5, 8, 32)
+DEFINE_PROJECT(project_dubgrp_int6_group, TRILLIM_DUBGRP_INT6, 8, 32)
 
 #undef DEFINE_PROJECT
+
+#define DEFINE_GROUP_DECODE(NAME, DTYPE) \
+static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
+    (void)worker; \
+    const Task *task = opaque; \
+    const Parameters *p = task->p; \
+    size_t first = tile * task->columns; \
+    size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns; \
+    for (size_t column = first; column < end; column += 4) { \
+        if (task->context->is_cancelled(task->context->cancellation_context)) { \
+            return TRILLIM_CANCELLED; \
+        } \
+        size_t count = end - column < 4 ? end - column : 4; \
+        PackedGroupRow group[4]; \
+        float32x4_t sums[4]; \
+        for (size_t c = 0; c < 4; ++c) { \
+            group[c] = packed_group_row(task->weight, p->width, p->outputs, column + (c < count ? c : 0), DTYPE); \
+            sums[c] = vdupq_n_f32(0); \
+        } \
+        for (size_t k = 0; k < p->width; k += 32) { \
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) { \
+                return TRILLIM_CANCELLED; \
+            } \
+            float32x4_t x[8]; \
+            for (size_t j = 0; j < 8; ++j) { \
+                x[j] = load4(task->input, k + j * 4, p->input_dtype); \
+            } \
+            for (size_t c = 0; c < 4; ++c) { \
+                float32x4_t weights[8], sum = sums[c]; \
+                packed_group_decode32(&group[c], k, DTYPE, false, weights); \
+                for (size_t j = 0; j < 8; ++j) { \
+                    sum = vfmaq_f32(sum, x[j], weights[j]); \
+                } \
+                sums[c] = sum; \
+            } \
+        } \
+        for (size_t c = 0; c < count; ++c) { \
+            store_result(task->output, column + c, p->output_dtype, (TrillimValue){.f = vaddvq_f32(sums[c])}); \
+        } \
+    } \
+    return TRILLIM_OK; \
+}
+
+DEFINE_GROUP_DECODE(project_grp_int4_decode, TRILLIM_GRP_INT4)
+DEFINE_GROUP_DECODE(project_grp_int5_decode, TRILLIM_GRP_INT5)
+DEFINE_GROUP_DECODE(project_dubgrp_int6_decode, TRILLIM_DUBGRP_INT6)
+DEFINE_GROUP_DECODE(project_grp_int8_decode, TRILLIM_GRP_INT8)
+
+#undef DEFINE_GROUP_DECODE
+
+/* Nonzero inputs and scales in [2^-40, 2^41) keep factored dots in the normal FP32 range. */
+enum { MIN_GROUP_EXPONENT = 87, MAX_GROUP_EXPONENT = 167, MAX_FACTORED_WIDTH = 1 << 16 };
+
+static TrillimStatus bounded_group_scales(
+    const uint8_t *scales, size_t count, const TrillimKernelContext *context, bool *valid
+) {
+    const unsigned minimum = MIN_GROUP_EXPONENT << 7;
+    const unsigned span = ((MAX_GROUP_EXPONENT - MIN_GROUP_EXPONENT + 1) << 7) - 1;
+    uint16x8_t rejected = vdupq_n_u16(0);
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        if ((i & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint16x8_t raw = vreinterpretq_u16_u8(vld1q_u8(scales + i * 2));
+        uint16x8_t magnitude = vandq_u16(raw, vdupq_n_u16(0x7fff));
+        uint16x8_t outside = vcgtq_u16(vsubq_u16(magnitude, vdupq_n_u16(minimum)), vdupq_n_u16(span));
+        rejected = vorrq_u16(rejected, vbicq_u16(outside, vceqzq_u16(magnitude)));
+    }
+    for (; i < count; ++i) {
+        uint16_t raw;
+        memcpy(&raw, scales + i * 2, sizeof(raw));
+        unsigned magnitude = raw & 0x7fff;
+        if (magnitude != 0 && magnitude - minimum > span) {
+            *valid = false;
+            return TRILLIM_OK;
+        }
+    }
+    *valid = vmaxvq_u16(rejected) == 0;
+    return TRILLIM_OK;
+}
+
+#if defined(TRILLIM_PACKED_BFDOT)
+static bool available_bf16(void) {
+    static atomic_int cached = ATOMIC_VAR_INIT(0);
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value) {
+        return value == 2;
+    }
+    bool available = false;
+#if defined(__APPLE__)
+    int flag = 0;
+    size_t size = sizeof(flag);
+    available = sysctlbyname("hw.optional.arm.FEAT_BF16", &flag, &size, NULL, 0) == 0 && flag != 0;
+#elif defined(__linux__) && defined(HWCAP2_BF16)
+    available = (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+#endif
+    atomic_store_explicit(&cached, available ? 2 : 1, memory_order_relaxed);
+    return available;
+}
+
+/* Every centered Q5 code is exactly representable in BF16. */
+static const uint8_t code_high_32[32] = {
+    193, 193, 193, 193, 193, 193, 193, 193, 193, 192, 192, 192, 192, 192, 192, 191,
+    0, 63, 64, 64, 64, 64, 64, 64, 65, 65, 65, 65, 65, 65, 65, 65,
+};
+static const uint8_t code_low_32[32] = {
+    128, 112, 96, 80, 64, 48, 32, 16, 0, 224, 192, 160, 128, 64, 0, 128,
+    0, 128, 0, 64, 128, 160, 192, 224, 0, 16, 32, 48, 64, 80, 96, 112,
+};
+static inline uint16x8x2_t bf16_from_q5(uint8x16_t codes) {
+    uint8x16_t lo = vqtbl2q_u8(vld1q_u8_x2(code_low_32), codes);
+    uint8x16_t hi = vqtbl2q_u8(vld1q_u8_x2(code_high_32), codes);
+    uint16x8x2_t weights = {{
+        vreinterpretq_u16_u8(vzip1q_u8(lo, hi)),
+        vreinterpretq_u16_u8(vzip2q_u8(lo, hi))
+    }};
+    return weights;
+}
+
+#endif
+
+static TrillimStatus check_factored_input(const Task *task, bool *bounded) {
+    const Parameters *p = task->p;
+    const uint32x4_t minimum = vdupq_n_u32((uint32_t)MIN_GROUP_EXPONENT << 23);
+    const uint32x4_t span = vdupq_n_u32(((uint32_t)(MAX_GROUP_EXPONENT - MIN_GROUP_EXPONENT + 1) << 23) - 1);
+    uint32x4_t rejected = vdupq_n_u32(0);
+    for (size_t k = 0; k < p->width; k += 4) {
+        if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint32x4_t magnitude = vandq_u32(vreinterpretq_u32_f32(load4(task->input, k, p->input_dtype)),
+            vdupq_n_u32(UINT32_C(0x7fffffff)));
+        uint32x4_t outside = vcgtq_u32(vsubq_u32(magnitude, minimum), span);
+        rejected = vorrq_u32(rejected, vbicq_u32(outside, vceqzq_u32(magnitude)));
+    }
+    *bounded = vmaxvq_u32(rejected) == 0;
+    return TRILLIM_OK;
+}
+
+#if defined(TRILLIM_PACKED_BFDOT)
+BF16 static TrillimStatus project_bf16_int5(void *opaque, size_t tile, size_t worker) {
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t first = tile * task->columns;
+    size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
+    size_t groups = p->width / 32;
+    PackedGroupRow first_row = packed_group_row(task->weight, p->width, p->outputs, first, TRILLIM_GRP_INT5);
+    bool valid;
+    TrillimStatus status = bounded_group_scales(first_row.scales, (end - first) * groups, task->context, &valid);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    if (!valid) {
+        return project_grp_int5_decode(opaque, tile, worker);
+    }
+    for (size_t column = first; column < end; column += 4) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - column < 4 ? end - column : 4;
+        PackedGroupRow row[4];
+        float32x4_t sums[4] = {0};
+        for (size_t c = 0; c < 4; ++c) {
+            row[c] = packed_group_row(task->weight, p->width, p->outputs, column + (c < count ? c : 0), TRILLIM_GRP_INT5);
+        }
+        for (size_t k = 0; k < p->width; k += 32) {
+            if (k != 0 && (k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            uint16x8_t x[4];
+            for (size_t j = 0; j < 4; ++j) {
+                x[j] = vld1q_u16((const uint16_t *)task->input + k + j * 8);
+            }
+            float32x4_t partial[4] = {0};
+            for (size_t c = 0; c < 4; ++c) {
+                uint8x16x2_t codes = packed_group_codes(&row[c], k, TRILLIM_GRP_INT5);
+                uint16x8x2_t lo = bf16_from_q5(codes.val[0]);
+                uint16x8x2_t hi = bf16_from_q5(codes.val[1]);
+                float32x4_t sum = dot_bf16(vdupq_n_f32(0), x[0], lo.val[0]);
+                sum = dot_bf16(sum, x[1], lo.val[1]);
+                sum = dot_bf16(sum, x[2], hi.val[0]);
+                sum = dot_bf16(sum, x[3], hi.val[1]);
+                partial[c] = sum;
+            }
+            for (size_t c = 0; c < 4; ++c) {
+                float scale = packed_group_scale(&row[c], k, TRILLIM_GRP_INT5);
+                sums[c] = vfmaq_n_f32(sums[c], partial[c], scale);
+            }
+        }
+        for (size_t c = 0; c < count; ++c) {
+            store_result(task->output, column + c, p->output_dtype, (TrillimValue){.f = vaddvq_f32(sums[c])});
+        }
+    }
+    return TRILLIM_OK;
+}
+
+#endif
+
+/* Keep activation and code products in FP32 and apply each scale after its block dot. */
+static inline __attribute__((always_inline)) TrillimStatus project_factored_group(
+    void *opaque, size_t tile, uint32_t dtype, TrillimTask fallback
+) {
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t first = tile * task->columns;
+    size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
+    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    size_t groups = p->width / group + (p->width % group != 0);
+    PackedGroupRow first_row = packed_group_row(task->weight, p->width, p->outputs, first, dtype);
+    bool valid;
+    TrillimStatus status = bounded_group_scales(first_row.scales, (end - first) * groups, task->context, &valid);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    if (!valid) {
+        return fallback(opaque, tile, 0);
+    }
+    for (size_t column = first; column < end; column += 4) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - column < 4 ? end - column : 4;
+        PackedGroupRow row[4];
+        float32x4_t sums[4] = {0};
+        for (size_t c = 0; c < 4; ++c) {
+            row[c] = packed_group_row(task->weight, p->width, p->outputs, column + (c < count ? c : 0), dtype);
+        }
+        for (size_t k = 0; k < p->width; k += group) {
+            if (k != 0 && (k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t partial[4] = {0};
+            size_t length = p->width - k < group ? p->width - k : group;
+            for (size_t offset = 0; offset < length; offset += 32) {
+                float32x4_t x[8];
+                for (size_t j = 0; j < 8; ++j) {
+                    x[j] = load4(task->input, k + offset + j * 4, p->input_dtype);
+                }
+                for (size_t c = 0; c < 4; ++c) {
+                    float32x4_t weights[8];
+                    packed_group_decode32(&row[c], k + offset, dtype, true, weights);
+                    float32x4_t lo = partial[c], hi = vdupq_n_f32(0);
+                    for (size_t j = 0; j < 4; ++j) {
+                        lo = vfmaq_f32(lo, x[j], weights[j]);
+                        hi = vfmaq_f32(hi, x[j + 4], weights[j + 4]);
+                    }
+                    partial[c] = vaddq_f32(lo, hi);
+                }
+            }
+            for (size_t c = 0; c < 4; ++c) {
+                sums[c] = vfmaq_n_f32(sums[c], partial[c], packed_group_scale(&row[c], k, dtype));
+            }
+        }
+        for (size_t c = 0; c < count; ++c) {
+            store_result(task->output, column + c, p->output_dtype, (TrillimValue){.f = vaddvq_f32(sums[c])});
+        }
+    }
+    return TRILLIM_OK;
+}
+
+#define DEFINE_FACTORED_PROJECT(NAME, DTYPE, FALLBACK) \
+static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
+    (void)worker; \
+    return project_factored_group(opaque, tile, DTYPE, FALLBACK); \
+}
+
+DEFINE_FACTORED_PROJECT(project_factored_int4, TRILLIM_GRP_INT4, project_grp_int4_decode)
+DEFINE_FACTORED_PROJECT(project_factored_int5, TRILLIM_GRP_INT5, project_grp_int5_decode)
+DEFINE_FACTORED_PROJECT(project_factored_int6, TRILLIM_DUBGRP_INT6, project_dubgrp_int6_decode)
+DEFINE_FACTORED_PROJECT(project_factored_int8, TRILLIM_GRP_INT8, project_grp_int8_decode)
+
+#undef DEFINE_FACTORED_PROJECT
+
+static TrillimTask factored_projection(uint32_t dtype) {
+    switch (dtype) {
+    case TRILLIM_GRP_INT4: return project_factored_int4;
+    case TRILLIM_GRP_INT5: return project_factored_int5;
+    case TRILLIM_DUBGRP_INT6: return project_factored_int6;
+    case TRILLIM_GRP_INT8: return project_factored_int8;
+    default: return NULL;
+    }
+}
+
+static TrillimTask group_projection(uint32_t dtype, size_t rows) {
+    switch (dtype) {
+    case TRILLIM_GRP_INT4: return rows == 1 ? project_grp_int4_decode : project_grp_int4_group;
+    case TRILLIM_GRP_INT5:
+        if (rows == 1) {
+            return project_grp_int5_decode;
+        }
+        return rows == 8 ? project_grp_int5_group : NULL;
+    case TRILLIM_DUBGRP_INT6:
+        if (rows == 1) {
+            return project_dubgrp_int6_decode;
+        }
+        return rows == 8 ? project_dubgrp_int6_group : NULL;
+    case TRILLIM_GRP_INT8: return rows == 1 ? project_grp_int8_decode : NULL;
+    default: return NULL;
+    }
+}
 
 static TrillimTask projection(uint32_t dtype, size_t rows) {
     if (rows == 8) {
@@ -513,8 +980,38 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
         (p->weight_dtype == TRILLIM_MAT_TERNARY || p->weight_dtype >= TRILLIM_GRP_INT5);
     size_t row_tile = large_tile ? 8 : 4;
     TrillimTask operation = p->output_dtype == TRILLIM_FP32 ? projection(p->weight_dtype, row_tile) : project_ordered;
+    if (p->output_dtype == TRILLIM_FP32 && p->width != 0 && p->width % 32 == 0) {
+        size_t group_rows = p->tokens == 1 ? 1 : row_tile;
+        TrillimTask groups = group_projection(p->weight_dtype, group_rows);
+        if (groups != NULL) {
+            operation = groups;
+            row_tile = group_rows;
+            if (row_tile == 1) {
+                task.columns = columns / 4 * 4;
+            }
+        }
+    }
+    if (row_tile == 1 && p->width >= 1024 && p->width <= MAX_FACTORED_WIDTH && p->outputs >= 16 &&
+        (p->input_dtype == TRILLIM_BF16 || p->input_dtype == TRILLIM_FP32)) {
+        TrillimTask factored = factored_projection(p->weight_dtype);
+        if (factored != NULL) {
+            bool bounded;
+            TrillimStatus status = check_factored_input(&task, &bounded);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            if (bounded) {
+                operation = factored;
+#if defined(TRILLIM_PACKED_BFDOT)
+                if (p->weight_dtype == TRILLIM_GRP_INT5 && p->input_dtype == TRILLIM_BF16 && available_bf16()) {
+                    operation = project_bf16_int5;
+                }
+#endif
+            }
+        }
+    }
     size_t rows = p->tokens / row_tile + (p->tokens % row_tile != 0);
-    size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
+    size_t tiles = p->outputs / task.columns + (p->outputs % task.columns != 0);
     if (p->width <= 65536 / (p->tokens * p->outputs)) {
         task.columns = p->outputs;
         for (size_t tile = 0; tile < rows; ++tile) {

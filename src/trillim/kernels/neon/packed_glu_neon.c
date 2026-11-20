@@ -171,6 +171,170 @@ static inline __attribute__((always_inline)) void trillim_packed_neon_decode16(
 enum { TILE_SIZE = 16 };
 
 typedef struct {
+    const uint8_t *codes;
+    const uint8_t *scales;
+    const uint8_t *high;
+    const uint8_t *subscales;
+} PackedGroupRow;
+
+static inline bool packed_group_dtype(uint32_t dtype) {
+    return dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5 ||
+        dtype == TRILLIM_DUBGRP_INT6 || dtype == TRILLIM_GRP_INT8;
+}
+
+static inline PackedGroupRow packed_group_row(
+    const uint8_t *data, size_t width, size_t outputs, size_t column, uint32_t dtype
+) {
+    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    size_t groups = width / group + (width % group != 0);
+    size_t block = column * groups, total = outputs * groups;
+    size_t code_bytes = dtype == TRILLIM_DUBGRP_INT6 ? 128 : (dtype == TRILLIM_GRP_INT8 ? 32 : 16);
+    PackedGroupRow row = {
+        .codes = data + block * code_bytes,
+        .scales = data + total * code_bytes + block * 2,
+        .high = NULL,
+        .subscales = NULL
+    };
+    if (dtype == TRILLIM_GRP_INT5) {
+        row.high = data + total * (16 + 2) + block * 4;
+    } else if (dtype == TRILLIM_DUBGRP_INT6) {
+        row.high = data + total * (128 + 2) + block * 64;
+        row.subscales = data + total * (128 + 2 + 64) + block * 16;
+    }
+    return row;
+}
+
+static inline float32x4_t packed_group_scaled(int16x4_t codes, float scale) {
+    return vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(codes)), scale);
+}
+
+static inline void packed_group_widen(
+    int8x16_t codes, bool scaled, int8_t subscale, float scale, float32x4_t result[4]
+) {
+    int16x8_t low = vmovl_s8(vget_low_s8(codes));
+    int16x8_t high = vmovl_high_s8(codes);
+    if (scaled) {
+        low = vmulq_n_s16(low, subscale);
+        high = vmulq_n_s16(high, subscale);
+    }
+    result[0] = packed_group_scaled(vget_low_s16(low), scale);
+    result[1] = packed_group_scaled(vget_high_s16(low), scale);
+    result[2] = packed_group_scaled(vget_low_s16(high), scale);
+    result[3] = packed_group_scaled(vget_high_s16(high), scale);
+}
+
+static inline void packed_group_q4(uint8x16_t codes, float scale, float32x4_t result[4]) {
+    /* The sixteen centered codes have zero low bytes in FP16. */
+    static const uint8_t fp16_high[16] = {
+        200, 199, 198, 197, 196, 194, 192, 188, 0, 60, 64, 66, 68, 69, 70, 71
+    };
+    uint8x16_t bits = vqtbl1q_u8(vld1q_u8(fp16_high), codes);
+    float16x8_t lo = vreinterpretq_f16_u16(vshll_n_u8(vget_low_u8(bits), 8));
+    float16x8_t hi = vreinterpretq_f16_u16(vshll_high_n_u8(bits, 8));
+    result[0] = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(lo)), scale);
+    result[1] = vmulq_n_f32(vcvt_high_f32_f16(lo), scale);
+    result[2] = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(hi)), scale);
+    result[3] = vmulq_n_f32(vcvt_high_f32_f16(hi), scale);
+}
+
+static inline uint8x16_t packed_group_q5_high(const uint8_t *high) {
+    static const uint8_t masks[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x16_t bytes = vcombine_u8(vdup_n_u8(high[0]), vdup_n_u8(high[1]));
+    return vandq_u8(vtstq_u8(bytes, vld1q_u8(masks)), vdupq_n_u8(16));
+}
+
+static inline __attribute__((always_inline)) void packed_group_decode32(
+    const PackedGroupRow *row, size_t k, uint32_t dtype, float32x4_t result[8]
+) {
+    uint16_t scale_bits;
+    if (dtype == TRILLIM_DUBGRP_INT6) {
+        size_t block = k / 256, segment = (k % 256) / 32;
+        const uint8_t *codes = row->codes + block * 128 + segment / 4 * 64 + segment % 4 / 2 * 32;
+        const uint8_t *high = row->high + block * 64 + segment / 4 * 32;
+        const int8_t *subscales = (const int8_t *)row->subscales + k / 16;
+        memcpy(&scale_bits, row->scales + block * 2, sizeof(scale_bits));
+        float scale = trillim_bf16(scale_bits);
+        int8x16_t zero = vdupq_n_s8(32);
+        int8x16_t shift = vdupq_n_s8(-(int8_t)(segment % 4 * 2));
+        uint8x16_t packed0 = vld1q_u8(codes), packed1 = vld1q_u8(codes + 16);
+        uint8x16_t lo0 = segment & 1 ? vshrq_n_u8(packed0, 4) : vandq_u8(packed0, vdupq_n_u8(15));
+        uint8x16_t lo1 = segment & 1 ? vshrq_n_u8(packed1, 4) : vandq_u8(packed1, vdupq_n_u8(15));
+        uint8x16_t upper0 = vshlq_u8(vld1q_u8(high), shift);
+        uint8x16_t upper1 = vshlq_u8(vld1q_u8(high + 16), shift);
+        upper0 = vshlq_n_u8(vandq_u8(upper0, vdupq_n_u8(3)), 4);
+        upper1 = vshlq_n_u8(vandq_u8(upper1, vdupq_n_u8(3)), 4);
+        int8x16_t a = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo0, upper0)), zero);
+        int8x16_t b = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(lo1, upper1)), zero);
+        packed_group_widen(a, true, subscales[0], scale, result);
+        packed_group_widen(b, true, subscales[1], scale, result + 4);
+        return;
+    }
+    memcpy(&scale_bits, row->scales + k / 16, sizeof(scale_bits));
+    float scale = trillim_bf16(scale_bits);
+    if (dtype == TRILLIM_GRP_INT8) {
+        const int8_t *codes = (const int8_t *)row->codes + k;
+        packed_group_widen(vld1q_s8(codes), false, 1, scale, result);
+        packed_group_widen(vld1q_s8(codes + 16), false, 1, scale, result + 4);
+        return;
+    }
+    uint8x16_t packed = vld1q_u8(row->codes + k / 2);
+    uint8x16_t a = vandq_u8(packed, vdupq_n_u8(15)), b = vshrq_n_u8(packed, 4);
+    if (dtype == TRILLIM_GRP_INT4) {
+        packed_group_q4(a, scale, result);
+        packed_group_q4(b, scale, result + 4);
+        return;
+    }
+    const uint8_t *high = row->high + k / 8;
+    int8x16_t low = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(a, packed_group_q5_high(high))), vdupq_n_s8(16));
+    int8x16_t upper = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(b, packed_group_q5_high(high + 2))), vdupq_n_s8(16));
+    packed_group_widen(low, false, 1, scale, result);
+    packed_group_widen(upper, false, 1, scale, result + 4);
+}
+
+enum { GROUP_ROWS = 2 };
+
+static inline __attribute__((always_inline)) TrillimStatus packed_group_dot(
+    const void *input, uint32_t input_dtype, size_t row, size_t rows, size_t width, uint32_t dtype,
+    const PackedGroupRow *first, const PackedGroupRow *second, const TrillimKernelContext *context,
+    float result[GROUP_ROWS], float other[GROUP_ROWS]
+) {
+    const bool pair = second != NULL;
+    float32x4_t a[GROUP_ROWS][4] = {{0}}, b[GROUP_ROWS][4] = {{0}};
+    for (size_t k = 0; k < width; k += 32) {
+        if ((k & 255) == 0 && context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t aw[8], bw[8];
+        packed_group_decode32(first, k, dtype, aw);
+        if (pair) {
+            packed_group_decode32(second, k, dtype, bw);
+        }
+        for (size_t j = 0; j < 8; ++j) {
+            float32x4_t x = trillim_neon_load4(input, row * width + k + j * 4, input_dtype);
+            a[0][j % 4] = vaddq_f32(a[0][j % 4], vmulq_f32(x, aw[j]));
+            if (pair) {
+                b[0][j % 4] = vaddq_f32(b[0][j % 4], vmulq_f32(x, bw[j]));
+            }
+            if (rows > 1) {
+                x = trillim_neon_load4(input, (row + 1) * width + k + j * 4, input_dtype);
+                a[1][j % 4] = vaddq_f32(a[1][j % 4], vmulq_f32(x, aw[j]));
+                if (pair) {
+                    b[1][j % 4] = vaddq_f32(b[1][j % 4], vmulq_f32(x, bw[j]));
+                }
+            }
+        }
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        result[r] = vaddvq_f32(vaddq_f32(vaddq_f32(a[r][0], a[r][2]), vaddq_f32(a[r][1], a[r][3])));
+        if (pair) {
+            other[r] = vaddvq_f32(vaddq_f32(vaddq_f32(b[r][0], b[r][2]), vaddq_f32(b[r][1], b[r][3])));
+        }
+    }
+    return TRILLIM_OK;
+}
+
+
+typedef struct {
     size_t tokens, width, outputs;
     uint32_t input_dtype, output_dtype;
     uint32_t gate_dtype, up_dtype;
@@ -293,6 +457,67 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
         ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+static inline __attribute__((always_inline)) TrillimStatus project_groups(
+    void *opaque, size_t tile, uint32_t dtype
+) {
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t tiles = p->outputs / TILE_SIZE + (p->outputs % TILE_SIZE != 0);
+    size_t row = tile / tiles * GROUP_ROWS, first = tile % tiles * TILE_SIZE;
+    size_t rows = p->tokens - row < GROUP_ROWS ? p->tokens - row : GROUP_ROWS;
+    size_t end = p->outputs - first < TILE_SIZE ? p->outputs : first + TILE_SIZE;
+    for (size_t column = first; column < end; ++column) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        PackedGroupRow a = packed_group_row(task->inputs[1], p->width, p->outputs, column, dtype);
+        PackedGroupRow b = packed_group_row(task->inputs[2], p->width, p->outputs, column, dtype);
+        float gate[GROUP_ROWS], up[GROUP_ROWS];
+        TrillimStatus status = packed_group_dot(
+            task->inputs[0], p->input_dtype, row, rows, p->width, dtype, &a, &b, task->context, gate, up
+        );
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        for (size_t r = 0; r < rows; ++r) {
+            float value = silu(gate[r]) * up[r];
+            size_t index = (row + r) * p->outputs + column;
+            trillim_store(task->output, index, p->output_dtype, (TrillimValue){.f = value});
+        }
+    }
+    return task->context->is_cancelled(task->context->cancellation_context)
+        ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+#define DEFINE_GROUP_PROJECT(NAME, DTYPE) \
+static TrillimStatus NAME##_##DTYPE(void *opaque, size_t tile, size_t worker) { \
+    (void)worker; \
+    return NAME(opaque, tile, DTYPE); \
+}
+
+DEFINE_GROUP_PROJECT(project_groups, TRILLIM_GRP_INT4)
+DEFINE_GROUP_PROJECT(project_groups, TRILLIM_GRP_INT5)
+DEFINE_GROUP_PROJECT(project_groups, TRILLIM_DUBGRP_INT6)
+DEFINE_GROUP_PROJECT(project_groups, TRILLIM_GRP_INT8)
+
+#undef DEFINE_GROUP_PROJECT
+
+static TrillimTask project_groups_operation(uint32_t dtype) {
+    switch (dtype) {
+    case TRILLIM_GRP_INT4: return project_groups_TRILLIM_GRP_INT4;
+    case TRILLIM_GRP_INT5: return project_groups_TRILLIM_GRP_INT5;
+    case TRILLIM_DUBGRP_INT6: return project_groups_TRILLIM_DUBGRP_INT6;
+    case TRILLIM_GRP_INT8: return project_groups_TRILLIM_GRP_INT8;
+    default: return NULL;
+    }
+}
+
+static size_t group_tiles(size_t tokens, size_t outputs) {
+    size_t rows = tokens / GROUP_ROWS + (tokens % GROUP_ROWS != 0);
+    size_t columns = outputs / TILE_SIZE + (outputs % TILE_SIZE != 0);
+    return rows * columns;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_glu(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -310,8 +535,14 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_glu(
     Task task = {outputs[0], inputs, p, context};
     size_t count = p->tokens * p->outputs;
     size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
-    return tiles == 1 ? project(&task, 0, 0) :
-        context->thread_pool->run(context->thread_pool->context, tiles, project, &task);
+    TrillimTask operation = project;
+    if (p->width != 0 && p->width % 32 == 0 && p->gate_dtype == p->up_dtype &&
+        packed_group_dtype(p->gate_dtype) && (p->tokens > 1 || p->gate_dtype != TRILLIM_GRP_INT8)) {
+        operation = project_groups_operation(p->gate_dtype);
+        tiles = group_tiles(p->tokens, p->outputs);
+    }
+    return tiles == 1 ? operation(&task, 0, 0) :
+        context->thread_pool->run(context->thread_pool->context, tiles, operation, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_packed_glu_tdl(void) {
@@ -374,6 +605,10 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_packed_glu_parameters(
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_packed_glu_capabilities(void) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    static const TrillimCapabilities caps = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
+#else
     static const TrillimCapabilities caps = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_NEON | TRILLIM_CAP_LIBM};
+#endif
     return &caps;
 }

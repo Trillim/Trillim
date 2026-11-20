@@ -81,6 +81,7 @@ typedef struct {
     const Parameters *p;
     size_t columns;
     const TrillimKernelContext *context;
+    bool bounded_input;
 } Task;
 
 static inline bool trillim_matrix_span(size_t base, size_t rows, size_t columns, size_t row_stride, size_t col_stride, size_t capacity) {
@@ -396,6 +397,291 @@ static TrillimTask projection(uint32_t dtype) {
     }
 }
 
+typedef struct {
+    const uint8_t *values;
+    const uint8_t *scales;
+    const uint8_t *high;
+    const int8_t *subscales;
+} GroupPlanes;
+
+static inline uint8x16_t spread_group_bits(const uint8_t *bits) {
+    const uint8x16_t mask = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x16_t bytes = vcombine_u8(vdup_n_u8(bits[0]), vdup_n_u8(bits[1]));
+    return vandq_u8(vceqq_u8(vandq_u8(bytes, mask), mask), vdupq_n_u8(16));
+}
+
+static inline __attribute__((always_inline)) int8x16x2_t load_group_codes(
+    const GroupPlanes *planes, size_t block, size_t k, uint32_t dtype
+) {
+    if (dtype == TRILLIM_GRP_INT8) {
+        return vld1q_s8_x2((const int8_t *)planes->values + block * 32);
+    }
+    const uint8x16_t mask = vdupq_n_u8(15);
+    uint8x16_t codes0, codes1;
+    uint8_t zero;
+    if (dtype == TRILLIM_DUBGRP_INT6) {
+        size_t half = k % 256 / 128;
+        size_t lane = k % 128 / 32;
+        uint8x16x2_t low = vld1q_u8_x2(planes->values + block * 128 + half * 64 + lane / 2 * 32);
+        uint8x16x2_t high = vld1q_u8_x2(planes->high + block * 64 + half * 32);
+        int8x16_t shift = vdupq_n_s8((int8_t)(4 - (int)lane * 2));
+        const uint8x16_t upper = vdupq_n_u8(48);
+        codes0 = vreinterpretq_u8_s8(vshlq_s8(vreinterpretq_s8_u8(high.val[0]), shift));
+        codes1 = vreinterpretq_u8_s8(vshlq_s8(vreinterpretq_s8_u8(high.val[1]), shift));
+        if (lane % 2 == 0) {
+            codes0 = vorrq_u8(vandq_u8(codes0, upper), vandq_u8(low.val[0], mask));
+            codes1 = vorrq_u8(vandq_u8(codes1, upper), vandq_u8(low.val[1], mask));
+        } else {
+            codes0 = vorrq_u8(vandq_u8(codes0, upper), vshrq_n_u8(low.val[0], 4));
+            codes1 = vorrq_u8(vandq_u8(codes1, upper), vshrq_n_u8(low.val[1], 4));
+        }
+        zero = 32;
+    } else {
+        uint8x16_t packed = vld1q_u8(planes->values + block * 16);
+        codes0 = vandq_u8(packed, mask);
+        codes1 = vshrq_n_u8(packed, 4);
+        zero = 8;
+        if (dtype == TRILLIM_GRP_INT5) {
+            const uint8_t *high = planes->high + block * 4;
+            codes0 = vorrq_u8(codes0, spread_group_bits(high));
+            codes1 = vorrq_u8(codes1, spread_group_bits(high + 2));
+            zero = 16;
+        }
+    }
+    uint8x16_t offset = vdupq_n_u8(zero);
+    int8x16x2_t result = {{
+        vreinterpretq_s8_u8(vsubq_u8(codes0, offset)),
+        vreinterpretq_s8_u8(vsubq_u8(codes1, offset)),
+    }};
+    return result;
+}
+
+static inline __attribute__((always_inline)) void decode_group_half(
+    int8x16_t codes, int8_t subscale, float scale, bool has_subscale, bool factored, float32x4_t result[4]
+) {
+    int16x8_t lo = vmovl_s8(vget_low_s8(codes));
+    int16x8_t hi = vmovl_high_s8(codes);
+    if (has_subscale) {
+        lo = vmulq_n_s16(lo, subscale);
+        hi = vmulq_n_s16(hi, subscale);
+    }
+    result[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+    result[1] = vcvtq_f32_s32(vmovl_high_s16(lo));
+    result[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+    result[3] = vcvtq_f32_s32(vmovl_high_s16(hi));
+    if (!factored) {
+        for (size_t j = 0; j < 4; ++j) {
+            result[j] = vmulq_n_f32(result[j], scale);
+        }
+    }
+}
+
+static inline float group_scale(const GroupPlanes *planes, size_t block) {
+    uint16_t bits;
+    memcpy(&bits, planes->scales + block * 2, sizeof(bits));
+    return trillim_bf16(bits);
+}
+
+static inline __attribute__((always_inline)) void decode_group32(
+    const GroupPlanes *planes, size_t block, size_t k, uint32_t dtype, bool factored, float32x4_t result[8]
+) {
+    float scale = factored ? 0 : group_scale(planes, block);
+    int8x16x2_t codes = load_group_codes(planes, block, k, dtype);
+    bool has_subscale = dtype == TRILLIM_DUBGRP_INT6;
+    const int8_t *subscales = has_subscale ? planes->subscales + block * 16 + k % 256 / 16 : NULL;
+    decode_group_half(codes.val[0], has_subscale ? subscales[0] : 0, scale, has_subscale, factored, result);
+    decode_group_half(codes.val[1], has_subscale ? subscales[1] : 0, scale, has_subscale, factored, result + 4);
+}
+
+/* Nonzero inputs and scales in [2^-40, 2^41) keep factored dots in the normal FP32 range. */
+enum { MIN_GROUP_EXPONENT = 87, MAX_GROUP_EXPONENT = 167, MAX_FACTORED_WIDTH = 1 << 16 };
+
+static TrillimStatus check_group_input(Task *task) {
+    const Parameters *p = task->p;
+    if (p->k > MAX_FACTORED_WIDTH) {
+        return TRILLIM_OK;
+    }
+    const uint32x4_t minimum = vdupq_n_u32((uint32_t)MIN_GROUP_EXPONENT << 23);
+    const uint32x4_t span = vdupq_n_u32(((uint32_t)(MAX_GROUP_EXPONENT - MIN_GROUP_EXPONENT + 1) << 23) - 1);
+    uint32x4_t rejected = vdupq_n_u32(0);
+    for (size_t batch = 0; batch < p->batches; ++batch) {
+        size_t base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
+        for (size_t k = 0; k < p->k; k += 4) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            uint32x4_t magnitude = vandq_u32(vreinterpretq_u32_f32(load4(task->input, base + k, p->a_dtype)),
+                vdupq_n_u32(UINT32_C(0x7fffffff)));
+            uint32x4_t outside = vcgtq_u32(vsubq_u32(magnitude, minimum), span);
+            rejected = vorrq_u32(rejected, vbicq_u32(outside, vceqzq_u32(magnitude)));
+        }
+    }
+    task->bounded_input = vmaxvq_u32(rejected) == 0;
+    return TRILLIM_OK;
+}
+
+static bool bounded_group_scales(const GroupPlanes *planes, size_t first, size_t count) {
+    const uint8_t *scales = planes->scales + first * 2;
+    const unsigned minimum = MIN_GROUP_EXPONENT << 7;
+    const unsigned span = ((MAX_GROUP_EXPONENT - MIN_GROUP_EXPONENT + 1) << 7) - 1;
+    uint16x8_t rejected = vdupq_n_u16(0);
+    size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        uint16x8_t raw = vreinterpretq_u16_u8(vld1q_u8(scales + i * 2));
+        uint16x8_t magnitude = vandq_u16(raw, vdupq_n_u16(0x7fff));
+        uint16x8_t outside = vcgtq_u16(vsubq_u16(magnitude, vdupq_n_u16(minimum)), vdupq_n_u16(span));
+        rejected = vorrq_u16(rejected, vbicq_u16(outside, vceqzq_u16(magnitude)));
+    }
+    for (; i < count; ++i) {
+        uint16_t raw;
+        memcpy(&raw, scales + i * 2, sizeof(raw));
+        unsigned magnitude = raw & 0x7fff;
+        if (magnitude != 0 && magnitude - minimum > span) {
+            return false;
+        }
+    }
+    return vmaxvq_u16(rejected) == 0;
+}
+
+static inline __attribute__((always_inline)) TrillimStatus project_factored_column_tile(
+    const Task *task, const GroupPlanes *planes, const size_t block[4], size_t a_base,
+    uint32_t dtype, float32x4_t sums[4]
+) {
+    const Parameters *p = task->p;
+    const size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    size_t groups = p->k / group;
+    for (size_t g = 0; g < groups; ++g) {
+        size_t k = g * group;
+        if (k != 0 && (k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t partial[4] = {0};
+        for (size_t offset = 0; offset < group; offset += 32) {
+            float32x4_t input[8];
+            for (size_t j = 0; j < 8; ++j) {
+                input[j] = load4(task->input, a_base + k + offset + j * 4, p->a_dtype);
+            }
+            for (size_t c = 0; c < 4; ++c) {
+                float32x4_t weights[8];
+                decode_group32(planes, block[c] + g, offset, dtype, true, weights);
+                for (size_t j = 0; j < 8; ++j) {
+                    partial[c] = vfmaq_f32(partial[c], input[j], weights[j]);
+                }
+            }
+        }
+        for (size_t c = 0; c < 4; ++c) {
+            sums[c] = vfmaq_n_f32(sums[c], partial[c], group_scale(planes, block[c] + g));
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline __attribute__((always_inline)) TrillimStatus project_grouped(
+    const Task *task, size_t tile, uint32_t dtype, size_t column_tile
+) {
+    const Parameters *p = task->p;
+    bool single_row = column_tile == 4;
+    size_t tiles = p->n / task->columns + (p->n % task->columns != 0);
+    size_t row_tiles = single_row ? 1 : p->m / 4 + (p->m % 4 != 0);
+    size_t batch = tile / (tiles * row_tiles);
+    size_t local = tile % (tiles * row_tiles);
+    size_t row = single_row ? 0 : local / tiles * 4;
+    size_t first = local % tiles * task->columns;
+    size_t rows = single_row ? 1 : (p->m - row < 4 ? p->m - row : 4);
+    size_t end = p->n - first < task->columns ? p->n : first + task->columns;
+    size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides) + row * p->a_row_stride;
+    size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
+    size_t group = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    size_t values = dtype == TRILLIM_GRP_INT8 ? 32 : group / 2;
+    size_t high = dtype == TRILLIM_DUBGRP_INT6 ? 64 : 0;
+    size_t blocks = p->b_storage_rows * (p->b_storage_columns / group);
+    GroupPlanes planes = {
+        task->weight,
+        task->weight + blocks * values,
+        task->weight + blocks * (values + 2),
+        (const int8_t *)(task->weight + blocks * (values + 2 + high)),
+    };
+    size_t groups = p->k / group;
+    for (size_t column = first; column < end; column += column_tile) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - column < column_tile ? end - column : column_tile;
+        size_t block[4];
+        bool factored = single_row && task->bounded_input;
+        for (size_t c = 0; c < column_tile; ++c) {
+            block[c] = b_base / group + (column + (c < count ? c : 0)) * groups;
+            if (factored && c < count) {
+                factored = bounded_group_scales(&planes, block[c], groups);
+            }
+        }
+        float32x4_t sums[4][4] = {{0}};
+        if (factored) {
+            TrillimStatus status = project_factored_column_tile(task, &planes, block, a_base, dtype, sums[0]);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        } else {
+            for (size_t k = 0; k < p->k; k += 32) {
+                if (k != 0 && (k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                float32x4_t weights[4][8];
+                for (size_t c = 0; c < column_tile; ++c) {
+                    decode_group32(&planes, block[c] + k / group, k, dtype, false, weights[c]);
+                }
+                for (size_t r = 0; r < rows; ++r) {
+                    size_t index = a_base + r * p->a_row_stride + k;
+                    for (size_t j = 0; j < 8; ++j) {
+                        float32x4_t x = load4(task->input, index + j * 4, p->a_dtype);
+                        for (size_t c = 0; c < column_tile; ++c) {
+                            sums[r][c] = vfmaq_f32(sums[r][c], x, weights[c][j]);
+                        }
+                    }
+                }
+            }
+        }
+        for (size_t r = 0; r < rows; ++r) {
+            size_t index = (batch * p->m + row + r) * p->n + column;
+            for (size_t c = 0; c < count; ++c) {
+                float sum = vaddvq_f32(sums[r][c]);
+                memcpy((uint8_t *)task->output + (index + c) * sizeof(sum), &sum, sizeof(sum));
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+#define DEFINE_GROUP_PROJECTION(NAME, DTYPE) \
+static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
+    (void)worker; \
+    const Task *task = opaque; \
+    if (task->p->m == 1) { \
+        return project_grouped(task, tile, DTYPE, 4); \
+    } \
+    return project_grouped(task, tile, DTYPE, 2); \
+}
+
+DEFINE_GROUP_PROJECTION(project_aligned_int4, TRILLIM_GRP_INT4)
+DEFINE_GROUP_PROJECTION(project_aligned_int5, TRILLIM_GRP_INT5)
+DEFINE_GROUP_PROJECTION(project_aligned_int6, TRILLIM_DUBGRP_INT6)
+DEFINE_GROUP_PROJECTION(project_aligned_int8, TRILLIM_GRP_INT8)
+
+#undef DEFINE_GROUP_PROJECTION
+
+static TrillimTask grouped_projection(const Parameters *p) {
+    if (p->k % group_width(p->b_dtype) != 0) {
+        return NULL;
+    }
+    switch (p->b_dtype) {
+    case TRILLIM_GRP_INT4: return project_aligned_int4;
+    case TRILLIM_GRP_INT5: return project_aligned_int5;
+    case TRILLIM_DUBGRP_INT6: return project_aligned_int6;
+    case TRILLIM_GRP_INT8: return project_aligned_int8;
+    default: return NULL;
+    }
+}
+
 static TrillimStatus project_ordered(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
@@ -649,13 +935,26 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_matmul(
     if (columns < 16) {
         columns = 16;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], p, columns, context};
+    bool grouped = false;
     TrillimTask operation = project_ordered;
     if (p->out_dtype == TRILLIM_FP32) {
-        operation = p->m == 1 && p->b_dtype == TRILLIM_MXFP4 ?
-            project_mxfp4_decode : projection(p->b_dtype);
+        operation = grouped_projection(p);
+        if (operation) {
+            grouped = true;
+            columns = columns / 4 * 4;
+        } else {
+            operation = p->m == 1 && p->b_dtype == TRILLIM_MXFP4 ?
+                project_mxfp4_decode : projection(p->b_dtype);
+        }
     } else if (p->b_dtype == TRILLIM_MXFP4 && p->k % 32 == 0 && p->n >= 4) {
         operation = project_mxfp4_ordered;
+    }
+    Task task = {outputs[0], inputs[0], inputs[1], p, columns, context, false};
+    if (grouped && p->m == 1 && p->n >= 16) {
+        TrillimStatus status = check_group_input(&task);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
     }
     size_t rows = p->m / 4 + (p->m % 4 != 0);
     size_t tiles = p->n / columns + (p->n % columns != 0);
