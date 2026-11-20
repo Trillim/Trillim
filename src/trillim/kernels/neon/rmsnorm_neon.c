@@ -330,6 +330,57 @@ static TrillimStatus normalize(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus normalize_pair(void *opaque, size_t pair, size_t worker) {
+    const TrillimRMSNormTask *task = opaque;
+    const TrillimRMSNormParameters *p = task->parameters;
+    size_t row = pair * 2;
+    if (p->rows - row == 1) {
+        return normalize(opaque, row, worker);
+    }
+    const uint16_t *input0 = (const uint16_t *)task->input + row * p->width;
+    const uint16_t *input1 = input0 + p->width;
+    uint16_t *output0 = (uint16_t *)task->output + row * p->width;
+    uint16_t *output1 = output0 + p->width;
+    float32x2_t sum = vdup_n_f32(0.0f);
+    for (size_t column = 0; column < p->width; column += 4) {
+        if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint16x4x2_t columns = vzip_u16(vld1_u16(input0 + column), vld1_u16(input1 + column));
+        float32x4_t first = vreinterpretq_f32_u32(vshll_n_u16(columns.val[0], 16));
+        float32x4_t second = vreinterpretq_f32_u32(vshll_n_u16(columns.val[1], 16));
+        float32x2_t a = vget_low_f32(first);
+        float32x2_t b = vget_high_f32(first);
+        float32x2_t c = vget_low_f32(second);
+        float32x2_t d = vget_high_f32(second);
+        // Each lane adds its row's squares in column order, as in normalize.
+        sum += a * a;
+        sum += b * b;
+        sum += c * c;
+        sum += d * d;
+    }
+    float denominator0 = sqrtf(vget_lane_f32(sum, 0) / (float)p->width + p->eps);
+    float denominator1 = sqrtf(vget_lane_f32(sum, 1) / (float)p->width + p->eps);
+    if (!isfinite(denominator0) || !isfinite(denominator1) || denominator0 == 0.0f || denominator1 == 0.0f) {
+        TrillimStatus status = normalize(opaque, row, worker);
+        return status == TRILLIM_OK ? normalize(opaque, row + 1, worker) : status;
+    }
+    float32x4_t divisor0 = vdupq_n_f32(denominator0);
+    float32x4_t divisor1 = vdupq_n_f32(denominator1);
+    float32x4_t offset = vdupq_n_f32(p->weight_offset);
+    for (size_t column = 0; column < p->width; column += 4) {
+        if ((column & 511) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t weight = vaddq_f32(load4(task->weight, column, TRILLIM_BF16), offset);
+        float32x4_t value0 = vdivq_f32(load4(input0, column, TRILLIM_BF16), divisor0);
+        float32x4_t value1 = vdivq_f32(load4(input1, column, TRILLIM_BF16), divisor1);
+        store4(output0, column, TRILLIM_BF16, vmulq_f32(value0, weight));
+        store4(output1, column, TRILLIM_BF16, vmulq_f32(value1, weight));
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus normalize_transposed(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const TrillimRMSNormTask *task = opaque;
@@ -417,6 +468,13 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
     bool transposed = p->row_stride == 1 && p->column_stride != 1;
     TrillimTask worker = transposed ? normalize_transposed : normalize;
     size_t tasks = transposed ? p->rows / 4 + (p->rows % 4 != 0) : p->rows;
+    if (p->input_dtype == TRILLIM_BF16 && p->weight_dtype == TRILLIM_BF16 &&
+        p->output_dtype == TRILLIM_BF16 && p->column_stride == 1 && p->row_stride == p->width &&
+        p->width % 4 == 0 && p->rows >= 2 && isfinite(p->weight_offset) &&
+        p->rows / 2 >= context->thread_pool->worker_count) {
+        worker = normalize_pair;
+        tasks = p->rows / 2 + (p->rows % 2 != 0);
+    }
     size_t serial_limit = p->output_dtype == TRILLIM_FP32 ? 4096 : 2048;
     if (transposed) {
         serial_limit = 8192;
