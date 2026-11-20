@@ -1,4 +1,5 @@
 #include "common.h"
+#include <arm_neon.h>
 
 #if defined(_WIN32)
 #define COMPONENT_API
@@ -20,6 +21,20 @@ extern TrillimStatus trillim_neon_try_packed_ffn_int8(
 )
 #if defined(__linux__)
     __asm__(".trillim_neon_try_packed_ffn_int8")
+#endif
+;
+
+extern float32x4_t trillim_neon_gelu_tanh4_prefill(float32x4_t)
+#if defined(__linux__)
+    __asm__(".trillim_neon_gelu_tanh4_prefill")
+#endif
+;
+extern TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    float32x4_t (*)(float32x4_t), const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8_prefill")
 #endif
 ;
 
@@ -89,9 +104,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_quantized_gelu_ffn(
     bool hidden_handled = false;
 #if defined(__APPLE__) || defined(__linux__)
     if (p->tokens == 1 || (p->tokens >= 4 && p->up_dtype == TRILLIM_GRP_INT8)) {
-        TrillimStatus status = trillim_neon_try_packed_ffn_int8(
-            hidden, inputs[0], inputs[1], inputs[2], &expand, gelu_tanh, context, &hidden_handled
-        );
+        TrillimStatus status = p->tokens == 1
+            ? trillim_neon_try_packed_ffn_int8(
+                hidden, inputs[0], inputs[1], inputs[2], &expand, gelu_tanh, context, &hidden_handled)
+            : trillim_neon_try_packed_ffn_int8_prefill(
+                hidden, inputs[0], inputs[1], inputs[2], &expand, gelu_tanh,
+                trillim_neon_gelu_tanh4_prefill, context, &hidden_handled);
         if (status != TRILLIM_OK) {
             return status;
         }

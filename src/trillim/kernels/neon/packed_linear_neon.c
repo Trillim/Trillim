@@ -1979,6 +1979,7 @@ typedef struct {
     const Task *projection;
     const uint8_t *gate;
     float (*silu)(float);
+    float32x4_t (*activate4)(float32x4_t);
     const void *activation;
     atomic_bool ordinary;
 } Int8PrefillTask;
@@ -2461,6 +2462,10 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
                     for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
                         vst1q_f32(output + 4 * c, result[c]);
                     }
+                } else if (paired && job->activate4 != NULL && count == Q8_PREFILL_COLUMN_PAIRS) {
+                    const float32x4_t up = vuzp1q_f32(result[0], result[1]);
+                    const float32x4_t gate = vuzp2q_f32(result[0], result[1]);
+                    vst1q_f32(output, vmulq_f32(up, job->activate4(gate)));
                 } else {
                     float values[Q8_PREFILL_COLUMNS];
                     memcpy(values, result, sizeof(values));
@@ -2523,7 +2528,8 @@ static TrillimStatus project_q4_prefill(void *opaque, size_t index, size_t worke
 }
 
 static TrillimStatus try_int8_prefill(
-    const Task *task, const uint8_t *gate, float (*silu)(float), size_t workers, bool *handled
+    const Task *task, const uint8_t *gate, float (*silu)(float),
+    float32x4_t (*activate4)(float32x4_t), size_t workers, bool *handled
 ) {
     const Parameters *p = task->p;
     const bool q6 = p->weight_dtype == TRILLIM_DUBGRP_INT6;
@@ -2554,7 +2560,7 @@ static TrillimStatus try_int8_prefill(
         const size_t chunk = p->outputs / workers / 2;
         scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
         const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
-        Int8PrefillTask job = {&scheduled, gate, silu, activation, ATOMIC_VAR_INIT(true)};
+        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true)};
         const TrillimThreadPool *pool = task->context->thread_pool;
         TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
         status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
@@ -2591,7 +2597,7 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
     *handled = false;
     const Parameters *p = task->p;
     if (p->tokens != 1) {
-        return try_int8_prefill(task, gate, silu, workers, handled);
+        return try_int8_prefill(task, gate, silu, NULL, workers, handled);
     }
     if (p->output_dtype != TRILLIM_FP32 || p->width < 32 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 ||
@@ -2679,6 +2685,31 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8(
     const size_t columns = chunk < 16 ? 16 : chunk;
     const Task task = {output, input, up, p, columns, context};
     return try_int8_projection(&task, gate, silu, workers, handled);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+__asm__(".private_extern _trillim_neon_try_packed_ffn_int8_prefill");
+#else
+__asm__(".hidden .trillim_neon_try_packed_ffn_int8_prefill\n.globl .trillim_neon_try_packed_ffn_int8_prefill");
+static TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    float32x4_t (*)(float32x4_t), const TrillimKernelContext *, bool *
+) __asm__(".trillim_neon_try_packed_ffn_int8_prefill");
+#endif
+static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
+    void *output, const void *input, const void *up, const void *gate, const void *parameters,
+    float (*scalar_gate)(float), float32x4_t (*vector_gate)(float32x4_t),
+    const TrillimKernelContext *context, bool *handled
+) {
+    *handled = false;
+    const size_t workers = context->thread_pool->worker_count;
+    if (workers == 0) {
+        return TRILLIM_OK;
+    }
+    const Task task = {output, input, up, parameters, 0, context};
+    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, workers, handled);
 }
 #endif
 
