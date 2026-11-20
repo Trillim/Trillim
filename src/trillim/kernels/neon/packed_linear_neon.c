@@ -2380,6 +2380,22 @@ static TrillimStatus project_q6_prefill(void *opaque, size_t index, size_t worke
                 return TRILLIM_CANCELLED;
             }
             const size_t inner = row % INT8_PREFILL_ROWS;
+            if (paired && job->activate4 != NULL && end - column >= Q6_PREFILL_COLUMN_PAIRS) {
+                const size_t pair = inner / 2;
+                float32x4_t (*rows)[INT8_PREFILL_PAIRS] = totals[row / INT8_PREFILL_ROWS];
+                const float32x4_t a = q8_prefill_row(rows[0][pair], rows[1][pair], inner);
+                const float32x4_t b = q8_prefill_row(rows[2][pair], rows[3][pair], inner);
+                const uint32x4_t magnitude = vmaxq_u32(
+                    vreinterpretq_u32_f32(vabsq_f32(a)), vreinterpretq_u32_f32(vabsq_f32(b)));
+                if (vmaxvq_u32(magnitude) >= 0x7f800000) {
+                    atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+                    return TRILLIM_OK;
+                }
+                const float32x4_t up = vuzp1q_f32(a, b), gate = vuzp2q_f32(a, b);
+                float *output = (float *)task->output + row * p->outputs + column;
+                vst1q_f32(output, vmulq_f32(up, job->activate4(gate)));
+                continue;
+            }
             for (size_t c = 0; c < Q6_PREFILL_COLUMN_PAIRS && column + c * stride < end; ++c) {
                 const float32x2_t pair = (inner & 1)
                     ? vget_high_f32(totals[row / INT8_PREFILL_ROWS][c][inner / 2])

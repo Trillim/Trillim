@@ -26,6 +26,20 @@ extern TrillimStatus trillim_neon_try_packed_ffn_int8(
     __asm__(".trillim_neon_try_packed_ffn_int8")
 #endif
 ;
+
+extern float32x4_t trillim_neon_silu4_prefill(float32x4_t)
+#if defined(__linux__)
+    __asm__(".trillim_neon_silu4_prefill")
+#endif
+;
+extern TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    float32x4_t (*)(float32x4_t), const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8_prefill")
+#endif
+;
 #endif
 
 extern COMPONENT_API TrillimStatus trillim_neon_packed_linear(
@@ -1402,9 +1416,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
         (p->up_dtype == TRILLIM_DUBGRP_INT6 || p->up_dtype == TRILLIM_GRP_INT4 || p->up_dtype == TRILLIM_GRP_INT8);
     if (scratch_size != 0 && p->up_dtype == p->gate_dtype && (p->tokens == 1 || int8_prefill)) {
         LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
-        status = trillim_neon_try_packed_ffn_int8(
-            task.hidden, inputs[0], inputs[1], inputs[2], &expand, silu, context, &hidden_handled
-        );
+        status = p->tokens == 1
+            ? trillim_neon_try_packed_ffn_int8(
+                task.hidden, inputs[0], inputs[1], inputs[2], &expand, silu, context, &hidden_handled)
+            : trillim_neon_try_packed_ffn_int8_prefill(
+                task.hidden, inputs[0], inputs[1], inputs[2], &expand, silu,
+                trillim_neon_silu4_prefill, context, &hidden_handled);
         if (status != TRILLIM_OK) {
             return status;
         }
