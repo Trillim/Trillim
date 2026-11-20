@@ -2235,6 +2235,23 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
+    const size_t scale_offset = begin * groups * 2;
+    const size_t scale_count = (end - begin) * groups;
+    bool ordinary;
+    TrillimStatus status = bounded_group_scales(weight.scales + scale_offset, scale_count, task->context, &ordinary);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    if (ordinary && paired) {
+        status = bounded_group_scales(second.scales + scale_offset, scale_count, task->context, &ordinary);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    if (!ordinary) {
+        atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+        return TRILLIM_OK;
+    }
     for (size_t column = begin; column < end; column += stride) {
         if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
             return TRILLIM_OK;
