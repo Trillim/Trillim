@@ -301,6 +301,16 @@ static bool optimized_layout(const TrillimAttentionParameters *p) {
         p->key_dim <= 4096 && p->value_dim <= 4096;
 }
 
+static size_t legacy_query_tile(const TrillimAttentionParameters *p, size_t workers) {
+    size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
+    if (p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_BF16 &&
+        p->k_dtype == TRILLIM_BF16 && p->v_dtype == TRILLIM_BF16 &&
+        p->heads <= 4 && p->queries <= 64 && p->heads * tiles < workers) {
+        return 4;
+    }
+    return 16;
+}
+
 static inline TrillimStatus trillim_attention_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const TrillimAttentionParameters *p = (const TrillimAttentionParameters *)parameters;
     inputs[0] = 0;
@@ -331,6 +341,14 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         return TRILLIM_ERROR;
     }
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
+    if (p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_BF16 &&
+        p->k_dtype == TRILLIM_BF16 && p->v_dtype == TRILLIM_BF16) {
+        size_t queries = p->queries < 64 ? p->queries : 64;
+        size_t short_tiles = queries / 4 + (queries % 4 != 0);
+        if (tiles < short_tiles) {
+            tiles = short_tiles;
+        }
+    }
     if (p->value_dim > SIZE_MAX - 64 || p->heads > SIZE_MAX / tiles ||
         p->heads * tiles > SIZE_MAX / sizeof(float) / (p->value_dim + 64)) {
         return TRILLIM_ERROR;
@@ -868,11 +886,12 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
     (void)worker;
     const TrillimAttentionTask *task = (const TrillimAttentionTask *)opaque;
     const TrillimAttentionParameters *p = task->parameters;
-    size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
+    size_t query_tile = legacy_query_tile(p, task->context->thread_pool->worker_count);
+    size_t tiles = p->queries / query_tile + (p->queries % query_tile != 0);
     size_t head = index / tiles;
     size_t kv_head = head / (p->heads / p->kv_heads);
-    size_t first = (index % tiles) * 16;
-    size_t last = p->queries - first < 16 ? p->queries : first + 16;
+    size_t first = (index % tiles) * query_tile;
+    size_t last = p->queries - first < query_tile ? p->queries : first + query_tile;
     float *scores = task->scratch + index * (p->value_dim + 64);
     float *accumulator = scores + 64;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
@@ -1915,7 +1934,8 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
         size_t slots = p->heads * groups < 128 ? p->heads * groups : 128;
         return context->thread_pool->run(context->thread_pool->context, slots, trillim_attention_tiled_task, &task);
     }
-    size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
+    size_t query_tile = legacy_query_tile(p, context->thread_pool->worker_count);
+    size_t tiles = p->queries / query_tile + (p->queries % query_tile != 0);
     return context->thread_pool->run(context->thread_pool->context, p->heads * tiles, trillim_attention_task, &task);
 }
 
