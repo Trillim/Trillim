@@ -2396,10 +2396,16 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
     }
     if (status == TRILLIM_OK) {
         Task scheduled;
-        if (operation == project_int8_q6_sdot && workers > 1) {
+        const bool wide_q8_square = p->weight_dtype == TRILLIM_GRP_INT8 &&
+            p->width >= 3072 && p->width == p->outputs;
+        const bool one_tile_per_worker = width == 32 && !wide_q8_square;
+        if (workers > 1 && (operation == project_int8_q6_sdot || one_tile_per_worker)) {
             scheduled = *task;
             const size_t columns = p->outputs / workers + (p->outputs % workers != 0);
             scheduled.columns = columns + (columns % 2 != 0);
+            if (one_tile_per_worker && scheduled.columns < task->columns) {
+                scheduled.columns = task->columns;
+            }
             task = &scheduled;
         }
         Int8ProjectionTask int8 = {task, activation, gate, silu};
