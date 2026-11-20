@@ -1,6 +1,9 @@
 
 #include "common.h"
 #include <arm_neon.h>
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 typedef struct {
     const uint8_t *data;
@@ -287,6 +290,80 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
         ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+/* An isolated kernel build can omit PackedLinear. */
+#if !defined(__APPLE__)
+__attribute__((weak)) extern TrillimStatus trillim_neon_packed_linear(
+    void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
+);
+#endif
+
+static TrillimKernel linked_projection(void) {
+#if defined(__APPLE__)
+    void *symbol = dlsym(RTLD_SELF, "trillim_neon_packed_linear");
+    TrillimKernel kernel;
+    memcpy(&kernel, &symbol, sizeof(kernel));
+    return kernel;
+#else
+    return trillim_neon_packed_linear;
+#endif
+}
+
+typedef struct {
+    size_t tokens, width, outputs;
+    uint32_t input_dtype, weight_dtype, output_dtype;
+} ProjectionParameters;
+
+enum { BIAS_TILE = 256 };
+
+static bool use_grouped_projection(const Task *task) {
+    const Parameters *p = task->p;
+    if (p->output_dtype != TRILLIM_FP32 ||
+        (uintptr_t)task->output % _Alignof(float) != 0 ||
+        p->width < 256 || p->width % 32 != 0 ||
+        p->weight_dtype < TRILLIM_GRP_INT8 || p->weight_dtype > TRILLIM_DUBGRP_INT6 ||
+        task->context->thread_pool->worker_count == 0) {
+        return false;
+    }
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
+static TrillimStatus project_then_add_bias(const Task *task, TrillimKernel projection) {
+    const Parameters *p = task->p;
+    /* Quantized Matmul and broadcast Add both produce FP32. */
+    const ProjectionParameters parameters = {
+        .tokens = p->tokens, .width = p->width, .outputs = p->outputs,
+        .input_dtype = p->input_dtype, .weight_dtype = p->weight_dtype, .output_dtype = TRILLIM_FP32,
+    };
+    void *outputs[] = {task->output};
+    TrillimStatus status = projection(outputs, task->inputs, NULL, &parameters, task->context);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    float *output = task->output;
+    const void *bias = task->inputs[2];
+    for (size_t row = 0; row < p->tokens; ++row) {
+        size_t offset = row * p->outputs;
+        for (size_t column = 0; column < p->outputs;) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t end = p->outputs - column < BIAS_TILE ? p->outputs : column + BIAS_TILE;
+            for (; end - column >= 4; column += 4) {
+                float *destination = output + offset + column;
+                float32x4_t value = vaddq_f32(vld1q_f32(destination), trillim_neon_load4(bias, column, p->bias_dtype));
+                vst1q_f32(destination, value);
+            }
+            for (; column < end; ++column) {
+                output[offset + column] += trillim_load(bias, column, p->bias_dtype).f;
+            }
+        }
+    }
+    return task->context->is_cancelled(task->context->cancellation_context)
+        ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear_bias(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -302,6 +379,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear_bias(
     const Parameters *p = parameters;
     (void)scratch;
     Task task = {outputs[0], inputs, p, context};
+    if (use_grouped_projection(&task)) {
+        TrillimKernel projection = linked_projection();
+        if (projection != NULL) {
+            return project_then_add_bias(&task, projection);
+        }
+    }
     size_t count = p->tokens * p->outputs;
     size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
     return tiles == 1 ? project(&task, 0, 0) :
