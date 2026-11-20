@@ -1456,15 +1456,27 @@ static bool quantize_activation_q8(const void *input, size_t k, uint32_t dtype, 
     return true;
 }
 
-static bool quantize_activation_q8k(const void *input, size_t k, uint32_t dtype, Q8KActivationBlock *out) {
+static inline __attribute__((always_inline)) bool quantize_activation_q8k_typed(
+    const void *input, size_t k, uint32_t dtype, Q8KActivationBlock *out, bool keep_sums
+) {
     float values[INT8_ACTIVATION_Q8_K];
-    float32x4_t max_vector = vdupq_n_f32(0);
-    for (size_t i = 0; i < INT8_ACTIVATION_Q8_K; i += 4) {
-        const float32x4_t x = load4(input, k + i, dtype);
-        vst1q_f32(values + i, x);
-        max_vector = vmaxq_f32(max_vector, vabsq_f32(x));
+    float32x4_t max0 = vdupq_n_f32(0);
+    float32x4_t max1 = max0, max2 = max0, max3 = max0;
+    for (size_t i = 0; i < INT8_ACTIVATION_Q8_K; i += 16) {
+        const float32x4_t x0 = load4(input, k + i, dtype);
+        const float32x4_t x1 = load4(input, k + i + 4, dtype);
+        const float32x4_t x2 = load4(input, k + i + 8, dtype);
+        const float32x4_t x3 = load4(input, k + i + 12, dtype);
+        vst1q_f32(values + i, x0);
+        vst1q_f32(values + i + 4, x1);
+        vst1q_f32(values + i + 8, x2);
+        vst1q_f32(values + i + 12, x3);
+        max0 = vmaxq_f32(max0, vabsq_f32(x0));
+        max1 = vmaxq_f32(max1, vabsq_f32(x1));
+        max2 = vmaxq_f32(max2, vabsq_f32(x2));
+        max3 = vmaxq_f32(max3, vabsq_f32(x3));
     }
-    const float maximum = vmaxvq_f32(max_vector);
+    const float maximum = vmaxvq_f32(vmaxq_f32(vmaxq_f32(max0, max1), vmaxq_f32(max2, max3)));
     if (maximum == 0) {
         memset(out, 0, sizeof(*out));
         return true;
@@ -1474,9 +1486,20 @@ static bool quantize_activation_q8k(const void *input, size_t k, uint32_t dtype,
     }
     /* Q8_K uses the sign of the first value attaining the maximum magnitude. */
     size_t peak = 0;
-    while (fabsf(values[peak]) != maximum) {
-        ++peak;
+    const float32x4_t maximum4 = vdupq_n_f32(maximum);
+    uint32x4_t matches;
+    do {
+        matches = vceqq_f32(vabsq_f32(vld1q_f32(values + peak)), maximum4);
+        if (vmaxvq_u32(matches) != 0) {
+            break;
+        }
+        peak += 4;
+    } while (peak < INT8_ACTIVATION_Q8_K);
+    if (peak == INT8_ACTIVATION_Q8_K) {
+        return false;
     }
+    const uint32x4_t lane = {0, 1, 2, 3};
+    peak += vminvq_u32(vbslq_u32(matches, lane, vdupq_n_u32(4)));
     const float inverse = -127.0f / values[peak];
     if (!isfinite(inverse) || inverse == 0) {
         return false;
@@ -1486,9 +1509,26 @@ static bool quantize_activation_q8k(const void *input, size_t k, uint32_t dtype,
         const int8x16_t x = quantize_activation_16(vld1q_f32(values + i), vld1q_f32(values + i + 4),
             vld1q_f32(values + i + 8), vld1q_f32(values + i + 12), inverse);
         vst1q_s8(out->values + i, x);
-        out->sums[i / 16] = vaddlvq_s8(x);
+        if (keep_sums) {
+            out->sums[i / 16] = vaddlvq_s8(x);
+        }
     }
     return true;
+}
+
+static __attribute__((noinline)) bool quantize_activation_q8k(
+    const void *input, size_t k, uint32_t dtype, Q8KActivationBlock *out, bool keep_sums
+) {
+    switch (dtype) {
+    case TRILLIM_FP32:
+        return quantize_activation_q8k_typed(input, k, TRILLIM_FP32, out, keep_sums);
+    case TRILLIM_BF16:
+        return quantize_activation_q8k_typed(input, k, TRILLIM_BF16, out, keep_sums);
+    case TRILLIM_FP16:
+        return quantize_activation_q8k_typed(input, k, TRILLIM_FP16, out, keep_sums);
+    default:
+        return false;
+    }
 }
 
 static inline float int8_weight_scale(const uint8_t *scales, size_t block) {
@@ -1985,9 +2025,9 @@ static TrillimStatus pack_q6_prefill_activation(
                 const size_t row = t * Q6_PREFILL_ROWS + 2 * pair;
                 Q8KActivationBlock first = {0}, second = {0};
                 if ((row < p->tokens && !quantize_activation_q8k(
-                        task->input, row * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &first)) ||
+                        task->input, row * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &first, false)) ||
                     (row + 1 < p->tokens && !quantize_activation_q8k(
-                        task->input, (row + 1) * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &second))) {
+                        task->input, (row + 1) * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &second, false))) {
                     return TRILLIM_OK;
                 }
                 destination->scales[pair] = (float32x4_t){first.scale, first.scale, second.scale, second.scale};
@@ -2218,7 +2258,8 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
             break;
         }
         const bool valid = width == 256
-            ? quantize_activation_q8k(task->input, g * width, p->input_dtype, (Q8KActivationBlock *)activation + g)
+            ? quantize_activation_q8k(task->input, g * width, p->input_dtype,
+                (Q8KActivationBlock *)activation + g, operation != project_int8_q6_sdot)
             : quantize_activation_q8(task->input, g * width, p->input_dtype, (Q8ActivationBlock *)activation + g);
         if (!valid) {
             free(activation);
