@@ -296,14 +296,10 @@ static inline TrillimStatus ordered_narrow_tile(
     if (t->p->a_dtype == TRILLIM_BF16) {
         return rows == 8 ?
             ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_BF16, 8) :
-            rows == 6 ?
-            ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_BF16, 6) :
             ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_BF16, 4);
     }
     return rows == 8 ?
         ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_FP16, 8) :
-        rows == 6 ?
-        ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_FP16, 6) :
         ordered_narrow_block(t, a_base, b_base, output, first, last, TRILLIM_FP16, 4);
 }
 
@@ -481,7 +477,7 @@ static TrillimStatus ordered_dot_tile(const Task *t, size_t a_base, size_t b_bas
                                       size_t output, size_t rows, size_t first, size_t last) {
     const Parameters *p = t->p;
     if (rows >= 4 && ordered_narrow_shape(p)) {
-        size_t full_rows = rows == 8 || rows == 6 ? rows : 4;
+        size_t full_rows = rows == 8 ? 8 : 4;
         TrillimStatus status = ordered_narrow_tile(t, a_base, b_base, output, first, last, full_rows);
         if (status != TRILLIM_OK || rows == full_rows) {
             return status;
