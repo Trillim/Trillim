@@ -919,7 +919,7 @@ static TrillimStatus attention_short_queries(
         for (size_t row = 0; row < rows; ++row) {
             sums[row] = vdupq_n_f32(0);
         }
-        for (size_t channel = 0; channel < 256; channel += 4) {
+        for (size_t channel = 0; channel < p->key_dim; channel += 4) {
             uint16x4_t a = vld1_u16(k0 + channel), b = vld1_u16(k1 + channel);
             uint16x4_t c = vld1_u16(k2 + channel), d = vld1_u16(k3 + channel);
             uint32x2_t ab_even = vreinterpret_u32_u16(vtrn1_u16(a, b));
@@ -973,13 +973,13 @@ static TrillimStatus attention_short_queries(
             total += scores[row][key];
         }
         denominator[row] = total;
-        for (size_t channel = 0; channel < 256; ++channel) {
+        for (size_t channel = 0; channel < p->value_dim; ++channel) {
             accumulator[row][channel] = 0.0f;
         }
     }
     size_t max_end = ends[rows - 1];
     uint32x4_t nan_flags = vdupq_n_u32(0);
-    for (size_t channel = 0; channel < 256; channel += 16) {
+    for (size_t channel = 0; channel < p->value_dim; channel += 16) {
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
@@ -1016,8 +1016,8 @@ static TrillimStatus attention_short_queries(
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        size_t output = ((first + row) * p->heads + head) * 256;
-        for (size_t channel = 0; channel < 256; ++channel) {
+        size_t output = ((first + row) * p->heads + head) * p->value_dim;
+        for (size_t channel = 0; channel < p->value_dim; ++channel) {
             TrillimValue value;
             value.f = accumulator[row][channel] / (denominator[row] > 0.0f ? denominator[row] : 1.0f);
             trillim_store(task->output, output + channel, p->output_dtype, value);
@@ -1036,14 +1036,28 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
     size_t kv_head = head / (p->heads / p->kv_heads);
     size_t first = (index % tiles) * query_tile;
     size_t last = p->queries - first < query_tile ? p->queries : first + query_tile;
-    if (query_tile == 4 && last - first >= 2 && p->length <= 64 &&
-        p->key_dim == 256 && p->value_dim == 256 &&
+    if (last - first >= 2 && p->queries <= 64 && p->length <= 64 &&
+        p->q_dtype == TRILLIM_BF16 && p->k_dtype == TRILLIM_BF16 &&
+        p->v_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_BF16 &&
+        p->key_dim <= 256 && p->key_dim % 16 == 0 &&
+        p->value_dim <= 256 && p->value_dim % 16 == 0 &&
         p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->v_strides[2] == 1 &&
         (!p->windowed || p->window >= p->length) &&
         (((uintptr_t)task->query | (uintptr_t)task->keys | (uintptr_t)task->values) & 1) == 0) {
-        TrillimStatus status = attention_short_queries(task, head, kv_head, first, last);
-        if (status != TRILLIM_ERROR) {
-            return status;
+        bool complete = true;
+        for (size_t begin = first; begin < last; begin += 4) {
+            size_t end = last - begin < 4 ? last : begin + 4;
+            TrillimStatus status = attention_short_queries(task, head, kv_head, begin, end);
+            if (status == TRILLIM_ERROR) {
+                complete = false;
+                break;
+            }
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        if (complete) {
+            return TRILLIM_OK;
         }
     }
     float *scores = task->scratch + index * (p->value_dim + 64);
