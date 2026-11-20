@@ -2,11 +2,11 @@
 #include <arm_neon.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <dlfcn.h>
 #include <limits.h>
-#include <stdlib.h>
 #elif defined(__linux__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
@@ -1359,6 +1359,450 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_prefil
 }
 #endif
 
+enum {
+    INT8_ACTIVATION_MAX_WIDTH = 65536,
+    INT8_ACTIVATION_Q8_0 = 32,
+    INT8_ACTIVATION_Q8_K = 256,
+};
+
+typedef struct {
+    uint16_t scale;
+    int8_t values[INT8_ACTIVATION_Q8_0];
+} Q8ActivationBlock;
+
+typedef struct {
+    float scale;
+    int8_t values[INT8_ACTIVATION_Q8_K];
+    int16_t sums[INT8_ACTIVATION_Q8_K / 16];
+} Q8KActivationBlock;
+
+typedef struct {
+    const Task *projection;
+    const void *activation;
+    const uint8_t *gate;
+    float (*silu)(float);
+} Int8ProjectionTask;
+
+__asm__(
+    ".irp reg,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n"
+    ".set trillim_sdot_v\\reg,\\reg\n"
+    ".endr\n"
+);
+
+static bool available_dotprod(void) {
+    static atomic_int cached;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value != 0) {
+        return value == 2;
+    }
+    bool available = false;
+#if defined(__APPLE__)
+    int flag = 0;
+    size_t size = sizeof(flag);
+    available = sysctlbyname("hw.optional.arm.FEAT_DotProd", &flag, &size, NULL, 0) == 0 && flag != 0;
+#elif defined(__linux__) && defined(HWCAP_ASIMDDP)
+    available = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#endif
+    atomic_store_explicit(&cached, available ? 2 : 1, memory_order_relaxed);
+    return available;
+}
+
+static inline int32x4_t int8_dot_widen(int8x16_t weight, int8x16_t input) {
+    const int16x8_t low = vmull_s8(vget_low_s8(weight), vget_low_s8(input));
+    const int16x8_t high = vmull_high_s8(weight, input);
+    return vpaddq_s32(vpaddlq_s16(low), vpaddlq_s16(high));
+}
+
+static inline int32x4_t int8_sdot(int8x16_t weight, int8x16_t input) {
+    int32x4_t accum = vdupq_n_s32(0);
+    __asm__(".inst 0x4e809400 | trillim_sdot_%0 | (trillim_sdot_%1 << 5) | (trillim_sdot_%2 << 16)"
+            : "+w"(accum) : "w"(weight), "w"(input));
+    return accum;
+}
+
+static inline int8x16_t quantize_activation_16(
+    float32x4_t x0, float32x4_t x1, float32x4_t x2, float32x4_t x3, float inverse
+) {
+    const int32x4_t q0 = vcvtnq_s32_f32(vmulq_n_f32(x0, inverse));
+    const int32x4_t q1 = vcvtnq_s32_f32(vmulq_n_f32(x1, inverse));
+    const int32x4_t q2 = vcvtnq_s32_f32(vmulq_n_f32(x2, inverse));
+    const int32x4_t q3 = vcvtnq_s32_f32(vmulq_n_f32(x3, inverse));
+    return vcombine_s8(vmovn_s16(vcombine_s16(vmovn_s32(q0), vmovn_s32(q1))),
+                        vmovn_s16(vcombine_s16(vmovn_s32(q2), vmovn_s32(q3))));
+}
+
+static bool quantize_activation_q8(const void *input, size_t k, uint32_t dtype, Q8ActivationBlock *out) {
+    float32x4_t x[8];
+    float32x4_t max_vector = vdupq_n_f32(0);
+    for (size_t i = 0; i < 8; ++i) {
+        x[i] = load4(input, k + i * 4, dtype);
+        max_vector = vmaxq_f32(max_vector, vabsq_f32(x[i]));
+    }
+    const float maximum = vmaxvq_f32(max_vector);
+    const float scale = maximum / 127.0f;
+    const float inverse = scale != 0 ? 1.0f / scale : 0;
+    if (!isfinite(inverse) || !isfinite(maximum) || scale > 65504.0f) {
+        return false;
+    }
+    out->scale = trillim_to_fp16(scale);
+    if (maximum != 0 && out->scale == 0) {
+        return false;
+    }
+    vst1q_s8(out->values, quantize_activation_16(x[0], x[1], x[2], x[3], inverse));
+    vst1q_s8(out->values + 16, quantize_activation_16(x[4], x[5], x[6], x[7], inverse));
+    return true;
+}
+
+static bool quantize_activation_q8k(const void *input, size_t k, uint32_t dtype, Q8KActivationBlock *out) {
+    float values[INT8_ACTIVATION_Q8_K];
+    float32x4_t max_vector = vdupq_n_f32(0);
+    for (size_t i = 0; i < INT8_ACTIVATION_Q8_K; i += 4) {
+        const float32x4_t x = load4(input, k + i, dtype);
+        vst1q_f32(values + i, x);
+        max_vector = vmaxq_f32(max_vector, vabsq_f32(x));
+    }
+    const float maximum = vmaxvq_f32(max_vector);
+    if (maximum == 0) {
+        memset(out, 0, sizeof(*out));
+        return true;
+    }
+    if (!isfinite(maximum)) {
+        return false;
+    }
+    /* Q8_K uses the sign of the first value attaining the maximum magnitude. */
+    size_t peak = 0;
+    while (fabsf(values[peak]) != maximum) {
+        ++peak;
+    }
+    const float inverse = -127.0f / values[peak];
+    if (!isfinite(inverse) || inverse == 0) {
+        return false;
+    }
+    out->scale = 1.0f / inverse;
+    for (size_t i = 0; i < INT8_ACTIVATION_Q8_K; i += 16) {
+        const int8x16_t x = quantize_activation_16(vld1q_f32(values + i), vld1q_f32(values + i + 4),
+            vld1q_f32(values + i + 8), vld1q_f32(values + i + 12), inverse);
+        vst1q_s8(out->values + i, x);
+        out->sums[i / 16] = vaddlvq_s8(x);
+    }
+    return true;
+}
+
+static inline float int8_weight_scale(const uint8_t *scales, size_t block) {
+    uint16_t bits;
+    memcpy(&bits, scales + block * sizeof(bits), sizeof(bits));
+    return trillim_bf16(bits);
+}
+
+static inline int8x16x2_t int8_decode_q5(const uint8_t *low, const uint8_t *high) {
+    uint32_t packed_high;
+    memcpy(&packed_high, high, sizeof(packed_high));
+    const uint8x16_t packed_low = vld1q_u8(low);
+    const uint8x16_t dup = vreinterpretq_u8_u32(vdupq_n_u32(packed_high));
+    const uint8x16_t indexes = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+    const uint8x16_t masks = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bit0 = vandq_u8(vtstq_u8(vqtbl1q_u8(dup, indexes), masks), vdupq_n_u8(16));
+    const uint8x16_t bit1 = vandq_u8(vtstq_u8(vqtbl1q_u8(dup, vaddq_u8(indexes, vdupq_n_u8(2))), masks), vdupq_n_u8(16));
+    return (int8x16x2_t){{
+        vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed_low, vdupq_n_u8(15)), bit0)), vdupq_n_s8(16)),
+        vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed_low, 4), bit1)), vdupq_n_s8(16)),
+    }};
+}
+
+static inline int8x16x2_t int8_decode_q4(const uint8_t *low) {
+    const uint8x16_t bits = vld1q_u8(low);
+    return (int8x16x2_t){{
+        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(bits, vdupq_n_u8(15))), vdupq_n_s8(8)),
+        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(bits, 4)), vdupq_n_s8(8)),
+    }};
+}
+
+static inline __attribute__((always_inline)) float dot_q8_activation(
+    const uint8_t *low, const uint8_t *scales, const uint8_t *high, const Q8ActivationBlock *x,
+    size_t groups, uint32_t dtype, bool widening
+) {
+    /* Match the four lane sums for even and odd blocks in the reference DOT kernel. */
+    float32x4_t even = vdupq_n_f32(0), odd = vdupq_n_f32(0);
+    size_t g = 0;
+    for (; g + 1 < groups; g += 2) {
+        int32x4_t partial[2];
+        float scale[2];
+        for (size_t p = 0; p < 2; ++p) {
+            const size_t block = g + p;
+            int8x16x2_t w;
+            if (dtype == TRILLIM_GRP_INT5) {
+                w = int8_decode_q5(low + block * 16, high + block * 4);
+            } else if (dtype == TRILLIM_GRP_INT4) {
+                w = int8_decode_q4(low + block * 16);
+            } else {
+                w.val[0] = vld1q_s8((const int8_t *) low + block * 32);
+                w.val[1] = vld1q_s8((const int8_t *) low + block * 32 + 16);
+            }
+            const int8x16_t a0 = vld1q_s8(x[block].values);
+            const int8x16_t a1 = vld1q_s8(x[block].values + 16);
+            partial[p] = widening ? vaddq_s32(int8_dot_widen(w.val[0], a0), int8_dot_widen(w.val[1], a1))
+                                  : vaddq_s32(int8_sdot(w.val[0], a0), int8_sdot(w.val[1], a1));
+            scale[p] = int8_weight_scale(scales, block) * (float) vreinterpret_f16_u16(vdup_n_u16(x[block].scale))[0];
+        }
+        even = vfmaq_n_f32(even, vcvtq_f32_s32(partial[0]), scale[0]);
+        odd = vfmaq_n_f32(odd, vcvtq_f32_s32(partial[1]), scale[1]);
+    }
+    float result = vaddvq_f32(even) + vaddvq_f32(odd);
+    if (g < groups) {
+        int8x16x2_t w;
+        if (dtype == TRILLIM_GRP_INT5) {
+            w = int8_decode_q5(low + g * 16, high + g * 4);
+        } else if (dtype == TRILLIM_GRP_INT4) {
+            w = int8_decode_q4(low + g * 16);
+        } else {
+            w.val[0] = vld1q_s8((const int8_t *) low + g * 32);
+            w.val[1] = vld1q_s8((const int8_t *) low + g * 32 + 16);
+        }
+        const int32x4_t partial = vaddq_s32(int8_dot_widen(w.val[0], vld1q_s8(x[g].values)),
+            int8_dot_widen(w.val[1], vld1q_s8(x[g].values + 16)));
+        result += (int8_weight_scale(scales, g) * trillim_fp16(x[g].scale)) * vaddvq_s32(partial);
+    }
+    return result;
+}
+
+static inline __attribute__((always_inline)) float dot_q8k_activation(
+    const uint8_t *restrict low, const uint8_t *restrict scales, const uint8_t *restrict high,
+    const int8_t *restrict subscales, const Q8KActivationBlock *restrict x, size_t groups, bool widening
+) {
+    float output = 0;
+    const uint8x16_t low_mask = vdupq_n_u8(15);
+    const uint8x16_t high_mask = vdupq_n_u8(48);
+    for (size_t g = 0; g < groups; ++g) {
+        int32x4_t sum = vdupq_n_s32(0);
+        for (size_t half = 0; half < 2; ++half) {
+            const uint8_t *l = low + g * 128 + half * 64;
+            const uint8_t *h = high + g * 64 + half * 32;
+            const int8_t *a = x[g].values + half * 128;
+            const int8x16_t s = vld1q_s8(subscales + g * 16);
+            const int16x8_t half_scales = half == 0 ? vmovl_s8(vget_low_s8(s)) : vmovl_high_s8(s);
+            const int16x8_t sums = vld1q_s16(x[g].sums + half * 8);
+            for (size_t lane = 0; lane < 4; ++lane) {
+                const int8x16_t shift_l = vdupq_n_s8(-(int8_t)((lane % 2) * 4));
+                const int8x16_t shift_h = vdupq_n_s8((int8_t)(4 - 2 * (int)lane));
+                const uint8_t *l32 = l + (lane / 2) * 32;
+                const uint8x16_t q0 = vorrq_u8(vandq_u8(vshlq_u8(vld1q_u8(l32), shift_l), low_mask),
+                    vandq_u8(vshlq_u8(vld1q_u8(h), shift_h), high_mask));
+                const uint8x16_t q1 = vorrq_u8(vandq_u8(vshlq_u8(vld1q_u8(l32 + 16), shift_l), low_mask),
+                    vandq_u8(vshlq_u8(vld1q_u8(h + 16), shift_h), high_mask));
+                const int8x16_t a0 = vld1q_s8(a + lane * 32);
+                const int8x16_t a1 = vld1q_s8(a + lane * 32 + 16);
+                int32x4_t d0 = widening ? int8_dot_widen(vreinterpretq_s8_u8(q0), a0) : int8_sdot(vreinterpretq_s8_u8(q0), a0);
+                int32x4_t d1 = widening ? int8_dot_widen(vreinterpretq_s8_u8(q1), a1) : int8_sdot(vreinterpretq_s8_u8(q1), a1);
+                const int16_t s0 = subscales[g * 16 + half * 8 + lane * 2];
+                const int16_t s1 = subscales[g * 16 + half * 8 + lane * 2 + 1];
+                sum = vmlaq_n_s32(sum, d0, s0);
+                sum = vmlaq_n_s32(sum, d1, s1);
+            }
+            const int32x4_t correction = vaddq_s32(
+                vmull_s16(vget_low_s16(sums), vget_low_s16(half_scales)),
+                vmull_high_s16(sums, half_scales));
+            sum = vmlsq_n_s32(sum, correction, 32);
+        }
+        output += (int8_weight_scale(scales, g) * x[g].scale) * vaddvq_s32(sum);
+    }
+    return output;
+}
+
+typedef struct {
+    const uint8_t *low;
+    const uint8_t *scales;
+    const uint8_t *high;
+    const int8_t *subscales;
+} Int8PackedWeight;
+
+static inline Int8PackedWeight int8_packed_weight(const uint8_t *weight, size_t total_groups, uint32_t dtype) {
+    const size_t low_size = dtype == TRILLIM_DUBGRP_INT6 ? 128 : (dtype == TRILLIM_GRP_INT8 ? 32 : 16);
+    const uint8_t *scales = weight + total_groups * low_size;
+    const uint8_t *high = scales + total_groups * 2;
+    const int8_t *subscales = (const int8_t *) (high + (dtype == TRILLIM_DUBGRP_INT6 ? total_groups * 64 : 0));
+    return (Int8PackedWeight){weight, scales, high, subscales};
+}
+
+static inline __attribute__((always_inline)) float int8_dot_row(
+    const Int8PackedWeight *weight, size_t offset, const void *activation, size_t groups,
+    uint32_t dtype, bool widening
+) {
+    if (dtype == TRILLIM_DUBGRP_INT6) {
+        return dot_q8k_activation(weight->low + offset * 128, weight->scales + offset * 2,
+            weight->high + offset * 64, weight->subscales + offset * 16, activation, groups, widening);
+    }
+    const size_t low_size = dtype == TRILLIM_GRP_INT8 ? 32 : 16;
+    return dot_q8_activation(weight->low + offset * low_size, weight->scales + offset * 2,
+        weight->high + (dtype == TRILLIM_GRP_INT5 ? offset * 4 : 0), activation, groups, dtype, widening);
+}
+
+static __attribute__((noinline)) TrillimStatus project_int8_nonfinite(
+    const Task *task, const uint8_t *weight, size_t row, float *result
+) {
+    const Parameters *p = task->p;
+    const size_t start = row * p->width;
+    float sum = 0.0f;
+    for (size_t k = 0; k < p->width; ++k) {
+        if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const float x = trillim_load(task->input, k, p->input_dtype).f;
+        const float w = trillim_packed_read_float(weight, start + k, p->weight_dtype, p->outputs, p->width);
+        sum += x * w;
+    }
+    *result = sum;
+    return TRILLIM_OK;
+}
+
+static inline __attribute__((always_inline)) TrillimStatus project_int8(
+    void *opaque, size_t index, bool widening, uint32_t dtype
+) {
+    const Int8ProjectionTask *quantized = opaque;
+    const Task *task = quantized->projection;
+    const Parameters *p = task->p;
+    const size_t group_width = dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    const size_t groups = p->width / group_width;
+    const size_t total_groups = groups * p->outputs;
+    const Int8PackedWeight weight = int8_packed_weight(task->weight, total_groups, dtype);
+    Int8PackedWeight gate = {0};
+    if (quantized->gate != NULL) {
+        gate = int8_packed_weight(quantized->gate, total_groups, dtype);
+    }
+    const size_t begin = index * task->columns;
+    const size_t end = p->outputs - begin < task->columns ? p->outputs : begin + task->columns;
+    for (size_t row = begin; row < end; ++row) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const size_t offset = row * groups;
+        float value = int8_dot_row(&weight, offset, quantized->activation, groups, dtype, widening);
+        if (!isfinite(value)) {
+            const TrillimStatus status = project_int8_nonfinite(task, task->weight, row, &value);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        if (quantized->gate != NULL) {
+            float gate_value = int8_dot_row(&gate, offset, quantized->activation, groups, dtype, widening);
+            if (!isfinite(gate_value)) {
+                const TrillimStatus status = project_int8_nonfinite(task, quantized->gate, row, &gate_value);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+            value *= quantized->silu(gate_value);
+        }
+        ((float *)task->output)[row] = value;
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+#define DEFINE_INT8_PROJECTION(name, widening, dtype) \
+    static TrillimStatus name(void *opaque, size_t index, size_t worker) { \
+        (void) worker; \
+        return project_int8(opaque, index, widening, dtype); \
+    }
+
+DEFINE_INT8_PROJECTION(project_int8_q4_neon, true, TRILLIM_GRP_INT4)
+DEFINE_INT8_PROJECTION(project_int8_q5_neon, true, TRILLIM_GRP_INT5)
+DEFINE_INT8_PROJECTION(project_int8_q6_neon, true, TRILLIM_DUBGRP_INT6)
+DEFINE_INT8_PROJECTION(project_int8_q8_neon, true, TRILLIM_GRP_INT8)
+
+DEFINE_INT8_PROJECTION(project_int8_q4_sdot, false, TRILLIM_GRP_INT4)
+DEFINE_INT8_PROJECTION(project_int8_q5_sdot, false, TRILLIM_GRP_INT5)
+DEFINE_INT8_PROJECTION(project_int8_q6_sdot, false, TRILLIM_DUBGRP_INT6)
+DEFINE_INT8_PROJECTION(project_int8_q8_sdot, false, TRILLIM_GRP_INT8)
+static TrillimTask int8_projection(uint32_t dtype) {
+    const bool dotprod = available_dotprod();
+    switch (dtype) {
+    case TRILLIM_GRP_INT4: return dotprod ? project_int8_q4_sdot : project_int8_q4_neon;
+    case TRILLIM_GRP_INT5: return dotprod ? project_int8_q5_sdot : project_int8_q5_neon;
+    case TRILLIM_DUBGRP_INT6: return dotprod ? project_int8_q6_sdot : project_int8_q6_neon;
+    case TRILLIM_GRP_INT8: return dotprod ? project_int8_q8_sdot : project_int8_q8_neon;
+    default: return NULL;
+    }
+}
+
+static __attribute__((noinline)) TrillimStatus try_int8_projection(
+    const Task *task, const uint8_t *gate, float (*silu)(float), size_t workers, bool *handled
+) {
+    *handled = false;
+    const Parameters *p = task->p;
+    if (p->tokens != 1 || p->output_dtype != TRILLIM_FP32 || p->width < 32 ||
+        p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 ||
+        !trillim_float(p->input_dtype) || !fhm_default_fpcr()) {
+        return TRILLIM_OK;
+    }
+    const size_t width = p->weight_dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
+    const TrillimTask operation = int8_projection(p->weight_dtype);
+    if (operation == NULL || p->width % width != 0) {
+        return TRILLIM_OK;
+    }
+    const size_t groups = p->width / width;
+    const size_t storage = groups * (width == 256 ? sizeof(Q8KActivationBlock) : sizeof(Q8ActivationBlock));
+    void *activation = malloc(storage);
+    if (activation == NULL) {
+        return TRILLIM_OK;
+    }
+    TrillimStatus status = TRILLIM_OK;
+    for (size_t g = 0; g < groups; ++g) {
+        if (g % (1024 / width) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            status = TRILLIM_CANCELLED;
+            break;
+        }
+        const bool valid = width == 256
+            ? quantize_activation_q8k(task->input, g * width, p->input_dtype, (Q8KActivationBlock *)activation + g)
+            : quantize_activation_q8(task->input, g * width, p->input_dtype, (Q8ActivationBlock *)activation + g);
+        if (!valid) {
+            free(activation);
+            return TRILLIM_OK;
+        }
+    }
+    if (status == TRILLIM_OK) {
+        Int8ProjectionTask int8 = {task, activation, gate, silu};
+        const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
+        if (p->width <= 65536 / p->outputs || workers == 1) {
+            Task serial = *task;
+            serial.columns = p->outputs;
+            Int8ProjectionTask serial_int8 = {&serial, activation, gate, silu};
+            status = operation(&serial_int8, 0, 0);
+        } else {
+            status = task->context->thread_pool->run(task->context->thread_pool->context, tiles, operation, &int8);
+        }
+        *handled = true;
+    }
+    free(activation);
+    return status;
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+__asm__(".private_extern _trillim_neon_try_packed_ffn_int8");
+#else
+/* The leading dot keeps the helper outside the catalog's kernel symbol namespace. */
+__asm__(".hidden .trillim_neon_try_packed_ffn_int8\n.globl .trillim_neon_try_packed_ffn_int8");
+static TrillimStatus trillim_neon_try_packed_ffn_int8(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    const TrillimKernelContext *, bool *
+) __asm__(".trillim_neon_try_packed_ffn_int8");
+#endif
+static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8(
+    void *output, const void *input, const void *up, const void *gate, const void *parameters,
+    float (*silu)(float), const TrillimKernelContext *context, bool *handled
+) {
+    const size_t workers = context->thread_pool->worker_count;
+    if (workers == 0) {
+        *handled = false;
+        return TRILLIM_OK;
+    }
+    const Parameters *p = parameters;
+    const size_t chunk = p->outputs / workers / 4;
+    const size_t columns = chunk < 16 ? 16 : chunk;
+    const Task task = {output, input, up, p, columns, context};
+    return try_int8_projection(&task, gate, silu, workers, handled);
+}
+#endif
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -1382,6 +1826,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
         columns = 16;
     }
     Task task = {outputs[0], inputs[0], inputs[1], p, columns, context};
+    bool int8_handled;
+    TrillimStatus int8_status = try_int8_projection(&task, NULL, NULL, workers, &int8_handled);
+    if (int8_status != TRILLIM_OK || int8_handled) {
+        return int8_status;
+    }
+
 #if defined(__APPLE__)
     bool prefill_handled;
     TrillimStatus prefill = try_packed_prefill(&task, &prefill_handled);

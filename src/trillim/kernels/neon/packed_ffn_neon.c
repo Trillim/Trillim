@@ -17,6 +17,17 @@
 #define COMPONENT_API
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+extern TrillimStatus trillim_neon_try_packed_ffn_int8(
+        void *, const void *, const void *, const void *, const void *, float (*)(float),
+    const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8")
+#endif
+;
+#endif
+
 extern COMPONENT_API TrillimStatus trillim_neon_packed_linear(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
 );
@@ -1391,7 +1402,19 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
         return status;
     }
 #endif
-    if (scratch_size != 0) {
+    bool hidden_handled = false;
+#if defined(__APPLE__) || defined(__linux__)
+    if (scratch_size != 0 && p->tokens == 1 && p->up_dtype == p->gate_dtype) {
+        LinearParameters expand = {1, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
+        status = trillim_neon_try_packed_ffn_int8(
+            task.hidden, inputs[0], inputs[1], inputs[2], &expand, silu, context, &hidden_handled
+        );
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+#endif
+    if (scratch_size != 0 && !hidden_handled) {
         size_t count = p->tokens * p->hidden_width;
         size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
         TrillimTask operation = project_hidden;

@@ -1,5 +1,12 @@
 #include "common.h"
 #include <math.h>
+#if !defined(_WIN32)
+#include <fenv.h>
+#include <stdlib.h>
+#endif
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -151,6 +158,144 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
         ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+#if !defined(_WIN32)
+/* A build containing only this source can continue using the scalar FFN. */
+#if !defined(__APPLE__)
+__attribute__((weak)) extern TrillimStatus trillim_scalar_block_linear(
+    void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
+);
+#endif
+
+static TrillimKernel linked_projection(void) {
+#if defined(__APPLE__)
+#define TRILLIM_KERNEL_NAME(symbol) #symbol
+    void *symbol = dlsym(RTLD_SELF, TRILLIM_KERNEL_NAME(trillim_scalar_block_linear));
+#undef TRILLIM_KERNEL_NAME
+    TrillimKernel kernel;
+    memcpy(&kernel, &symbol, sizeof(kernel));
+    return kernel;
+#else
+    return trillim_scalar_block_linear;
+#endif
+}
+
+typedef struct {
+    size_t tokens, width, outputs;
+    uint32_t input_dtype, weight_dtype, output_dtype;
+} LinearParameters;
+
+static size_t quantized_group_width(uint32_t dtype) {
+    switch (dtype) {
+    case TRILLIM_GRP_INT4:
+    case TRILLIM_GRP_INT5:
+    case TRILLIM_GRP_INT8:
+        return 32;
+    case TRILLIM_DUBGRP_INT6:
+        return 256;
+    default:
+        return 0;
+    }
+}
+
+static TrillimStatus check_activation(
+    const void *input, uint32_t dtype, size_t width, size_t group,
+    const TrillimKernelContext *context, bool *ordinary
+) {
+    *ordinary = false;
+    for (size_t start = 0; start < width; start += group) {
+        if (start % 1024 == 0 && context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float peak = 0.0f;
+        for (size_t i = 0; i < group; ++i) {
+            float value = trillim_load(input, start + i, dtype).f;
+            if (!isfinite(value)) {
+                return TRILLIM_OK;
+            }
+            if (fabsf(value) > peak) {
+                peak = fabsf(value);
+            }
+        }
+        if (peak != 0.0f) {
+            if (group == 256) {
+                if (peak > 0x1p40f || !isfinite(127.0f / peak)) {
+                    return TRILLIM_OK;
+                }
+            } else {
+                float step = peak / 127.0f;
+                if (step > 65504.0f || trillim_to_fp16(step) == 0) {
+                    return TRILLIM_OK;
+                }
+            }
+        }
+    }
+    *ordinary = true;
+    return TRILLIM_OK;
+}
+
+static TrillimStatus try_int8_ffn(const Task *task, bool *handled) {
+    *handled = false;
+    const Parameters *p = task->p;
+    if (p->tokens != 1 ||
+        task->context->thread_pool->worker_count == 0 ||
+        p->width == 0 || p->width > 65536 || p->hidden_width < 16 || p->hidden_width > 65536 ||
+        p->outputs < 16 || p->output_dtype != TRILLIM_FP32 || p->up_dtype != p->gate_dtype ||
+        fegetround() != FE_TONEAREST) {
+        return TRILLIM_OK;
+    }
+    TrillimKernel projection = linked_projection();
+    if (projection == NULL) {
+        return TRILLIM_OK;
+    }
+    size_t up_group = quantized_group_width(p->up_dtype);
+    size_t down_group = quantized_group_width(p->down_dtype);
+    if (up_group == 0 || down_group == 0 || p->width % up_group || p->hidden_width % down_group) {
+        return TRILLIM_OK;
+    }
+    const TrillimKernelContext *context = task->context;
+    bool ordinary;
+    TrillimStatus status = check_activation(task->inputs[0], p->input_dtype, p->width, up_group, context, &ordinary);
+    if (status != TRILLIM_OK || !ordinary) {
+        return status;
+    }
+    float *gate = malloc(p->hidden_width * sizeof(*gate));
+    if (gate == NULL) {
+        return TRILLIM_OK;
+    }
+    LinearParameters expand = {1, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
+    void *up_outputs[] = {task->hidden};
+    status = projection(up_outputs, task->inputs, NULL, &expand, context);
+    if (status == TRILLIM_OK) {
+        const void *gate_inputs[] = {task->inputs[0], task->inputs[2]};
+        void *gate_outputs[] = {gate};
+        status = projection(gate_outputs, gate_inputs, NULL, &expand, context);
+    }
+    if (status == TRILLIM_OK) {
+        float *hidden = task->hidden;
+        for (size_t i = 0; i < p->hidden_width; ++i) {
+            if (i % 256 == 0 && context->is_cancelled(context->cancellation_context)) {
+                status = TRILLIM_CANCELLED;
+                break;
+            }
+            hidden[i] *= silu(gate[i]);
+        }
+    }
+    free(gate);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    status = check_activation(task->hidden, TRILLIM_FP32, p->hidden_width, down_group, context, &ordinary);
+    if (status != TRILLIM_OK || !ordinary) {
+        return status;
+    }
+    LinearParameters down = {1, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, p->output_dtype};
+    const void *down_inputs[] = {task->hidden, task->inputs[3]};
+    void *down_outputs[] = {task->output};
+    *handled = true;
+    return projection(down_outputs, down_inputs, NULL, &down, context);
+}
+#endif
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_packed_ffn(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -165,6 +310,13 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_packed_ffn(
     }
     const Parameters *p = parameters;
     Task task = {outputs[0], inputs, scratch, p, context};
+#if !defined(_WIN32)
+    bool handled;
+    status = try_int8_ffn(&task, &handled);
+    if (status != TRILLIM_OK || handled) {
+        return status;
+    }
+#endif
     if (scratch_size != 0) {
         size_t count = p->tokens * p->hidden_width;
         size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
