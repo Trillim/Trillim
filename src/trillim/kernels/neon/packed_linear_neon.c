@@ -1,12 +1,51 @@
 #include "common.h"
 #include <arm_neon.h>
 #include <math.h>
+#include <stdatomic.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+
+#if defined(__apple_build_version__) && __clang_major__ <= 17
+/* Older Apple assemblers discard feature directives when compiling assembly text. */
+__asm__(
+    ".irp reg,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n"
+    ".set trillim_fhm_v\\reg,\\reg\n"
+    ".endr\n"
+);
+#define FHM
+static inline float32x4_t fhm_low(float32x4_t sum, float16x8_t a, float16x8_t b) {
+    __asm__ volatile(".inst 0x4e20ec00 | trillim_fhm_%0 | (trillim_fhm_%1 << 5) | (trillim_fhm_%2 << 16)"
+        : "+w"(sum) : "w"(a), "w"(b));
+    return sum;
+}
+static inline float32x4_t fhm_high(float32x4_t sum, float16x8_t a, float16x8_t b) {
+    __asm__ volatile(".inst 0x6e20cc00 | trillim_fhm_%0 | (trillim_fhm_%1 << 5) | (trillim_fhm_%2 << 16)"
+        : "+w"(sum) : "w"(a), "w"(b));
+    return sum;
+}
+#else
+/* Function targets disappear before the builder's separate assembly step. */
+__asm__(".arch armv8.6-a+bf16+fp16fml");
+#if defined(__clang__)
+#define FHM __attribute__((target("fp16fml")))
+#else
+#define FHM __attribute__((target("+fp16fml")))
+#endif
+FHM static inline float32x4_t fhm_low(float32x4_t sum, float16x8_t a, float16x8_t b) {
+    return vfmlalq_low_f16(sum, a, b);
+}
+FHM static inline float32x4_t fhm_high(float32x4_t sum, float16x8_t a, float16x8_t b) {
+    return vfmlalq_high_f16(sum, a, b);
+}
+#endif
+
 /* Apple Clang 17 crashes while optimizing the BFDOT loop. */
 #if !defined(__apple_build_version__) || __clang_major__ > 17
 #define TRILLIM_PACKED_BFDOT 1
-#include <stdatomic.h>
-/* Function targets disappear before the builder's separate assembly step. */
-__asm__(".arch armv8.6-a+bf16");
 #if defined(__clang__)
 #define BF16 __attribute__((target("bf16")))
 #else
@@ -15,12 +54,6 @@ __asm__(".arch armv8.6-a+bf16");
 BF16 static inline float32x4_t dot_bf16(float32x4_t sum, uint16x8_t a, uint16x8_t b) {
     return vbfdotq_f32(sum, vreinterpretq_bf16_u16(a), vreinterpretq_bf16_u16(b));
 }
-#if defined(__APPLE__)
-#include <sys/sysctl.h>
-#elif defined(__linux__)
-#include <sys/auxv.h>
-#include <asm/hwcap.h>
-#endif
 #endif
 
 typedef struct {
@@ -360,18 +393,25 @@ static inline void packed_group_widen(
     result[3] = packed_group_scaled(vget_high_s16(high), scale, factored);
 }
 
-static inline void packed_group_q4(uint8x16_t codes, float scale, bool factored, float32x4_t result[4]) {
+static inline float16x8x2_t packed_group_q4_half(uint8x16_t codes) {
     /* The sixteen centered codes have zero low bytes in FP16. */
     static const uint8_t fp16_high[16] = {
         200, 199, 198, 197, 196, 194, 192, 188, 0, 60, 64, 66, 68, 69, 70, 71
     };
     uint8x16_t bits = vqtbl1q_u8(vld1q_u8(fp16_high), codes);
-    float16x8_t lo = vreinterpretq_f16_u16(vshll_n_u8(vget_low_u8(bits), 8));
-    float16x8_t hi = vreinterpretq_f16_u16(vshll_high_n_u8(bits, 8));
-    result[0] = vcvt_f32_f16(vget_low_f16(lo));
-    result[1] = vcvt_high_f32_f16(lo);
-    result[2] = vcvt_f32_f16(vget_low_f16(hi));
-    result[3] = vcvt_high_f32_f16(hi);
+    float16x8x2_t values = {{
+        vreinterpretq_f16_u16(vshll_n_u8(vget_low_u8(bits), 8)),
+        vreinterpretq_f16_u16(vshll_high_n_u8(bits, 8)),
+    }};
+    return values;
+}
+
+static inline void packed_group_q4(uint8x16_t codes, float scale, bool factored, float32x4_t result[4]) {
+    float16x8x2_t values = packed_group_q4_half(codes);
+    result[0] = vcvt_f32_f16(vget_low_f16(values.val[0]));
+    result[1] = vcvt_high_f32_f16(values.val[0]);
+    result[2] = vcvt_f32_f16(vget_low_f16(values.val[1]));
+    result[3] = vcvt_high_f32_f16(values.val[1]);
     if (!factored) {
         for (size_t j = 0; j < 4; ++j) {
             result[j] = vmulq_n_f32(result[j], scale);
@@ -849,6 +889,137 @@ static TrillimTask factored_projection(uint32_t dtype) {
     }
 }
 
+enum { MAX_FHM_WIDTH = 8192 };
+
+typedef struct {
+    Task projection;
+    const uint8_t *input;
+} FhmTask;
+
+static bool available_fhm(void) {
+    static atomic_int cached;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value) {
+        return value == 2;
+    }
+    bool available = false;
+#if defined(__APPLE__)
+    int flag = 0;
+    size_t size = sizeof(flag);
+    available = sysctlbyname("hw.optional.arm.FEAT_FHM", &flag, &size, NULL, 0) == 0 && flag != 0;
+#elif defined(__linux__) && defined(HWCAP_ASIMDFHM)
+    available = (getauxval(AT_HWCAP) & HWCAP_ASIMDFHM) != 0;
+#endif
+    atomic_store_explicit(&cached, available ? 2 : 1, memory_order_relaxed);
+    return available;
+}
+
+static bool fhm_default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
+static TrillimStatus prepare_fhm_input(const Task *task, uint16_t *input, bool *valid) {
+    const Parameters *p = task->p;
+    uint32x4_t changed = vdupq_n_u32(0);
+    for (size_t k = 0; k < p->width; k += 8) {
+        if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t low = load4(task->input, k, p->input_dtype);
+        float32x4_t high = load4(task->input, k + 4, p->input_dtype);
+        float16x8_t half = vcvt_high_f16_f32(vcvt_f16_f32(low), high);
+        uint32x4_t low_bits = vreinterpretq_u32_f32(vcvt_f32_f16(vget_low_f16(half)));
+        uint32x4_t high_bits = vreinterpretq_u32_f32(vcvt_high_f32_f16(half));
+        changed = vorrq_u32(changed, veorq_u32(vreinterpretq_u32_f32(low), low_bits));
+        changed = vorrq_u32(changed, veorq_u32(vreinterpretq_u32_f32(high), high_bits));
+        vst1q_u16(input + k, vreinterpretq_u16_f16(half));
+    }
+    *valid = vmaxvq_u32(changed) == 0;
+    return TRILLIM_OK;
+}
+
+FHM static TrillimStatus project_fhm_int4(void *opaque, size_t tile, size_t worker) {
+    FhmTask *fhm = opaque;
+    const Task *task = &fhm->projection;
+    const Parameters *p = task->p;
+    if (!fhm_default_fpcr()) {
+        return project_factored_int4(&fhm->projection, tile, worker);
+    }
+    size_t first = tile * task->columns;
+    size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
+    size_t groups = p->width / 32;
+    PackedGroupRow first_row = packed_group_row(task->weight, p->width, p->outputs, first, TRILLIM_GRP_INT4);
+    bool valid;
+    TrillimStatus status = bounded_group_scales(first_row.scales, (end - first) * groups, task->context, &valid);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+    if (!valid) {
+        return project_grp_int4_decode(&fhm->projection, tile, worker);
+    }
+    for (size_t column = first; column < end; column += 4) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - column < 4 ? end - column : 4;
+        PackedGroupRow row[4];
+        float32x4_t sums[4] = {0};
+        for (size_t c = 0; c < 4; ++c) {
+            row[c] = packed_group_row(task->weight, p->width, p->outputs, column + (c < count ? c : 0), TRILLIM_GRP_INT4);
+        }
+        for (size_t k = 0; k < p->width; k += 32) {
+            if (k != 0 && (k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            uint8x16x4_t input = vld1q_u8_x4(fhm->input + k * sizeof(uint16_t));
+            float16x8_t x0 = vreinterpretq_f16_u8(input.val[0]), x1 = vreinterpretq_f16_u8(input.val[1]);
+            float16x8_t x2 = vreinterpretq_f16_u8(input.val[2]), x3 = vreinterpretq_f16_u8(input.val[3]);
+            for (size_t c = 0; c < 4; ++c) {
+                uint8x16x2_t codes = packed_group_codes(&row[c], k, TRILLIM_GRP_INT4);
+                float16x8x2_t low = packed_group_q4_half(codes.val[0]);
+                float16x8x2_t high = packed_group_q4_half(codes.val[1]);
+                float32x4_t lo = vdupq_n_f32(0), hi = lo;
+                lo = fhm_low(lo, x0, low.val[0]);
+                hi = fhm_low(hi, x2, high.val[0]);
+                lo = fhm_high(lo, x0, low.val[0]);
+                hi = fhm_high(hi, x2, high.val[0]);
+                lo = fhm_low(lo, x1, low.val[1]);
+                hi = fhm_low(hi, x3, high.val[1]);
+                lo = fhm_high(lo, x1, low.val[1]);
+                hi = fhm_high(hi, x3, high.val[1]);
+                float scale = packed_group_scale(&row[c], k, TRILLIM_GRP_INT4);
+                sums[c] = vfmaq_n_f32(sums[c], vaddq_f32(lo, hi), scale);
+            }
+        }
+        for (size_t c = 0; c < count; ++c) {
+            store_result(task->output, column + c, p->output_dtype, (TrillimValue){.f = vaddvq_f32(sums[c])});
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static __attribute__((noinline)) TrillimStatus run_fhm_int4(const Task *task, size_t tiles, bool *handled) {
+    *handled = false;
+    if (!available_fhm() || !fhm_default_fpcr()) {
+        return TRILLIM_OK;
+    }
+    /* Widening FMA uses the half-width activations only after a bit-exact round trip. */
+    uint16_t input[MAX_FHM_WIDTH];
+    FhmTask fhm = {*task, task->input};
+    if (task->p->input_dtype != TRILLIM_FP16) {
+        TrillimStatus status = prepare_fhm_input(task, input, handled);
+        if (status != TRILLIM_OK || !*handled) {
+            return status;
+        }
+        fhm.input = (const uint8_t *)input;
+    }
+    *handled = true;
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    return pool->run(pool->context, tiles, project_fhm_int4, &fhm);
+}
+
 static TrillimTask group_projection(uint32_t dtype, size_t rows) {
     switch (dtype) {
     case TRILLIM_GRP_INT4: return rows == 1 ? project_grp_int4_decode : project_grp_int4_group;
@@ -991,8 +1162,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
             }
         }
     }
-    if (row_tile == 1 && p->width >= 1024 && p->width <= MAX_FACTORED_WIDTH && p->outputs >= 16 &&
-        (p->input_dtype == TRILLIM_BF16 || p->input_dtype == TRILLIM_FP32)) {
+    if (row_tile == 1 && p->width >= 1024 && p->width <= MAX_FACTORED_WIDTH && p->outputs >= 16) {
         TrillimTask factored = factored_projection(p->weight_dtype);
         if (factored != NULL) {
             bool bounded;
@@ -1012,6 +1182,14 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
     }
     size_t rows = p->tokens / row_tile + (p->tokens % row_tile != 0);
     size_t tiles = p->outputs / task.columns + (p->outputs % task.columns != 0);
+    bool large_fhm = p->input_dtype == TRILLIM_FP32 ? p->outputs >= 32768 : p->outputs > 1024;
+    if (operation == project_factored_int4 && p->width <= MAX_FHM_WIDTH && large_fhm) {
+        bool handled;
+        TrillimStatus status = run_fhm_int4(&task, tiles, &handled);
+        if (status != TRILLIM_OK || handled) {
+            return status;
+        }
+    }
     if (p->width <= 65536 / (p->tokens * p->outputs)) {
         task.columns = p->outputs;
         for (size_t tile = 0; tile < rows; ++tile) {
