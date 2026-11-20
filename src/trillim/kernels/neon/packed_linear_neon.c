@@ -1980,7 +1980,6 @@ typedef struct {
     const uint8_t *gate;
     float (*silu)(float);
     const void *activation;
-    void *workspace;
     atomic_bool ordinary;
 } Int8PrefillTask;
 
@@ -2115,13 +2114,13 @@ enum { Q8_PREFILL_COLUMNS = 8, Q8_PREFILL_COLUMN_PAIRS = Q8_PREFILL_COLUMNS / 2 
 
 typedef struct {
     int8x16_t values[4][Q8_PREFILL_COLUMN_PAIRS];
-    float32x4_t scales[Q8_PREFILL_COLUMNS / 4];
+    float32x2_t scales[Q8_PREFILL_COLUMN_PAIRS];
 } Q8PrefillWeight;
 
 typedef struct {
     const Task *projection;
     Q8PrefillActivation *packed;
-    size_t groups, cells, chunk;
+    size_t rows, cells, chunk;
     atomic_bool ordinary;
 } Q8PrefillPackingTask;
 
@@ -2164,28 +2163,25 @@ static inline __attribute__((always_inline)) TrillimStatus pack_q8_prefill_range
     const Task *task = job->projection;
     size_t begin = index * job->chunk;
     const size_t end = job->cells - begin < job->chunk ? job->cells : begin + job->chunk;
-    size_t t = begin / job->groups;
-    size_t first = begin % job->groups;
+    size_t g = begin / job->rows;
+    size_t first = begin % job->rows;
     while (begin < end) {
-        const size_t remaining = job->groups - first;
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
+            return TRILLIM_OK;
+        }
+        const size_t remaining = job->rows - first;
         const size_t count = end - begin < remaining ? end - begin : remaining;
         for (size_t i = 0; i < count; ++i) {
-            const size_t g = first + i;
-            if (i == 0 || (g & 31) == 0) {
-                if (task->context->is_cancelled(task->context->cancellation_context)) {
-                    return TRILLIM_CANCELLED;
-                }
-                if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
-                    return TRILLIM_OK;
-                }
-            }
-            if (!pack_q8_activation_cell(task, job->packed + begin + i, t, g, dtype)) {
+            if (!pack_q8_activation_cell(task, job->packed + begin + i, first + i, g, dtype)) {
                 atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
                 return TRILLIM_OK;
             }
         }
         begin += count;
-        ++t;
+        ++g;
         first = 0;
     }
     return TRILLIM_OK;
@@ -2211,7 +2207,7 @@ static TrillimStatus pack_q8_prefill_activation(
     const size_t cells = rows * groups;
     const size_t tasks = p->tokens * p->width < 32768 ? 1 : pool->worker_count;
     const size_t chunk = cells / tasks + (cells % tasks != 0);
-    Q8PrefillPackingTask job = {task, activation, groups, cells, chunk, ATOMIC_VAR_INIT(true)};
+    Q8PrefillPackingTask job = {task, activation, rows, cells, chunk, ATOMIC_VAR_INIT(true)};
     const size_t count = cells / chunk + (cells % chunk != 0);
     TrillimStatus status = count == 1 ? pack_q8_prefill_tile(&job, 0, 0) :
         pool->run(pool->context, count, pack_q8_prefill_tile, &job);
@@ -2219,74 +2215,63 @@ static TrillimStatus pack_q8_prefill_activation(
     return status;
 }
 
-static inline __attribute__((always_inline)) void pack_q8_prefill_weight(
-    Int8PackedWeight first, Int8PackedWeight second, size_t column, size_t end, size_t groups,
-    Q8PrefillWeight *packed, uint32_t dtype, bool paired
+static inline __attribute__((always_inline)) void pack_q8_prefill_group(
+    Int8PackedWeight first, Int8PackedWeight second, size_t offsets[Q8_PREFILL_COLUMN_PAIRS][2],
+    size_t g, Q8PrefillWeight *packed, uint32_t dtype
 ) {
-    size_t offsets[Q8_PREFILL_COLUMN_PAIRS][2];
+    float scales[Q8_PREFILL_COLUMNS];
+    INT8_PREFILL_UNROLL
     for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
-        const size_t first_column = column + (paired ? c : 2 * c);
-        const size_t second_column = first_column + !paired;
-        offsets[c][0] = (first_column < end ? first_column : column) * groups;
-        offsets[c][1] = (second_column < end ? second_column : column) * groups;
+        const size_t a = offsets[c][0] + g, b = offsets[c][1] + g;
+        scales[2 * c] = int8_weight_scale(first.scales, a);
+        scales[2 * c + 1] = int8_weight_scale(second.scales, b);
+        const int8x16x2_t w0 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(first.low + a * 16) :
+            vld1q_s8_x2((const int8_t *)first.low + a * 32);
+        const int8x16x2_t w1 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(second.low + b * 16) :
+            vld1q_s8_x2((const int8_t *)second.low + b * 32);
+        packed->values[0][c] = vcombine_s8(vget_low_s8(w0.val[0]), vget_low_s8(w1.val[0]));
+        packed->values[1][c] = vcombine_s8(vget_high_s8(w0.val[0]), vget_high_s8(w1.val[0]));
+        packed->values[2][c] = vcombine_s8(vget_low_s8(w0.val[1]), vget_low_s8(w1.val[1]));
+        packed->values[3][c] = vcombine_s8(vget_high_s8(w0.val[1]), vget_high_s8(w1.val[1]));
     }
-    for (size_t g = 0; g < groups; ++g) {
-        Q8PrefillWeight *destination = packed + g;
-        float scales[Q8_PREFILL_COLUMNS];
-        INT8_PREFILL_UNROLL
-        for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
-            const size_t a = offsets[c][0] + g, b = offsets[c][1] + g;
-            scales[2 * c] = int8_weight_scale(first.scales, a);
-            scales[2 * c + 1] = int8_weight_scale(second.scales, b);
-            const int8x16x2_t w0 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(first.low + a * 16) :
-                vld1q_s8_x2((const int8_t *)first.low + a * 32);
-            const int8x16x2_t w1 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(second.low + b * 16) :
-                vld1q_s8_x2((const int8_t *)second.low + b * 32);
-            destination->values[0][c] = vcombine_s8(vget_low_s8(w0.val[0]), vget_low_s8(w1.val[0]));
-            destination->values[1][c] = vcombine_s8(vget_high_s8(w0.val[0]), vget_high_s8(w1.val[0]));
-            destination->values[2][c] = vcombine_s8(vget_low_s8(w0.val[1]), vget_low_s8(w1.val[1]));
-            destination->values[3][c] = vcombine_s8(vget_high_s8(w0.val[1]), vget_high_s8(w1.val[1]));
-        }
-        INT8_PREFILL_UNROLL
-        for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
-            destination->scales[c] = vld1q_f32(scales + 4 * c);
-        }
+    INT8_PREFILL_UNROLL
+    for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
+        packed->scales[c] = vld1_f32(scales + 2 * c);
     }
 }
 
-static void dot_q8_prefill(
-    const Q8PrefillWeight *restrict weight, const Q8PrefillActivation *restrict input,
-    size_t groups, float32x4_t result[INT8_PREFILL_ROWS][Q8_PREFILL_COLUMNS / 4]
+static inline __attribute__((always_inline)) float32x4_t q8_prefill_row(
+    float32x4_t a, float32x4_t b, size_t row
 ) {
-    float32x4_t sum[INT8_PREFILL_ROWS][Q8_PREFILL_COLUMNS / 4] = {0};
-    for (size_t g = 0; g < groups; ++g) {
-        const Q8PrefillWeight *w = weight + g;
-        const Q8PrefillActivation *x = input + g;
-        int32x4_t accum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] = {0};
+    return row & 1 ? vcombine_f32(vget_high_f32(a), vget_high_f32(b)) :
+        vcombine_f32(vget_low_f32(a), vget_low_f32(b));
+}
+
+static inline __attribute__((always_inline)) void accumulate_q8_prefill_group(
+    const Q8PrefillWeight *w, const Q8PrefillActivation *x,
+    float32x4_t sum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS]
+) {
+    int32x4_t accum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] = {0};
+    INT8_PREFILL_UNROLL
+    for (size_t k = 0; k < 4; ++k) {
+        const int8x16_t a0 = x->values[k][0], a1 = x->values[k][1];
         INT8_PREFILL_UNROLL
-        for (size_t k = 0; k < 4; ++k) {
-            const int8x16_t a0 = x->values[k][0], a1 = x->values[k][1];
-            INT8_PREFILL_UNROLL
-            for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
-                const int8x16_t b = w->values[k][c];
-                accum[0][c] = int8_prefill_i8mm(accum[0][c], a0, b);
-                accum[1][c] = int8_prefill_i8mm(accum[1][c], a1, b);
-            }
-        }
-        INT8_PREFILL_UNROLL
-        for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
-            const float32x4_t scale = w->scales[c];
-            const int32x4_t r0 = vcombine_s32(vget_low_s32(accum[0][2 * c]), vget_low_s32(accum[0][2 * c + 1]));
-            const int32x4_t r1 = vcombine_s32(vget_high_s32(accum[0][2 * c]), vget_high_s32(accum[0][2 * c + 1]));
-            const int32x4_t r2 = vcombine_s32(vget_low_s32(accum[1][2 * c]), vget_low_s32(accum[1][2 * c + 1]));
-            const int32x4_t r3 = vcombine_s32(vget_high_s32(accum[1][2 * c]), vget_high_s32(accum[1][2 * c + 1]));
-            sum[0][c] = vfmaq_f32(sum[0][c], vcvtq_f32_s32(r0), vmulq_laneq_f32(scale, x->scales[0], 0));
-            sum[1][c] = vfmaq_f32(sum[1][c], vcvtq_f32_s32(r1), vmulq_laneq_f32(scale, x->scales[0], 2));
-            sum[2][c] = vfmaq_f32(sum[2][c], vcvtq_f32_s32(r2), vmulq_laneq_f32(scale, x->scales[1], 0));
-            sum[3][c] = vfmaq_f32(sum[3][c], vcvtq_f32_s32(r3), vmulq_laneq_f32(scale, x->scales[1], 2));
+        for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
+            const int8x16_t b = w->values[k][c];
+            accum[0][c] = int8_prefill_i8mm(accum[0][c], a0, b);
+            accum[1][c] = int8_prefill_i8mm(accum[1][c], a1, b);
         }
     }
-    memcpy(result, sum, sizeof(sum));
+    INT8_PREFILL_UNROLL
+    for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
+        const float32x2_t weight_scale = w->scales[c];
+        const float32x4_t scale = vcombine_f32(weight_scale, weight_scale);
+        INT8_PREFILL_UNROLL
+        for (size_t pair = 0; pair < INT8_PREFILL_PAIRS; ++pair) {
+            const float32x4_t dot = vcvtq_f32_s32(accum[pair][c]);
+            sum[pair][c] = vfmaq_f32(sum[pair][c], dot, vmulq_f32(scale, x->scales[pair]));
+        }
+    }
 }
 
 enum {
@@ -2417,33 +2402,56 @@ static TrillimStatus project_q6_prefill(void *opaque, size_t index, size_t worke
 #undef INT8_PREFILL_UNROLL
 
 static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wide(
-    Int8PrefillTask *job, Int8PackedWeight weight, Int8PackedWeight second, Q8PrefillWeight *packed,
+    Int8PrefillTask *job, Int8PackedWeight weight, Int8PackedWeight second,
     size_t begin, size_t end, size_t groups, uint32_t dtype, bool paired
 ) {
     const Task *task = job->projection;
     const Parameters *p = task->p;
     const size_t step = paired ? Q8_PREFILL_COLUMN_PAIRS : Q8_PREFILL_COLUMNS;
+    const size_t row_tiles = p->tokens / INT8_PREFILL_ROWS + (p->tokens % INT8_PREFILL_ROWS != 0);
     const Q8PrefillActivation *activation = job->activation;
     for (size_t column = begin; column < end; column += step) {
         if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
             return TRILLIM_OK;
         }
-        if (task->context->is_cancelled(task->context->cancellation_context)) {
-            return TRILLIM_CANCELLED;
-        }
         const size_t count = end - column < step ? end - column : step;
-        pack_q8_prefill_weight(weight, second, column, end, groups, packed, dtype, paired);
+        size_t offsets[Q8_PREFILL_COLUMN_PAIRS][2];
+        for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
+            const size_t a = column + (paired ? c : 2 * c);
+            const size_t b = a + !paired;
+            offsets[c][0] = (a < end ? a : column) * groups;
+            offsets[c][1] = (b < end ? b : column) * groups;
+        }
+        /* Keep the previous even and odd accumulation order for FP32 rounding. */
+        float32x4_t totals[INT8_PREFILL_MAX_TOKENS / INT8_PREFILL_ROWS][2]
+            [INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS];
+        memset(totals, 0, row_tiles * sizeof(totals[0]));
+        for (size_t g = 0; g < groups; ++g) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            Q8PrefillWeight packed;
+            pack_q8_prefill_group(weight, second, offsets, g, &packed, dtype);
+            for (size_t t = 0; t < row_tiles; ++t) {
+                accumulate_q8_prefill_group(&packed, activation + g * row_tiles + t, totals[t][g & 1]);
+            }
+        }
         for (size_t row = 0; row < p->tokens; row += INT8_PREFILL_ROWS) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            float32x4_t result[INT8_PREFILL_ROWS][Q8_PREFILL_COLUMNS / 4];
-            dot_q8_prefill(packed, activation + row / INT8_PREFILL_ROWS * groups, groups, result);
+            float32x4_t (*sum)[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] =
+                totals[row / INT8_PREFILL_ROWS];
             const size_t rows = p->tokens - row < INT8_PREFILL_ROWS ? p->tokens - row : INT8_PREFILL_ROWS;
             for (size_t r = 0; r < rows; ++r) {
                 float *output = (float *)task->output + (row + r) * p->outputs + column;
+                float32x4_t result[Q8_PREFILL_COLUMNS / 4];
                 for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
-                    const uint32x4_t absolute = vandq_u32(vreinterpretq_u32_f32(result[r][c]), vdupq_n_u32(0x7fffffff));
+                    const size_t pair = r / 2;
+                    const float32x4_t a = vaddq_f32(sum[0][pair][2 * c], sum[1][pair][2 * c]);
+                    const float32x4_t b = vaddq_f32(sum[0][pair][2 * c + 1], sum[1][pair][2 * c + 1]);
+                    result[c] = q8_prefill_row(a, b, r);
+                    const uint32x4_t absolute = vandq_u32(vreinterpretq_u32_f32(result[c]), vdupq_n_u32(0x7fffffff));
                     if (vmaxvq_u32(absolute) >= 0x7f800000) {
                         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
                         return TRILLIM_OK;
@@ -2451,11 +2459,11 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
                 }
                 if (!paired && count == Q8_PREFILL_COLUMNS) {
                     for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
-                        vst1q_f32(output + 4 * c, result[r][c]);
+                        vst1q_f32(output + 4 * c, result[c]);
                     }
                 } else {
                     float values[Q8_PREFILL_COLUMNS];
-                    memcpy(values, result[r], sizeof(values));
+                    memcpy(values, result, sizeof(values));
                     for (size_t c = 0; c < count; ++c) {
                         output[c] = paired ? values[2 * c] * job->silu(values[2 * c + 1]) : values[c];
                     }
@@ -2470,6 +2478,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
 static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
     void *opaque, size_t index, size_t worker, uint32_t dtype
 ) {
+    (void)worker;
     Int8PrefillTask *job = opaque;
     const Task *task = job->projection;
     const Parameters *p = task->p;
@@ -2481,7 +2490,6 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
         ? int8_packed_weight(job->gate, total, dtype) : weight;
     const size_t begin = index * task->columns;
     const size_t end = p->outputs - begin < task->columns ? p->outputs : begin + task->columns;
-    Q8PrefillWeight *packed = (Q8PrefillWeight *)job->workspace + worker * groups;
     if (!fhm_default_fpcr()) {
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
@@ -2503,7 +2511,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
-    return project_q8_prefill_wide(job, weight, second, packed, begin, end, groups, dtype, paired);
+    return project_q8_prefill_wide(job, weight, second, begin, end, groups, dtype, paired);
 }
 
 static TrillimStatus project_q8_prefill(void *opaque, size_t index, size_t worker) {
@@ -2531,12 +2539,10 @@ static TrillimStatus try_int8_prefill(
     const size_t groups = p->width / group;
     const size_t rows = p->tokens / INT8_PREFILL_ROWS + (p->tokens % INT8_PREFILL_ROWS != 0);
     const size_t activation_bytes = rows * groups * (q6 ? sizeof(Q6PrefillActivation) : sizeof(Q8PrefillActivation));
-    const size_t weight_stride = q6 ? 0 : groups * sizeof(Q8PrefillWeight);
-    if (activation_bytes > 4 * 1024 * 1024 ||
-        (weight_stride != 0 && workers > (8 * 1024 * 1024 - activation_bytes) / weight_stride)) {
+    if (activation_bytes > 4 * 1024 * 1024) {
         return TRILLIM_OK;
     }
-    void *activation = malloc(activation_bytes + workers * weight_stride);
+    void *activation = malloc(activation_bytes);
     if (activation == NULL) {
         return TRILLIM_OK;
     }
@@ -2548,8 +2554,7 @@ static TrillimStatus try_int8_prefill(
         const size_t chunk = p->outputs / workers / 2;
         scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
         const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
-        void *workspace = (uint8_t *)activation + activation_bytes;
-        Int8PrefillTask job = {&scheduled, gate, silu, activation, workspace, ATOMIC_VAR_INIT(true)};
+        Int8PrefillTask job = {&scheduled, gate, silu, activation, ATOMIC_VAR_INIT(true)};
         const TrillimThreadPool *pool = task->context->thread_pool;
         TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
         status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
