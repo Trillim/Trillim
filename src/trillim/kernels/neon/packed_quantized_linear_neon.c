@@ -295,6 +295,10 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_packed_quantized_linea
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_packed_quantized_linear_capabilities(void) {
-    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_NEON};
+#if defined(__APPLE__) && defined(__aarch64__)
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
+#else
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_NEON | TRILLIM_CAP_LIBM};
+#endif
     return &capabilities;
 }

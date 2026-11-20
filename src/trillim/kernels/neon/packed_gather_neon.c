@@ -696,6 +696,10 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_packed_gather_neon_par
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_packed_gather_neon_capabilities(void) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM};
+#else
     static const TrillimCapabilities capabilities = {TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_NEON | TRILLIM_CAP_LIBM};
+#endif
     return &capabilities;
 }
