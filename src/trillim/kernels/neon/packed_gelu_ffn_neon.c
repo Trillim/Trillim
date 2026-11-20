@@ -73,6 +73,30 @@ enum { MAX_FHM_WIDTH = 8192 };
 #define COMPONENT_API __attribute__((visibility("default")))
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+extern TrillimStatus trillim_neon_try_packed_ffn_int8(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8")
+#endif
+;
+
+static float gelu_tanh(float x) {
+    const float cube = (x * x) * x;
+    const float correction = cube * 0.044715f;
+    const float argument = (x + correction) * 0.7978845608028654f;
+    const float scaled = argument * 2.0f;
+    const float e = expf(-fabsf(scaled));
+    const float denominator = e + 1.0f;
+    const float probability = scaled >= 0.0f ? 1.0f / denominator : e / denominator;
+    const float doubled = probability * 2.0f;
+    const float cdf = doubled - 1.0f;
+    return (x * 0.5f) * (cdf + 1.0f);
+}
+#endif
+
 extern COMPONENT_API TrillimStatus trillim_neon_packed_linear(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
 );
@@ -357,14 +381,26 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_gelu_ffn(
     if (p->tokens == 0 || p->outputs == 0) {
         return TRILLIM_OK;
     }
-    bool bounded = false;
+    float *hidden = scratch;
+    LinearParameters projection = {p->tokens, p->width, p->hidden, TRILLIM_BF16, TRILLIM_GRP_INT4, TRILLIM_FP32};
+    bool hidden_handled = false;
+#if defined(__APPLE__) || defined(__linux__)
     if (p->tokens == 1) {
+        TrillimStatus status = trillim_neon_try_packed_ffn_int8(
+            hidden, inputs[0], inputs[1], inputs[2], &projection, gelu_tanh, context, &hidden_handled
+        );
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+#endif
+    bool bounded = false;
+    if (p->tokens == 1 && !hidden_handled) {
         TrillimStatus status = check_bounds(inputs[0], p->width, context, &bounded);
         if (status != TRILLIM_OK) {
             return status;
         }
     }
-    float *hidden = scratch;
     if (bounded) {
         size_t workers = context->thread_pool->worker_count;
         if (workers == 0) {
@@ -379,10 +415,9 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_gelu_ffn(
         if (status != TRILLIM_OK) {
             return status;
         }
-    } else {
+    } else if (!hidden_handled) {
         size_t count = p->tokens * p->hidden;
         float *gate = hidden + count;
-        LinearParameters projection = {p->tokens, p->width, p->hidden, TRILLIM_BF16, TRILLIM_GRP_INT4, TRILLIM_FP32};
         void *up_outputs[] = {hidden}, *gate_outputs[] = {gate};
         const void *up_inputs[] = {inputs[0], inputs[1]}, *gate_inputs[] = {inputs[0], inputs[2]};
         TrillimStatus status = trillim_neon_packed_linear(up_outputs, up_inputs, NULL, &projection, context);
