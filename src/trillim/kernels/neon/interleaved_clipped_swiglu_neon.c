@@ -114,6 +114,12 @@ static TrillimStatus apply(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
+static inline bool default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_interleaved_clipped_swiglu(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -127,7 +133,9 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_interleaved_clipped_swiglu(
         return TRILLIM_OK;
     }
     Task task = {outputs[0], inputs[0], p, context};
-    if (p->rows > 4 && p->rows > 16384 / p->width) {
+    bool decode_parallel = p->rows == 4 && p->width >= 2048 &&
+        context->thread_pool->worker_count >= 4 && default_fpcr();
+    if (decode_parallel || (p->rows > 4 && p->rows > 16384 / p->width)) {
         return context->thread_pool->run(context->thread_pool->context, p->rows, apply, &task);
     }
     for (size_t row = 0; row < p->rows; ++row) {
