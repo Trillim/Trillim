@@ -385,7 +385,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_gelu_ffn(
     LinearParameters projection = {p->tokens, p->width, p->hidden, TRILLIM_BF16, TRILLIM_GRP_INT4, TRILLIM_FP32};
     bool hidden_handled = false;
 #if defined(__APPLE__) || defined(__linux__)
-    if (p->tokens == 1) {
+    if (p->tokens == 1 || p->tokens >= 4) {
         TrillimStatus status = trillim_neon_try_packed_ffn_int8(
             hidden, inputs[0], inputs[1], inputs[2], &projection, gelu_tanh, context, &hidden_handled
         );

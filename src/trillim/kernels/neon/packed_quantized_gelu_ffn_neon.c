@@ -88,7 +88,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_quantized_gelu_ffn(
     const LinearParameters expand = {p->tokens, p->width, p->hidden, TRILLIM_BF16, p->up_dtype, TRILLIM_FP32};
     bool hidden_handled = false;
 #if defined(__APPLE__) || defined(__linux__)
-    if (p->tokens == 1) {
+    if (p->tokens == 1 || (p->tokens >= 4 && p->up_dtype == TRILLIM_GRP_INT8)) {
         TrillimStatus status = trillim_neon_try_packed_ffn_int8(
             hidden, inputs[0], inputs[1], inputs[2], &expand, gelu_tanh, context, &hidden_handled
         );

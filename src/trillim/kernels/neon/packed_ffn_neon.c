@@ -1397,10 +1397,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
     Task task = {outputs[0], inputs, scratch, p, context, NULL, NULL};
     bool hidden_handled = false;
 #if defined(__APPLE__) || defined(__linux__)
-    bool q6_prefill = p->tokens >= 4 && p->up_dtype == TRILLIM_DUBGRP_INT6 &&
-        p->gate_dtype == TRILLIM_DUBGRP_INT6 && p->down_dtype == TRILLIM_DUBGRP_INT6 &&
-        p->output_dtype == TRILLIM_FP32;
-    if (scratch_size != 0 && p->up_dtype == p->gate_dtype && (p->tokens == 1 || q6_prefill)) {
+    const bool int8_prefill = p->tokens >= 4 && p->output_dtype == TRILLIM_FP32 &&
+        p->up_dtype == p->gate_dtype && p->up_dtype == p->down_dtype &&
+        (p->up_dtype == TRILLIM_DUBGRP_INT6 || p->up_dtype == TRILLIM_GRP_INT4 || p->up_dtype == TRILLIM_GRP_INT8);
+    if (scratch_size != 0 && p->up_dtype == p->gate_dtype && (p->tokens == 1 || int8_prefill)) {
         LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
         status = trillim_neon_try_packed_ffn_int8(
             task.hidden, inputs[0], inputs[1], inputs[2], &expand, silu, context, &hidden_handled
@@ -1408,7 +1408,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
         if (status != TRILLIM_OK) {
             return status;
         }
-        if (q6_prefill && hidden_handled) {
+        if (int8_prefill && hidden_handled) {
             LinearParameters down = {p->tokens, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
             const void *down_inputs[] = {scratch, inputs[3]};
             return trillim_neon_packed_linear(outputs, down_inputs, NULL, &down, context);
