@@ -1982,6 +1982,7 @@ typedef struct {
     float32x4_t (*activate4)(float32x4_t);
     const void *activation;
     atomic_bool ordinary;
+    bool output_bf16;
 } Int8PrefillTask;
 
 static bool int8_prefill_i8mm_available(void) {
@@ -2248,6 +2249,28 @@ static inline __attribute__((always_inline)) float32x4_t q8_prefill_row(
         vcombine_f32(vget_low_f32(a), vget_low_f32(b));
 }
 
+static inline bool finite_prefill_result(float32x4_t value) {
+    const uint32x4_t absolute = vandq_u32(vreinterpretq_u32_f32(value), vdupq_n_u32(0x7fffffff));
+    return vmaxvq_u32(absolute) < 0x7f800000;
+}
+
+static inline uint16x4_t round_finite_bf16(float32x4_t value) {
+    const uint32x4_t bits = vreinterpretq_u32_f32(value);
+    const uint32x4_t upper = vshrq_n_u32(bits, 16);
+    const uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+    return vshrn_n_u32(vaddq_u32(bits, bias), 16);
+}
+
+static inline void store_prefill_bf16(void *base, size_t offset, const float32x4_t values[2], size_t count) {
+    const uint16x8_t bits = vcombine_u16(round_finite_bf16(values[0]), round_finite_bf16(values[1]));
+    uint8_t *output = (uint8_t *)base + offset * sizeof(uint16_t);
+    if (count == 8) {
+        memcpy(output, &bits, sizeof(bits));
+    } else {
+        memcpy(output, &bits, count * sizeof(uint16_t));
+    }
+}
+
 static inline __attribute__((always_inline)) void accumulate_q8_prefill_group(
     const Q8PrefillWeight *w, const Q8PrefillActivation *x,
     float32x4_t sum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS]
@@ -2461,19 +2484,23 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
                 totals[row / INT8_PREFILL_ROWS];
             const size_t rows = p->tokens - row < INT8_PREFILL_ROWS ? p->tokens - row : INT8_PREFILL_ROWS;
             for (size_t r = 0; r < rows; ++r) {
-                float *output = (float *)task->output + (row + r) * p->outputs + column;
+                const size_t offset = (row + r) * p->outputs + column;
                 float32x4_t result[Q8_PREFILL_COLUMNS / 4];
                 for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
                     const size_t pair = r / 2;
                     const float32x4_t a = vaddq_f32(sum[0][pair][2 * c], sum[1][pair][2 * c]);
                     const float32x4_t b = vaddq_f32(sum[0][pair][2 * c + 1], sum[1][pair][2 * c + 1]);
                     result[c] = q8_prefill_row(a, b, r);
-                    const uint32x4_t absolute = vandq_u32(vreinterpretq_u32_f32(result[c]), vdupq_n_u32(0x7fffffff));
-                    if (vmaxvq_u32(absolute) >= 0x7f800000) {
+                    if (!finite_prefill_result(result[c])) {
                         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
                         return TRILLIM_OK;
                     }
                 }
+                if (job->output_bf16) {
+                    store_prefill_bf16(task->output, offset, result, count);
+                    continue;
+                }
+                float *output = (float *)task->output + offset;
                 if (!paired && count == Q8_PREFILL_COLUMNS) {
                     for (size_t c = 0; c < Q8_PREFILL_COLUMNS / 4; ++c) {
                         vst1q_f32(output + 4 * c, result[c]);
@@ -2545,7 +2572,7 @@ static TrillimStatus project_q4_prefill(void *opaque, size_t index, size_t worke
 
 static TrillimStatus try_int8_prefill(
     const Task *task, const uint8_t *gate, float (*silu)(float),
-    float32x4_t (*activate4)(float32x4_t), size_t workers, bool *handled
+    float32x4_t (*activate4)(float32x4_t), bool output_bf16, size_t workers, bool *handled
 ) {
     const Parameters *p = task->p;
     const bool q6 = p->weight_dtype == TRILLIM_DUBGRP_INT6;
@@ -2554,7 +2581,7 @@ static TrillimStatus try_int8_prefill(
         p->weight_dtype != TRILLIM_GRP_INT4) ||
         p->tokens < 4 || p->tokens > INT8_PREFILL_MAX_TOKENS || p->width < group || p->width % group != 0 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 || p->output_dtype != TRILLIM_FP32 ||
-        (uintptr_t)task->output % _Alignof(float) != 0 || !trillim_float(p->input_dtype) ||
+        (!output_bf16 && (uintptr_t)task->output % _Alignof(float) != 0) || !trillim_float(p->input_dtype) ||
         !fhm_default_fpcr() || !int8_prefill_i8mm_available()) {
         return TRILLIM_OK;
     }
@@ -2576,7 +2603,7 @@ static TrillimStatus try_int8_prefill(
         const size_t chunk = p->outputs / workers / 2;
         scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
         const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
-        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true)};
+        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true), output_bf16};
         const TrillimThreadPool *pool = task->context->thread_pool;
         TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
         status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
@@ -2613,7 +2640,7 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
     *handled = false;
     const Parameters *p = task->p;
     if (p->tokens != 1) {
-        return try_int8_prefill(task, gate, silu, NULL, workers, handled);
+        return try_int8_prefill(task, gate, silu, NULL, false, workers, handled);
     }
     if (p->output_dtype != TRILLIM_FP32 || p->width < 32 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 ||
@@ -2725,7 +2752,31 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8_pref
         return TRILLIM_OK;
     }
     const Task task = {output, input, up, parameters, 0, context};
-    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, workers, handled);
+    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, false, workers, handled);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+__asm__(".private_extern _trillim_neon_try_packed_linear_bf16");
+#else
+__asm__(".hidden .trillim_neon_try_packed_linear_bf16\n.globl .trillim_neon_try_packed_linear_bf16");
+static TrillimStatus trillim_neon_try_packed_linear_bf16(
+    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+) __asm__(".trillim_neon_try_packed_linear_bf16");
+#endif
+static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bf16(
+    void *output, const void *input, const void *weight, const void *parameters,
+    const TrillimKernelContext *context, bool *handled
+) {
+    *handled = false;
+    const Parameters *p = parameters;
+    const size_t workers = context->thread_pool->worker_count;
+    if (workers == 0 || (p->weight_dtype != TRILLIM_GRP_INT4 && p->weight_dtype != TRILLIM_GRP_INT8)) {
+        return TRILLIM_OK;
+    }
+    const Task task = {output, input, weight, p, 0, context};
+    return try_int8_prefill(&task, NULL, NULL, NULL, true, workers, handled);
 }
 #endif
 

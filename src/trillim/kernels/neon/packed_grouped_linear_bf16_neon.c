@@ -8,6 +8,16 @@ extern TrillimStatus trillim_neon_cast(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
 );
 
+#if defined(__APPLE__) || defined(__linux__)
+extern TrillimStatus trillim_neon_try_packed_linear_bf16(
+    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_linear_bf16")
+#endif
+;
+#endif
+
 typedef struct {
     size_t tokens, width, outputs;
     uint32_t weight_dtype;
@@ -62,6 +72,16 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_grouped_linear_bf16(
     }
     const LinearParameters projection = {p->tokens, p->width, p->outputs, TRILLIM_BF16,
         p->weight_dtype, TRILLIM_FP32};
+#if defined(__APPLE__) || defined(__linux__)
+    if (p->tokens >= 4) {
+        bool handled;
+        const TrillimStatus status = trillim_neon_try_packed_linear_bf16(
+            outputs[0], inputs[0], inputs[1], &projection, context, &handled);
+        if (status != TRILLIM_OK || handled) {
+            return status;
+        }
+    }
+#endif
     void *projected[] = {scratch};
     const TrillimStatus status = trillim_neon_packed_linear(projected, inputs, NULL, &projection, context);
     if (status != TRILLIM_OK) {
