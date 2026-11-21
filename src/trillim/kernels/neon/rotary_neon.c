@@ -122,6 +122,55 @@ static inline void store4(void *data, size_t index, uint32_t dtype, float32x4_t 
     vst1_u16((uint16_t *)data + index, vmovn_u32(rounded));
 }
 
+static inline __attribute__((always_inline)) TrillimStatus rotate_row(
+    const TrillimRotaryTask *task, size_t head, size_t token
+) {
+    const TrillimRotaryParameters *p = task->parameters;
+    if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+    size_t base = head * p->strides[0] + token * p->strides[1];
+    size_t output = (token * p->heads + head) * p->dim;
+    size_t column = p->rotary_dim;
+    for (; p->dim - column >= 4; column += 4) {
+        if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+        store4(task->output, output + column, p->output_dtype,
+            load4(task->input, base + column, p->input_dtype));
+    }
+    for (; column < p->dim; ++column) {
+        store(task, output + column, trillim_read_float(task->input, base + column, p->input_dtype));
+    }
+    const float *angles = task->angles + token * p->rotary_dim;
+    size_t pairs = p->rotary_dim / 2;
+    size_t pair = 0;
+    for (; pairs - pair >= 4; pair += 4) {
+        if ((pair & 127) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+        float32x4_t a, b;
+        if (p->interleaved) {
+            float32x4_t low = load4(task->input, base + pair * 2, p->input_dtype);
+            float32x4_t high = load4(task->input, base + pair * 2 + 4, p->input_dtype);
+            a = vuzp1q_f32(low, high);
+            b = vuzp2q_f32(low, high);
+        } else {
+            a = load4(task->input, base + pair, p->input_dtype);
+            b = load4(task->input, base + pair + pairs, p->input_dtype);
+        }
+        float32x4_t c = vld1q_f32(angles + pair);
+        float32x4_t s = vld1q_f32(angles + pairs + pair);
+        float32x4_t first = vfmaq_f32(vnegq_f32(vmulq_f32(b, s)), a, c);
+        float32x4_t second = vfmaq_f32(vmulq_f32(a, s), b, c);
+        if (p->interleaved) {
+            store4(task->output, output + pair * 2, p->output_dtype, vzip1q_f32(first, second));
+            store4(task->output, output + pair * 2 + 4, p->output_dtype, vzip2q_f32(first, second));
+        } else {
+            store4(task->output, output + pair, p->output_dtype, first);
+            store4(task->output, output + pair + pairs, p->output_dtype, second);
+        }
+    }
+    for (; pair < pairs; ++pair) {
+        trillim_rotate_pair(task, base, output, angles, pair);
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus trillim_rotary_task_neon(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const TrillimRotaryTask *task = opaque;
@@ -131,50 +180,8 @@ static TrillimStatus trillim_rotary_task_neon(void *opaque, size_t tile, size_t 
     size_t first = tile * block;
     size_t last = rows - first < block ? rows : first + block;
     for (size_t index = first; index < last; ++index) {
-        if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        size_t head = index % p->heads;
-        size_t token = index / p->heads;
-        size_t base = head * p->strides[0] + token * p->strides[1];
-        size_t output = (token * p->heads + head) * p->dim;
-        size_t column = p->rotary_dim;
-        for (; p->dim - column >= 4; column += 4) {
-            if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-            store4(task->output, output + column, p->output_dtype,
-                load4(task->input, base + column, p->input_dtype));
-        }
-        for (; column < p->dim; ++column) {
-            store(task, output + column, trillim_read_float(task->input, base + column, p->input_dtype));
-        }
-        const float *angles = task->angles + token * p->rotary_dim;
-        size_t pairs = p->rotary_dim / 2;
-        size_t pair = 0;
-        for (; pairs - pair >= 4; pair += 4) {
-            if ((pair & 127) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-            float32x4_t a, b;
-            if (p->interleaved) {
-                float32x4_t low = load4(task->input, base + pair * 2, p->input_dtype);
-                float32x4_t high = load4(task->input, base + pair * 2 + 4, p->input_dtype);
-                a = vuzp1q_f32(low, high);
-                b = vuzp2q_f32(low, high);
-            } else {
-                a = load4(task->input, base + pair, p->input_dtype);
-                b = load4(task->input, base + pair + pairs, p->input_dtype);
-            }
-            float32x4_t c = vld1q_f32(angles + pair);
-            float32x4_t s = vld1q_f32(angles + pairs + pair);
-            float32x4_t first = vfmaq_f32(vnegq_f32(vmulq_f32(b, s)), a, c);
-            float32x4_t second = vfmaq_f32(vmulq_f32(a, s), b, c);
-            if (p->interleaved) {
-                store4(task->output, output + pair * 2, p->output_dtype, vzip1q_f32(first, second));
-                store4(task->output, output + pair * 2 + 4, p->output_dtype, vzip2q_f32(first, second));
-            } else {
-                store4(task->output, output + pair, p->output_dtype, first);
-                store4(task->output, output + pair + pairs, p->output_dtype, second);
-            }
-        }
-        for (; pair < pairs; ++pair) {
-            trillim_rotate_pair(task, base, output, angles, pair);
-        }
+        const TrillimStatus status = rotate_row(task, index % p->heads, index / p->heads);
+        if (status != TRILLIM_OK) return status;
     }
     return TRILLIM_OK;
 }
@@ -196,6 +203,18 @@ static TrillimStatus prepare_angles(void *opaque, size_t token, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus rotate_token(void *opaque, size_t token, size_t worker) {
+    const TrillimRotaryTask *task = opaque;
+    const TrillimStatus status = prepare_angles(opaque, token, worker);
+    if (status != TRILLIM_OK) return status;
+    const size_t heads = task->parameters->heads;
+    for (size_t head = 0; head < heads; ++head) {
+        const TrillimStatus applied = rotate_row(task, head, token);
+        if (applied != TRILLIM_OK) return applied;
+    }
+    return TRILLIM_OK;
+}
+
 static bool can_alias(const void *parameters, size_t output, size_t input) {
     if (parameters == NULL) {
         return output == 0 && input == 0;
@@ -213,6 +232,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rotary(void *const *outputs, const voi
     const TrillimRotaryParameters *p = (const TrillimRotaryParameters *)parameters;
     if (!p->heads || !p->tokens) return TRILLIM_OK;
     TrillimRotaryTask task = {outputs[0], inputs[0], inputs[1], scratch, p, context};
+    if (p->tokens >= 16 && p->tokens <= 128 && p->heads <= 32 && p->dim <= 256 &&
+        p->tokens >= context->thread_pool->worker_count &&
+        p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_BF16 && !p->interleaved &&
+        p->strides[0] == p->dim && p->strides[1] == p->heads * p->dim && p->strides[2] == 1) {
+        return context->thread_pool->run(context->thread_pool->context, p->tokens, rotate_token, &task);
+    }
     TrillimStatus status =
         p->tokens == 1 ? prepare_angles(&task, 0, 0)
                        : context->thread_pool->run(context->thread_pool->context, p->tokens, prepare_angles, &task);
