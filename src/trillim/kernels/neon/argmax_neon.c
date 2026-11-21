@@ -21,6 +21,19 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     return TRILLIM_OK;
 }
 
+typedef struct {
+    float32x4_t maximum;
+    int32x4_t indices;
+    uint32x4_t ordered;
+} MaxLanes;
+
+static inline void track(MaxLanes *lanes, float32x4_t values, int32x4_t positions) {
+    lanes->ordered = vandq_u32(lanes->ordered, vceqq_f32(values, values));
+    uint32x4_t choose = vcgtq_f32(values, lanes->maximum);
+    lanes->maximum = vbslq_f32(choose, values, lanes->maximum);
+    lanes->indices = vbslq_s32(choose, positions, lanes->indices);
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_argmax(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -32,37 +45,51 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_argmax(
     int64_t selected = INT64_MAX;
     float best = 0.0f;
     size_t index = 0;
-    bool nan = false;
     if (p->count >= 4) {
-        float32x4_t maximum = vld1q_f32(input);
-        const int32_t lane_indices[] = {0, 1, 2, 3};
-        int32x4_t lanes = vld1q_s32(lane_indices);
-        int32x4_t indices = lanes;
-        nan = vminvq_u32(vceqq_f32(maximum, maximum)) != UINT32_MAX;
-        for (index = 4; p->count - index >= 4; index += 4) {
-            if ((index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
-            float32x4_t value = vld1q_f32(input + index);
-            nan |= vminvq_u32(vceqq_f32(value, value)) != UINT32_MAX;
-            uint32x4_t choose = vcgtq_f32(value, maximum);
-            maximum = vbslq_f32(choose, value, maximum);
-            int32x4_t positions = vaddq_s32(vdupq_n_s32((int32_t)index), lanes);
-            indices = vbslq_s32(choose, positions, indices);
+        enum { vectors = 4, block = 4 * vectors };
+        const int32_t first_indices[] = {0, 1, 2, 3};
+        const int32x4_t first = vld1q_s32(first_indices);
+        const int32x4_t stride = vdupq_n_s32(4);
+        const MaxLanes initial = {vld1q_f32(input), first, vdupq_n_u32(UINT32_MAX)};
+        MaxLanes maxima[vectors];
+        for (size_t vector = 0; vector < vectors; ++vector) {
+            maxima[vector] = initial;
         }
-        float values[4];
-        int32_t positions[4];
-        vst1q_f32(values, maximum);
-        vst1q_s32(positions, indices);
-        best = values[0];
-        selected = positions[0];
-        for (size_t lane = 1; lane < 4; ++lane) {
-            if (values[lane] > best || (values[lane] == best && positions[lane] < selected)) {
-                best = values[lane];
-                selected = positions[lane];
+        for (; p->count - index >= block; index += block) {
+            if (index != 0 && (index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+            int32x4_t positions = vaddq_s32(vdupq_n_s32((int32_t)index), first);
+            for (size_t vector = 0; vector < vectors; ++vector) {
+                track(&maxima[vector], vld1q_f32(input + index + vector * 4), positions);
+                positions = vaddq_s32(positions, stride);
             }
         }
+        for (; p->count - index >= 4; index += 4) {
+            if (index != 0 && (index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+            track(&maxima[0], vld1q_f32(input + index), vaddq_s32(vdupq_n_s32((int32_t)index), first));
+        }
+        uint32x4_t ordered = maxima[0].ordered;
+        for (size_t vector = 1; vector < vectors; ++vector) {
+            ordered = vandq_u32(ordered, maxima[vector].ordered);
+        }
+        if (vminvq_u32(ordered) == UINT32_MAX) {
+            for (size_t vector = 0; vector < vectors; ++vector) {
+                float values[4];
+                int32_t positions[4];
+                vst1q_f32(values, maxima[vector].maximum);
+                vst1q_s32(positions, maxima[vector].indices);
+                for (size_t lane = 0; lane < 4; ++lane) {
+                    if (selected == INT64_MAX || values[lane] > best ||
+                        (values[lane] == best && positions[lane] < selected)) {
+                        best = values[lane];
+                        selected = positions[lane];
+                    }
+                }
+            }
+        } else {
+            /* The original scalar comparison defines the ordering when a NaN occurs. */
+            index = 0;
+        }
     }
-    /* The scalar comparison also defines the ordering when a NaN occurs. */
-    if (nan) { index = 0; selected = INT64_MAX; }
     for (; index < p->count; ++index) {
         if ((index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
         if (selected == INT64_MAX || !(best >= input[index])) {
