@@ -27,6 +27,14 @@ extern TrillimStatus trillim_neon_try_packed_ffn_int8(
 #endif
 ;
 
+extern TrillimStatus trillim_neon_try_packed_linear_bf16(
+    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_linear_bf16")
+#endif
+;
+
 extern float32x4_t trillim_neon_silu4_prefill(float32x4_t)
 #if defined(__linux__)
     __asm__(".trillim_neon_silu4_prefill")
@@ -1392,6 +1400,40 @@ static TrillimStatus try_prefill(
     return trillim_neon_try_packed_linear_prefill(
         task->output, task->hidden, task->inputs[3], &down, context, handled
     );
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+__asm__(".private_extern _trillim_neon_try_packed_ffn_bf16");
+#else
+__asm__(".hidden .trillim_neon_try_packed_ffn_bf16\n.globl .trillim_neon_try_packed_ffn_bf16");
+static TrillimStatus trillim_neon_try_packed_ffn_bf16(
+    void *, const void *const *, void *, const void *, const TrillimKernelContext *, bool *
+) __asm__(".trillim_neon_try_packed_ffn_bf16");
+#endif
+static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_bf16(
+    void *output, const void *const *inputs, void *hidden, const void *parameters,
+    const TrillimKernelContext *context, bool *handled
+) {
+    *handled = false;
+    const Parameters *p = parameters;
+    if (p->tokens == 1 && (p->hidden_width < 1024 ||
+        p->hidden_width > MAX_FACTORED_WIDTH || p->hidden_width % 32 != 0)) {
+        return TRILLIM_OK;
+    }
+    const LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
+    bool expanded;
+    const TrillimStatus status = p->tokens == 1
+        ? trillim_neon_try_packed_ffn_int8(
+            hidden, inputs[0], inputs[1], inputs[2], &expand, silu, context, &expanded)
+        : trillim_neon_try_packed_ffn_int8_prefill(
+            hidden, inputs[0], inputs[1], inputs[2], &expand, silu, trillim_neon_silu4_prefill, context, &expanded);
+    if (status != TRILLIM_OK || !expanded) {
+        return status;
+    }
+    const LinearParameters down = {p->tokens, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
+    return trillim_neon_try_packed_linear_bf16(output, hidden, inputs[3], &down, context, handled);
 }
 #endif
 

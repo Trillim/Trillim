@@ -1766,7 +1766,7 @@ static __attribute__((noinline)) TrillimStatus project_int8_nonfinite(
 }
 
 static inline __attribute__((always_inline)) TrillimStatus project_int8(
-    void *opaque, size_t index, bool share_activation, bool widening, uint32_t dtype
+    void *opaque, size_t index, bool share_activation, bool widening, uint32_t dtype, uint32_t output_dtype
 ) {
     const Int8ProjectionTask *quantized = opaque;
     const Task *task = quantized->projection;
@@ -1814,7 +1814,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8(
                 }
                 value *= quantized->silu(gate_value);
             }
-            store_result(task->output, row + c, TRILLIM_FP32, (TrillimValue){.f = value});
+            store_result(task->output, row + c, output_dtype, (TrillimValue){.f = value});
         }
     }
     return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
@@ -1823,7 +1823,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8(
 #define DEFINE_INT8_PROJECTION(name, share, widening, dtype) \
     static TrillimStatus name(void *opaque, size_t index, size_t worker) { \
         (void) worker; \
-        return project_int8(opaque, index, share, widening, dtype); \
+        return project_int8(opaque, index, share, widening, dtype, TRILLIM_FP32); \
     }
 
 DEFINE_INT8_PROJECTION(project_int8_q4_neon, false, true, TRILLIM_GRP_INT4)
@@ -2684,13 +2684,31 @@ static TrillimTask int8_projection(uint32_t dtype, bool paired, size_t width) {
     }
 }
 
+#define DEFINE_INT8_BF16_PROJECTION(name, widening, dtype) \
+    static TrillimStatus name(void *opaque, size_t index, size_t worker) { \
+        (void)worker; \
+        return project_int8(opaque, index, true, widening, dtype, TRILLIM_BF16); \
+    }
+
+DEFINE_INT8_BF16_PROJECTION(project_int8_q4_neon_bf16, true, TRILLIM_GRP_INT4)
+DEFINE_INT8_BF16_PROJECTION(project_int8_q4_sdot_bf16, false, TRILLIM_GRP_INT4)
+DEFINE_INT8_BF16_PROJECTION(project_int8_q8_neon_bf16, true, TRILLIM_GRP_INT8)
+DEFINE_INT8_BF16_PROJECTION(project_int8_q8_sdot_bf16, false, TRILLIM_GRP_INT8)
+
+static TrillimTask int8_projection_bf16(uint32_t dtype) {
+    const bool dotprod = available_dotprod();
+    return dtype == TRILLIM_GRP_INT4 ?
+        (dotprod ? project_int8_q4_sdot_bf16 : project_int8_q4_neon_bf16) :
+        (dotprod ? project_int8_q8_sdot_bf16 : project_int8_q8_neon_bf16);
+}
+
 static __attribute__((noinline)) TrillimStatus try_int8_projection(
-    const Task *task, const uint8_t *gate, float (*silu)(float), size_t workers, bool *handled
+    const Task *task, const uint8_t *gate, float (*silu)(float), bool output_bf16, size_t workers, bool *handled
 ) {
     *handled = false;
     const Parameters *p = task->p;
     if (p->tokens != 1) {
-        return try_int8_prefill(task, gate, silu, NULL, false, workers, handled);
+        return try_int8_prefill(task, gate, silu, NULL, output_bf16, workers, handled);
     }
     if (p->output_dtype != TRILLIM_FP32 || p->width < 32 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 ||
@@ -2698,7 +2716,8 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
         return TRILLIM_OK;
     }
     const size_t width = p->weight_dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
-    const TrillimTask operation = int8_projection(p->weight_dtype, gate != NULL, p->width);
+    const TrillimTask operation = output_bf16 ? int8_projection_bf16(p->weight_dtype) :
+        int8_projection(p->weight_dtype, gate != NULL, p->width);
     if (operation == NULL || p->width % width != 0) {
         return TRILLIM_OK;
     }
@@ -2777,7 +2796,7 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8(
     const size_t chunk = p->outputs / workers / 4;
     const size_t columns = chunk < 16 ? 16 : chunk;
     const Task task = {output, input, up, p, columns, context};
-    return try_int8_projection(&task, gate, silu, workers, handled);
+    return try_int8_projection(&task, gate, silu, false, workers, handled);
 }
 #endif
 
@@ -2825,8 +2844,9 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bf16(
     if (workers == 0 || (p->weight_dtype != TRILLIM_GRP_INT4 && p->weight_dtype != TRILLIM_GRP_INT8)) {
         return TRILLIM_OK;
     }
-    const Task task = {output, input, weight, p, 0, context};
-    return try_int8_prefill(&task, NULL, NULL, NULL, true, workers, handled);
+    const size_t chunk = p->outputs / workers / 4 / 2 * 2;
+    const Task task = {output, input, weight, p, chunk < 16 ? 16 : chunk, context};
+    return try_int8_projection(&task, NULL, NULL, true, workers, handled);
 }
 #endif
 
@@ -2854,7 +2874,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
     }
     Task task = {outputs[0], inputs[0], inputs[1], p, columns, context};
     bool int8_handled;
-    TrillimStatus int8_status = try_int8_projection(&task, NULL, NULL, workers, &int8_handled);
+    TrillimStatus int8_status = try_int8_projection(&task, NULL, NULL, false, workers, &int8_handled);
     if (int8_status != TRILLIM_OK || int8_handled) {
         return int8_status;
     }
