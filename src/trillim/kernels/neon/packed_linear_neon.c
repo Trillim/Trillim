@@ -2650,7 +2650,7 @@ static TrillimStatus try_int8_prefill(
         pack_q8_prefill_activation(task, activation, rows, &ordinary);
     if (status == TRILLIM_OK && ordinary) {
         Task scheduled = *task;
-        const size_t chunk = p->outputs / workers / 2;
+        const size_t chunk = q6 ? p->outputs / workers / 2 : p->outputs / workers;
         scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
         const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
         Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true), output_bf16};
