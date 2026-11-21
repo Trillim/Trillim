@@ -368,15 +368,36 @@ static TrillimStatus normalize_pair(void *opaque, size_t pair, size_t worker) {
     float32x4_t divisor0 = vdupq_n_f32(denominator0);
     float32x4_t divisor1 = vdupq_n_f32(denominator1);
     float32x4_t offset = vdupq_n_f32(p->weight_offset);
+    uint32_t weight_dtype = p->weight_dtype;
     for (size_t column = 0; column < p->width; column += 4) {
         if ((column & 511) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
-        float32x4_t weight = vaddq_f32(load4(task->weight, column, TRILLIM_BF16), offset);
+        float32x4_t weight = vaddq_f32(load4(task->weight, column, weight_dtype), offset);
         float32x4_t value0 = vdivq_f32(load4(input0, column, TRILLIM_BF16), divisor0);
         float32x4_t value1 = vdivq_f32(load4(input1, column, TRILLIM_BF16), divisor1);
         store4(output0, column, TRILLIM_BF16, vmulq_f32(value0, weight));
         store4(output1, column, TRILLIM_BF16, vmulq_f32(value1, weight));
+    }
+    return TRILLIM_OK;
+}
+
+typedef struct {
+    TrillimRMSNormTask *task;
+    size_t grain;
+} PairBatch;
+
+static TrillimStatus normalize_pair_batch(void *opaque, size_t tile, size_t worker) {
+    const PairBatch *batch = opaque;
+    size_t rows = batch->task->parameters->rows;
+    size_t pairs = rows / 2 + (rows % 2 != 0);
+    size_t first = tile * batch->grain;
+    size_t count = pairs - first < batch->grain ? pairs - first : batch->grain;
+    for (size_t pair = first; pair < first + count; ++pair) {
+        TrillimStatus status = normalize_pair(batch->task, pair, worker);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
     }
     return TRILLIM_OK;
 }
@@ -468,7 +489,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
     bool transposed = p->row_stride == 1 && p->column_stride != 1;
     TrillimTask worker = transposed ? normalize_transposed : normalize;
     size_t tasks = transposed ? p->rows / 4 + (p->rows % 4 != 0) : p->rows;
-    if (p->input_dtype == TRILLIM_BF16 && p->weight_dtype == TRILLIM_BF16 &&
+    if (p->input_dtype == TRILLIM_BF16 && trillim_float(p->weight_dtype) &&
         p->output_dtype == TRILLIM_BF16 && p->column_stride == 1 && p->row_stride == p->width &&
         p->width % 4 == 0 && p->rows >= 2 && isfinite(p->weight_offset) &&
         p->rows / 2 >= context->thread_pool->worker_count) {
@@ -487,6 +508,15 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
             }
         }
         return TRILLIM_OK;
+    }
+    size_t workers = context->thread_pool->worker_count;
+    if (worker == normalize_pair && workers != 0) {
+        size_t grain = tasks / workers / 2;
+        if (grain > 1) {
+            PairBatch batch = {&task, grain};
+            size_t tiles = tasks / grain + (tasks % grain != 0);
+            return context->thread_pool->run(context->thread_pool->context, tiles, normalize_pair_batch, &batch);
+        }
     }
     return context->thread_pool->run(context->thread_pool->context, tasks, worker, &task);
 }
