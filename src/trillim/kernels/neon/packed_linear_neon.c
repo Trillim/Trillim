@@ -2158,9 +2158,11 @@ static inline void pack_q6_prefill_group(
 #define INT8_PREFILL_UNROLL
 #endif
 
+enum { Q8_PREFILL_ROWS = 2, Q8_PREFILL_PAIRS = Q8_PREFILL_ROWS / 2 };
+
 typedef struct {
-    int8x16_t values[4][INT8_PREFILL_PAIRS];
-    float32x4_t scales[INT8_PREFILL_PAIRS];
+    int8x16_t values[4][Q8_PREFILL_PAIRS];
+    float32x4_t scales[Q8_PREFILL_PAIRS];
 } Q8PrefillActivation;
 
 enum { Q8_PREFILL_COLUMNS = 8, Q8_PREFILL_COLUMN_PAIRS = Q8_PREFILL_COLUMNS / 2 };
@@ -2181,8 +2183,8 @@ static inline __attribute__((always_inline)) bool pack_q8_activation_cell(
     const Task *task, Q8PrefillActivation *destination, size_t t, size_t g, uint32_t dtype
 ) {
     const Parameters *p = task->p;
-    for (size_t pair = 0; pair < INT8_PREFILL_PAIRS; ++pair) {
-        const size_t row = t * INT8_PREFILL_ROWS + 2 * pair;
+    for (size_t pair = 0; pair < Q8_PREFILL_PAIRS; ++pair) {
+        const size_t row = t * Q8_PREFILL_ROWS + 2 * pair;
         const size_t start = row * p->width + g * INT8_ACTIVATION_Q8_0;
         Q8ActivationBlock first, second;
         if (row < p->tokens) {
@@ -2324,17 +2326,15 @@ static inline void store_prefill_bf16(void *base, size_t offset, const float32x4
 
 static inline __attribute__((always_inline)) void accumulate_q8_prefill_group(
     const Q8PrefillWeight *w, const Q8PrefillActivation *x,
-    float32x4_t sum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS]
+    float32x4_t sum[Q8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS]
 ) {
-    int32x4_t accum[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] = {0};
+    int32x4_t accum[Q8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] = {0};
     INT8_PREFILL_UNROLL
     for (size_t k = 0; k < 4; ++k) {
-        const int8x16_t a0 = x->values[k][0], a1 = x->values[k][1];
+        const int8x16_t a = x->values[k][0];
         INT8_PREFILL_UNROLL
         for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
-            const int8x16_t b = w->values[k][c];
-            accum[0][c] = int8_prefill_i8mm(accum[0][c], a0, b);
-            accum[1][c] = int8_prefill_i8mm(accum[1][c], a1, b);
+            accum[0][c] = int8_prefill_i8mm(accum[0][c], a, w->values[k][c]);
         }
     }
     INT8_PREFILL_UNROLL
@@ -2342,7 +2342,7 @@ static inline __attribute__((always_inline)) void accumulate_q8_prefill_group(
         const float32x2_t weight_scale = w->scales[c];
         const float32x4_t scale = vcombine_f32(weight_scale, weight_scale);
         INT8_PREFILL_UNROLL
-        for (size_t pair = 0; pair < INT8_PREFILL_PAIRS; ++pair) {
+        for (size_t pair = 0; pair < Q8_PREFILL_PAIRS; ++pair) {
             const float32x4_t dot = vcvtq_f32_s32(accum[pair][c]);
             sum[pair][c] = vfmaq_f32(sum[pair][c], dot, vmulq_f32(scale, x->scales[pair]));
         }
@@ -2499,7 +2499,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
     const Task *task = job->projection;
     const Parameters *p = task->p;
     const size_t step = paired ? Q8_PREFILL_COLUMN_PAIRS : Q8_PREFILL_COLUMNS;
-    const size_t row_tiles = p->tokens / INT8_PREFILL_ROWS + (p->tokens % INT8_PREFILL_ROWS != 0);
+    const size_t row_tiles = p->tokens / Q8_PREFILL_ROWS + (p->tokens % Q8_PREFILL_ROWS != 0);
     const Q8PrefillActivation *activation = job->activation;
     for (size_t column = begin; column < end; column += step) {
         if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
@@ -2521,8 +2521,8 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
             offsets[c][1] = (b < end ? b : column) * groups;
         }
         /* Keep the previous even and odd accumulation order for FP32 rounding. */
-        float32x4_t totals[INT8_PREFILL_MAX_TOKENS / INT8_PREFILL_ROWS][2]
-            [INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS];
+        float32x4_t totals[INT8_PREFILL_MAX_TOKENS / Q8_PREFILL_ROWS][2]
+            [Q8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS];
         memset(totals, 0, row_tiles * sizeof(totals[0]));
         for (size_t g = 0; g < groups; ++g) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
@@ -2534,13 +2534,13 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
                 accumulate_q8_prefill_group(&packed, activation + g * row_tiles + t, totals[t][g & 1]);
             }
         }
-        for (size_t row = 0; row < p->tokens; row += INT8_PREFILL_ROWS) {
+        for (size_t row = 0; row < p->tokens; row += Q8_PREFILL_ROWS) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            float32x4_t (*sum)[INT8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] =
-                totals[row / INT8_PREFILL_ROWS];
-            const size_t rows = p->tokens - row < INT8_PREFILL_ROWS ? p->tokens - row : INT8_PREFILL_ROWS;
+            float32x4_t (*sum)[Q8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS] =
+                totals[row / Q8_PREFILL_ROWS];
+            const size_t rows = p->tokens - row < Q8_PREFILL_ROWS ? p->tokens - row : Q8_PREFILL_ROWS;
             for (size_t r = 0; r < rows; ++r) {
                 const size_t offset = (row + r) * p->outputs + column;
                 float32x4_t result[Q8_PREFILL_COLUMNS / 4];
@@ -2661,7 +2661,8 @@ static TrillimStatus try_int8_prefill(
         return TRILLIM_OK;
     }
     const size_t groups = p->width / group;
-    const size_t rows = p->tokens / INT8_PREFILL_ROWS + (p->tokens % INT8_PREFILL_ROWS != 0);
+    const size_t tile_rows = q6 ? INT8_PREFILL_ROWS : Q8_PREFILL_ROWS;
+    const size_t rows = p->tokens / tile_rows + (p->tokens % tile_rows != 0);
     const size_t activation_bytes = rows * groups * (q6 ? sizeof(Q6PrefillActivation) : sizeof(Q8PrefillActivation));
     if (activation_bytes > 4 * 1024 * 1024) {
         return TRILLIM_OK;
