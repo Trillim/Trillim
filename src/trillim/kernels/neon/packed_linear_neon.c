@@ -2010,37 +2010,87 @@ static inline int32x4_t int8_prefill_i8mm(int32x4_t accum, int8x16_t input, int8
     return accum;
 }
 
+typedef struct {
+    const Task *projection;
+    Q6PrefillActivation *packed;
+    size_t tiles, cells, chunk;
+    atomic_bool ordinary;
+} Q6PrefillPackingTask;
+
+static bool pack_q6_prefill_cell(
+    const Task *task, Q6PrefillActivation *destination, size_t tile, size_t group
+) {
+    const Parameters *p = task->p;
+    for (size_t pair = 0; pair < INT8_PREFILL_PAIRS; ++pair) {
+        const size_t row = tile * INT8_PREFILL_ROWS + 2 * pair;
+        const size_t start = row * p->width + group * INT8_ACTIVATION_Q8_K;
+        Q8KActivationBlock first = {0}, second = {0};
+        if ((row < p->tokens && !quantize_activation_q8k(
+                task->input, start, p->input_dtype, &first, false)) ||
+            (row + 1 < p->tokens && !quantize_activation_q8k(
+                task->input, start + p->width, p->input_dtype, &second, false))) {
+            return false;
+        }
+        destination->scales[pair] = (float32x4_t){first.scale, first.scale, second.scale, second.scale};
+        for (size_t k = 0; k < 32; ++k) {
+            destination->values[k][pair] = vcombine_s8(
+                vld1_s8(first.values + k * 8), vld1_s8(second.values + k * 8));
+        }
+    }
+    return true;
+}
+
+static TrillimStatus pack_q6_prefill_tile(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    Q6PrefillPackingTask *job = opaque;
+    if (!fhm_default_fpcr()) {
+        atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+        return TRILLIM_OK;
+    }
+    const Task *task = job->projection;
+    size_t begin = index * job->chunk;
+    const size_t end = job->cells - begin < job->chunk ? job->cells : begin + job->chunk;
+    size_t group = begin / job->tiles, first = begin % job->tiles;
+    while (begin < end) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
+            return TRILLIM_OK;
+        }
+        const size_t available = job->tiles - first;
+        const size_t count = end - begin < available ? end - begin : available;
+        for (size_t i = 0; i < count; ++i) {
+            if (i != 0 && (i & 3) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            if (!pack_q6_prefill_cell(task, job->packed + begin + i, first + i, group)) {
+                atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+                return TRILLIM_OK;
+            }
+        }
+        begin += count;
+        ++group;
+        first = 0;
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus pack_q6_prefill_activation(
     const Task *task, Q6PrefillActivation *packed, size_t tiles, bool *ordinary
 ) {
     const Parameters *p = task->p;
+    const TrillimThreadPool *pool = task->context->thread_pool;
     const size_t groups = p->width / INT8_ACTIVATION_Q8_K;
-    *ordinary = false;
-    for (size_t t = 0; t < tiles; ++t) {
-        for (size_t g = 0; g < groups; ++g) {
-            if ((g & 3) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
-            Q6PrefillActivation *destination = packed + g * tiles + t;
-            for (size_t pair = 0; pair < INT8_PREFILL_PAIRS; ++pair) {
-                const size_t row = t * INT8_PREFILL_ROWS + 2 * pair;
-                Q8KActivationBlock first = {0}, second = {0};
-                if ((row < p->tokens && !quantize_activation_q8k(
-                        task->input, row * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &first, false)) ||
-                    (row + 1 < p->tokens && !quantize_activation_q8k(
-                        task->input, (row + 1) * p->width + g * INT8_ACTIVATION_Q8_K, p->input_dtype, &second, false))) {
-                    return TRILLIM_OK;
-                }
-                destination->scales[pair] = (float32x4_t){first.scale, first.scale, second.scale, second.scale};
-                for (size_t k = 0; k < 32; ++k) {
-                    destination->values[k][pair] = vcombine_s8(
-                        vld1_s8(first.values + k * 8), vld1_s8(second.values + k * 8));
-                }
-            }
-        }
-    }
-    *ordinary = true;
-    return TRILLIM_OK;
+    const size_t cells = tiles * groups;
+    const size_t tasks = p->tokens * p->width < 131072 ? 1 : pool->worker_count;
+    const size_t chunk = cells / tasks + (cells % tasks != 0);
+    Q6PrefillPackingTask job = {task, packed, tiles, cells, chunk, ATOMIC_VAR_INIT(true)};
+    const size_t count = cells / chunk + (cells % chunk != 0);
+    const TrillimStatus status = count == 1 ? pack_q6_prefill_tile(&job, 0, 0) :
+        pool->run(pool->context, count, pack_q6_prefill_tile, &job);
+    *ordinary = atomic_load_explicit(&job.ordinary, memory_order_relaxed);
+    return status;
 }
 
 static inline uint8x16x2_t q6_prefill_interleave(const uint8_t *a, const uint8_t *b) {
