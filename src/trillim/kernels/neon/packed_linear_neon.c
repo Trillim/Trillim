@@ -1983,6 +1983,7 @@ typedef struct {
     const void *activation;
     atomic_bool ordinary;
     bool output_bf16;
+    const uint8_t *bias;
 } Int8PrefillTask;
 
 static bool int8_prefill_i8mm_available(void) {
@@ -2493,7 +2494,7 @@ static TrillimStatus project_q6_prefill(void *opaque, size_t index, size_t worke
 
 static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wide(
     Int8PrefillTask *job, Int8PackedWeight weight, Int8PackedWeight second,
-    size_t begin, size_t end, size_t groups, uint32_t dtype, bool paired
+    size_t begin, size_t end, size_t groups, uint32_t dtype, bool paired, bool biased
 ) {
     const Task *task = job->projection;
     const Parameters *p = task->p;
@@ -2505,6 +2506,13 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
             return TRILLIM_OK;
         }
         const size_t count = end - column < step ? end - column : step;
+        float32x4_t addends[2];
+        if (biased) {
+            uint16x8_t bits = vdupq_n_u16(0);
+            memcpy(&bits, job->bias + column * sizeof(uint16_t), count * sizeof(uint16_t));
+            addends[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16));
+            addends[1] = vreinterpretq_f32_u32(vshll_high_n_u16(bits, 16));
+        }
         size_t offsets[Q8_PREFILL_COLUMN_PAIRS][2];
         for (size_t c = 0; c < Q8_PREFILL_COLUMN_PAIRS; ++c) {
             const size_t a = column + (paired ? c : 2 * c);
@@ -2546,7 +2554,15 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
                         return TRILLIM_OK;
                     }
                 }
-                if (job->output_bf16) {
+                if (biased || job->output_bf16) {
+                    if (biased) {
+                        result[0] = vaddq_f32(result[0], addends[0]);
+                        result[1] = vaddq_f32(result[1], addends[1]);
+                        if (!finite_prefill_result(result[0]) || !finite_prefill_result(result[1])) {
+                            atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+                            return TRILLIM_OK;
+                        }
+                    }
                     store_prefill_bf16(task->output, offset, result, count);
                     continue;
                 }
@@ -2574,7 +2590,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
 }
 
 static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
-    void *opaque, size_t index, size_t worker, uint32_t dtype
+    void *opaque, size_t index, size_t worker, uint32_t dtype, bool biased
 ) {
     (void)worker;
     Int8PrefillTask *job = opaque;
@@ -2582,7 +2598,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
     const Parameters *p = task->p;
     const size_t groups = p->width / INT8_ACTIVATION_Q8_0;
     const size_t total = groups * p->outputs;
-    const bool paired = job->gate != NULL;
+    const bool paired = !biased && job->gate != NULL;
     const Int8PackedWeight weight = int8_packed_weight(task->weight, total, dtype);
     const Int8PackedWeight second = paired
         ? int8_packed_weight(job->gate, total, dtype) : weight;
@@ -2609,20 +2625,29 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8_prefill(
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
-    return project_q8_prefill_wide(job, weight, second, begin, end, groups, dtype, paired);
+    return project_q8_prefill_wide(job, weight, second, begin, end, groups, dtype, paired, biased);
 }
 
 static TrillimStatus project_q8_prefill(void *opaque, size_t index, size_t worker) {
-    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT8);
+    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT8, false);
 }
 
 static TrillimStatus project_q4_prefill(void *opaque, size_t index, size_t worker) {
-    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT4);
+    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT4, false);
+}
+
+static TrillimStatus project_q4_bias_prefill(void *opaque, size_t index, size_t worker) {
+    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT4, true);
+}
+
+static TrillimStatus project_q8_bias_prefill(void *opaque, size_t index, size_t worker) {
+    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT8, true);
 }
 
 static TrillimStatus try_int8_prefill(
     const Task *task, const uint8_t *gate, float (*silu)(float),
-    float32x4_t (*activate4)(float32x4_t), bool output_bf16, size_t workers, bool *handled
+    float32x4_t (*activate4)(float32x4_t), bool output_bf16, const uint8_t *bias,
+    size_t workers, bool *handled
 ) {
     const Parameters *p = task->p;
     const bool q6 = p->weight_dtype == TRILLIM_DUBGRP_INT6;
@@ -2653,9 +2678,13 @@ static TrillimStatus try_int8_prefill(
         const size_t chunk = q6 ? p->outputs / workers / 2 : p->outputs / workers;
         scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
         const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
-        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true), output_bf16};
+        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true),
+            output_bf16, bias};
         const TrillimThreadPool *pool = task->context->thread_pool;
         TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
+        if (bias != NULL) {
+            project = p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_bias_prefill : project_q8_bias_prefill;
+        }
         status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
         *handled = atomic_load_explicit(&job.ordinary, memory_order_relaxed);
     }
@@ -2708,7 +2737,7 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
     *handled = false;
     const Parameters *p = task->p;
     if (p->tokens != 1) {
-        return try_int8_prefill(task, gate, silu, NULL, output_bf16, workers, handled);
+        return try_int8_prefill(task, gate, silu, NULL, output_bf16, NULL, workers, handled);
     }
     if (p->output_dtype != TRILLIM_FP32 || p->width < 32 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 ||
@@ -2821,7 +2850,7 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8_pref
         return TRILLIM_OK;
     }
     const Task task = {output, input, up, parameters, 0, context};
-    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, false, workers, handled);
+    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, false, NULL, workers, handled);
 }
 #endif
 
@@ -2847,6 +2876,31 @@ static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bf16(
     const size_t chunk = p->outputs / workers / 4 / 2 * 2;
     const Task task = {output, input, weight, p, chunk < 16 ? 16 : chunk, context};
     return try_int8_projection(&task, NULL, NULL, true, workers, handled);
+}
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+__asm__(".private_extern _trillim_neon_try_packed_linear_bias_bf16");
+#else
+__asm__(".hidden .trillim_neon_try_packed_linear_bias_bf16\n.globl .trillim_neon_try_packed_linear_bias_bf16");
+static TrillimStatus trillim_neon_try_packed_linear_bias_bf16(
+    void *, const void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+) __asm__(".trillim_neon_try_packed_linear_bias_bf16");
+#endif
+static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bias_bf16(
+    void *output, const void *input, const void *weight, const void *bias, const void *parameters,
+    const TrillimKernelContext *context, bool *handled
+) {
+    *handled = false;
+    const Parameters *p = parameters;
+    const size_t workers = context->thread_pool->worker_count;
+    if (workers == 0 || p->width < 256 || bias == NULL ||
+        (p->weight_dtype != TRILLIM_GRP_INT4 && p->weight_dtype != TRILLIM_GRP_INT8)) {
+        return TRILLIM_OK;
+    }
+    const Task task = {output, input, weight, p, 0, context};
+    return try_int8_prefill(&task, NULL, NULL, NULL, true, bias, workers, handled);
 }
 #endif
 
