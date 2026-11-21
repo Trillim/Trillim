@@ -1,4 +1,5 @@
 #include "common.h"
+#include <arm_neon.h>
 
 extern TrillimStatus trillim_neon_packed_gelu_ffn(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
@@ -11,6 +12,42 @@ extern const TrillimParameterSchema *trillim_neon_packed_quantized_gelu_ffn_para
 extern TrillimStatus trillim_neon_cast(
     void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
 );
+
+#if defined(__APPLE__) || defined(__linux__)
+extern float trillim_neon_packed_gelu_tanh(float)
+#if defined(__linux__)
+    __asm__(".trillim_neon_packed_gelu_tanh")
+#endif
+;
+extern float32x4_t trillim_neon_gelu_tanh4_prefill(float32x4_t)
+#if defined(__linux__)
+    __asm__(".trillim_neon_gelu_tanh4_prefill")
+#endif
+;
+extern TrillimStatus trillim_neon_try_packed_ffn_int8(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8")
+#endif
+;
+extern TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
+    void *, const void *, const void *, const void *, const void *, float (*)(float),
+    float32x4_t (*)(float32x4_t), const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_ffn_int8_prefill")
+#endif
+;
+extern TrillimStatus trillim_neon_try_packed_linear_bf16(
+    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
+)
+#if defined(__linux__)
+    __asm__(".trillim_neon_try_packed_linear_bf16")
+#endif
+;
+#endif
 
 typedef struct {
     size_t tokens, width, hidden, outputs;
@@ -26,6 +63,42 @@ typedef struct {
     const size_t *shape, *strides;
     uint32_t input_dtype, output_dtype;
 } CastParameters;
+
+static bool can_reuse_gate(const Parameters *p) {
+    return p->outputs <= p->hidden &&
+           (p->up_dtype == TRILLIM_GRP_INT4 || p->up_dtype == TRILLIM_GRP_INT8) &&
+           (p->down_dtype == TRILLIM_GRP_INT4 || p->down_dtype == TRILLIM_GRP_INT8);
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+typedef struct {
+    size_t tokens, width, outputs;
+    uint32_t input_dtype, weight_dtype, output_dtype;
+} LinearParameters;
+
+static TrillimStatus try_direct_bf16(
+    void *output, const void *const *inputs, void *hidden, const Parameters *p,
+    const TrillimKernelContext *context, bool *handled
+) {
+    *handled = false;
+    if (p->tokens != 1 && p->tokens < 4) {
+        return TRILLIM_OK;
+    }
+    const LinearParameters expand = {p->tokens, p->width, p->hidden, TRILLIM_BF16, p->up_dtype, TRILLIM_FP32};
+    bool expanded;
+    const TrillimStatus status = p->tokens == 1
+        ? trillim_neon_try_packed_ffn_int8(
+            hidden, inputs[0], inputs[1], inputs[2], &expand, trillim_neon_packed_gelu_tanh, context, &expanded)
+        : trillim_neon_try_packed_ffn_int8_prefill(
+            hidden, inputs[0], inputs[1], inputs[2], &expand, trillim_neon_packed_gelu_tanh,
+            trillim_neon_gelu_tanh4_prefill, context, &expanded);
+    if (status != TRILLIM_OK || !expanded) {
+        return status;
+    }
+    const LinearParameters down = {p->tokens, p->hidden, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
+    return trillim_neon_try_packed_linear_bf16(output, hidden, inputs[3], &down, context, handled);
+}
+#endif
 
 static TrillimStatus requirements(const void *opaque, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = opaque;
@@ -43,11 +116,13 @@ static TrillimStatus requirements(const void *opaque, size_t *inputs, size_t *ou
     if (status != TRILLIM_OK) {
         return status;
     }
-    if (*scratch > SIZE_MAX - projected) {
-        return TRILLIM_ERROR;
+    if (!can_reuse_gate(p)) {
+        if (*scratch > SIZE_MAX - projected) {
+            return TRILLIM_ERROR;
+        }
+        *scratch += projected;
     }
     outputs[0] = projected / 2;
-    *scratch += projected;
     return TRILLIM_OK;
 }
 
@@ -62,8 +137,19 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_gelu_ffn_bf16(
     if (p->tokens == 0 || p->outputs == 0) {
         return TRILLIM_OK;
     }
-    const size_t hidden_bytes = p->tokens * p->hidden * 2 * sizeof(float);
-    void *temporary = (uint8_t *)scratch + hidden_bytes;
+    const bool reuse_gate = can_reuse_gate(p);
+#if defined(__APPLE__) || defined(__linux__)
+    if (reuse_gate) {
+        bool handled;
+        const TrillimStatus direct = try_direct_bf16(outputs[0], inputs, scratch, p, context, &handled);
+        if (direct != TRILLIM_OK || handled) {
+            return direct;
+        }
+    }
+#endif
+    /* The child consumes the gate projection before writing the down projection. */
+    const size_t hidden_bytes = p->tokens * p->hidden * sizeof(float);
+    void *temporary = (uint8_t *)scratch + (reuse_gate ? hidden_bytes : 2 * hidden_bytes);
     void *projected[] = {temporary};
     TrillimStatus status;
     if (p->up_dtype == TRILLIM_GRP_INT4) {
