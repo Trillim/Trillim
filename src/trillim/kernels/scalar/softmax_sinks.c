@@ -13,6 +13,7 @@ typedef struct {
     float *scratch;
     const Parameters *p;
     const TrillimKernelContext *context;
+    size_t rows_per_task;
 } Task;
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs,
@@ -102,6 +103,18 @@ static TrillimStatus softmax(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus softmax_tile(void *opaque, size_t tile, size_t worker) {
+    Task *task = opaque;
+    size_t first = tile * task->rows_per_task;
+    size_t count = task->p->rows - first;
+    if (count > task->rows_per_task) count = task->rows_per_task;
+    for (size_t row = first; row < first + count; ++row) {
+        TrillimStatus status = softmax(task,row,worker);
+        if (status != TRILLIM_OK) return status;
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_softmax_sinks(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -110,12 +123,18 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_softmax_sinks(
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], scratch, p, context};
+    Task task = {outputs[0], inputs[0], inputs[1], scratch, p, context, 1};
     if (p->rows == 1) {
         return softmax(&task, 0, 0);
     }
-    return context->thread_pool->run(context->thread_pool->context, p->rows,
-                                     softmax, &task);
+    if (!p->rows || !p->width) return TRILLIM_OK;
+    size_t batch = p->width <= 1024 ? 1024 / p->width : 1;
+    size_t workers = context->thread_pool->worker_count;
+    size_t per_worker = workers ? p->rows / workers : 0;
+    if (per_worker && batch > per_worker) batch = per_worker;
+    task.rows_per_task = batch;
+    return context->thread_pool->run(context->thread_pool->context,
+        p->rows / batch + (p->rows % batch != 0), softmax_tile, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_scalar_softmax_sinks_tdl(void) {

@@ -28,28 +28,40 @@ SIMD TRILLIM_KERNEL TrillimStatus trillim_x86_argmax_avx2(
     size_t index = 0;
     bool nan = false;
     if (p->count >= 8) {
-        __m256 maximum = _mm256_loadu_ps(input);
-        __m256i indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-        nan = _mm256_movemask_ps(_mm256_cmp_ps(maximum, maximum, _CMP_UNORD_Q)) != 0;
-        for (index = 8; p->count - index >= 8; index += 8) {
-            if ((index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
-            __m256 value = _mm256_loadu_ps(input + index);
-            nan |= _mm256_movemask_ps(_mm256_cmp_ps(value, value, _CMP_UNORD_Q)) != 0;
-            __m256 choose = _mm256_cmp_ps(value, maximum, _CMP_GT_OQ);
-            maximum = _mm256_blendv_ps(maximum, value, choose);
-            __m256i positions = _mm256_add_epi32(_mm256_set1_epi32((int32_t)index), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-            indices = _mm256_blendv_epi8(indices, positions, _mm256_castps_si256(choose));
+        __m256 maxima[4];
+        __m256i positions[4];
+        const __m256i lanes = _mm256_setr_epi32(0,1,2,3,4,5,6,7);
+        for (size_t v = 0; v < 4; ++v) {
+            maxima[v] = _mm256_loadu_ps(input);
+            positions[v] = lanes;
         }
-        float values[8];
-        int32_t positions[8];
-        _mm256_storeu_ps(values, maximum);
-        _mm256_storeu_si256((__m256i *)positions, indices);
-        best = values[0];
-        selected = positions[0];
-        for (size_t lane = 1; lane < 8; ++lane) {
-            if (values[lane] > best || (values[lane] == best && positions[lane] < selected)) {
-                best = values[lane];
-                selected = positions[lane];
+        for (; p->count - index >= 32; index += 32) {
+            if ((index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+            for (size_t v = 0; v < 4; ++v) {
+                __m256 x = _mm256_loadu_ps(input + index + v * 8);
+                nan |= _mm256_movemask_ps(_mm256_cmp_ps(x,x,_CMP_UNORD_Q)) != 0;
+                __m256 choose = _mm256_cmp_ps(x,maxima[v],_CMP_GT_OQ);
+                maxima[v] = _mm256_blendv_ps(maxima[v],x,choose);
+                __m256i ids = _mm256_add_epi32(lanes,_mm256_set1_epi32((int32_t)(index + v * 8)));
+                positions[v] = _mm256_blendv_epi8(positions[v],ids,_mm256_castps_si256(choose));
+            }
+        }
+        for (; p->count - index >= 8; index += 8) {
+            if ((index & 1023) == 0 && context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+            __m256 x = _mm256_loadu_ps(input + index);
+            nan |= _mm256_movemask_ps(_mm256_cmp_ps(x,x,_CMP_UNORD_Q)) != 0;
+            __m256 choose = _mm256_cmp_ps(x,maxima[0],_CMP_GT_OQ);
+            maxima[0] = _mm256_blendv_ps(maxima[0],x,choose);
+            positions[0] = _mm256_blendv_epi8(positions[0],_mm256_add_epi32(lanes,_mm256_set1_epi32((int32_t)index)),_mm256_castps_si256(choose));
+        }
+        for (size_t v = 0; v < 4; ++v) {
+            float values[8]; int32_t ids[8];
+            _mm256_storeu_ps(values,maxima[v]);
+            _mm256_storeu_si256((__m256i *)ids,positions[v]);
+            for (size_t lane = 0; lane < 8; ++lane) {
+                if (selected == INT64_MAX || values[lane] > best || (values[lane] == best && ids[lane] < selected)) {
+                    best = values[lane]; selected = ids[lane];
+                }
             }
         }
     }

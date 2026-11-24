@@ -70,7 +70,7 @@ typedef struct {
 TRILLIM_AVX2 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
-    if (!p->rank || !p->shape || !p->mask_strides || !trillim_float(p->input_dtype) ||
+    if (!p->rank || !p->shape || !p->mask_strides || (!trillim_float(p->input_dtype) && p->input_dtype != TRILLIM_INT64) ||
         (p->output_dtype != TRILLIM_INT32 && p->output_dtype != TRILLIM_INT64) ||
         p->shape[p->rank - 1] != p->width || p->width > INT32_MAX) return TRILLIM_ERROR;
     size_t rows = 1;
@@ -97,6 +97,23 @@ TRILLIM_AVX2 static int64_t scalar_argmax(const Task *task, size_t row) {
     size_t mask_base = p->width ? trillim_offset(base,p->rank,p->shape,p->mask_strides) : 0;
     size_t mask_step = p->mask_strides[p->rank - 1];
     int64_t selected = INT64_MAX;
+    if (p->input_dtype == TRILLIM_INT64) {
+        int64_t best = INT64_MIN;
+        for (size_t column = 0; column < p->width; ++column) {
+            if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return -1;
+            }
+            if (!task->mask[mask_base + column * mask_step]) {
+                continue;
+            }
+            int64_t value = trillim_load(task->input, base + column, TRILLIM_INT64).i;
+            if (selected == INT64_MAX || value > best) {
+                best = value;
+                selected = (int64_t)column;
+            }
+        }
+        return selected;
+    }
     float best = 0;
     for (size_t column = 0; column < p->width; ++column) {
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return -1;
@@ -115,6 +132,12 @@ TRILLIM_AVX2 static TrillimStatus apply(void *opaque,size_t row,size_t worker) {
     const Task *task = opaque;
     const Parameters *p = task->p;
     if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+    if (p->input_dtype == TRILLIM_INT64) {
+        int64_t index = scalar_argmax(task,row);
+        if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+        trillim_store(task->output,row,p->output_dtype,(TrillimValue){.i=index});
+        return TRILLIM_OK;
+    }
     size_t base = row * p->width;
     size_t mask_base = p->width ? trillim_offset(base,p->rank,p->shape,p->mask_strides) : 0;
     size_t mask_step = p->mask_strides[p->rank - 1];
@@ -194,8 +217,8 @@ TRILLIM_KERNEL const char *trillim_x86_argmax_masked_avx2_tdl(void) {
            "    axis = c.attrs.get('axis',-1)\n"
            "    if not isinstance(rank,int) or rank != len(x.shape) or rank < 1 or not isinstance(axis,int) or axis not in (-1,rank-1):\n"
            "        raise ValueError('masked Argmax requires the final axis')\n"
-           "    if x.dtype not in ('fp16','bf16','fp32') or mask.dtype != 'bool' or o.dtype not in ('int32','int64'):\n"
-           "        raise ValueError('masked Argmax requires native floating scores, a boolean mask and integer indices')\n"
+           "    if x.dtype not in ('fp16','bf16','fp32','int64') or mask.dtype != 'bool' or o.dtype not in ('int32','int64'):\n"
+           "        raise ValueError('masked Argmax requires floating or INT64 scores, a boolean mask and integer indices')\n"
            "    if (x.strides or _contiguous_strides(x.shape)) != _contiguous_strides(x.shape) or o.shape != x.shape[:-1]:\n"
            "        raise ValueError('masked Argmax requires contiguous score rows and an axis-reduced output')\n"
            "    return dict(rows=_product(x.shape[:-1]),width=x.shape[-1],rank=rank,shape=x.shape,\n"
