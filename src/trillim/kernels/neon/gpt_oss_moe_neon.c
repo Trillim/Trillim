@@ -2016,14 +2016,16 @@ typedef struct {
     uint32_t a_dtype;
 } RoutedMatmulParameters;
 
-enum { ROUTES_PER_TILE = 4 };
+enum { ROUTES_PER_TILE = 4, Q8_ROUTES_PER_TILE = 8, PREFILL_ROUTES_PER_TASK = 16 };
 
 typedef struct {
     void *output;
     const uint8_t *activation, *codes, *scales;
     const RoutedMatmulParameters *p;
     const TrillimKernelContext *context;
-    const size_t *offsets, *tiles, *slots;
+    const size_t *offsets;
+    size_t *tiles;
+    const size_t *slots;
     size_t columns, column_tiles;
     const RoutedQ8 *quantized;
     bool doubled_columns;
@@ -2374,7 +2376,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8(
     const int8x16_t palette = vld1q_s8(values);
     const RoutedMatmulParameters *p = task->p;
     size_t groups = p->k / Q8_GROUP;
-    const RoutedQ8 *activation[ROUTES_PER_TILE];
+    const RoutedQ8 *activation[Q8_ROUTES_PER_TILE];
     size_t route_rows = p->a_route_stride == 0 ? 1 : p->routes;
     for (size_t r = 0; r < count; ++r) {
         size_t token = p->a_token_stride == 0 ? 0 : slots[r] / p->routes;
@@ -2392,7 +2394,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_int8(
             codes[c] = task->codes + block * 16;
             scales[c] = task->scales + block;
         }
-        float32x4_t sum[ROUTES_PER_TILE] = {0}, partial[ROUTES_PER_TILE] = {0};
+        float32x4_t sum[Q8_ROUTES_PER_TILE] = {0}, partial[Q8_ROUTES_PER_TILE] = {0};
         for (size_t g = 0; g < groups; ++g) {
             if ((g & 31) == 0 && cancelled(task->context)) {
                 return TRILLIM_CANCELLED;
@@ -2491,12 +2493,8 @@ static TrillimStatus project_int8_decode(const RoutedMatmulTask *task, size_t ex
     return TRILLIM_OK;
 }
 
-static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t worker) {
-    (void)worker;
-    const RoutedMatmulTask *task = opaque;
-    const RoutedMatmulParameters *p = task->p;
-    size_t route_tile = tile / task->column_tiles;
-    size_t low = 0, high = p->experts;
+static inline size_t routed_expert(const RoutedMatmulTask *task, size_t route_tile) {
+    size_t low = 0, high = task->p->experts;
     while (low < high) {
         size_t mid = low + (high - low) / 2;
         if (task->tiles[mid + 1] <= route_tile) {
@@ -2505,13 +2503,13 @@ static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t wor
             high = mid;
         }
     }
-    size_t expert = low;
-    size_t offset = task->offsets[expert] + (route_tile - task->tiles[expert]) * ROUTES_PER_TILE;
-    size_t count = task->offsets[expert + 1] - offset;
-    if (count > ROUTES_PER_TILE) {
-        count = ROUTES_PER_TILE;
-    }
-    const size_t *slots = task->slots + offset;
+    return low;
+}
+
+static inline __attribute__((always_inline)) TrillimStatus project_routed_fp32(
+    const RoutedMatmulTask *task, size_t expert, size_t first, size_t end, const size_t *slots, size_t count
+) {
+    const RoutedMatmulParameters *p = task->p;
     const uint8_t *activation[ROUTES_PER_TILE];
     size_t a_size = trillim_itemsize(p->a_dtype);
     for (size_t r = 0; r < count; ++r) {
@@ -2521,6 +2519,27 @@ static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t wor
     for (size_t r = count; r < ROUTES_PER_TILE; ++r) {
         activation[r] = activation[0];
     }
+    if (count == 1) {
+        return project_fp32(task, expert, first, end, slots, activation, 1, 1, 4);
+    }
+    if (count == 2) {
+        return project_fp32(task, expert, first, end, slots, activation, 2, 2, 2);
+    }
+    return project_fp32(task, expert, first, end, slots, activation, count, ROUTES_PER_TILE, 2);
+}
+
+static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const RoutedMatmulTask *task = opaque;
+    const RoutedMatmulParameters *p = task->p;
+    size_t route_tile = tile / task->column_tiles;
+    size_t expert = routed_expert(task, route_tile);
+    size_t offset = task->offsets[expert] + (route_tile - task->tiles[expert]) * ROUTES_PER_TILE;
+    size_t count = task->offsets[expert + 1] - offset;
+    if (count > ROUTES_PER_TILE) {
+        count = ROUTES_PER_TILE;
+    }
+    const size_t *slots = task->slots + offset;
     size_t first = tile % task->column_tiles * task->columns;
     size_t end = p->n - first < task->columns ? p->n : first + task->columns;
     bool bounded;
@@ -2541,7 +2560,7 @@ static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t wor
             if (bounded) {
                 status = project_int8_decode(task, expert, column, limit, slots[0]);
             } else {
-                status = project_fp32(task, expert, column, limit, slots, activation, 1, 1, 4);
+                status = project_routed_fp32(task, expert, column, limit, slots, 1);
             }
             if (status != TRILLIM_OK) {
                 return status;
@@ -2561,13 +2580,71 @@ static TrillimStatus routed_matmul_project(void *opaque, size_t tile, size_t wor
         }
         return project_int8(task, expert, first, end, slots, count, ROUTES_PER_TILE);
     }
+    return project_routed_fp32(task, expert, first, end, slots, count);
+}
+
+static TrillimStatus project_prefill_int8(
+    const RoutedMatmulTask *task, size_t expert, size_t first, size_t end, const size_t *slots, size_t count
+) {
     if (count == 1) {
-        return project_fp32(task, expert, first, end, slots, activation, 1, 1, 4);
+        return project_int8(task, expert, first, end, slots, 1, 1);
     }
     if (count == 2) {
-        return project_fp32(task, expert, first, end, slots, activation, 2, 2, 2);
+        return project_int8(task, expert, first, end, slots, 2, 2);
     }
-    return project_fp32(task, expert, first, end, slots, activation, count, ROUTES_PER_TILE, 2);
+    if (count <= ROUTES_PER_TILE) {
+        return project_int8(task, expert, first, end, slots, count, ROUTES_PER_TILE);
+    }
+    if (count <= 6) {
+        return project_int8(task, expert, first, end, slots, count, 6);
+    }
+    return project_int8(task, expert, first, end, slots, count, Q8_ROUTES_PER_TILE);
+}
+
+static TrillimStatus routed_matmul_prefill(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const RoutedMatmulTask *task = opaque;
+    const RoutedMatmulParameters *p = task->p;
+    size_t route_tile = tile / task->column_tiles;
+    size_t expert = routed_expert(task, route_tile);
+    size_t offset = task->offsets[expert] + (route_tile - task->tiles[expert]) * PREFILL_ROUTES_PER_TASK;
+    size_t end_slot = task->offsets[expert + 1];
+    if (end_slot - offset > PREFILL_ROUTES_PER_TASK) {
+        end_slot = offset + PREFILL_ROUTES_PER_TASK;
+    }
+    size_t first = tile % task->column_tiles * task->columns;
+    size_t end = p->n - first < task->columns ? p->n : first + task->columns;
+    bool bounded;
+    TrillimStatus status = validate_weights(task, expert, first, end, &bounded);
+    if (status != TRILLIM_OK) {
+        return status;
+    }
+
+    bool quantized = routed_matmul_default_fpcr();
+    /* Keep exceptional scales on the same fallback tiles as the narrow path. */
+    bool split = quantized && !bounded && task->doubled_columns && end - first > task->columns / 2;
+    size_t columns = split ? task->columns / 2 : end - first;
+    for (size_t column = first; column < end; column += columns) {
+        size_t limit = end - column < columns ? end : column + columns;
+        if (split) {
+            status = validate_weights(task, expert, column, limit, &bounded);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        bool use_q8 = quantized && bounded;
+        size_t step = use_q8 ? Q8_ROUTES_PER_TILE : ROUTES_PER_TILE;
+        for (size_t row = offset; row < end_slot; row += step) {
+            size_t count = end_slot - row < step ? end_slot - row : step;
+            const size_t *slots = task->slots + row;
+            status = use_q8 ? project_prefill_int8(task, expert, column, limit, slots, count)
+                            : project_routed_fp32(task, expert, column, limit, slots, count);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+    }
+    return TRILLIM_OK;
 }
 
 static __attribute__((noinline)) TrillimStatus try_routed_int8(RoutedMatmulTask *task, bool *handled) {
@@ -2607,16 +2684,25 @@ static __attribute__((noinline)) TrillimStatus try_routed_int8(RoutedMatmulTask 
         }
     }
     if (valid) {
-        if (p->tokens == 1 && p->routes == 4 &&
-            task->tiles[p->experts] == p->routes && p->n % 4 == 0) {
+        const TrillimThreadPool *pool = task->context->thread_pool;
+        bool prefill = p->tokens >= 32;
+        if (prefill) {
+            for (size_t expert = 0; expert < p->experts; ++expert) {
+                size_t routes = task->offsets[expert + 1] - task->offsets[expert];
+                task->tiles[expert + 1] = task->tiles[expert] +
+                    routes / PREFILL_ROUTES_PER_TASK + (routes % PREFILL_ROUTES_PER_TASK != 0);
+            }
+        }
+        bool decode = p->tokens == 1 && p->routes == 4 && task->tiles[p->experts] == p->routes;
+        if (p->n % 4 == 0 && (decode || prefill)) {
             task->doubled_columns = true;
             task->columns *= 2;
             task->column_tiles = p->n / task->columns + (p->n % task->columns != 0);
         }
         task->quantized = quantized;
         *handled = true;
-        const TrillimThreadPool *pool = task->context->thread_pool;
-        status = pool->run(pool->context, task->tiles[p->experts] * task->column_tiles, routed_matmul_project, task);
+        TrillimTask project = prefill ? routed_matmul_prefill : routed_matmul_project;
+        status = pool->run(pool->context, task->tiles[p->experts] * task->column_tiles, project, task);
         task->quantized = NULL;
     }
     if (quantized != local) {
