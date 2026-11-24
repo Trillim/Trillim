@@ -2007,6 +2007,7 @@ typedef struct {
     atomic_bool ordinary;
     bool output_bf16;
     const uint8_t *bias;
+    size_t column_tiles, row_chunk;
 } linear_Int8PrefillTask;
 
 static bool linear_int8_prefill_i8mm_available(void) {
@@ -2517,12 +2518,16 @@ static TrillimStatus linear_project_q6_prefill(void *opaque, size_t index, size_
 
 static inline __attribute__((always_inline)) TrillimStatus linear_project_q8_prefill_wide(
     linear_Int8PrefillTask *job, linear_Int8PackedWeight weight, linear_Int8PackedWeight second,
-    size_t begin, size_t end, size_t groups, uint32_t dtype, bool paired, bool biased
+    size_t begin, size_t end, size_t groups, size_t first_row_tile, uint32_t dtype, bool paired, bool biased
 ) {
     const LinearTask *task = job->projection;
     const PackedLinearParameters *p = task->p;
     const size_t step = paired ? linear_Q8_PREFILL_COLUMN_PAIRS : linear_Q8_PREFILL_COLUMNS;
-    const size_t row_tiles = p->tokens / linear_Q8_PREFILL_ROWS + (p->tokens % linear_Q8_PREFILL_ROWS != 0);
+    const size_t all_rows = p->tokens / linear_Q8_PREFILL_ROWS + (p->tokens % linear_Q8_PREFILL_ROWS != 0);
+    const size_t row_tiles = all_rows - first_row_tile < job->row_chunk ? all_rows - first_row_tile : job->row_chunk;
+    const size_t first_row = first_row_tile * linear_Q8_PREFILL_ROWS;
+    const size_t end_row = p->tokens - first_row < row_tiles * linear_Q8_PREFILL_ROWS
+        ? p->tokens : first_row + row_tiles * linear_Q8_PREFILL_ROWS;
     const linear_Q8PrefillActivation *activation = job->activation;
     for (size_t column = begin; column < end; column += step) {
         if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
@@ -2554,15 +2559,15 @@ static inline __attribute__((always_inline)) TrillimStatus linear_project_q8_pre
             linear_Q8PrefillWeight packed;
             linear_pack_q8_prefill_group(weight, second, offsets, g, &packed, dtype);
             for (size_t t = 0; t < row_tiles; ++t) {
-                linear_accumulate_q8_prefill_group(&packed, activation + g * row_tiles + t, totals[t][g & 1]);
+                linear_accumulate_q8_prefill_group(&packed, activation + g * all_rows + first_row_tile + t, totals[t][g & 1]);
             }
         }
-        for (size_t row = 0; row < p->tokens; row += linear_Q8_PREFILL_ROWS) {
+        for (size_t row = first_row; row < end_row; row += linear_Q8_PREFILL_ROWS) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             float32x4_t (*sum)[linear_Q8_PREFILL_PAIRS][linear_Q8_PREFILL_COLUMN_PAIRS] =
-                totals[row / linear_Q8_PREFILL_ROWS];
+                totals[(row - first_row) / linear_Q8_PREFILL_ROWS];
             const size_t rows = p->tokens - row < linear_Q8_PREFILL_ROWS ? p->tokens - row : linear_Q8_PREFILL_ROWS;
             for (size_t r = 0; r < rows; ++r) {
                 const size_t offset = (row + r) * p->outputs + column;
@@ -2625,7 +2630,9 @@ static inline __attribute__((always_inline)) TrillimStatus linear_project_int8_p
     const linear_Int8PackedWeight weight = linear_int8_packed_weight(task->weight, total, dtype);
     const linear_Int8PackedWeight second = paired
         ? linear_int8_packed_weight(job->gate, total, dtype) : weight;
-    const size_t begin = index * task->columns;
+    const size_t column_tile = index % job->column_tiles;
+    const size_t first_row_tile = index / job->column_tiles * job->row_chunk;
+    const size_t begin = column_tile * task->columns;
     const size_t end = p->outputs - begin < task->columns ? p->outputs : begin + task->columns;
     if (!linear_fhm_default_fpcr()) {
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
@@ -2648,7 +2655,7 @@ static inline __attribute__((always_inline)) TrillimStatus linear_project_int8_p
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
-    return linear_project_q8_prefill_wide(job, weight, second, begin, end, groups, dtype, paired, biased);
+    return linear_project_q8_prefill_wide(job, weight, second, begin, end, groups, first_row_tile, dtype, paired, biased);
 }
 
 static TrillimStatus linear_project_q8_prefill(void *opaque, size_t index, size_t worker) {
@@ -2728,9 +2735,19 @@ static TrillimStatus linear_try_int8_prefill(
             free(activation);
             return status;
         }
+        size_t split = 1;
+        if (!q6 && tiles < workers && rows >= 16 && rows * p->width >= 32768) {
+            /* Leave at least eight row pairs per task to amortize repacking weights. */
+            const size_t available = workers / tiles;
+            const size_t useful = rows / 8;
+            split = available < useful ? available : useful;
+        }
+        const size_t row_chunk = rows / split + (rows % split != 0);
+        const size_t row_tiles = rows / row_chunk + (rows % row_chunk != 0);
         linear_Int8PrefillTask job = {&panel, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true),
-            output_bf16, bias};
-        status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
+            output_bf16, bias, tiles, row_chunk};
+        const size_t tasks = tiles * row_tiles;
+        status = tasks == 1 ? project(&job, 0, 0) : pool->run(pool->context, tasks, project, &job);
         if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
             free(activation);
             return status;
