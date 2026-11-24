@@ -49,7 +49,7 @@ I8MM static inline int32x4_t matrix_product(int32x4_t sum, int8x16_t a, int8x16_
 #include <stdatomic.h>
 #endif
 
-enum { PACKED_ROWS = 4, PACKED_COLUMNS = 16, LOWBIT_COLUMNS = 4, LOWBIT_WIDTH = 128, I8MM_ROWS = 8 };
+enum { PACKED_ROWS = 4, PACKED_COLUMNS = 16, LOWBIT_COLUMNS = 4, LOWBIT_WIDTH = 128, GROUP32_WIDTH = 32, Q6_WIDTH = 256, I8MM_ROWS = 8 };
 
 typedef struct {
     size_t tokens, width, outputs;
@@ -279,6 +279,10 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
 }
 
 #ifdef DOTPROD
+static inline bool group32_dtype(uint32_t dtype) {
+    return dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5 || dtype == TRILLIM_MXFP4;
+}
+
 static bool has_dotprod(void) {
     static atomic_int cached;
     int support = atomic_load_explicit(&cached, memory_order_relaxed);
@@ -300,10 +304,15 @@ static bool has_dotprod(void) {
 }
 
 DOTPROD __attribute__((always_inline))
-static inline TrillimStatus project_lowbit_columns(const Task *task, size_t row, size_t rows,
-                                                size_t first, size_t end, bool ternary) {
+static inline TrillimStatus project_dotprod_columns(const Task *task, size_t row, size_t rows,
+                                                size_t first, size_t end, uint32_t dtype) {
     const Parameters *p = task->p;
-    const size_t block_bytes = ternary ? 32 : 16;
+    const bool ternary = dtype == TRILLIM_GRP_TERNARY;
+    const bool q6 = dtype == TRILLIM_DUBGRP_INT6;
+    const bool group32 = group32_dtype(dtype);
+    const bool direct_decode = group32 || q6;
+    const size_t group_width = q6 ? Q6_WIDTH : group32 ? GROUP32_WIDTH : LOWBIT_WIDTH;
+    const size_t block_bytes = q6 ? 128 : ternary ? 32 : 16;
     const uint8x16_t sign_mask = {128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1};
     const uint8x16_t first_pair = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
     const uint8x16_t one = vdupq_n_u8(1);
@@ -312,17 +321,32 @@ static inline TrillimStatus project_lowbit_columns(const Task *task, size_t row,
         float32x4_t totals[PACKED_ROWS] = {0};
         bool malformed = false;
         for (size_t g = 0; g < task->groups; ++g) {
-            if ((g & 1) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            if ((g & (q6 ? 0 : group32 ? 7 : 1)) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             uint8x16_t packed[2][LOWBIT_COLUMNS];
+            Block blocks[LOWBIT_COLUMNS];
             uint16_t scale_bits[LOWBIT_COLUMNS];
+            float mxfp4_scales[LOWBIT_COLUMNS];
             uint8x16_t invalid = vdupq_n_u8(0);
             for (size_t c = 0; c < LOWBIT_COLUMNS; ++c) {
                 size_t block = (column + c) * task->groups + g;
                 const uint8_t *values = task->values + block * block_bytes;
-                memcpy(&scale_bits[c], task->scales + block * 2, sizeof(scale_bits[c]));
-                packed[0][c] = vld1q_u8(values);
+                if (dtype == TRILLIM_MXFP4) {
+                    mxfp4_scales[c] = trillim_mxfp4_scale(task->scales[block]) * 0.5f;
+                } else {
+                    memcpy(&scale_bits[c], task->scales + block * 2, sizeof(scale_bits[c]));
+                }
+                if (direct_decode) {
+                    blocks[c] = (Block){
+                        values,
+                        task->high + block * task->layout->high,
+                        task->subscales + block * task->layout->subscales,
+                        dtype,
+                    };
+                } else {
+                    packed[0][c] = vld1q_u8(values);
+                }
                 if (ternary) {
                     packed[1][c] = vld1q_u8(values + 16);
                     uint8x16_t low = vandq_u8(packed[0][c], vshrq_n_u8(packed[0][c], 1));
@@ -336,20 +360,22 @@ static inline TrillimStatus project_lowbit_columns(const Task *task, size_t row,
             }
 
             int32x4_t dots[PACKED_ROWS][LOWBIT_COLUMNS] = {0};
-            const int8_t *input = task->input + row * p->width + g * LOWBIT_WIDTH;
+            const int8_t *input = task->input + row * p->width + g * group_width;
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
 #pragma GCC unroll 8
 #endif
-            for (size_t chunk = 0; chunk < LOWBIT_WIDTH / 16; ++chunk) {
+            for (size_t chunk = 0; chunk < group_width / 16; ++chunk) {
                 int8x16_t activations[PACKED_ROWS];
                 for (size_t r = 0; r < rows; ++r) {
                     activations[r] = vld1q_s8(input + r * p->width + chunk * 16);
                 }
                 for (size_t c = 0; c < LOWBIT_COLUMNS; ++c) {
                     int8x16_t weights;
-                    if (ternary) {
+                    if (direct_decode) {
+                        weights = decode(&blocks[c], chunk * 16);
+                    } else if (ternary) {
                         int8x16_t shift = vdupq_n_s8((int)(chunk / 2) * 2 - 6);
                         uint8x16_t codes = vshlq_u8(packed[chunk % 2][c], shift);
                         weights = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(codes, vdupq_n_u8(3)), one));
@@ -359,11 +385,17 @@ static inline TrillimStatus project_lowbit_columns(const Task *task, size_t row,
                         weights = vreinterpretq_s8_u8(vornq_u8(one, vtstq_u8(bytes, sign_mask)));
                     }
                     for (size_t r = 0; r < rows; ++r) {
-                        dots[r][c] = dot_product(dots[r][c], activations[r], weights);
+                        if (q6) {
+                            int32x4_t dot = dot_product(vdupq_n_s32(0), activations[r], weights);
+                            dots[r][c] = vmlaq_n_s32(dots[r][c], dot, blocks[c].subscales[chunk]);
+                        } else {
+                            dots[r][c] = dot_product(dots[r][c], activations[r], weights);
+                        }
                     }
                 }
             }
-            const float32x4_t scales = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(scale_bits), 16));
+            const float32x4_t scales = dtype == TRILLIM_MXFP4 ? vld1q_f32(mxfp4_scales)
+                : vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(scale_bits), 16));
             for (size_t r = 0; r < rows; ++r) {
                 int32x4_t first_pair_sum = vpaddq_s32(dots[r][0], dots[r][1]);
                 int32x4_t second_pair_sum = vpaddq_s32(dots[r][2], dots[r][3]);
@@ -390,26 +422,39 @@ static inline TrillimStatus project_lowbit_columns(const Task *task, size_t row,
     return project_columns(task, row, rows, column, end);
 }
 
+DOTPROD __attribute__((always_inline))
+static inline TrillimStatus project_dotprod_dtype(const Task *task, size_t row, size_t rows, size_t first, size_t end) {
+    switch (task->p->weight_dtype) {
+    case TRILLIM_GRP_INT4:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT4);
+    case TRILLIM_GRP_INT5:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT5);
+    case TRILLIM_DUBGRP_INT6:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_DUBGRP_INT6);
+    case TRILLIM_GRP_BINARY:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_BINARY);
+    case TRILLIM_GRP_TERNARY:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_TERNARY);
+    case TRILLIM_MXFP4:
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_MXFP4);
+    default:
+        return project_columns(task, row, rows, first, end);
+    }
+}
+
 DOTPROD
-static TrillimStatus project_lowbit_rows(const Task *task, size_t row, size_t rows, size_t first, size_t end) {
-    const Parameters *p = task->p;
+static TrillimStatus project_dotprod_rows(const Task *task, size_t row, size_t rows, size_t first, size_t end) {
     if (rows == PACKED_ROWS) {
-        if (p->weight_dtype == TRILLIM_GRP_TERNARY) {
-            return project_lowbit_columns(task, row, PACKED_ROWS, first, end, true);
-        }
-        return project_lowbit_columns(task, row, PACKED_ROWS, first, end, false);
+        return project_dotprod_dtype(task, row, PACKED_ROWS, first, end);
     }
     if (rows == 1) {
-        if (p->weight_dtype == TRILLIM_GRP_TERNARY) {
-            return project_lowbit_columns(task, row, 1, first, end, true);
-        }
-        return project_lowbit_columns(task, row, 1, first, end, false);
+        return project_dotprod_dtype(task, row, 1, first, end);
     }
     return project_columns(task, row, rows, first, end);
 }
 
 DOTPROD
-static TrillimStatus project_lowbit(void *opaque, size_t tile, size_t worker) {
+static TrillimStatus project_dotprod(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
     const Parameters *p = task->p;
@@ -417,7 +462,7 @@ static TrillimStatus project_lowbit(void *opaque, size_t tile, size_t worker) {
     size_t rows = p->tokens - row < PACKED_ROWS ? p->tokens - row : PACKED_ROWS;
     size_t first = tile % task->column_tiles * task->columns;
     size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
-    return project_lowbit_rows(task, row, rows, first, end);
+    return project_dotprod_rows(task, row, rows, first, end);
 }
 
 static bool has_i8mm(void) {
@@ -459,7 +504,7 @@ static inline float32x4_t zip_high_f32(float32x4_t a, float32x4_t b) {
 static TrillimStatus project_i8mm_edges(const Task *task, size_t row, size_t rows, size_t first, size_t end) {
     for (size_t r = 0; r < rows; r += PACKED_ROWS) {
         size_t count = rows - r < PACKED_ROWS ? rows - r : PACKED_ROWS;
-        TrillimStatus status = project_lowbit_rows(task, row + r, count, first, end);
+        TrillimStatus status = project_dotprod_rows(task, row + r, count, first, end);
         if (status != TRILLIM_OK) {
             return status;
         }
@@ -468,9 +513,14 @@ static TrillimStatus project_i8mm_edges(const Task *task, size_t row, size_t row
 }
 
 I8MM __attribute__((always_inline))
-static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, size_t first, size_t end, bool ternary) {
+static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, size_t first, size_t end, uint32_t dtype) {
     const Parameters *p = task->p;
-    const size_t block_bytes = ternary ? 32 : 16;
+    const bool ternary = dtype == TRILLIM_GRP_TERNARY;
+    const bool q6 = dtype == TRILLIM_DUBGRP_INT6;
+    const bool group32 = group32_dtype(dtype);
+    const bool direct_decode = group32 || q6;
+    const size_t group_width = q6 ? Q6_WIDTH : group32 ? GROUP32_WIDTH : LOWBIT_WIDTH;
+    const size_t block_bytes = q6 ? 128 : ternary ? 32 : 16;
     const uint8x16_t sign_mask = {128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1};
     const uint8x16_t first_pair = {0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8};
     const uint8x16_t one = vdupq_n_u8(1);
@@ -479,17 +529,32 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
         float32x4_t totals[I8MM_ROWS / 2][LOWBIT_COLUMNS / 2] = {0};
         bool malformed = false;
         for (size_t g = 0; g < task->groups; ++g) {
-            if (task->context->is_cancelled(task->context->cancellation_context)) {
+            if ((g & (group32 ? 3 : 0)) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             int8x16_t packed[2][LOWBIT_COLUMNS];
+            Block blocks[LOWBIT_COLUMNS];
             uint16_t scale_bits[LOWBIT_COLUMNS];
+            float mxfp4_scales[LOWBIT_COLUMNS];
             uint8x16_t invalid = vdupq_n_u8(0);
             for (size_t c = 0; c < LOWBIT_COLUMNS; ++c) {
                 size_t block = (column + c) * task->groups + g;
                 const uint8_t *values = task->values + block * block_bytes;
-                memcpy(&scale_bits[c], task->scales + block * 2, sizeof(scale_bits[c]));
-                packed[0][c] = vld1q_s8((const int8_t *)values);
+                if (dtype == TRILLIM_MXFP4) {
+                    mxfp4_scales[c] = trillim_mxfp4_scale(task->scales[block]) * 0.5f;
+                } else {
+                    memcpy(&scale_bits[c], task->scales + block * 2, sizeof(scale_bits[c]));
+                }
+                if (direct_decode) {
+                    blocks[c] = (Block){
+                        values,
+                        task->high + block * task->layout->high,
+                        task->subscales + block * task->layout->subscales,
+                        dtype,
+                    };
+                } else {
+                    packed[0][c] = vld1q_s8((const int8_t *)values);
+                }
                 if (ternary) {
                     packed[1][c] = vld1q_s8((const int8_t *)values + 16);
                     uint8x16_t lo = vreinterpretq_u8_s8(packed[0][c]);
@@ -504,24 +569,29 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
             }
 
             uint8x16_t pairs[2][2][LOWBIT_COLUMNS / 2];
-            for (size_t h = 0; h < (ternary ? 2u : 1u); ++h) {
-                for (size_t c = 0; c < LOWBIT_COLUMNS / 2; ++c) {
-                    int8x16_t a = packed[h][c * 2];
-                    int8x16_t b = packed[h][c * 2 + 1];
-                    pairs[h][0][c] = vreinterpretq_u8_s8(zip_low_s8(a, b));
-                    pairs[h][1][c] = vreinterpretq_u8_s8(zip_high_s8(a, b));
+            if (!direct_decode) {
+                for (size_t h = 0; h < (ternary ? 2u : 1u); ++h) {
+                    for (size_t c = 0; c < LOWBIT_COLUMNS / 2; ++c) {
+                        int8x16_t a = packed[h][c * 2];
+                        int8x16_t b = packed[h][c * 2 + 1];
+                        pairs[h][0][c] = vreinterpretq_u8_s8(zip_low_s8(a, b));
+                        pairs[h][1][c] = vreinterpretq_u8_s8(zip_high_s8(a, b));
+                    }
                 }
             }
 
             // SMMLA accumulates a pair of token rows by a pair of output columns.
             int32x4_t dots[I8MM_ROWS / 2][LOWBIT_COLUMNS / 2] = {0};
-            const int8_t *input = task->input + row * p->width + g * LOWBIT_WIDTH;
+            const int8_t *input = task->input + row * p->width + g * group_width;
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
 #pragma GCC unroll 8
 #endif
-            for (size_t chunk = 0; chunk < LOWBIT_WIDTH / 16; ++chunk) {
+            for (size_t chunk = 0; chunk < group_width / 16; ++chunk) {
+                if (q6 && chunk == 8 && task->context->is_cancelled(task->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
                 int8x16_t activations[2][I8MM_ROWS / 2];
                 for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
                     const int8_t *a = input + r * 2 * p->width + chunk * 16;
@@ -530,10 +600,33 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
                     activations[0][r] = zip_low_s8(first, second);
                     activations[1][r] = zip_high_s8(first, second);
                 }
+                if (q6) {
+                    // Apply the shared subscale to each complete 16-element dot.
+                    for (size_t c = 0; c < LOWBIT_COLUMNS / 2; ++c) {
+                        const Block *left = &blocks[c * 2];
+                        const Block *right = &blocks[c * 2 + 1];
+                        int8x16_t a = decode(left, chunk * 16);
+                        int8x16_t b = decode(right, chunk * 16);
+                        int8x16_t lo = zip_low_s8(a, b);
+                        int8x16_t hi = zip_high_s8(a, b);
+                        int32x2_t subscales = {left->subscales[chunk], right->subscales[chunk]};
+                        int32x4_t scales = vcombine_s32(subscales, subscales);
+                        for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
+                            int32x4_t dot = matrix_product(vdupq_n_s32(0), activations[0][r], lo);
+                            dot = matrix_product(dot, activations[1][r], hi);
+                            dots[r][c] = vmlaq_s32(dots[r][c], dot, scales);
+                        }
+                    }
+                    continue;
+                }
                 for (size_t part = 0; part < 2; ++part) {
                     for (size_t c = 0; c < LOWBIT_COLUMNS / 2; ++c) {
                         int8x16_t weights;
-                        if (ternary) {
+                        if (group32) {
+                            int8x16_t first_weights = decode(&blocks[c * 2], chunk * 16);
+                            int8x16_t second_weights = decode(&blocks[c * 2 + 1], chunk * 16);
+                            weights = part == 0 ? zip_low_s8(first_weights, second_weights) : zip_high_s8(first_weights, second_weights);
+                        } else if (ternary) {
                             int8x16_t shift = vdupq_n_s8((int)(chunk / 2) * 2 - 6);
                             uint8x16_t codes = vshlq_u8(pairs[chunk % 2][part][c], shift);
                             weights = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(codes, vdupq_n_u8(3)), one));
@@ -548,7 +641,8 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
                     }
                 }
             }
-            const float32x4_t scales = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(scale_bits), 16));
+            const float32x4_t scales = dtype == TRILLIM_MXFP4 ? vld1q_f32(mxfp4_scales)
+                : vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(scale_bits), 16));
             const float32x4_t scales0 = zip_low_f32(scales, scales);
             const float32x4_t scales1 = zip_high_f32(scales, scales);
             for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
@@ -591,10 +685,22 @@ static TrillimStatus project_i8mm(void *opaque, size_t tile, size_t worker) {
     if (rows < I8MM_ROWS) {
         return project_i8mm_edges(task, row, rows, first, end);
     }
-    if (p->weight_dtype == TRILLIM_GRP_TERNARY) {
-        return project_i8mm_columns(task, row, first, end, true);
+    switch (p->weight_dtype) {
+    case TRILLIM_GRP_INT4:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT4);
+    case TRILLIM_GRP_INT5:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT5);
+    case TRILLIM_DUBGRP_INT6:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_DUBGRP_INT6);
+    case TRILLIM_GRP_BINARY:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_BINARY);
+    case TRILLIM_GRP_TERNARY:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_TERNARY);
+    case TRILLIM_MXFP4:
+        return project_i8mm_columns(task, row, first, end, TRILLIM_MXFP4);
+    default:
+        return project_i8mm_edges(task, row, rows, first, end);
     }
-    return project_i8mm_columns(task, row, first, end, false);
 }
 
 #endif
@@ -637,10 +743,18 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_quantized_linear(
     };
     TrillimTask project_task = project;
 #ifdef DOTPROD
-    if (p->width % LOWBIT_WIDTH == 0 &&
-        (p->weight_dtype == TRILLIM_GRP_BINARY || p->weight_dtype == TRILLIM_GRP_TERNARY) && has_dotprod()) {
-        project_task = project_lowbit;
-        if (p->tokens >= I8MM_ROWS && has_i8mm()) {
+    bool group32 = group32_dtype(p->weight_dtype);
+    if (p->width % layout->width == 0 &&
+        (group32 || p->weight_dtype == TRILLIM_DUBGRP_INT6 ||
+         p->weight_dtype == TRILLIM_GRP_BINARY || p->weight_dtype == TRILLIM_GRP_TERNARY) &&
+        has_dotprod()) {
+        project_task = project_dotprod;
+        bool prefer_i8mm = p->tokens >= I8MM_ROWS;
+#if defined(__APPLE__)
+        // SDOT is faster for 32-value groups with small Apple Silicon thread pools.
+        prefer_i8mm = prefer_i8mm && (!group32 || workers > 4);
+#endif
+        if (prefer_i8mm && has_i8mm()) {
             project_task = project_i8mm;
             tile_rows = I8MM_ROWS;
         }

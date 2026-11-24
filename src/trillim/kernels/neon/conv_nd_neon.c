@@ -571,6 +571,98 @@ static TrillimStatus depthwise_short(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
+
+enum { DEPTHWISE_CHANNELS = 64, DEPTHWISE_POSITIONS = 32 };
+
+static float32x4_t depthwise_combine_pairs(float32x4_t lower, float32x4_t upper, bool high) {
+    uint64x2_t a = vreinterpretq_u64_f32(lower), b = vreinterpretq_u64_f32(upper);
+    return vreinterpretq_f32_u64(high ? vzip2q_u64(a, b) : vzip1q_u64(a, b));
+}
+
+static TrillimStatus depthwise_time_major(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    const size_t rows = task->output_volume;
+    const size_t temporal_tiles = rows / DEPTHWISE_POSITIONS + (rows % DEPTHWISE_POSITIONS != 0);
+    const size_t first = tile % temporal_tiles * DEPTHWISE_POSITIONS;
+    const size_t last = rows - first < DEPTHWISE_POSITIONS ? rows : first + DEPTHWISE_POSITIONS;
+    size_t channel = tile / temporal_tiles * DEPTHWISE_CHANNELS;
+    const size_t end = p->channels - channel < DEPTHWISE_CHANNELS ? p->channels : channel + DEPTHWISE_CHANNELS;
+    const float *input = task->input;
+    float *output = task->output;
+    for (; end - channel >= 4; channel += 4) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t w[4];
+        if (p->weight_dtype == TRILLIM_FP32) {
+            float32x4x4_t packed = vld4q_f32((const float *)task->weight + channel * 4);
+            for (size_t k = 0; k < 4; ++k) {
+                w[k] = packed.val[k];
+            }
+        } else {
+            uint16x4x4_t packed = vld4_u16((const uint16_t *)task->weight + channel * 4);
+            for (size_t k = 0; k < 4; ++k) {
+                w[k] = p->weight_dtype == TRILLIM_FP16 ?
+                    vcvt_f32_f16(vreinterpret_f16_u16(packed.val[k])) :
+                    vreinterpretq_f32_u32(vshll_n_u16(packed.val[k], 16));
+            }
+        }
+        size_t position = first;
+        for (; last - position >= 4; position += 4) {
+            const float *x = input + position * p->channels + channel;
+            float32x4_t centers[7];
+            for (size_t j = 0; j < 7; ++j) {
+                centers[j] = vld1q_f32(x + j * p->channels);
+            }
+            float32x4_t sums[4];
+            for (size_t j = 0; j < 4; ++j) {
+                float32x4_t s = vdupq_n_f32(0.0f);
+                s = vfmaq_f32(s, centers[j], w[0]);
+                s = vfmaq_f32(s, centers[j + 1], w[1]);
+                s = vfmaq_f32(s, centers[j + 2], w[2]);
+                sums[j] = vfmaq_f32(s, centers[j + 3], w[3]);
+            }
+            const float32x4_t first_low = vzip1q_f32(sums[0], sums[1]);
+            const float32x4_t first_high = vzip2q_f32(sums[0], sums[1]);
+            const float32x4_t second_low = vzip1q_f32(sums[2], sums[3]);
+            const float32x4_t second_high = vzip2q_f32(sums[2], sums[3]);
+            float *dst = output + channel * rows + position;
+            vst1q_f32(dst, depthwise_combine_pairs(first_low, second_low, false));
+            vst1q_f32(dst + rows, depthwise_combine_pairs(first_low, second_low, true));
+            vst1q_f32(dst + 2 * rows, depthwise_combine_pairs(first_high, second_high, false));
+            vst1q_f32(dst + 3 * rows, depthwise_combine_pairs(first_high, second_high, true));
+        }
+        for (; position < last; ++position) {
+            const float *x = input + position * p->channels + channel;
+            float32x4_t sum = vdupq_n_f32(0.0f);
+            for (size_t k = 0; k < 4; ++k) {
+                sum = vfmaq_f32(sum, vld1q_f32(x + k * p->channels), w[k]);
+            }
+            float *dst = output + channel * rows + position;
+            if (rows == 1) {
+                vst1q_f32(dst, sum);
+            } else {
+                vst1q_lane_f32(dst, sum, 0);
+                vst1q_lane_f32(dst + rows, sum, 1);
+                vst1q_lane_f32(dst + 2 * rows, sum, 2);
+                vst1q_lane_f32(dst + 3 * rows, sum, 3);
+            }
+        }
+    }
+    for (; channel < end; ++channel) {
+        for (size_t position = first; position < last; ++position) {
+            const size_t out[] = {position};
+            TrillimStatus status = convolve1(task, channel, position, out);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_conv_nd(void *const *outputs, const void *const *inputs, void *scratch,
                                                   const void *parameters, const TrillimKernelContext *context) {
     (void)scratch;
@@ -609,14 +701,22 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_conv_nd(void *const *outputs, const vo
     }
     if (p->dimensions == 1 && p->groups == p->channels && p->outputs == p->channels &&
         task.output_contiguous && p->input_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32 &&
-        p->input_shape[0] == 5 && p->output_shape[0] == 2 && p->kernel[0] == 4 &&
+        p->input_shape[0] > 3 && task.output_volume == p->input_shape[0] - 3 && p->kernel[0] == 4 &&
         p->stride[0] == 1 && p->padding[0] == 0 && p->dilation[0] == 1 &&
         p->channel_stride == 1 && p->input_strides[0] == p->channels &&
         (uintptr_t)task.input % sizeof(float) == 0 && (uintptr_t)task.output % sizeof(float) == 0 &&
         trillim_float(p->weight_dtype) &&
         (uintptr_t)task.weight % trillim_itemsize(p->weight_dtype) == 0) {
-        return context->thread_pool->run(context->thread_pool->context,
-            p->outputs / 32 + (p->outputs % 32 != 0), depthwise_short, &task);
+        const TrillimThreadPool *pool = context->thread_pool;
+        if (task.output_volume == 2) {
+            return pool->run(pool->context, p->outputs / 32 + (p->outputs % 32 != 0),
+                             depthwise_short, &task);
+        }
+        const size_t temporal = task.output_volume / DEPTHWISE_POSITIONS +
+            (task.output_volume % DEPTHWISE_POSITIONS != 0);
+        const size_t channels = p->channels / DEPTHWISE_CHANNELS +
+            (p->channels % DEPTHWISE_CHANNELS != 0);
+        return pool->run(pool->context, temporal * channels, depthwise_time_major, &task);
     }
     size_t tiles = task.output_volume / 64 + (task.output_volume % 64 != 0);
     size_t count = p->outputs * tiles;

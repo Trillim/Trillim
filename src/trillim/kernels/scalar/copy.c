@@ -419,6 +419,40 @@ static inline TrillimStatus trillim_cast_task(void *opaque, size_t tile, size_t 
     return TRILLIM_OK;
 }
 
+static TrillimStatus copy_native(void *output, const void *input, size_t bytes,
+                                 bool normalize_bool, bool broadcast,
+                                 const TrillimKernelContext *context) {
+    enum { CHUNK_BYTES = 32 * 1024 };
+    if (output == input && !normalize_bool) {
+        return TRILLIM_OK;
+    }
+    uint8_t *destination = output;
+    const uint8_t *source = input;
+    uintptr_t to = (uintptr_t)destination, from = (uintptr_t)source;
+    bool backward = !broadcast && to > from && to - from < bytes;
+    uint8_t value = broadcast && *source != 0;
+    for (size_t remaining = bytes; remaining;) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = remaining < CHUNK_BYTES ? remaining : CHUNK_BYTES;
+        size_t offset = backward ? remaining - count : bytes - remaining;
+        uint8_t *target = destination + offset;
+        if (broadcast) {
+            memset(target, value, count);
+        } else {
+            memmove(target, source + offset, count);
+            if (normalize_bool) {
+                for (size_t i = 0; i < count; ++i) {
+                    target[i] = target[i] != 0;
+                }
+            }
+        }
+        remaining -= count;
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_copy(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -427,10 +461,24 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_copy(
         return TRILLIM_CANCELLED;
     }
     const TrillimCastParameters *p = (const TrillimCastParameters *)parameters;
+    if (p->count == 0) {
+        return TRILLIM_OK;
+    }
+    size_t bytes = trillim_itemsize(p->output_dtype), span;
+    if (bytes && p->input_dtype == p->output_dtype &&
+        trillim_span(p->rank, p->shape, p->strides, &span)) {
+        bool normalize_bool = p->output_dtype == TRILLIM_BOOL;
+        bool broadcast = normalize_bool && span == 1;
+        if (broadcast || (p->count <= span && trillim_contiguous(p->rank, p->shape, p->strides))) {
+            const uint8_t *source = inputs[0];
+            return copy_native(outputs[0], source + p->source_offset * bytes, p->count * bytes,
+                               normalize_bool, broadcast, context);
+        }
+    }
     TrillimCastTask task = {outputs[0], inputs[0], (float *)scratch, p, context};
     TrillimStatus status = context->thread_pool->run(context->thread_pool->context,
         p->count / 1024 + (p->count % 1024 != 0), trillim_cast_task, &task);
-    if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->output_dtype) != 0) {
+    if (status != TRILLIM_OK || bytes) {
         return status;
     }
     return trillim_encode_quant((const float *)scratch, p->output_rows, p->output_columns,
