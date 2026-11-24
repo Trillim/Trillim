@@ -1,4 +1,5 @@
 #include "common.h"
+#include <fenv.h>
 #include <math.h>
 
 #if defined(__clang__)
@@ -28,6 +29,258 @@ typedef struct {
     size_t b_storage_rows;
     size_t b_storage_columns;
 } TrillimMatmulParameters;
+
+enum { PACKED_ACTIVATION_TILE = 4, PACKED_ACTIVATION_MAX_BYTES = 32 * 1024 * 1024 };
+
+typedef struct {
+    const void *input;
+    const TrillimKernelContext *context;
+    float *scales;
+    int8_t *codes;
+    size_t width;
+    size_t groups;
+    const TrillimMatmulParameters *p;
+} PackedActivation;
+
+static inline size_t packed_activation_group(uint32_t dtype) {
+    switch (dtype) {
+    case TRILLIM_GRP_INT4:
+    case TRILLIM_GRP_INT5:
+    case TRILLIM_GRP_INT8:
+        return 32;
+    case TRILLIM_DUBGRP_INT6:
+        return 256;
+    default:
+        return 0;
+    }
+}
+
+static inline bool packed_activation_quantize(
+    const void *input, uint32_t dtype, size_t start, size_t group, float *scale, int8_t *codes
+) {
+    float values[256];
+    float peak = 0.0f;
+    for (size_t i = 0; i < group; ++i) {
+        float value = trillim_load(input, start + i, dtype).f;
+        if (!isfinite(value)) {
+            return false;
+        }
+        if (fabsf(value) > fabsf(peak)) {
+            peak = value;
+        }
+        values[i] = value;
+    }
+    if (peak == 0.0f) {
+        *scale = 0.0f;
+        memset(codes, 0, group);
+        return true;
+    }
+    float inverse;
+    if (group == 256) {
+        inverse = -127.0f / peak;
+        if (!isfinite(inverse) || inverse == 0.0f || fabsf(peak) > 0x1p40f) {
+            return false;
+        }
+        *scale = 1.0f / inverse;
+    } else {
+        float step = fabsf(peak) / 127.0f;
+        if (step > 65504.0f || (*scale = trillim_fp16(trillim_to_fp16(step))) == 0.0f) {
+            return false;
+        }
+        inverse = 1.0f / step;
+    }
+    for (size_t i = 0; i < group; ++i) {
+        /* Bias the significand to round to nearest, ties to even. */
+        float rounded = values[i] * inverse + 12582912.0f;
+        uint32_t bits;
+        memcpy(&bits, &rounded, sizeof(bits));
+        codes[i] = (int8_t)((int32_t)(bits & UINT32_C(0x007fffff)) - INT32_C(0x00400000));
+    }
+    return true;
+}
+
+static inline TrillimStatus packed_activation_row(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const PackedActivation *a = opaque;
+    size_t group = a->width / a->groups;
+    float *scales = a->scales + row * a->groups;
+    int8_t *codes = a->codes + row * a->width;
+    if (fegetround() != FE_TONEAREST) {
+        scales[0] = NAN;
+        return TRILLIM_OK;
+    }
+    const TrillimMatmulParameters *p = a->p;
+    size_t offset = trillim_offset(row / p->m, p->rank, p->batch_shape, p->a_batch_strides) +
+        row % p->m * p->a_row_stride;
+    for (size_t g = 0; g < a->groups; ++g) {
+        if (g % 4 == 0 && a->context->is_cancelled(a->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t start = g * group;
+        if (!packed_activation_quantize(a->input, p->a_dtype, offset + start,
+                group, scales + g, codes + start)) {
+            scales[0] = NAN;
+            return TRILLIM_OK;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline size_t packed_activation_space(uint32_t dtype, size_t rows, size_t width, size_t columns) {
+    size_t group = packed_activation_group(dtype);
+    if (!group || columns < 16) {
+        return 0;
+    }
+    size_t bounded_width = width < 65536 ? width : 65536;
+    size_t row_bytes = (bounded_width / group) * (group + sizeof(float));
+    if (!row_bytes) {
+        return 0;
+    }
+    return rows > PACKED_ACTIVATION_MAX_BYTES / row_bytes ? PACKED_ACTIVATION_MAX_BYTES : rows * row_bytes;
+}
+
+static inline TrillimStatus packed_activation_prepare(
+    PackedActivation *a, const void *input, const TrillimMatmulParameters *p,
+    const TrillimKernelContext *context, void *scratch
+) {
+    size_t width = p->k;
+    size_t group = packed_activation_group(p->b_dtype);
+    if (scratch == NULL || !group || width < group || width > 65536 || width % group || p->n < 16 ||
+        fegetround() != FE_TONEAREST) {
+        return TRILLIM_OK;
+    }
+    size_t rows = p->batches * p->m;
+    size_t groups = width / group;
+    if (rows > PACKED_ACTIVATION_MAX_BYTES / (groups * sizeof(float) + width)) {
+        return TRILLIM_OK;
+    }
+    float *scales = scratch;
+    int8_t *codes = (int8_t *)(scales + rows * groups);
+    *a = (PackedActivation){input, context, scales, codes, width, groups, p};
+    const TrillimThreadPool *pool = context->thread_pool;
+    return rows == 1 ? packed_activation_row(a, 0, 0)
+                     : pool->run(pool->context, rows, packed_activation_row, a);
+}
+
+static inline int32_t packed_q6_dot(
+    const uint8_t *low, const uint8_t *high, const int8_t *subscales, const int8_t *codes
+) {
+    int32_t total = 0;
+    for (size_t region = 0; region < 8; ++region) {
+        size_t half = region / 4;
+        size_t lane = region % 4;
+        const uint8_t *l = low + half * 64 + lane / 2 * 32;
+        const uint8_t *h = high + half * 32;
+        for (size_t sub = 0; sub < 2; ++sub) {
+            int32_t sum = 0;
+            size_t first = sub * 16;
+            for (size_t i = first; i < first + 16; ++i) {
+                int32_t lo = (l[i] >> ((lane % 2) * 4)) & 15;
+                int32_t hi = (h[i] >> (lane * 2)) & 3;
+                int32_t w = (lo | hi << 4) - 32;
+                sum += w * codes[region * 32 + i];
+            }
+            total += sum * subscales[region * 2 + sub];
+        }
+    }
+    return total;
+}
+
+static inline bool packed_activation_ready(const PackedActivation *a, size_t row) {
+    return a->scales != NULL && !isnan(a->scales[row * a->groups]);
+}
+
+static inline TrillimStatus packed_activation_dot(
+    const PackedActivation *a, size_t first_row, size_t rows, const uint8_t *weight,
+    uint32_t dtype, size_t storage_rows, size_t storage_groups, size_t first_group, size_t column,
+    float sums[PACKED_ACTIVATION_TILE], bool *used
+) {
+    *used = false;
+    for (size_t row = 0; row < rows; ++row) {
+        if (!packed_activation_ready(a, first_row + row)) {
+            return TRILLIM_OK;
+        }
+    }
+    size_t total = storage_rows * storage_groups;
+    size_t block = column * storage_groups + first_group;
+    bool q6 = dtype == TRILLIM_DUBGRP_INT6;
+    size_t low_size = q6 ? 128 : (dtype == TRILLIM_GRP_INT8 ? 32 : 16);
+    const uint8_t *low = weight + block * low_size;
+    const uint8_t *scales = weight + total * low_size + block * 2;
+    const uint8_t *high = weight + total * (low_size + 2);
+    const int8_t *subscales = (const int8_t *)(high + (q6 ? total * 64 + block * 16 : 0));
+    size_t high_size = q6 ? 64 : (dtype == TRILLIM_GRP_INT5 ? 4 : 0);
+    high += block * high_size;
+    const int8_t *codes = a->codes + first_row * a->width;
+    const float *activation_scales = a->scales + first_row * a->groups;
+    float output[PACKED_ACTIVATION_TILE] = {0};
+    for (size_t g = 0; g < a->groups; ++g) {
+        if ((q6 || g % 8 == 0) && a->context->is_cancelled(a->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        uint16_t bits;
+        memcpy(&bits, scales + g * 2, sizeof(bits));
+        float scale = trillim_bf16(bits);
+        if (!isfinite(scale) || fabsf(scale) > 0x1p40f) {
+            return TRILLIM_OK;
+        }
+        const uint8_t *l = low + g * low_size;
+        const uint8_t *h = high + g * high_size;
+        int32_t dots[PACKED_ACTIVATION_TILE] = {0};
+        if (q6 && rows == 1) {
+            dots[0] = packed_q6_dot(l, h, subscales + g * 16, codes + g * 256);
+        } else if (q6) {
+            for (size_t region = 0; region < 8; ++region) {
+                size_t half = region / 4, lane = region % 4;
+                const uint8_t *lower = l + half * 64 + lane / 2 * 32;
+                const uint8_t *upper = h + half * 32;
+                const int8_t *s = subscales + g * 16 + region * 2;
+                int16_t decoded[32];
+                for (size_t i = 0; i < 32; ++i) {
+                    int32_t lo = (lower[i] >> (lane % 2 * 4)) & 15;
+                    int32_t hi = (upper[i] >> (lane * 2)) & 3;
+                    decoded[i] = (int16_t)(((lo | hi << 4) - 32) * s[i / 16]);
+                }
+                for (size_t row = 0; row < rows; ++row) {
+                    const int8_t *x = codes + row * a->width + g * 256 + region * 32;
+                    for (size_t i = 0; i < 32; ++i) {
+                        dots[row] += decoded[i] * x[i];
+                    }
+                }
+            }
+        } else {
+            int8_t decoded[32];
+            const int8_t *w = (const int8_t *)l;
+            if (dtype != TRILLIM_GRP_INT8) {
+                uint32_t fifth = 0;
+                int32_t center = 8;
+                if (dtype == TRILLIM_GRP_INT5) {
+                    fifth = (uint32_t)h[0] | (uint32_t)h[1] << 8 |
+                        (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
+                    center = 16;
+                }
+                for (size_t i = 0; i < 16; ++i) {
+                    decoded[i] = (int8_t)((int32_t)((l[i] & 15) | ((fifth >> i & 1) << 4)) - center);
+                    decoded[i + 16] = (int8_t)((int32_t)((l[i] >> 4) | ((fifth >> (i + 16) & 1) << 4)) - center);
+                }
+                w = decoded;
+            }
+            for (size_t row = 0; row < rows; ++row) {
+                const int8_t *x = codes + row * a->width + g * 32;
+                for (size_t i = 0; i < 32; ++i) {
+                    dots[row] += w[i] * x[i];
+                }
+            }
+        }
+        for (size_t row = 0; row < rows; ++row) {
+            float combined_scale = scale * activation_scales[row * a->groups + g];
+            output[row] += (float)dots[row] * combined_scale;
+        }
+    }
+    memcpy(sums, output, rows * sizeof(*sums));
+    *used = true;
+    return TRILLIM_OK;
+}
 
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
     size_t itemsize = trillim_itemsize(dtype);
@@ -83,6 +336,7 @@ typedef struct {
     const TrillimMatmulParameters *p;
     size_t columns;
     const TrillimKernelContext *context;
+    PackedActivation activation;
 } Task;
 
 static size_t group_width(uint32_t dtype) {
@@ -151,6 +405,9 @@ static inline TrillimStatus requirements(const void *parameters, size_t *inputs,
         }
     }
     outputs[0] = p->batches * p->m * p->n * bytes;
+    if (p->out_dtype == TRILLIM_FP32) {
+        *scratch = packed_activation_space(p->b_dtype, p->batches * p->m, p->k, p->n);
+    }
     return TRILLIM_OK;
 }
 
@@ -295,7 +552,17 @@ static TrillimStatus project_##NAME(void *opaque, size_t index, size_t worker) {
         size_t storage_row = flat / p->b_storage_columns; \
         size_t storage_column = flat % p->b_storage_columns; \
         float sums[4] = {0}; \
-        for (size_t k = 0; k < p->k;) { \
+        bool quantized = false; \
+        if (task->activation.scales != NULL) { \
+            size_t storage_groups = p->b_storage_columns / group; \
+            TrillimStatus status = packed_activation_dot(&task->activation, batch * p->m + row, rows, task->b, \
+                p->b_dtype, p->b_storage_rows, storage_groups, storage_column / group, \
+                storage_row, sums, &quantized); \
+            if (status != TRILLIM_OK) { \
+                return status; \
+            } \
+        } \
+        for (size_t k = 0; !quantized && k < p->k;) { \
             if (task->context->is_cancelled(task->context->cancellation_context)) { \
                 return TRILLIM_CANCELLED; \
             } \
@@ -401,7 +668,6 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_block_matmul(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
-    (void)scratch;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
@@ -418,7 +684,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_block_matmul(
     if (columns < 16) {
         columns = 16;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], p, columns, context};
+    Task task = {outputs[0], inputs[0], inputs[1], p, columns, context, {0}};
     size_t rows = p->m / 4 + (p->m % 4 != 0);
     size_t tiles = p->n / columns + (p->n % columns != 0);
     bool mxfp4_matvec = p->b_dtype == TRILLIM_MXFP4 && p->m == 1 && p->n >= 4 && p->k % 32 == 0;
@@ -430,8 +696,15 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_block_matmul(
     default: return TRILLIM_ERROR;
     }
     size_t tasks = p->batches * rows * tiles;
-    return tasks == 1 ? project(&task, 0, 0)
-                      : context->thread_pool->run(context->thread_pool->context, tasks, project, &task);
+    TrillimStatus status = TRILLIM_OK;
+    if (p->a_col_stride == 1 && p->out_dtype == TRILLIM_FP32) {
+        status = packed_activation_prepare(&task.activation, inputs[0], p, context, scratch);
+    }
+    if (status == TRILLIM_OK) {
+        status = tasks == 1 ? project(&task, 0, 0)
+            : context->thread_pool->run(context->thread_pool->context, tasks, project, &task);
+    }
+    return status;
 }
 
 TRILLIM_KERNEL const char *trillim_scalar_block_matmul_tdl(void) {
@@ -485,7 +758,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_block_matmul_paramet
     static const size_t outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(TrillimMatmulParameters), TRILLIM_ALIGNOF(TrillimMatmulParameters),
-        sizeof(fields) / sizeof(fields[0]), fields, 2, 1, requirements, NULL, inputs, outputs, 1
+        sizeof(fields) / sizeof(fields[0]), fields, 2, 1, requirements, NULL, inputs, outputs, 4
     };
     return &schema;
 }
