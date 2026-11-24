@@ -402,7 +402,8 @@ static TrillimStatus apply_blas_values(const Task *task, size_t kv_head, const f
     const Parameters *p = task->p;
     const float *packed = task->packed_values + kv_head * p->length * p->value_dim;
     for (size_t channel = 0; channel < p->value_dim; channel += BLAS_COLUMNS) {
-        _Alignas(64) float values[BLAS_COLUMNS];
+        /* Accelerate can change the accumulation order at a different C alignment. */
+        _Alignas(256) float values[BLAS_COLUMNS];
         /* Use the decomposed PV Matmul's depth blocks and accumulation order. */
         for (size_t first = 0; first < p->length; first += BLAS_DEPTH) {
             if (task->context->is_cancelled(task->context->cancellation_context)) {

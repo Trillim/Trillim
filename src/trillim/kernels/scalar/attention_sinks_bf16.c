@@ -359,7 +359,8 @@ static TrillimStatus apply_blas_values(const Task *task, size_t kv_head,
     bool transpose = p->v_strides[1] == 1;
     for (size_t channel = 0; channel < p->value_dim;) {
         size_t width = p->value_dim - channel < columns ? p->value_dim - channel : columns;
-        _Alignas(64) float sums[128];
+        /* Keep Accelerate's beta=1 reduction independent of stack placement. */
+        _Alignas(256) float sums[128];
         /* Match the scalar BLAS matmul for one output row. */
         for (size_t first = 0; first < p->length;) {
             if (cancelled(task)) {
