@@ -1333,7 +1333,12 @@ static TrillimStatus run_hidden(
 }
 
 #if defined(__APPLE__)
-enum { PREFILL_ELEMENTS = 1 << 21, MIN_PREFILL_WEIGHTS = 1 << 21, GATE_TILE = 1024 };
+enum {
+    PREFILL_GATE_BYTES = 8 * 1024 * 1024,
+    PREFILL_ROW_TILE = 64,
+    MIN_PREFILL_WEIGHTS = 1 << 21,
+    GATE_TILE = 1024,
+};
 
 typedef struct {
     float *hidden;
@@ -1356,50 +1361,68 @@ static TrillimStatus apply_prefill_gate(void *opaque, size_t tile, size_t worker
     return TRILLIM_OK;
 }
 
-static TrillimStatus try_prefill(
-    const Task *task, size_t scratch_size, bool *handled
-) {
+static TrillimStatus try_prefill(const Task *task, bool *handled) {
     const Parameters *p = task->p;
     *handled = false;
     if (p->tokens < 32 || p->width < 256 || p->width % 32 != 0 ||
         p->hidden_width < 1024 || p->hidden_width % 32 != 0 || p->outputs < 1024 || p->outputs > INT32_MAX ||
-        p->tokens > PREFILL_ELEMENTS / p->width || p->tokens > PREFILL_ELEMENTS / p->hidden_width ||
         p->width * p->hidden_width < MIN_PREFILL_WEIGHTS || p->hidden_width * p->outputs < MIN_PREFILL_WEIGHTS ||
         p->output_dtype != TRILLIM_FP32 || (uintptr_t)task->output % _Alignof(float) != 0 ||
         p->up_dtype != p->gate_dtype || p->up_dtype != p->down_dtype || !packed_group_dtype(p->up_dtype) ||
         !default_fpcr()) {
         return TRILLIM_OK;
     }
-    /* The up projection uses the existing FP32 hidden scratch. */
-    float *gate = malloc(scratch_size);
+    size_t panel_rows = PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
+    if (panel_rows == 0) {
+        return TRILLIM_OK;
+    }
+    if (panel_rows >= p->tokens) {
+        panel_rows = p->tokens;
+    } else if (panel_rows >= PREFILL_ROW_TILE) {
+        panel_rows = panel_rows / PREFILL_ROW_TILE * PREFILL_ROW_TILE;
+    }
+    float *gate = malloc(panel_rows * p->hidden_width * sizeof(float));
     if (gate == NULL) {
         return TRILLIM_OK;
     }
     const TrillimKernelContext *context = task->context;
-    LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
-    bool projected;
-    TrillimStatus status = trillim_neon_try_packed_linear_prefill(
-        task->hidden, task->inputs[0], task->inputs[1], &expand, context, &projected
-    );
-    if (status == TRILLIM_OK && projected) {
+    const TrillimThreadPool *pool = context->thread_pool;
+    size_t input_stride = p->width * trillim_itemsize(p->input_dtype);
+    TrillimStatus status = TRILLIM_OK;
+    size_t row = 0;
+    while (row < p->tokens) {
+        size_t rows = p->tokens - row < panel_rows ? p->tokens - row : panel_rows;
+        float *hidden = (float *)task->hidden + row * p->hidden_width;
+        float *output = (float *)task->output + row * p->outputs;
+        const uint8_t *input = (const uint8_t *)task->inputs[0] + row * input_stride;
+        LinearParameters expand = {rows, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
+        bool projected;
         status = trillim_neon_try_packed_linear_prefill(
-            gate, task->inputs[0], task->inputs[2], &expand, context, &projected
+            hidden, input, task->inputs[1], &expand, context, &projected
         );
-    }
-    if (status == TRILLIM_OK && projected) {
-        PrefillGateTask product = {task->hidden, gate, p->tokens * p->hidden_width, context};
+        if (status != TRILLIM_OK || !projected) {
+            break;
+        }
+        status = trillim_neon_try_packed_linear_prefill(gate, input, task->inputs[2], &expand, context, &projected);
+        if (status != TRILLIM_OK || !projected) {
+            break;
+        }
+        PrefillGateTask product = {hidden, gate, rows * p->hidden_width, context};
         size_t tiles = product.count / GATE_TILE + (product.count % GATE_TILE != 0);
-        const TrillimThreadPool *pool = context->thread_pool;
         status = pool->run(pool->context, tiles, apply_prefill_gate, &product);
+        if (status != TRILLIM_OK) {
+            break;
+        }
+        LinearParameters down = {rows, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
+        status = trillim_neon_try_packed_linear_prefill(output, hidden, task->inputs[3], &down, context, &projected);
+        if (status != TRILLIM_OK || !projected) {
+            break;
+        }
+        row += rows;
     }
     free(gate);
-    if (status != TRILLIM_OK || !projected) {
-        return status;
-    }
-    LinearParameters down = {p->tokens, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
-    return trillim_neon_try_packed_linear_prefill(
-        task->output, task->hidden, task->inputs[3], &down, context, handled
-    );
+    *handled = row == p->tokens;
+    return status;
 }
 #endif
 
@@ -1476,7 +1499,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
 #endif
 #if defined(__APPLE__)
     bool prefill;
-    status = try_prefill(&task, scratch_size, &prefill);
+    status = try_prefill(&task, &prefill);
     if (status != TRILLIM_OK || prefill) {
         return status;
     }

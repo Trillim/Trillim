@@ -1134,7 +1134,7 @@ enum {
     PACKED_PREFILL_N = 96,
     PACKED_PREFILL_K = 1536,
     PACKED_PREFILL_LANES = 32,
-    PACKED_PREFILL_ACTIVATIONS = 1 << 21,
+    PACKED_PREFILL_ACTIVATION_ELEMENTS = 1 << 20,
 };
 
 typedef void (*PackedPrefillSgemm)(int, int, int, int, int, int, float, const float *, int,
@@ -1313,8 +1313,8 @@ static TrillimStatus try_packed_prefill(const Task *task, bool *handled) {
     const Parameters *p = task->p;
     const TrillimThreadPool *pool = task->context->thread_pool;
     *handled = false;
-    if (pool->worker_count == 0 || p->tokens < 32 || p->outputs < 1024 || p->width < 256 || p->width % 32 != 0 ||
-        p->width > INT_MAX || p->outputs > INT_MAX || p->tokens > PACKED_PREFILL_ACTIVATIONS / p->width ||
+    if (pool->worker_count == 0 || p->tokens == 0 || p->outputs < 1024 || p->width < 256 || p->width % 32 != 0 ||
+        p->width > INT_MAX || p->outputs > INT_MAX ||
         p->width < ((1 << 21) + p->outputs - 1) / p->outputs ||
         (uintptr_t)task->output % _Alignof(float) != 0 || p->output_dtype != TRILLIM_FP32) {
         return TRILLIM_OK;
@@ -1328,23 +1328,48 @@ static TrillimStatus try_packed_prefill(const Task *task, bool *handled) {
     size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
     size_t lanes = pool->worker_count < tiles ? pool->worker_count : tiles;
     lanes = lanes < PACKED_PREFILL_LANES ? lanes : PACKED_PREFILL_LANES;
-    /* Each lane reuses one panel while activations stay widened for the entire projection. */
     size_t depth = p->width < PACKED_PREFILL_K ? p->width : PACKED_PREFILL_K;
     bool direct = p->input_dtype == TRILLIM_FP32 && (uintptr_t)task->input % _Alignof(float) == 0;
-    size_t activations = direct ? 0 : p->tokens * p->width;
+    size_t capacity = direct ? p->tokens : PACKED_PREFILL_ACTIVATION_ELEMENTS / p->width;
+    if (capacity == 0) {
+        return TRILLIM_OK;
+    }
+    if (capacity > p->tokens) {
+        capacity = p->tokens;
+    }
+    if (p->tokens > capacity && capacity >= PACKED_PREFILL_M) {
+        capacity = capacity / PACKED_PREFILL_M * PACKED_PREFILL_M;
+    }
+    size_t activations = direct ? 0 : capacity * p->width;
     float *workspace = malloc((activations + lanes * columns * depth) * sizeof(float));
     if (workspace == NULL) {
         return TRILLIM_OK;
     }
-    bool ordinary;
-    TrillimStatus status = pack_prefill_activations(task, direct ? NULL : workspace, &ordinary);
-    if (status == TRILLIM_OK && ordinary) {
-        PackedPrefillTask job = {task, direct ? task->input : workspace, workspace + activations,
+    TrillimStatus status = TRILLIM_OK;
+    for (size_t first = 0; first < p->tokens;) {
+        Parameters panel_parameters = *p;
+        panel_parameters.tokens = p->tokens - first < capacity ? p->tokens - first : capacity;
+        Task panel = *task;
+        panel.p = &panel_parameters;
+        panel.input = (const uint8_t *)task->input + first * p->width * trillim_itemsize(p->input_dtype);
+        panel.output = (float *)task->output + first * p->outputs;
+        bool ordinary;
+        status = pack_prefill_activations(&panel, direct ? NULL : workspace, &ordinary);
+        if (status != TRILLIM_OK || !ordinary) {
+            free(workspace);
+            return status;
+        }
+        PackedPrefillTask job = {&panel, direct ? panel.input : workspace, workspace + activations,
             columns, depth, tiles, lanes, ATOMIC_VAR_INIT(true)};
         status = pool->run(pool->context, lanes, operation, &job);
-        *handled = atomic_load_explicit(&job.ordinary, memory_order_relaxed);
+        if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
+            free(workspace);
+            return status;
+        }
+        first += panel_parameters.tokens;
     }
     free(workspace);
+    *handled = true;
     return status;
 }
 
@@ -1962,7 +1987,7 @@ static TrillimStatus project_int8_q6_sdot(void *opaque, size_t index, size_t wor
 
 #undef Q6_AQ_UNROLL
 
-enum { INT8_PREFILL_ROWS = 4, INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2, INT8_PREFILL_MAX_TOKENS = 256 };
+enum { INT8_PREFILL_ROWS = 4, INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2, INT8_PREFILL_PANEL_TOKENS = 128 };
 
 typedef struct {
     int8x16_t values[32][INT8_PREFILL_PAIRS];
@@ -2351,7 +2376,7 @@ static inline __attribute__((always_inline)) void accumulate_q8_prefill_group(
 
 enum {
     Q6_PREFILL_COLUMN_PAIRS = 4,
-    Q6_PREFILL_MAX_TILES = INT8_PREFILL_MAX_TOKENS / INT8_PREFILL_ROWS,
+    Q6_PREFILL_MAX_TILES = INT8_PREFILL_PANEL_TOKENS / INT8_PREFILL_ROWS,
 };
 
 static inline __attribute__((always_inline)) void accumulate_q6_prefill_group(
@@ -2521,7 +2546,7 @@ static inline __attribute__((always_inline)) TrillimStatus project_q8_prefill_wi
             offsets[c][1] = (b < end ? b : column) * groups;
         }
         /* Keep the previous even and odd accumulation order for FP32 rounding. */
-        float32x4_t totals[INT8_PREFILL_MAX_TOKENS / Q8_PREFILL_ROWS][2]
+        float32x4_t totals[INT8_PREFILL_PANEL_TOKENS / Q8_PREFILL_ROWS][2]
             [Q8_PREFILL_PAIRS][Q8_PREFILL_COLUMN_PAIRS];
         memset(totals, 0, row_tiles * sizeof(totals[0]));
         for (size_t g = 0; g < groups; ++g) {
@@ -2649,12 +2674,13 @@ static TrillimStatus try_int8_prefill(
     float32x4_t (*activate4)(float32x4_t), bool output_bf16, const uint8_t *bias,
     size_t workers, bool *handled
 ) {
+    *handled = false;
     const Parameters *p = task->p;
     const bool q6 = p->weight_dtype == TRILLIM_DUBGRP_INT6;
     const size_t group = q6 ? INT8_ACTIVATION_Q8_K : INT8_ACTIVATION_Q8_0;
     if ((!q6 && p->weight_dtype != TRILLIM_GRP_INT8 &&
         p->weight_dtype != TRILLIM_GRP_INT4) ||
-        p->tokens < 4 || p->tokens > INT8_PREFILL_MAX_TOKENS || p->width < group || p->width % group != 0 ||
+        p->tokens < 4 || p->width < group || p->width % group != 0 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 || p->output_dtype != TRILLIM_FP32 ||
         (!output_bf16 && (uintptr_t)task->output % _Alignof(float) != 0) || !trillim_float(p->input_dtype) ||
         !fhm_default_fpcr() || !int8_prefill_i8mm_available()) {
@@ -2662,34 +2688,59 @@ static TrillimStatus try_int8_prefill(
     }
     const size_t groups = p->width / group;
     const size_t tile_rows = q6 ? INT8_PREFILL_ROWS : Q8_PREFILL_ROWS;
-    const size_t rows = p->tokens / tile_rows + (p->tokens % tile_rows != 0);
-    const size_t activation_bytes = rows * groups * (q6 ? sizeof(Q6PrefillActivation) : sizeof(Q8PrefillActivation));
-    if (activation_bytes > 8 * 1024 * 1024) {
+    const size_t record_size = q6 ? sizeof(Q6PrefillActivation) : sizeof(Q8PrefillActivation);
+    size_t capacity = (4 * 1024 * 1024) / record_size / groups;
+    if (capacity > INT8_PREFILL_PANEL_TOKENS / tile_rows) {
+        capacity = INT8_PREFILL_PANEL_TOKENS / tile_rows;
+    }
+    size_t needed = p->tokens / tile_rows + (p->tokens % tile_rows != 0);
+    if (capacity > needed) {
+        capacity = needed;
+    }
+    if (capacity == 0) {
         return TRILLIM_OK;
     }
-    void *activation = malloc(activation_bytes);
+    void *activation = malloc(capacity * groups * record_size);
     if (activation == NULL) {
         return TRILLIM_OK;
     }
-    bool ordinary;
-    TrillimStatus status = q6 ? pack_q6_prefill_activation(task, activation, rows, &ordinary) :
-        pack_q8_prefill_activation(task, activation, rows, &ordinary);
-    if (status == TRILLIM_OK && ordinary) {
-        Task scheduled = *task;
-        const size_t chunk = q6 ? p->outputs / workers / 2 : p->outputs / workers;
-        scheduled.columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
-        const size_t tiles = p->outputs / scheduled.columns + (p->outputs % scheduled.columns != 0);
-        Int8PrefillTask job = {&scheduled, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true),
-            output_bf16, bias};
-        const TrillimThreadPool *pool = task->context->thread_pool;
-        TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
-        if (bias != NULL) {
-            project = p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_bias_prefill : project_q8_bias_prefill;
+    capacity *= tile_rows;
+    const size_t chunk = q6 ? p->outputs / workers / 2 : p->outputs / workers;
+    const size_t columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
+    const size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
+    if (bias != NULL) {
+        project = p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_bias_prefill : project_q8_bias_prefill;
+    }
+    TrillimStatus status = TRILLIM_OK;
+    for (size_t first = 0; first < p->tokens;) {
+        Parameters panel_parameters = *p;
+        panel_parameters.tokens = p->tokens - first < capacity ? p->tokens - first : capacity;
+        Task panel = *task;
+        panel.p = &panel_parameters;
+        panel.columns = columns;
+        panel.input = (const uint8_t *)task->input + first * p->width * trillim_itemsize(p->input_dtype);
+        panel.output = (uint8_t *)task->output + first * p->outputs * (output_bf16 ? sizeof(uint16_t) : sizeof(float));
+        const size_t rows = panel_parameters.tokens / tile_rows + (panel_parameters.tokens % tile_rows != 0);
+        bool ordinary;
+        status = q6 ? pack_q6_prefill_activation(&panel, activation, rows, &ordinary) :
+            pack_q8_prefill_activation(&panel, activation, rows, &ordinary);
+        if (status != TRILLIM_OK || !ordinary) {
+            free(activation);
+            return status;
         }
+        Int8PrefillTask job = {&panel, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true),
+            output_bf16, bias};
         status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
-        *handled = atomic_load_explicit(&job.ordinary, memory_order_relaxed);
+        if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
+            free(activation);
+            return status;
+        }
+        first += panel_parameters.tokens;
     }
     free(activation);
+    *handled = true;
     return status;
 }
 
@@ -2935,10 +2986,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
     }
 
 #if defined(__APPLE__)
-    bool prefill_handled;
-    TrillimStatus prefill = try_packed_prefill(&task, &prefill_handled);
-    if (prefill != TRILLIM_OK || prefill_handled) {
-        return prefill;
+    if (p->tokens >= 32) {
+        bool prefill_handled;
+        TrillimStatus prefill = try_packed_prefill(&task, &prefill_handled);
+        if (prefill != TRILLIM_OK || prefill_handled) {
+            return prefill;
+        }
     }
 #endif
     bool large_tile = p->tokens >= 16 && p->output_dtype == TRILLIM_FP32 &&
