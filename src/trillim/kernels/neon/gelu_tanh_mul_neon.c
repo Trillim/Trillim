@@ -1,25 +1,21 @@
 #include "common.h"
 #include <arm_neon.h>
+#include <math.h>
 
-#if !defined(_WIN32)
-#define COMPONENT_API __attribute__((visibility("default")))
-#else
-#define COMPONENT_API
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
 #endif
 
-extern COMPONENT_API TrillimStatus trillim_neon_gelu_tanh(
-    void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
-);
-extern COMPONENT_API const TrillimCapabilities *trillim_neon_gelu_tanh_capabilities(void);
+#if defined(__APPLE__) && defined(__aarch64__)
+/* AArch64 NEON is baseline; macOS catalog hardware flags are unavailable. */
+#define TRILLIM_NEON_REQUIRED UINT64_C(0)
+#else
+#define TRILLIM_NEON_REQUIRED TRILLIM_CAP_NEON
+#endif
 
-/* One tile of the GELU kernel keeps its call on the current worker. */
 enum { TILE = 1024 };
-
-typedef struct {
-    size_t count;
-    uint32_t input_dtype;
-    uint32_t output_dtype;
-} GeluParameters;
 
 typedef struct {
     size_t count;
@@ -50,16 +46,85 @@ static bool can_alias(const void *parameters, size_t output, size_t input) {
     return output == 0 && input < 2;
 }
 
+static float gelu_tanh(float x) {
+    float cube = (x * x) * x;
+    float sum = x + cube * 0.044715f;
+    float argument = sum * 0.7978845608028654f;
+    float scaled = argument * 2.0f;
+    float e = expf(-fabsf(scaled));
+    float denominator = e + 1.0f;
+    float probability = scaled >= 0.0f ? 1.0f / denominator : e / denominator;
+    float cdf = probability * 2.0f - 1.0f;
+    return (x * 0.5f) * (cdf + 1.0f);
+}
+
+static float32x4_t exp4(float32x4_t x) {
+    if (vminvq_u32(vandq_u32(vcgeq_f32(x, vdupq_n_f32(-87.0f)),
+                              vcleq_f32(x, vdupq_n_f32(0.0f)))) != UINT32_MAX) {
+        float lanes[4];
+        vst1q_f32(lanes, x);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            lanes[lane] = expf(lanes[lane]);
+        }
+        return vld1q_f32(lanes);
+    }
+    /* Cody-Waite reduction leaves |r| <= log(2)/2 for the degree-seven series. */
+    int32x4_t power = vcvtnq_s32_f32(vmulq_n_f32(x, 1.4426950408889634f));
+    float32x4_t integer = vcvtq_f32_s32(power);
+    float32x4_t r = vfmaq_n_f32(x, integer, -0.693145751953125f);
+    r = vfmaq_n_f32(r, integer, -1.428606765330187e-6f);
+    float32x4_t p = vdupq_n_f32(1.0f / 5040.0f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 720.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    int32x4_t exponent = vshlq_n_s32(vaddq_s32(power, vdupq_n_s32(127)), 23);
+    return vmulq_f32(p, vreinterpretq_f32_s32(exponent));
+}
+
+static float32x4_t gelu_tanh4(float32x4_t x) {
+    float32x4_t cube = vmulq_f32(vmulq_f32(x, x), x);
+    float32x4_t sum = vaddq_f32(x, vmulq_n_f32(cube, 0.044715f));
+    float32x4_t argument = vmulq_n_f32(sum, 0.7978845608028654f);
+    float32x4_t scaled = vmulq_n_f32(argument, 2.0f);
+    float32x4_t e = exp4(vnegq_f32(vabsq_f32(scaled)));
+    float32x4_t denominator = vaddq_f32(e, vdupq_n_f32(1.0f));
+    float32x4_t positive = vdivq_f32(vdupq_n_f32(1.0f), denominator);
+    float32x4_t negative = vdivq_f32(e, denominator);
+    float32x4_t probability = vbslq_f32(vcgeq_f32(scaled, vdupq_n_f32(0.0f)), positive, negative);
+    float32x4_t cdf = vsubq_f32(vmulq_n_f32(probability, 2.0f), vdupq_n_f32(1.0f));
+    return vmulq_f32(vmulq_n_f32(x, 0.5f), vaddq_f32(cdf, vdupq_n_f32(1.0f)));
+}
+
+static TrillimStatus gelu_tanh_tile(
+    const float *input, float *output, size_t count, const TrillimKernelContext *context
+) {
+    if (context->is_cancelled(context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t i = 0;
+    for (; count - i >= 4; i += 4) {
+        vst1q_f32(output + i, gelu_tanh4(vld1q_f32(input + i)));
+    }
+    for (; i < count; ++i) {
+        output[i] = gelu_tanh(input[i]);
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
     size_t begin = tile * TILE;
     size_t count = task->count - begin < TILE ? task->count - begin : TILE;
     float activation[TILE];
-    const void *inputs[] = {task->gate + begin};
-    void *outputs[] = {activation};
-    GeluParameters gelu = {count, TRILLIM_FP32, TRILLIM_FP32};
-    TrillimStatus status = trillim_neon_gelu_tanh(outputs, inputs, NULL, &gelu, task->context);
+    TrillimStatus status = gelu_tanh_tile(task->gate + begin, activation, count, task->context);
     if (status != TRILLIM_OK) {
         return status;
     }
@@ -122,5 +187,8 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_gelu_tanh_mul_paramete
 }
 
 TRILLIM_KERNEL const TrillimCapabilities *trillim_neon_gelu_tanh_mul_capabilities(void) {
-    return trillim_neon_gelu_tanh_capabilities();
+    static const TrillimCapabilities capabilities = {
+        TRILLIM_KERNEL_ABI_VERSION, TRILLIM_CAP_LIBM | TRILLIM_NEON_REQUIRED
+    };
+    return &capabilities;
 }

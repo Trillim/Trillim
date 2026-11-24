@@ -108,18 +108,6 @@ static float32x4_t gelu_tanh4(float32x4_t x) {
     return vmulq_f32(vmulq_n_f32(x, 0.5f), vaddq_f32(cdf, vdupq_n_f32(1.0f)));
 }
 
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_gelu_tanh4_prefill");
-#else
-__asm__(".hidden .trillim_neon_gelu_tanh4_prefill\n.globl .trillim_neon_gelu_tanh4_prefill");
-static float32x4_t trillim_neon_gelu_tanh4_prefill(float32x4_t) __asm__(".trillim_neon_gelu_tanh4_prefill");
-#endif
-static __attribute__((used)) float32x4_t trillim_neon_gelu_tanh4_prefill(float32x4_t x) {
-    return gelu_tanh4(x);
-}
-#endif
-
 static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;

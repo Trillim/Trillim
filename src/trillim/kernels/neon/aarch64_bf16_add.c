@@ -1,4 +1,5 @@
 #include "common.h"
+#include <arm_neon.h>
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #define TRILLIM_NEON_REQUIRED UINT64_C(0)
@@ -6,19 +7,52 @@
 #define TRILLIM_NEON_REQUIRED TRILLIM_CAP_NEON
 #endif
 
-extern TrillimStatus trillim_neon_add(
-    void *const *, const void *const *, void *, const void *, const TrillimKernelContext *
-);
-
 typedef struct {
     size_t count;
 } Parameters;
 
 typedef struct {
-    size_t count, rank;
-    const size_t *shape, *a_strides, *b_strides;
-    uint32_t dtype;
-} AddParameters;
+    uint16_t *output;
+    const uint16_t *a, *b;
+    size_t count;
+    const TrillimKernelContext *context;
+} Task;
+
+static inline float32x4_t load4(const uint16_t *data) {
+    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(data), 16));
+}
+
+static inline void store4(uint16_t *data, float32x4_t value) {
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    uint32x4_t upper = vshrq_n_u32(bits, 16);
+    uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+    uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+    uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+    rounded = vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(0x40)), rounded);
+    vst1_u16(data, vmovn_u32(rounded));
+}
+
+static TrillimStatus add(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t i = tile * 4096;
+    size_t end = task->count - i < 4096 ? task->count : i + 4096;
+    for (; end - i >= 4; i += 4) {
+        store4(task->output + i, vaddq_f32(load4(task->a + i), load4(task->b + i)));
+    }
+    for (; i < end; ++i) {
+        if ((i & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float a = trillim_load(task->a, i, TRILLIM_BF16).f;
+        float b = trillim_load(task->b, i, TRILLIM_BF16).f;
+        trillim_store(task->output, i, TRILLIM_BF16, (TrillimValue){.f = a + b});
+    }
+    return TRILLIM_OK;
+}
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
@@ -39,10 +73,26 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_aarch64_bf16_add(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
+    (void)scratch;
+    if (context->is_cancelled(context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
     const Parameters *p = parameters;
-    const size_t stride = 1;
-    const AddParameters add = {p->count, 1, &p->count, &stride, &stride, TRILLIM_BF16};
-    return trillim_neon_add(outputs, inputs, scratch, &add, context);
+    if (p->count == 0) {
+        return TRILLIM_OK;
+    }
+    Task task = {outputs[0], inputs[0], inputs[1], p->count, context};
+    size_t tiles = p->count / 4096 + (p->count % 4096 != 0);
+    if (p->count <= 16384) {
+        for (size_t tile = 0; tile < tiles; ++tile) {
+            TrillimStatus status = add(&task, tile, 0);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return TRILLIM_OK;
+    }
+    return context->thread_pool->run(context->thread_pool->context, tiles, add, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_aarch64_bf16_add_tdl(void) {

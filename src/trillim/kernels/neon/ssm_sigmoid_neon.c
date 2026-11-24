@@ -81,18 +81,6 @@ static float32x4_t sigmoid4(float32x4_t value) {
     return vbslq_f32(vcgeq_f32(value, vdupq_n_f32(0.0f)), positive, negative);
 }
 
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_silu4_prefill");
-#else
-__asm__(".hidden .trillim_neon_silu4_prefill\n.globl .trillim_neon_silu4_prefill");
-static float32x4_t trillim_neon_silu4_prefill(float32x4_t) __asm__(".trillim_neon_silu4_prefill");
-#endif
-static __attribute__((used)) float32x4_t trillim_neon_silu4_prefill(float32x4_t value) {
-    return vmulq_f32(value, sigmoid4(value));
-}
-#endif
-
 static float32x4_t apply4(float32x4_t value) {
     return sigmoid4(value);
 }

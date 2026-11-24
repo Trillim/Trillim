@@ -1372,16 +1372,6 @@ static TrillimStatus try_packed_prefill(const Task *task, bool *handled) {
     *handled = true;
     return status;
 }
-
-/* Link the FFN component without exporting another kernel entry point. */
-__asm__(".private_extern _trillim_neon_try_packed_linear_prefill");
-static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_prefill(
-    void *output, const void *input, const void *weight, const void *parameters,
-    const TrillimKernelContext *context, bool *handled
-) {
-    const Task task = {.output = output, .input = input, .weight = weight, .p = parameters, .context = context};
-    return try_packed_prefill(&task, handled);
-}
 #endif
 
 enum {
@@ -2852,109 +2842,6 @@ static __attribute__((noinline)) TrillimStatus try_int8_projection(
     free(activation);
     return status;
 }
-
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_try_packed_ffn_int8");
-#else
-/* The leading dot keeps the helper outside the catalog's kernel symbol namespace. */
-__asm__(".hidden .trillim_neon_try_packed_ffn_int8\n.globl .trillim_neon_try_packed_ffn_int8");
-static TrillimStatus trillim_neon_try_packed_ffn_int8(
-    void *, const void *, const void *, const void *, const void *, float (*)(float),
-    const TrillimKernelContext *, bool *
-) __asm__(".trillim_neon_try_packed_ffn_int8");
-#endif
-static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8(
-    void *output, const void *input, const void *up, const void *gate, const void *parameters,
-    float (*silu)(float), const TrillimKernelContext *context, bool *handled
-) {
-    const size_t workers = context->thread_pool->worker_count;
-    if (workers == 0) {
-        *handled = false;
-        return TRILLIM_OK;
-    }
-    const Parameters *p = parameters;
-    const size_t chunk = p->outputs / workers / 4;
-    const size_t columns = chunk < 16 ? 16 : chunk;
-    const Task task = {output, input, up, p, columns, context};
-    return try_int8_projection(&task, gate, silu, false, workers, handled);
-}
-#endif
-
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_try_packed_ffn_int8_prefill");
-#else
-__asm__(".hidden .trillim_neon_try_packed_ffn_int8_prefill\n.globl .trillim_neon_try_packed_ffn_int8_prefill");
-static TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
-    void *, const void *, const void *, const void *, const void *, float (*)(float),
-    float32x4_t (*)(float32x4_t), const TrillimKernelContext *, bool *
-) __asm__(".trillim_neon_try_packed_ffn_int8_prefill");
-#endif
-static __attribute__((used)) TrillimStatus trillim_neon_try_packed_ffn_int8_prefill(
-    void *output, const void *input, const void *up, const void *gate, const void *parameters,
-    float (*scalar_gate)(float), float32x4_t (*vector_gate)(float32x4_t),
-    const TrillimKernelContext *context, bool *handled
-) {
-    *handled = false;
-    const size_t workers = context->thread_pool->worker_count;
-    if (workers == 0) {
-        return TRILLIM_OK;
-    }
-    const Task task = {output, input, up, parameters, 0, context};
-    return try_int8_prefill(&task, gate, scalar_gate, vector_gate, false, NULL, workers, handled);
-}
-#endif
-
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_try_packed_linear_bf16");
-#else
-__asm__(".hidden .trillim_neon_try_packed_linear_bf16\n.globl .trillim_neon_try_packed_linear_bf16");
-static TrillimStatus trillim_neon_try_packed_linear_bf16(
-    void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
-) __asm__(".trillim_neon_try_packed_linear_bf16");
-#endif
-static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bf16(
-    void *output, const void *input, const void *weight, const void *parameters,
-    const TrillimKernelContext *context, bool *handled
-) {
-    *handled = false;
-    const Parameters *p = parameters;
-    const size_t workers = context->thread_pool->worker_count;
-    if (workers == 0 || (p->weight_dtype != TRILLIM_GRP_INT4 && p->weight_dtype != TRILLIM_GRP_INT8)) {
-        return TRILLIM_OK;
-    }
-    const size_t chunk = p->outputs / workers / 4 / 2 * 2;
-    const Task task = {output, input, weight, p, chunk < 16 ? 16 : chunk, context};
-    return try_int8_projection(&task, NULL, NULL, true, workers, handled);
-}
-#endif
-
-#if defined(__APPLE__) || defined(__linux__)
-#if defined(__APPLE__)
-__asm__(".private_extern _trillim_neon_try_packed_linear_bias_bf16");
-#else
-__asm__(".hidden .trillim_neon_try_packed_linear_bias_bf16\n.globl .trillim_neon_try_packed_linear_bias_bf16");
-static TrillimStatus trillim_neon_try_packed_linear_bias_bf16(
-    void *, const void *, const void *, const void *, const void *, const TrillimKernelContext *, bool *
-) __asm__(".trillim_neon_try_packed_linear_bias_bf16");
-#endif
-static __attribute__((used)) TrillimStatus trillim_neon_try_packed_linear_bias_bf16(
-    void *output, const void *input, const void *weight, const void *bias, const void *parameters,
-    const TrillimKernelContext *context, bool *handled
-) {
-    *handled = false;
-    const Parameters *p = parameters;
-    const size_t workers = context->thread_pool->worker_count;
-    if (workers == 0 || p->width < 256 || bias == NULL ||
-        (p->weight_dtype != TRILLIM_GRP_INT4 && p->weight_dtype != TRILLIM_GRP_INT8)) {
-        return TRILLIM_OK;
-    }
-    const Task task = {output, input, weight, p, 0, context};
-    return try_int8_prefill(&task, NULL, NULL, NULL, true, bias, workers, handled);
-}
-#endif
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear(
     void *const *outputs, const void *const *inputs, void *scratch,
