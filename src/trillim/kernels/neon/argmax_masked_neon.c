@@ -83,15 +83,25 @@ static TrillimStatus apply(void *opaque,size_t row,size_t worker) {
     int32x4_t selected = vdupq_n_s32(INT32_MAX);
     const int32_t positions[] = {0,1,2,3};
     int32x4_t lanes = vld1q_s32(positions);
-    bool nan = false;
+    uint32x4_t nan_lanes = vdupq_n_u32(0);
     size_t column = 0;
     for (; p->width - column >= 4; column += 4) {
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        uint32_t masks[4];
-        for (size_t lane = 0; lane < 4; ++lane) masks[lane] = task->mask[mask_base + (column + lane) * mask_step] ? UINT32_MAX : 0;
-        uint32x4_t active = vld1q_u32(masks);
+        uint32x4_t active;
+        if (mask_step == 1) {
+            uint32_t bits;
+            memcpy(&bits, task->mask + mask_base + column, sizeof(bits));
+            uint16x8_t bytes = vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(bits)));
+            active = vcgtq_u32(vmovl_u16(vget_low_u16(bytes)), vdupq_n_u32(0));
+        } else if (mask_step == 0) {
+            active = vdupq_n_u32(task->mask[mask_base] ? UINT32_MAX : 0);
+        } else {
+            uint32_t masks[4];
+            for (size_t lane = 0; lane < 4; ++lane) masks[lane] = task->mask[mask_base + (column + lane) * mask_step] ? UINT32_MAX : 0;
+            active = vld1q_u32(masks);
+        }
         float32x4_t value = load4(task->input,base + column,p->input_dtype);
-        nan |= vmaxvq_u32(vbicq_u32(active,vceqq_f32(value,value))) != 0;
+        nan_lanes = vorrq_u32(nan_lanes,vbicq_u32(active,vceqq_f32(value,value)));
         uint32x4_t choose = vandq_u32(active,vorrq_u32(vmvnq_u32(valid),vcgtq_f32(value,best)));
         best = vbslq_f32(choose,value,best);
         selected = vbslq_s32(choose,vaddq_s32(vdupq_n_s32((int32_t)column),lanes),selected);
@@ -99,7 +109,7 @@ static TrillimStatus apply(void *opaque,size_t row,size_t worker) {
     }
     int64_t index = INT64_MAX;
     float maximum = 0;
-    if (!nan) {
+    if (vmaxvq_u32(nan_lanes) == 0) {
         float values[4];
         int32_t indices[4];
         uint32_t active[4];
