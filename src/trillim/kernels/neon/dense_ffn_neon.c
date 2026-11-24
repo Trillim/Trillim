@@ -617,11 +617,95 @@ typedef struct {
     float *scratch;
     size_t count;
     size_t lanes;
+    size_t reuse, workspace;
+    atomic_bool single_threaded;
 } DenseGluBlasTask;
+
+#if defined(__APPLE__)
+enum { DENSE_GLU_MAX_ROW_REUSE = 8 };
+
+static TrillimStatus dense_glu_blas_grouped(const DenseGluBlasTask *job, size_t index) {
+    const DenseGluTask *t = &job->task;
+    const DenseGluParameters *p = t->p;
+    const size_t width = dense_glu_block_n(p);
+    const size_t depth = dense_glu_block_k(p);
+    const size_t columns = p->n / width + (p->n % width != 0);
+    const size_t row_capacity = job->reuse * DENSE_GLU_BLOCK_M;
+    float *a_pack = job->scratch + index * job->workspace;
+    float *b_pack = a_pack + row_capacity * depth;
+    float *up = b_pack + depth * width;
+    for (size_t tile = index; tile < job->count; tile += job->lanes) {
+        const size_t row = tile / columns * row_capacity;
+        const size_t column = tile % columns * width;
+        const size_t rows = p->m - row < row_capacity ? p->m - row : row_capacity;
+        const size_t n = p->n - column < width ? p->n - column : width;
+        float *gate = (float *)t->output + row * p->n + column;
+        for (size_t start = 0; start < p->k; start += depth) {
+            if (t->context->is_cancelled(t->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const size_t k = p->k - start < depth ? p->k - start : depth;
+            const size_t a_index = row * p->a_row_stride + start;
+            const size_t b_index = column * p->b_col_stride + start;
+            const float *a = a_pack;
+            size_t lda = k;
+            TrillimStatus status;
+            if (p->a_dtype == TRILLIM_FP32 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
+                a = (const float *)t->a + a_index;
+                lda = p->a_row_stride;
+            } else {
+                status = dense_glu_pack(t->a, p->a_dtype, a_index, rows, k, p->a_row_stride, 1, a_pack, t->context);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+            for (size_t projection = 0; projection < 2; ++projection) {
+                const void *weight = projection == 0 ? t->b : t->up;
+                const size_t ldc = projection == 0 ? p->n : n;
+                float *output = projection == 0 ? gate : up;
+                status = dense_glu_pack(weight, p->b_dtype, b_index, n, k, p->b_col_stride, 1, b_pack, t->context);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+                for (size_t r = 0; r < rows; r += DENSE_GLU_BLOCK_M) {
+                    if (t->context->is_cancelled(t->context->cancellation_context)) {
+                        return TRILLIM_CANCELLED;
+                    }
+                    const size_t m = rows - r < DENSE_GLU_BLOCK_M ? rows - r : DENSE_GLU_BLOCK_M;
+                    dense_glu_sgemm(101, 111, 112, (int)m, (int)n, (int)k, 1.0f,
+                        a + r * lda, (int)lda, b_pack, (int)k,
+                        start == 0 ? 0.0f : 1.0f, output + r * ldc, (int)ldc);
+                }
+            }
+        }
+        for (size_t r = 0; r < rows; ++r) {
+            if ((r & 7) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t col = 0;
+            for (; n - col >= 4; col += 4) {
+                float *destination = gate + r * p->n + col;
+                const float32x4_t value = activate4(vld1q_f32(destination), vld1q_f32(up + r * n + col));
+                vst1q_f32(destination, value);
+            }
+            for (; col < n; ++col) {
+                const size_t output = (row + r) * p->n + column + col;
+                dense_glu_store(t, output, gate[r * p->n + col], up[r * n + col]);
+            }
+        }
+    }
+    return t->context->is_cancelled(t->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+#endif
 
 static TrillimStatus dense_glu_blas_project_impl(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const DenseGluBlasTask *job = opaque;
+#if defined(__APPLE__)
+    if (job->reuse > 1) {
+        return dense_glu_blas_grouped(job, index);
+    }
+#endif
     const DenseGluTask *t = &job->task;
     const DenseGluParameters *p = t->p;
     size_t width = dense_glu_block_n(p);
@@ -720,17 +804,44 @@ static TrillimStatus dense_glu_blas_project_impl(void *opaque, size_t index, siz
 
 static TrillimStatus dense_glu_blas_project(void *opaque, size_t index, size_t worker) {
 #ifdef __APPLE__
+    DenseGluBlasTask *job = opaque;
     if (dense_glu_get_threading != NULL && dense_glu_set_threading != NULL) {
-        unsigned previous = dense_glu_get_threading();
-        if (previous != 1 && dense_glu_set_threading(1) == 0) {
-            TrillimStatus status = dense_glu_blas_project_impl(opaque, index, worker);
-            (void)dense_glu_set_threading(previous);
-            return status;
+        const unsigned previous = dense_glu_get_threading();
+        if (previous != 1) {
+            if (dense_glu_set_threading(1) == 0) {
+                const TrillimStatus status = dense_glu_blas_project_impl(opaque, index, worker);
+                (void)dense_glu_set_threading(previous);
+                return status;
+            }
+            if (job->reuse > 1) {
+                atomic_store_explicit(&job->single_threaded, false, memory_order_relaxed);
+                return TRILLIM_OK;
+            }
         }
     }
 #endif
     return dense_glu_blas_project_impl(opaque, index, worker);
 }
+
+#if defined(__APPLE__)
+typedef struct {
+    const DenseGluTask *task;
+    float *packed;
+} DenseGluPackTask;
+
+enum { DENSE_GLU_PACK_ROWS = 16 };
+
+static TrillimStatus dense_glu_pack_rows(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const DenseGluPackTask *job = opaque;
+    const DenseGluTask *task = job->task;
+    const DenseGluParameters *p = task->p;
+    const size_t row = tile * DENSE_GLU_PACK_ROWS;
+    const size_t count = p->m - row < DENSE_GLU_PACK_ROWS ? p->m - row : DENSE_GLU_PACK_ROWS;
+    return dense_glu_pack(task->a, p->a_dtype, row * p->a_row_stride, count, p->k, p->a_row_stride,
+        1, job->packed + row * p->k, task->context);
+}
+#endif
 
 static TrillimStatus dense_glu_run(void *const *outputs, const void *const *inputs,
                                     void *scratch, const void *parameters,
@@ -748,7 +859,59 @@ static TrillimStatus dense_glu_run(void *const *outputs, const void *const *inpu
         size_t columns = p->n / dense_glu_block_n(p) + (p->n % dense_glu_block_n(p) != 0);
         size_t count = rows * columns;
         size_t lanes = count < DENSE_GLU_LANES ? count : DENSE_GLU_LANES;
-        DenseGluBlasTask job = {task, scratch, count, lanes};
+        DenseGluBlasTask job = {task, scratch, count, lanes, 1, DENSE_GLU_WORKSPACE, ATOMIC_VAR_INIT(true)};
+#if defined(__APPLE__)
+        const size_t workers = context->thread_pool->worker_count;
+        if (p->b_dtype != TRILLIM_FP32 && rows > 1 && columns >= workers &&
+            workers != 0 && dense_glu_get_threading != NULL && dense_glu_set_threading != NULL) {
+            const size_t width = dense_glu_block_n(p);
+            const size_t depth = dense_glu_block_k(p);
+            size_t reuse = rows < DENSE_GLU_MAX_ROW_REUSE ? rows : DENSE_GLU_MAX_ROW_REUSE;
+            for (; reuse > 1; --reuse) {
+                const size_t workspace = reuse * DENSE_GLU_BLOCK_M * (depth + width) + depth * width;
+                /* Reuse the space reserved for legacy BLAS tiles. */
+                if (workspace <= lanes * DENSE_GLU_WORKSPACE / workers) {
+                    job.reuse = reuse;
+                    job.workspace = workspace;
+                    job.count = (rows / reuse + (rows % reuse != 0)) * columns;
+                    job.lanes = workers;
+                    break;
+                }
+            }
+        }
+        DenseGluParameters prepacked;
+        const size_t allocated = lanes * DENSE_GLU_WORKSPACE;
+        const size_t used = job.lanes * job.workspace;
+        if (job.reuse > 1 && p->a_dtype != TRILLIM_FP32 && p->k <= INT32_MAX &&
+            p->m <= (allocated - used) / p->k) {
+            float *activations = (float *)scratch + used;
+            DenseGluPackTask packing = {&task, activations};
+            const size_t tiles = p->m / DENSE_GLU_PACK_ROWS + (p->m % DENSE_GLU_PACK_ROWS != 0);
+            TrillimStatus status = context->thread_pool->run(
+                context->thread_pool->context, tiles, dense_glu_pack_rows, &packing
+            );
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            prepacked = *p;
+            prepacked.a_dtype = TRILLIM_FP32;
+            prepacked.a_row_stride = p->k;
+            job.task.p = &prepacked;
+            job.task.a = activations;
+        }
+        if (job.reuse > 1) {
+            const TrillimStatus status = context->thread_pool->run(
+                context->thread_pool->context, job.lanes, dense_glu_blas_project, &job);
+            if (status != TRILLIM_OK || atomic_load_explicit(&job.single_threaded, memory_order_relaxed)) {
+                return status;
+            }
+            job.task = task;
+            job.count = count;
+            job.lanes = lanes;
+            job.reuse = 1;
+            job.workspace = DENSE_GLU_WORKSPACE;
+        }
+#endif
         return context->thread_pool->run(context->thread_pool->context, lanes, dense_glu_blas_project, &job);
     }
     size_t height = dense_glu_tile_rows(p);
@@ -2100,7 +2263,7 @@ static TrillimStatus dense_pack(const void *source, uint32_t dtype, size_t base,
 
 static size_t row_reuse(const DenseParameters *p, const TrillimKernelContext *context) {
     size_t workers = context->thread_pool->worker_count;
-    size_t minimum_rows = workers <= 8 || p->n >= 2048 ? 128 : 512;
+    size_t minimum_rows = workers <= 8 || p->n >= 2048 ? 96 : 512;
     if (p->m < minimum_rows || p->out_dtype != TRILLIM_FP32 || p->b_dtype == TRILLIM_FP32 || p->k == 0) {
         return 1;
     }
