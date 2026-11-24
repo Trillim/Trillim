@@ -2712,11 +2712,11 @@ static TrillimStatus linear_try_int8_prefill(
 
 linear_DEFINE_INT8_PROJECTION(linear_project_int8_q8_sdot, false, false, TRILLIM_GRP_INT8)
 linear_DEFINE_INT8_PROJECTION(linear_project_int8_q8_sdot_pair, true, false, TRILLIM_GRP_INT8)
-static TrillimTask linear_int8_projection(uint32_t dtype, bool paired, size_t width) {
+static TrillimTask linear_int8_projection(uint32_t dtype, bool paired, size_t width, size_t workers) {
     const bool dotprod = linear_available_dotprod();
     switch (dtype) {
     case TRILLIM_GRP_INT4:
-        if (paired && width > 2048) {
+        if (paired && width > 2048 && (!dotprod || workers > 4)) {
             return dotprod ? linear_project_int8_q4_sdot : linear_project_int8_q4_neon;
         }
         return dotprod ? linear_project_int8_q4_sdot_pair : linear_project_int8_q4_neon_pair;
@@ -2764,7 +2764,7 @@ static __attribute__((noinline)) TrillimStatus linear_try_int8_projection(
     }
     const size_t width = p->weight_dtype == TRILLIM_DUBGRP_INT6 ? 256 : 32;
     const TrillimTask operation = output_bf16 ? linear_int8_projection_bf16(p->weight_dtype) :
-        linear_int8_projection(p->weight_dtype, gate != NULL, p->width);
+        linear_int8_projection(p->weight_dtype, gate != NULL, p->width, workers);
     if (operation == NULL || p->width % width != 0) {
         return TRILLIM_OK;
     }
