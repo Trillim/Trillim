@@ -481,19 +481,33 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
         }
         return TRILLIM_OK;
     }
-    if (active && p->dtype > TRILLIM_BOOL && p->dtype != TRILLIM_FP16 &&
-        p->dtype != TRILLIM_BF16 && trillim_itemsize(p->dtype) &&
-        trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
-        size_t bytes = trillim_itemsize(p->dtype);
-        for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
-            if (task->context->is_cancelled(task->context->cancellation_context)) {
-                return TRILLIM_CANCELLED;
-            }
-            size_t count = p->slice_size - begin < 1024 ? p->slice_size - begin : 1024;
-            memcpy((uint8_t *)task->output + (item * p->slice_size + begin) * bytes,
-                   (const uint8_t *)task->inputs[0] + (source + begin) * bytes, count * bytes);
+    size_t bytes = trillim_itemsize(p->dtype);
+    if (active && bytes && p->dtype > TRILLIM_BOOL &&
+        p->dtype != TRILLIM_FP16 && p->dtype != TRILLIM_BF16) {
+        size_t width = 0, stride = 0;
+        if (trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
+            width = p->slice_size;
+        } else if (p->slice_rank == 2 && p->slice_strides[1] == 1 &&
+                   p->slice_shape[1] >= 16 && p->slice_size % p->slice_shape[1] == 0 &&
+                   p->slice_size / p->slice_shape[1] == p->slice_shape[0]) {
+            width = p->slice_shape[1];
+            stride = p->slice_strides[0];
         }
-        return TRILLIM_OK;
+        if (width) {
+            for (size_t offset = 0; offset < p->slice_size; offset += width, source += stride) {
+                for (size_t begin = 0; begin < width; begin += 1024) {
+                    if (task->context->is_cancelled(task->context->cancellation_context)) {
+                        return TRILLIM_CANCELLED;
+                    }
+                    size_t count = width - begin < 1024 ? width - begin : 1024;
+                    uint8_t *output = (uint8_t *)task->output +
+                        (item * p->slice_size + offset + begin) * bytes;
+                    const uint8_t *input = (const uint8_t *)task->inputs[0] + (source + begin) * bytes;
+                    memcpy(output, input, count * bytes);
+                }
+            }
+            return TRILLIM_OK;
+        }
     }
     for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
         if (task->context->is_cancelled(task->context->cancellation_context)) {
