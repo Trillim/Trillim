@@ -22,6 +22,12 @@ static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
     return sum;
 }
 
+static inline int32x4_t matrix_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
+    __asm__(".inst 0x4e80a400 | trillim_asm_%0 | (trillim_asm_%1 << 5) | (trillim_asm_%2 << 16)"
+        : "+w"(sum) : "w"(a), "w"(b));
+    return sum;
+}
+
 #else
 /* Assembly is rebuilt with baseline flags after function target attributes vanish. */
 __asm__(".arch armv8.6-a+dotprod+i8mm");
@@ -34,6 +40,10 @@ __asm__(".arch armv8.6-a+dotprod+i8mm");
 #endif
 DOTPROD static inline int32x4_t dot_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
     return vdotq_s32(sum, a, b);
+}
+
+I8MM static inline int32x4_t matrix_product(int32x4_t sum, int8x16_t a, int8x16_t b) {
+    return vmmlaq_s32(sum, a, b);
 }
 
 #endif
@@ -588,6 +598,155 @@ DOTPROD static TrillimStatus project_dotprod(void *opaque, size_t tile, size_t w
     return TRILLIM_OK;
 }
 
+enum { TERNARY_WIDTH = 128, TERNARY_BLOCK_BYTES = 32, DOT_ROWS = 4, MATRIX_ROWS = 8, FAST_COLUMNS = 4 };
+
+static inline __attribute__((always_inline)) uint8x16_t ternary_codes(uint8x16_t packed, size_t plane) {
+    switch (plane) {
+    case 0: return vshrq_n_u8(packed, 6);
+    case 1: return vandq_u8(vshrq_n_u8(packed, 4), vdupq_n_u8(3));
+    case 2: return vandq_u8(vshrq_n_u8(packed, 2), vdupq_n_u8(3));
+    default: return vandq_u8(packed, vdupq_n_u8(3));
+    }
+}
+
+static inline uint8x16_t invalid_ternary_codes(uint8x16_t invalid, uint8x16_t packed) {
+    return vorrq_u8(invalid, vandq_u8(packed, vshrq_n_u8(packed, 1)));
+}
+
+static TrillimStatus store_projection(const Task *task, size_t row, size_t rows, size_t column,
+                                      size_t columns, size_t start, const uint8_t *const *weights,
+                                      const int32_t *row_sums, int32_t sums[][FAST_COLUMNS]) {
+    const size_t width = task->p->width;
+    if (start < width) {
+        for (size_t c = 0; c < columns; ++c) {
+            for (size_t k = start; k < width; ++k) {
+                const unsigned shift = 6 - (unsigned)(k % TERNARY_WIDTH / 32) * 2;
+                const int32_t code = (weights[c][start / 4 + k % 32] >> shift) & 3;
+                if (code == 3) {
+                    return TRILLIM_ERROR;
+                }
+                for (size_t r = 0; r < rows; ++r) {
+                    sums[r][c] += (int32_t)task->input[(row + r) * width + k] * code;
+                }
+            }
+        }
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < columns; ++c) {
+            store(task, row + r, column + c, sums[r][c] - row_sums[r]);
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline int8x16_t interleave_pair(int8x16_t a, int8x16_t b, size_t part) {
+    const int64x2_t first = vreinterpretq_s64_s8(a);
+    const int64x2_t second = vreinterpretq_s64_s8(b);
+    return vreinterpretq_s8_s64(part == 0 ? vzip1q_s64(first, second) : vzip2q_s64(first, second));
+}
+
+I8MM static TrillimStatus project_i8mm(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
+    const size_t row = tile / tiles * MATRIX_ROWS;
+    const size_t rows = p->tokens - row < MATRIX_ROWS ? p->tokens - row : MATRIX_ROWS;
+    size_t column = tile % tiles * task->columns;
+    const size_t end = p->outputs - column < task->columns ? p->outputs : column + task->columns;
+    const size_t stride = (p->width / TERNARY_WIDTH + (p->width % TERNARY_WIDTH != 0)) * TERNARY_BLOCK_BYTES;
+    const int8_t *input = task->input + row * p->width;
+    if (rows < MATRIX_ROWS) {
+        size_t dot_tile = (tile / tiles * (MATRIX_ROWS / DOT_ROWS)) * tiles + tile % tiles;
+        TrillimStatus status = project_dotprod(opaque, dot_tile, worker);
+        if (status == TRILLIM_OK && rows > DOT_ROWS) {
+            status = project_dotprod(opaque, dot_tile + tiles, worker);
+        }
+        return status;
+    }
+
+    int32_t row_sums[MATRIX_ROWS];
+    for (size_t r = 0; r < MATRIX_ROWS; ++r) {
+        const int8_t *x = input + r * p->width;
+        int32x4_t sum = vdupq_n_s32(0);
+        size_t k = 0;
+        for (; k + 16 <= p->width; k += 16) {
+            if ((k & 4095) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            sum = vpadalq_s16(sum, vpaddlq_s8(vld1q_s8(x + k)));
+        }
+        row_sums[r] = vaddvq_s32(sum);
+        for (; k < p->width; ++k) {
+            row_sums[r] += x[k];
+        }
+    }
+    for (; column < end; column += FAST_COLUMNS) {
+        const size_t columns = end - column < FAST_COLUMNS ? end - column : FAST_COLUMNS;
+        const uint8_t *weights[FAST_COLUMNS];
+        for (size_t c = 0; c < FAST_COLUMNS; ++c) {
+            weights[c] = (const uint8_t *)task->weight + (column + (c < columns ? c : 0)) * stride;
+        }
+        int32x4_t dots[MATRIX_ROWS / 2][FAST_COLUMNS / 2] = {0};
+        uint8x16_t invalid = vdupq_n_u8(0);
+        size_t k = 0;
+        for (; k + TERNARY_WIDTH <= p->width; k += TERNARY_WIDTH) {
+            if ((k & 4095) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            for (size_t half = 0; half < TERNARY_BLOCK_BYTES; half += 16) {
+                uint8x16_t packed[2][FAST_COLUMNS / 2];
+                for (size_t c = 0; c < FAST_COLUMNS / 2; ++c) {
+                    int8x16_t a = vld1q_s8((const int8_t *)weights[c * 2] + k / 4 + half);
+                    int8x16_t b = vld1q_s8((const int8_t *)weights[c * 2 + 1] + k / 4 + half);
+                    invalid = invalid_ternary_codes(invalid, vreinterpretq_u8_s8(a));
+                    invalid = invalid_ternary_codes(invalid, vreinterpretq_u8_s8(b));
+                    packed[0][c] = vreinterpretq_u8_s8(interleave_pair(a, b, 0));
+                    packed[1][c] = vreinterpretq_u8_s8(interleave_pair(a, b, 1));
+                }
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+                for (size_t plane = 0; plane < 4; ++plane) {
+                    int8x16_t values[2][MATRIX_ROWS / 2];
+                    for (size_t r = 0; r < MATRIX_ROWS / 2; ++r) {
+                        const int8_t *a = input + r * 2 * p->width + k + half + plane * 32;
+                        int8x16_t x0 = vld1q_s8(a);
+                        int8x16_t x1 = vld1q_s8(a + p->width);
+                        values[0][r] = interleave_pair(x0, x1, 0);
+                        values[1][r] = interleave_pair(x0, x1, 1);
+                    }
+                    for (size_t part = 0; part < 2; ++part) {
+                        for (size_t c = 0; c < FAST_COLUMNS / 2; ++c) {
+                            int8x16_t codes = vreinterpretq_s8_u8(ternary_codes(packed[part][c], plane));
+                            for (size_t r = 0; r < MATRIX_ROWS / 2; ++r) {
+                                dots[r][c] = matrix_product(dots[r][c], values[part][r], codes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (vmaxvq_u8(vandq_u8(invalid, vdupq_n_u8(0x55)))) {
+            return TRILLIM_ERROR;
+        }
+        int32_t sums[MATRIX_ROWS][FAST_COLUMNS];
+        for (size_t r = 0; r < MATRIX_ROWS / 2; ++r) {
+            const int64x2_t first = vreinterpretq_s64_s32(dots[r][0]);
+            const int64x2_t second = vreinterpretq_s64_s32(dots[r][1]);
+            vst1q_s32(sums[r * 2], vreinterpretq_s32_s64(vzip1q_s64(first, second)));
+            vst1q_s32(sums[r * 2 + 1], vreinterpretq_s32_s64(vzip2q_s64(first, second)));
+        }
+        TrillimStatus status = store_projection(task, row, rows, column, columns, k, weights, row_sums, sums);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_quantized_linear(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -608,7 +767,8 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_quantized_linear(
     unsigned cpu_features = features();
     bool decode = (cpu_features & 2) && p->tokens == 1 &&
         p->width % 128 == 0 && p->outputs % 4 == 0;
-    size_t column_step = decode ? 4 : 2;
+    const bool matrix = (cpu_features & 6) == 6 && p->tokens >= MATRIX_ROWS && p->width >= TERNARY_WIDTH;
+    size_t column_step = decode || matrix ? FAST_COLUMNS : 2;
     columns = columns / column_step * column_step;
     if (columns < 16) {
         columns = 16;
@@ -617,9 +777,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_quantized_linear(
     float gamma;
     memcpy(&gamma, (const uint8_t *)inputs[1] + p->outputs * stride, sizeof(gamma));
     Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, columns, gamma, 0, context};
-    size_t rows = p->tokens / 4 + (p->tokens % 4 != 0);
+    const size_t row_tile = matrix ? MATRIX_ROWS : DOT_ROWS;
+    size_t rows = p->tokens / row_tile + (p->tokens % row_tile != 0);
     size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
-    TrillimTask project = (cpu_features & 2) ? project_dotprod : project_neon;
+    TrillimTask project = matrix ? project_i8mm : (cpu_features & 2) ? project_dotprod : project_neon;
     if (decode) {
         // The packed codes are weight + 1. Correct every dot with the same input sum.
         int32x4_t sum = vdupq_n_s32(0);
