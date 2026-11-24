@@ -1,7 +1,7 @@
 #include "common.h"
 #include <math.h>
 
-enum { PACKED_ROWS = 4, PACKED_COLUMNS = 16 };
+enum { PACKED_ROWS = 4, PACKED_COLUMNS = 16, LOWBIT_GROUP = 128 };
 
 typedef struct {
     size_t tokens, width, outputs;
@@ -35,8 +35,8 @@ static const Layout *packed_layout(uint32_t dtype) {
         [TRILLIM_GRP_INT4 - TRILLIM_GRP_INT4] = {32, 16, 2, 0, 0},
         [TRILLIM_GRP_INT5 - TRILLIM_GRP_INT4] = {32, 16, 2, 4, 0},
         [TRILLIM_DUBGRP_INT6 - TRILLIM_GRP_INT4] = {256, 128, 2, 64, 16},
-        [TRILLIM_GRP_BINARY - TRILLIM_GRP_INT4] = {128, 16, 2, 0, 0},
-        [TRILLIM_GRP_TERNARY - TRILLIM_GRP_INT4] = {128, 32, 2, 0, 0},
+        [TRILLIM_GRP_BINARY - TRILLIM_GRP_INT4] = {LOWBIT_GROUP, 16, 2, 0, 0},
+        [TRILLIM_GRP_TERNARY - TRILLIM_GRP_INT4] = {LOWBIT_GROUP, 32, 2, 0, 0},
         [TRILLIM_MXFP4 - TRILLIM_GRP_INT4] = {32, 16, 1, 0, 0},
     };
     return dtype >= TRILLIM_GRP_INT4 && dtype <= TRILLIM_MXFP4 ? &layouts[dtype - TRILLIM_GRP_INT4] : NULL;
@@ -81,8 +81,53 @@ static float weight_scale(const Task *task, size_t block) {
     return trillim_bf16(bits);
 }
 
+static bool lowbit_dot(const Block *block, const int8_t *input, size_t stride, size_t rows, int32_t *sums) {
+    int8_t weights[LOWBIT_GROUP];
+    const uint8_t *values = block->values;
+    if (block->dtype == TRILLIM_GRP_BINARY) {
+        static const int8_t nibbles[16][4] = {
+            {-1, -1, -1, -1}, {-1, -1, -1,  1}, {-1, -1,  1, -1}, {-1, -1,  1,  1},
+            {-1,  1, -1, -1}, {-1,  1, -1,  1}, {-1,  1,  1, -1}, {-1,  1,  1,  1},
+            { 1, -1, -1, -1}, { 1, -1, -1,  1}, { 1, -1,  1, -1}, { 1, -1,  1,  1},
+            { 1,  1, -1, -1}, { 1,  1, -1,  1}, { 1,  1,  1, -1}, { 1,  1,  1,  1},
+        };
+        for (size_t i = 0; i < LOWBIT_GROUP / 8; ++i) {
+            uint8_t packed = values[i];
+            memcpy(weights + i * 8, nibbles[packed >> 4], 4);
+            memcpy(weights + i * 8 + 4, nibbles[packed & 15], 4);
+        }
+    } else {
+        enum { LANES = LOWBIT_GROUP / 4 };
+        uint8_t invalid = 0;
+        for (size_t i = 0; i < LANES; ++i) {
+            uint8_t packed = values[i];
+            // A ternary code is invalid when both bits are set.
+            invalid |= packed & (packed >> 1) & 0x55;
+            weights[i] = (int8_t)((packed >> 6) - 1);
+            weights[LANES + i] = (int8_t)(((packed >> 4) & 3) - 1);
+            weights[2 * LANES + i] = (int8_t)(((packed >> 2) & 3) - 1);
+            weights[3 * LANES + i] = (int8_t)((packed & 3) - 1);
+        }
+        if (invalid) {
+            return false;
+        }
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        const int8_t *x = input + row * stride;
+        int32_t sum = 0;
+        for (size_t i = 0; i < LOWBIT_GROUP; ++i) {
+            sum += x[i] * weights[i];
+        }
+        sums[row] = sum;
+    }
+    return true;
+}
+
 static inline bool scalar_dot(const Block *block, const int8_t *input, size_t stride, size_t rows, size_t count,
                               int32_t *sums) {
+    if (count == LOWBIT_GROUP && (block->dtype == TRILLIM_GRP_BINARY || block->dtype == TRILLIM_GRP_TERNARY)) {
+        return lowbit_dot(block, input, stride, rows, sums);
+    }
     const uint8_t *values = block->values;
     for (size_t i = 0; i < count; ++i) {
         int32_t code;
