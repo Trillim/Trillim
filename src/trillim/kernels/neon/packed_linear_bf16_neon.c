@@ -1968,6 +1968,7 @@ typedef struct {
     atomic_bool ordinary;
     bool output_bf16;
     const uint8_t *bias;
+    size_t column_tiles, row_chunk;
 } linear_Int8PrefillTask;
 
 static bool linear_int8_prefill_i8mm_available(void) {
@@ -2379,13 +2380,18 @@ static TrillimStatus linear_project_q6_prefill(void *opaque, size_t index, size_
     const LinearTask *task = job->projection;
     const PackedLinearParameters *p = task->p;
     const size_t groups = p->width / linear_INT8_ACTIVATION_Q8_K;
-    const size_t row_tiles = p->tokens / linear_INT8_PREFILL_ROWS + (p->tokens % linear_INT8_PREFILL_ROWS != 0);
+    const size_t all_rows = p->tokens / linear_INT8_PREFILL_ROWS + (p->tokens % linear_INT8_PREFILL_ROWS != 0);
+    const size_t first_row_tile = index / job->column_tiles * job->row_chunk;
+    const size_t row_tiles = all_rows - first_row_tile < job->row_chunk ? all_rows - first_row_tile : job->row_chunk;
+    const size_t first_row = first_row_tile * linear_INT8_PREFILL_ROWS;
+    const size_t end_row = p->tokens - first_row < row_tiles * linear_INT8_PREFILL_ROWS
+        ? p->tokens : first_row + row_tiles * linear_INT8_PREFILL_ROWS;
     const size_t total = groups * p->outputs;
     const bool paired = job->gate != NULL;
     const size_t stride = paired ? 1 : 2;
     const linear_Int8PackedWeight weight = linear_int8_packed_weight(task->weight, total, TRILLIM_DUBGRP_INT6);
     const linear_Int8PackedWeight second = paired ? linear_int8_packed_weight(job->gate, total, TRILLIM_DUBGRP_INT6) : weight;
-    const size_t begin = index * task->columns;
+    const size_t begin = index % job->column_tiles * task->columns;
     const size_t end = p->outputs - begin < task->columns ? p->outputs : begin + task->columns;
     if (!linear_fhm_default_fpcr()) {
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
@@ -2430,17 +2436,43 @@ static TrillimStatus linear_project_q6_prefill(void *opaque, size_t index, size_
                 linear_pack_q6_prefill_group(weight, second, first[c] * groups + g, next[c] * groups + g, packed + c);
             }
             for (size_t t = 0; t < row_tiles; ++t) {
-                linear_accumulate_q6_prefill_group(packed, activations + g * row_tiles + t, totals[t]);
+                linear_accumulate_q6_prefill_group(packed, activations + g * all_rows + first_row_tile + t, totals[t]);
             }
         }
-        for (size_t row = 0; row < p->tokens; ++row) {
+        for (size_t row = first_row; row < end_row; ++row) {
             if ((row % linear_INT8_PREFILL_ROWS) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             const size_t inner = row % linear_INT8_PREFILL_ROWS;
-            if (paired && job->activate4 != NULL && end - column >= linear_Q6_PREFILL_COLUMN_PAIRS) {
+            if (!paired) {
                 const size_t pair = inner / 2;
-                float32x4_t (*rows)[linear_INT8_PREFILL_PAIRS] = totals[row / linear_INT8_PREFILL_ROWS];
+                float32x4_t (*rows)[linear_INT8_PREFILL_PAIRS] = totals[(row - first_row) / linear_INT8_PREFILL_ROWS];
+                const float32x4_t a = linear_q8_prefill_row(rows[0][pair], rows[1][pair], inner);
+                const float32x4_t b = linear_q8_prefill_row(rows[2][pair], rows[3][pair], inner);
+                if (!linear_finite_prefill_result(a) || !linear_finite_prefill_result(b)) {
+                    atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+                    return TRILLIM_OK;
+                }
+                const size_t count = end - column < 2 * linear_Q6_PREFILL_COLUMN_PAIRS
+                    ? end - column : 2 * linear_Q6_PREFILL_COLUMN_PAIRS;
+                if (job->output_bf16) {
+                    const float32x4_t values[2] = {a, b};
+                    linear_store_prefill_bf16(task->output, row * p->outputs + column, values, count);
+                } else {
+                    float *out = (float *)task->output + row * p->outputs + column;
+                    if (count == 2 * linear_Q6_PREFILL_COLUMN_PAIRS) {
+                        vst1q_f32(out, a);
+                        vst1q_f32(out + 4, b);
+                    } else {
+                        const float32x4_t values[2] = {a, b};
+                        memcpy(out, values, count * sizeof(float));
+                    }
+                }
+                continue;
+            }
+            if (job->activate4 != NULL && end - column >= linear_Q6_PREFILL_COLUMN_PAIRS) {
+                const size_t pair = inner / 2;
+                float32x4_t (*rows)[linear_INT8_PREFILL_PAIRS] = totals[(row - first_row) / linear_INT8_PREFILL_ROWS];
                 const float32x4_t a = linear_q8_prefill_row(rows[0][pair], rows[1][pair], inner);
                 const float32x4_t b = linear_q8_prefill_row(rows[2][pair], rows[3][pair], inner);
                 const uint32x4_t magnitude = vmaxq_u32(
@@ -2456,8 +2488,8 @@ static TrillimStatus linear_project_q6_prefill(void *opaque, size_t index, size_
             }
             for (size_t c = 0; c < linear_Q6_PREFILL_COLUMN_PAIRS && column + c * stride < end; ++c) {
                 const float32x2_t pair = (inner & 1)
-                    ? vget_high_f32(totals[row / linear_INT8_PREFILL_ROWS][c][inner / 2])
-                    : vget_low_f32(totals[row / linear_INT8_PREFILL_ROWS][c][inner / 2]);
+                    ? vget_high_f32(totals[(row - first_row) / linear_INT8_PREFILL_ROWS][c][inner / 2])
+                    : vget_low_f32(totals[(row - first_row) / linear_INT8_PREFILL_ROWS][c][inner / 2]);
                 const float a = vget_lane_f32(pair, 0), b = vget_lane_f32(pair, 1);
                 if (!isfinite(a) || !isfinite(b)) {
                     atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
@@ -2689,9 +2721,19 @@ static TrillimStatus linear_try_int8_prefill(
             free(activation);
             return status;
         }
+        size_t split = 1;
+        if (q6 && tiles < workers && rows >= 8 && rows * p->width >= 16384) {
+            /* Keep enough token rows per task to reuse each unpacked weight block. */
+            const size_t available = workers / tiles;
+            const size_t useful = rows / 4;
+            split = available < useful ? available : useful;
+        }
+        const size_t row_chunk = rows / split + (rows % split != 0);
+        const size_t row_tiles = rows / row_chunk + (rows % row_chunk != 0);
         linear_Int8PrefillTask job = {&panel, gate, silu, activate4, activation, ATOMIC_VAR_INIT(true),
-            output_bf16, bias};
-        status = tiles == 1 ? project(&job, 0, 0) : pool->run(pool->context, tiles, project, &job);
+            output_bf16, bias, tiles, row_chunk};
+        const size_t tasks = tiles * row_tiles;
+        status = tasks == 1 ? project(&job, 0, 0) : pool->run(pool->context, tasks, project, &job);
         if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
             free(activation);
             return status;
@@ -3011,6 +3053,15 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear_bf16(
         return TRILLIM_OK;
     }
     const PackedLinearParameters projection = {p->tokens, p->width, p->outputs, TRILLIM_BF16, TRILLIM_DUBGRP_INT6, TRILLIM_FP32};
+    const size_t workers = context->thread_pool->worker_count;
+    if (p->tokens >= 4 && workers != 0) {
+        const LinearTask task = {outputs[0], inputs[0], inputs[1], &projection, 0, context};
+        bool handled;
+        const TrillimStatus status = linear_try_int8_prefill(&task, NULL, NULL, NULL, true, NULL, workers, &handled);
+        if (status != TRILLIM_OK || handled) {
+            return status;
+        }
+    }
     void *temporary = scratch;
     void *projected[] = {temporary};
     const TrillimStatus status = project_linear(projected, inputs, NULL, &projection, context);
