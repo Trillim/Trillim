@@ -114,6 +114,11 @@ static bool payload(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) 
     return true;
 }
 
+static size_t query_groups(const TrillimAttentionParameters *p) {
+    size_t rows = (p->heads / p->kv_heads) * p->queries;
+    return rows / 4 + (rows % 4 != 0);
+}
+
 static TrillimStatus trillim_attention_requirements(
     const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch
 ) {
@@ -123,7 +128,10 @@ static TrillimStatus trillim_attention_requirements(
         return TRILLIM_OK;
     }
     if (p->rank != 3 || !p->kv_heads || p->heads % p->kv_heads || !p->key_dim || !p->value_dim ||
-        p->output_dtype != TRILLIM_FP32 || p->q_strides[2] != 1 || p->k_strides[2] != 1 || p->v_strides[2] != 1 ||
+        (p->output_dtype != TRILLIM_FP32 &&
+         (p->output_dtype != TRILLIM_BF16 || p->q_dtype != TRILLIM_BF16 ||
+          p->k_dtype != TRILLIM_BF16 || p->v_dtype != TRILLIM_BF16 ||
+          (p->length > 64 && p->queries != 1))) || p->q_strides[2] != 1 || p->k_strides[2] != 1 || p->v_strides[2] != 1 ||
         p->causal > 1 || p->windowed > 1 || p->default_scale > 1 || p->queries > INT64_MAX || p->length > INT64_MAX ||
         p->heads > SIZE_MAX / p->queries ||
         p->heads * p->queries > SIZE_MAX / trillim_itemsize(p->output_dtype) / p->value_dim) {
@@ -143,11 +151,11 @@ static TrillimStatus trillim_attention_requirements(
         !payload(p->v_rows, p->v_columns, p->v_dtype, &inputs[2]))) {
         return TRILLIM_ERROR;
     }
-    size_t groups = p->queries / 4 + (p->queries % 4 != 0);
-    if (p->key_dim > SIZE_MAX - 64 || p->value_dim > SIZE_MAX - 64 - p->key_dim || p->heads > SIZE_MAX / groups) {
+    size_t groups = query_groups(p);
+    if (p->key_dim > SIZE_MAX - 64 || p->value_dim > SIZE_MAX - 64 - p->key_dim) {
         return TRILLIM_ERROR;
     }
-    size_t slots = p->heads * groups < 128 ? p->heads * groups : 128;
+    size_t slots = p->kv_heads * groups < 128 ? p->kv_heads * groups : 128;
     if (slots > SIZE_MAX / sizeof(float) / 4 / (p->key_dim + p->value_dim + 64)) {
         return TRILLIM_ERROR;
     }
@@ -159,11 +167,12 @@ static TrillimStatus trillim_attention_requirements(
 static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index, size_t slot) {
     const TrillimAttentionParameters *p = task->parameters;
     const TrillimKernelContext *context = task->context;
-    size_t groups = p->queries / 4 + (p->queries % 4 != 0);
-    size_t head = index / groups;
-    size_t kv_head = head / (p->heads / p->kv_heads);
+    size_t groups = query_groups(p);
+    size_t kv_head = index / groups;
+    size_t rows_per_head = (p->heads / p->kv_heads) * p->queries;
     size_t first = index % groups * 4;
-    size_t rows = p->queries - first < 4 ? p->queries - first : 4;
+    size_t rows = rows_per_head - first < 4 ? rows_per_head - first : 4;
+    size_t first_head = kv_head * (p->heads / p->kv_heads);
     float *queries = task->scratch + slot * 4 * (p->key_dim + p->value_dim + 64);
     float *accumulator = queries + 4 * p->key_dim;
     float *scores = accumulator + 4 * p->value_dim;
@@ -173,7 +182,9 @@ static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index,
     size_t begin[4], end[4];
     size_t first_key = p->length, last_key = 0;
     for (size_t row = 0; row < rows; ++row) {
-        size_t query = head * p->q_strides[0] + (first + row) * p->q_strides[1];
+        size_t head = first_head + (first + row) / p->queries;
+        size_t position_index = (first + row) % p->queries;
+        size_t query = head * p->q_strides[0] + position_index * p->q_strides[1];
         size_t channel = 0;
         for (; p->key_dim - channel >= 8; channel += 8) {
             if ((channel & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
@@ -190,7 +201,7 @@ static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index,
             }
             accumulator[row * p->value_dim + channel] = 0;
         }
-        int64_t position = (int64_t)p->length - (int64_t)p->queries + (int64_t)(first + row);
+        int64_t position = (int64_t)p->length - (int64_t)p->queries + (int64_t)position_index;
         begin[row] = p->windowed && position >= 0 && (uint64_t)position + 1 > p->window ?
             (size_t)position + 1 - p->window : 0;
         end[row] = p->causal ? (position < 0 ? 0 : (size_t)position + 1) : p->length;
@@ -207,11 +218,29 @@ static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index,
         }
         size_t count = last_key - block < 64 ? last_key - block : 64;
         for (size_t key = 0; key < count; ++key) {
+            size_t base = kv_head * p->k_strides[0] + (block + key) * p->k_strides[1];
+            if (p->output_dtype == TRILLIM_BF16) {
+                float sums[4] = {0};
+                for (size_t channel = 0; channel < p->key_dim; ++channel) {
+                    if ((channel & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
+                        return TRILLIM_CANCELLED;
+                    }
+                    float value = trillim_bf16(((const uint16_t *)task->keys)[base + channel]);
+                    for (size_t row = 0; row < rows; ++row) {
+                        sums[row] += queries[row * p->key_dim + channel] * value;
+                    }
+                }
+                for (size_t row = 0; row < rows; ++row) {
+                    scores[row * 64 + key] =
+                        block + key >= begin[row] && block + key < end[row] ? sums[row] * scale : -INFINITY;
+                }
+                continue;
+            }
+
             __m256 sums[4][2];
             for (size_t row = 0; row < rows; ++row) {
                 sums[row][0] = sums[row][1] = _mm256_set1_ps(0);
             }
-            size_t base = kv_head * p->k_strides[0] + (block + key) * p->k_strides[1];
             size_t channel = 0;
             for (; p->key_dim - channel >= 16; channel += 16) {
                 if ((channel & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
@@ -256,7 +285,7 @@ static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index,
             maximum[row] = peak;
             __m256 total = _mm256_set1_ps(0);
             size_t key = 0;
-            for (; count - key >= 8; key += 8) {
+            for (; p->output_dtype == TRILLIM_FP32 && count - key >= 8; key += 8) {
                 float *target = scores + row * 64 + key;
                 __m256 value = exp_negative(_mm256_sub_ps(_mm256_loadu_ps(target), _mm256_set1_ps(normalization_peak)));
                 _mm256_storeu_ps(target, value);
@@ -323,7 +352,8 @@ static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index,
         }
     }
     for (size_t row = 0; row < rows; ++row) {
-        size_t output = ((first + row) * p->heads + head) * p->value_dim;
+        size_t head = first_head + (first + row) / p->queries;
+        size_t output = (((first + row) % p->queries) * p->heads + head) * p->value_dim;
         for (size_t channel = 0; channel < p->value_dim; ++channel) {
             if ((channel & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -339,8 +369,8 @@ static TrillimStatus attend(void *opaque, size_t slot, size_t worker) {
     (void)worker;
     const TrillimAttentionTask *task = opaque;
     const TrillimAttentionParameters *p = task->parameters;
-    size_t groups = p->queries / 4 + (p->queries % 4 != 0);
-    size_t tiles = p->heads * groups;
+    size_t groups = query_groups(p);
+    size_t tiles = p->kv_heads * groups;
     size_t slots = tiles < 128 ? tiles : 128;
     for (size_t index = slot; index < tiles;) {
         TrillimStatus status = attend_tile(task, index, slot);
@@ -363,9 +393,10 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_attention_tiled(
         return TRILLIM_CANCELLED;
     }
     const TrillimAttentionParameters *p = parameters;
+    if (!p->heads || !p->queries) return TRILLIM_OK;
     TrillimAttentionTask task = {outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context};
-    size_t groups = p->queries / 4 + (p->queries % 4 != 0);
-    size_t slots = p->heads * groups < 128 ? p->heads * groups : 128;
+    size_t groups = query_groups(p);
+    size_t slots = p->kv_heads * groups < 128 ? p->kv_heads * groups : 128;
     return context->thread_pool->run(context->thread_pool->context, slots, attend, &task);
 }
 

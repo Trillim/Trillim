@@ -7,7 +7,7 @@
 #include <dlfcn.h>
 #endif
 
-enum { MAX_TASKS = 64, VALUE_TILE = 32, BLAS_DEPTH = 1024, PACK_ROWS = 256 };
+enum { MAX_TASKS = 64, VALUE_TILE = 32, BLAS_DEPTH = 1024, PACK_ROWS = 256, ROWS_PER_TILE = 2 };
 
 typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
                       const float *, int, float, float *, int);
@@ -35,11 +35,16 @@ typedef struct {
     const void *sinks;
     float *scratch;
     float *packed_values;
-    size_t rows, tasks;
+    size_t tiles, tasks;
     float scale;
     const Parameters *p;
     const TrillimKernelContext *context;
 } Task;
+
+static size_t row_tiles(const Parameters *p) {
+    size_t rows = (p->heads / p->kv_heads) * p->queries;
+    return rows / ROWS_PER_TILE + (rows % ROWS_PER_TILE != 0);
+}
 
 static bool blas_shape(const Parameters *p) {
     return p->length && p->value_dim > 4096 / p->length &&
@@ -155,11 +160,12 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     if (!p->length) {
         return TRILLIM_OK;
     }
-    size_t tasks = rows < MAX_TASKS ? rows : MAX_TASKS;
+    size_t tiles = p->kv_heads * row_tiles(p);
+    size_t tasks = tiles < MAX_TASKS ? tiles : MAX_TASKS;
     size_t q_shape[] = {p->heads, p->queries, p->key_dim};
     size_t k_shape[] = {p->kv_heads, p->length, p->key_dim};
     size_t v_shape[] = {p->kv_heads, p->length, p->value_dim};
-    if (p->length > SIZE_MAX / sizeof(float) / tasks ||
+    if (p->length > SIZE_MAX / sizeof(float) / ROWS_PER_TILE / tasks ||
         p->heads > SIZE_MAX / trillim_itemsize(p->sink_dtype) ||
         !input_span(q_shape, p->q_strides, p->q_rows, p->q_columns, &inputs[0]) ||
         !input_span(k_shape, p->k_strides, p->k_rows, p->k_columns, &inputs[1]) ||
@@ -167,7 +173,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
         return TRILLIM_ERROR;
     }
     inputs[3] = p->heads * trillim_itemsize(p->sink_dtype);
-    *scratch = tasks * p->length * sizeof(float);
+    *scratch = tasks * ROWS_PER_TILE * p->length * sizeof(float);
     if (blas_shape(p)) {
         size_t available = SIZE_MAX - *scratch;
         if (p->length > available / sizeof(float) / p->kv_heads / p->value_dim) {
@@ -272,23 +278,31 @@ static TrillimStatus normalize(const Task *task, float *scores, float sink) {
 }
 
 static TrillimStatus apply_values(const Task *task, const uint16_t *v,
-                                  const float *probabilities, uint16_t *output) {
+                                  float *const *probabilities, uint16_t *const *outputs,
+                                  size_t rows) {
     const Parameters *p = task->p;
     for (size_t first = 0; first < p->value_dim;) {
         size_t width = p->value_dim - first < VALUE_TILE ? p->value_dim - first : VALUE_TILE;
-        float sums[VALUE_TILE] = {0};
+        float sums[ROWS_PER_TILE][VALUE_TILE] = {{0}};
         for (size_t key = 0; key < p->length; ++key) {
             if ((key & 255) == 0 && cancelled(task)) {
                 return TRILLIM_CANCELLED;
             }
-            float weight = probabilities[key];
             const uint16_t *value = v + key * p->v_strides[1] + first * p->v_strides[2];
+            float weight0 = probabilities[0][key];
+            float weight1 = rows == 2 ? probabilities[1][key] : 0.0f;
             for (size_t channel = 0; channel < width; ++channel) {
-                sums[channel] += weight * trillim_bf16(value[channel * p->v_strides[2]]);
+                float decoded = trillim_bf16(value[channel * p->v_strides[2]]);
+                sums[0][channel] += weight0 * decoded;
+                if (rows == 2) {
+                    sums[1][channel] += weight1 * decoded;
+                }
             }
         }
-        for (size_t channel = 0; channel < width; ++channel) {
-            output[first + channel] = trillim_to_bf16(sums[channel]);
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t channel = 0; channel < width; ++channel) {
+                outputs[row][first + channel] = trillim_to_bf16(sums[row][channel]);
+            }
         }
         first += width;
     }
@@ -369,46 +383,67 @@ static TrillimStatus apply_blas_values(const Task *task, size_t kv_head,
 
 static TrillimStatus attention_rows(const Task *task, size_t index) {
     const Parameters *p = task->p;
-    float *scores = p->length ? task->scratch + index * p->length : NULL;
     size_t group = p->heads / p->kv_heads;
-    for (size_t flat = index; flat < task->rows; flat += task->tasks) {
-        size_t head = flat / p->queries, row = flat % p->queries;
-        uint16_t *output = task->output + (row * p->heads + head) * p->value_dim;
-        if (cancelled(task)) {
-            return TRILLIM_CANCELLED;
+    size_t rows = group * p->queries;
+    float *scores = p->length ? task->scratch + index * ROWS_PER_TILE * p->length : NULL;
+    for (size_t flat = index; flat < p->kv_heads * task->tiles; flat += task->tasks) {
+        size_t kv_head = flat / task->tiles;
+        size_t first = flat % task->tiles * ROWS_PER_TILE;
+        size_t count = rows - first < ROWS_PER_TILE ? rows - first : ROWS_PER_TILE;
+        uint16_t *outputs[ROWS_PER_TILE];
+        float *probabilities[ROWS_PER_TILE];
+        for (size_t lane = 0; lane < count; ++lane) {
+            size_t head = kv_head * group + (first + lane) / p->queries;
+            size_t row = (first + lane) % p->queries;
+            uint16_t *output = task->output + (row * p->heads + head) * p->value_dim;
+            if (cancelled(task)) {
+                return TRILLIM_CANCELLED;
+            }
+            if (!p->length) {
+                for (size_t offset = 0; offset < p->value_dim;) {
+                    if (cancelled(task)) {
+                        return TRILLIM_CANCELLED;
+                    }
+                    size_t width = p->value_dim - offset < 1024 ? p->value_dim - offset : 1024;
+                    memset(output + offset, 0, width * sizeof(*output));
+                    offset += width;
+                }
+                continue;
+            }
+            size_t distance = p->queries - row;
+            size_t position_end = distance > p->length ? 0 : p->length - distance + 1;
+            size_t end = p->causal ? position_end : p->length;
+            size_t begin = p->windowed && position_end > p->window ? position_end - p->window : 0;
+            const uint16_t *q = task->q + head * p->q_strides[0] + row * p->q_strides[1];
+            const uint16_t *k = task->k + kv_head * p->k_strides[0];
+            float sink = trillim_load(task->sinks, head, p->sink_dtype).f;
+            probabilities[lane] = scores + lane * p->length;
+            outputs[lane] = output;
+            TrillimStatus status = compute_scores(task, q, k, begin, end, probabilities[lane]);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            status = normalize(task, probabilities[lane], sink);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
         }
         if (!p->length) {
-            for (size_t first = 0; first < p->value_dim;) {
-                if (cancelled(task)) {
-                    return TRILLIM_CANCELLED;
-                }
-                size_t width = p->value_dim - first < 1024 ? p->value_dim - first : 1024;
-                memset(output + first, 0, width * sizeof(*output));
-                first += width;
-            }
             continue;
         }
-        size_t kv_head = head / group;
-        size_t distance = p->queries - row;
-        size_t position_end = distance > p->length ? 0 : p->length - distance + 1;
-        size_t end = p->causal ? position_end : p->length;
-        size_t begin = p->windowed && position_end > p->window ? position_end - p->window : 0;
-        const uint16_t *q = task->q + head * p->q_strides[0] + row * p->q_strides[1];
-        const uint16_t *k = task->k + kv_head * p->k_strides[0];
-        const uint16_t *v = task->v + kv_head * p->v_strides[0];
-        float sink = trillim_load(task->sinks, head, p->sink_dtype).f;
-        TrillimStatus status = compute_scores(task, q, k, begin, end, scores);
-        if (status != TRILLIM_OK) {
-            return status;
-        }
-        status = normalize(task, scores, sink);
-        if (status != TRILLIM_OK) {
-            return status;
-        }
-        status = task->packed_values ? apply_blas_values(task, kv_head, scores, output) :
-                                       apply_values(task, v, scores, output);
-        if (status != TRILLIM_OK) {
-            return status;
+        if (task->packed_values) {
+            for (size_t lane = 0; lane < count; ++lane) {
+                TrillimStatus status = apply_blas_values(task, kv_head, probabilities[lane], outputs[lane]);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+        } else {
+            const uint16_t *v = task->v + kv_head * p->v_strides[0];
+            TrillimStatus status = apply_values(task, v, probabilities, outputs, count);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
         }
     }
     return TRILLIM_OK;
@@ -441,16 +476,17 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_attention_sinks_bf16(
     if (!p->heads || !p->queries) {
         return TRILLIM_OK;
     }
-    size_t rows = p->heads * p->queries;
-    size_t tasks = rows < MAX_TASKS ? rows : MAX_TASKS;
+    size_t tiles = row_tiles(p);
+    size_t work = p->kv_heads * tiles;
+    size_t tasks = work < MAX_TASKS ? work : MAX_TASKS;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
     Task task = {
         outputs[0], inputs[0], inputs[1], inputs[2], inputs[3],
-        scratch, NULL, rows, tasks, scale, p, context
+        scratch, NULL, tiles, tasks, scale, p, context
     };
     const TrillimThreadPool *pool = context->thread_pool;
     if (blas_shape(p) && initialize_blas()) {
-        task.packed_values = task.scratch + tasks * p->length;
+        task.packed_values = task.scratch + tasks * ROWS_PER_TILE * p->length;
         size_t columns = blas_columns(p);
         size_t bands = p->value_dim / columns + (p->value_dim % columns != 0);
         size_t tiles = p->length / PACK_ROWS + (p->length % PACK_ROWS != 0);

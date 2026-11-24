@@ -48,6 +48,12 @@ static inline bool trillim_attention_span(const size_t *shape, const size_t *str
         trillim_span(3, shape, strides, &span) && span <= rows * columns;
 }
 
+static bool short_bf16_attention(const TrillimAttentionParameters *p) {
+    return p->q_dtype == TRILLIM_BF16 && p->k_dtype == TRILLIM_BF16 &&
+        p->v_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_BF16 &&
+        p->length <= 64 && p->key_dim <= 1024 && p->value_dim <= 1024;
+}
+
 static inline TrillimStatus trillim_attention_requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const TrillimAttentionParameters *p = (const TrillimAttentionParameters *)parameters;
     inputs[0] = 0;
@@ -77,12 +83,15 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         !trillim_packed_payload_size(p->v_rows, p->v_columns, p->v_dtype, &inputs[2]))) {
         return TRILLIM_ERROR;
     }
+    outputs[0] = p->heads * p->queries * p->value_dim * trillim_itemsize(p->output_dtype);
+    if (short_bf16_attention(p)) {
+        return TRILLIM_OK;
+    }
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
     if (p->value_dim > SIZE_MAX - 64 || p->heads > SIZE_MAX / tiles ||
         p->heads * tiles > SIZE_MAX / sizeof(float) / (p->value_dim + 64)) {
         return TRILLIM_ERROR;
     }
-    outputs[0] = p->heads * p->queries * p->value_dim * trillim_itemsize(p->output_dtype);
     *scratch = p->heads * tiles * (p->value_dim + 64) * sizeof(float);
     return TRILLIM_OK;
 }
@@ -194,6 +203,88 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
     return TRILLIM_OK;
 }
 
+static TrillimStatus short_bf16_tile(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const TrillimAttentionTask *task = opaque;
+    const TrillimAttentionParameters *p = task->parameters;
+    const TrillimKernelContext *context = task->context;
+    const uint16_t *query = task->query, *keys = task->keys, *values = task->values;
+    uint16_t *output = task->output;
+    size_t group = p->heads / p->kv_heads;
+    size_t group_rows = group * p->queries;
+    size_t tiles = group_rows / 4 + (group_rows % 4 != 0);
+    size_t kv_head = index / tiles, first = index % tiles * 4;
+    size_t rows = group_rows - first < 4 ? group_rows - first : 4;
+    size_t begin[4], end[4];
+    const uint16_t *queries[4];
+    uint16_t *outputs[4];
+    size_t first_key = p->length, last_key = 0;
+    for (size_t lane = 0; lane < rows; ++lane) {
+        size_t head = kv_head * group + (first + lane) / p->queries;
+        size_t position = (first + lane) % p->queries;
+        size_t distance = p->queries - position;
+        size_t position_end = distance > p->length ? 0 : p->length - distance + 1;
+        queries[lane] = query + head * p->q_strides[0] + position * p->q_strides[1];
+        outputs[lane] = output + (position * p->heads + head) * p->value_dim;
+        begin[lane] = p->windowed && position_end > p->window ? position_end - p->window : 0;
+        end[lane] = p->causal ? position_end : p->length;
+        if (begin[lane] < first_key) first_key = begin[lane];
+        if (end[lane] > last_key) last_key = end[lane];
+    }
+    float scores[4][64];
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    float peak[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+    for (size_t key = first_key; key < last_key; ++key) {
+        if (context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+        const uint16_t *k = keys + kv_head * p->k_strides[0] + key * p->k_strides[1];
+        float sums[4] = {0};
+        for (size_t channel = 0; channel < p->key_dim; ++channel) {
+            float value = trillim_bf16(k[channel * p->k_strides[2]]);
+            for (size_t lane = 0; lane < rows; ++lane) {
+                sums[lane] += trillim_bf16(queries[lane][channel * p->q_strides[2]]) * value;
+            }
+        }
+        for (size_t lane = 0; lane < rows; ++lane) {
+            if (key >= begin[lane] && key < end[lane]) {
+                scores[lane][key] = sums[lane] * scale;
+                peak[lane] = fmaxf(peak[lane], scores[lane][key]);
+            }
+        }
+    }
+    float denominators[4];
+    for (size_t lane = 0; lane < rows; ++lane) {
+        float sum = 0.0f;
+        float maximum = peak[lane] == -INFINITY ? 0.0f : peak[lane];
+        for (size_t key = begin[lane]; key < end[lane]; ++key) {
+            scores[lane][key] = expf(scores[lane][key] - maximum);
+            sum += scores[lane][key];
+        }
+        denominators[lane] = sum > 0.0f ? sum : 1.0f;
+    }
+    for (size_t first_channel = 0; first_channel < p->value_dim; first_channel += 32) {
+        if (context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
+        size_t channels = p->value_dim - first_channel < 32 ? p->value_dim - first_channel : 32;
+        float sums[4][32] = {{0}};
+        for (size_t key = first_key; key < last_key; ++key) {
+            const uint16_t *value = values + kv_head * p->v_strides[0] + key * p->v_strides[1];
+            for (size_t channel = 0; channel < channels; ++channel) {
+                float decoded = trillim_bf16(value[(first_channel + channel) * p->v_strides[2]]);
+                for (size_t lane = 0; lane < rows; ++lane) {
+                    if (key >= begin[lane] && key < end[lane]) {
+                        sums[lane][channel] += scores[lane][key] * decoded;
+                    }
+                }
+            }
+        }
+        for (size_t lane = 0; lane < rows; ++lane) {
+            for (size_t channel = 0; channel < channels; ++channel) {
+                outputs[lane][first_channel + channel] = trillim_to_bf16(sums[lane][channel] / denominators[lane]);
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_attention(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -203,6 +294,14 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_attention(
     }
     const TrillimAttentionParameters *p = (const TrillimAttentionParameters *)parameters;
     TrillimAttentionTask task = {(float *)outputs[0], inputs[0], inputs[1], inputs[2], (float *)scratch, p, context};
+    if (!p->heads || !p->queries) {
+        return TRILLIM_OK;
+    }
+    if (short_bf16_attention(p)) {
+        size_t group_rows = (p->heads / p->kv_heads) * p->queries;
+        size_t tiles = group_rows / 4 + (group_rows % 4 != 0);
+        return context->thread_pool->run(context->thread_pool->context, p->kv_heads * tiles, short_bf16_tile, &task);
+    }
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
     return context->thread_pool->run(context->thread_pool->context, p->heads * tiles, trillim_attention_task, &task);
 }

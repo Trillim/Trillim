@@ -1,6 +1,5 @@
 #include "common.h"
 #include <fenv.h>
-#include <stdlib.h>
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -21,7 +20,7 @@ typedef struct {
     uint32_t a_dtype;
 } Parameters;
 
-enum { Q8_GROUP = 32, Q8_MAX_WIDTH = 8192, Q8_MAX_BYTES = 8 * 1024 * 1024 };
+enum { Q8_GROUP = 32, Q8_LOCAL_GROUPS = 512, Q8_MAX_WIDTH = 8192, Q8_MAX_BYTES = 8 * 1024 * 1024 };
 
 typedef struct {
     int8_t codes[Q8_GROUP];
@@ -40,6 +39,20 @@ typedef struct {
     size_t tiles;
     const RoutedQ8 *quantized;
 } Task;
+
+static size_t quantized_groups(const Parameters *p) {
+    if (p->n < 16 || p->k < Q8_GROUP || p->k > Q8_MAX_WIDTH || p->k % Q8_GROUP) {
+        return 0;
+    }
+    size_t groups = p->k / Q8_GROUP;
+    size_t token_rows = p->a_token_stride == 0 ? 1 : p->tokens;
+    size_t route_rows = p->a_route_stride == 0 ? 1 : p->routes;
+    size_t max_groups = Q8_MAX_BYTES / sizeof(RoutedQ8);
+    if (route_rows == 0 || token_rows > max_groups / route_rows / groups) {
+        return 0;
+    }
+    return token_rows * route_rows * groups;
+}
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
@@ -66,6 +79,16 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[0] = a_span * a_bytes;
     inputs[2] = index_span * sizeof(int64_t);
     outputs[0] = p->tokens * p->routes * p->n * sizeof(float);
+    /* Runtime rows can be smaller than the arena's bound and still qualify for Q8. */
+    if (p->n >= 16) {
+        size_t groups_per_row = (p->k < Q8_MAX_WIDTH ? p->k : Q8_MAX_WIDTH) / Q8_GROUP;
+        size_t max_groups = Q8_MAX_BYTES / sizeof(RoutedQ8);
+        size_t rows = p->tokens * p->routes;
+        size_t groups = rows > max_groups / groups_per_row ? max_groups : rows * groups_per_row;
+        if (groups > Q8_LOCAL_GROUPS) {
+            *scratch = groups * sizeof(RoutedQ8);
+        }
+    }
     return TRILLIM_OK;
 }
 
@@ -289,21 +312,20 @@ static TrillimStatus run_tiles(Task *task, size_t tasks) {
     return tasks == 1 ? project(task, 0, 0) : pool->run(pool->context, tasks, project, task);
 }
 
-static TrillimStatus try_routed_int8(Task *task, size_t tasks, bool *handled) {
+static TrillimStatus try_routed_int8(Task *task, size_t tasks, RoutedQ8 *scratch, bool *handled) {
     const Parameters *p = task->parameters;
     const TrillimKernelContext *context = task->context;
+    size_t total = quantized_groups(p);
+    if (total == 0) {
+        return TRILLIM_OK;
+    }
     size_t groups = p->k / Q8_GROUP;
     size_t token_rows = p->a_token_stride == 0 ? 1 : p->tokens;
     size_t route_rows = p->a_route_stride == 0 ? 1 : p->routes;
-    size_t max_groups = Q8_MAX_BYTES / sizeof(RoutedQ8);
-    if (token_rows > max_groups / route_rows / groups) {
-        return TRILLIM_OK;
-    }
-    size_t total = token_rows * route_rows * groups;
-    RoutedQ8 local[512];
-    RoutedQ8 *quantized = total <= sizeof(local) / sizeof(local[0]) ? local : malloc(total * sizeof(*quantized));
+    RoutedQ8 local[Q8_LOCAL_GROUPS];
+    RoutedQ8 *quantized = total <= Q8_LOCAL_GROUPS ? local : scratch;
     if (quantized == NULL) {
-        return TRILLIM_OK;
+        return TRILLIM_ERROR;
     }
     TrillimStatus status = TRILLIM_OK;
     bool valid = true;
@@ -330,9 +352,6 @@ static TrillimStatus try_routed_int8(Task *task, size_t tasks, bool *handled) {
         status = run_tiles(task, tasks);
         task->quantized = NULL;
     }
-    if (quantized != local) {
-        free(quantized);
-    }
     return status;
 }
 
@@ -340,7 +359,6 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_routed_matmul(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
-    (void)scratch;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
     }
@@ -371,10 +389,9 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_routed_matmul(
     const uint8_t *scales = weight + p->experts * p->n * (p->k / 32) * 16;
     Task task = {outputs[0], inputs[0], weight, scales, inputs[2], p, context, columns, tiles, NULL};
     size_t tasks = items * tiles;
-    if (p->n >= 16 && p->k >= Q8_GROUP && p->k <= Q8_MAX_WIDTH && p->k % Q8_GROUP == 0 &&
-        default_floating_point()) {
+    if (default_floating_point()) {
         bool handled = false;
-        TrillimStatus status = try_routed_int8(&task, tasks, &handled);
+        TrillimStatus status = try_routed_int8(&task, tasks, scratch, &handled);
         if (status != TRILLIM_OK || handled) {
             return status;
         }
@@ -432,7 +449,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_routed_matmul_parame
     static const size_t outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), sizeof(fields) / sizeof(fields[0]),
-        fields, 3, 1, requirements, NULL, inputs, outputs, 1
+        fields, 3, 1, requirements, NULL, inputs, outputs, TRILLIM_ALIGNOF(RoutedQ8)
     };
     return &schema;
 }
