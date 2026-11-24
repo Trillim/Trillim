@@ -513,6 +513,70 @@ static inline __attribute__((always_inline)) TrillimStatus ordered_decode16_type
     return TRILLIM_OK;
 }
 
+static inline __attribute__((always_inline)) uint16x8x4_t ordered_bf16_weights8(const uint16_t *w, size_t stride) {
+    const uint16x8_t a = vld1q_u16(w);
+    const uint16x8_t b = vld1q_u16(w + stride);
+    const uint16x8_t c = vld1q_u16(w + 2 * stride);
+    const uint16x8_t d = vld1q_u16(w + 3 * stride);
+    const uint16x8x2_t ab = vzipq_u16(a, b);
+    const uint16x8x2_t cd = vzipq_u16(c, d);
+    const uint32x4x2_t low = vzipq_u32(vreinterpretq_u32_u16(ab.val[0]), vreinterpretq_u32_u16(cd.val[0]));
+    const uint32x4x2_t high = vzipq_u32(vreinterpretq_u32_u16(ab.val[1]), vreinterpretq_u32_u16(cd.val[1]));
+    return (uint16x8x4_t){{
+        vreinterpretq_u16_u32(low.val[0]), vreinterpretq_u16_u32(low.val[1]),
+        vreinterpretq_u16_u32(high.val[0]), vreinterpretq_u16_u32(high.val[1])
+    }};
+}
+
+static TrillimStatus ordered_bf16_decode16(
+    const Task *t, size_t a_base, size_t b_base, size_t output, size_t column
+) {
+    const Parameters *p = t->p;
+    const uint16_t *input = (const uint16_t *)t->a + a_base;
+    const uint16_t *weights = (const uint16_t *)t->b + b_base + column * p->b_col_stride;
+    float32x4_t sums[4] = {0};
+    for (size_t k = 0; k < p->k; k += 8) {
+        if ((k & 1023) == 0 && t->context->is_cancelled(t->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        if ((k & 63) == 0 && p->k - k > 128) {
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+            for (size_t i = 0; i < 16; ++i) {
+                __builtin_prefetch(weights + i * p->b_col_stride + k + 128, 0, 0);
+            }
+        }
+        const uint16x8_t activation = vld1q_u16(input + k);
+        const float32x4_t x0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(activation), 16));
+        const float32x4_t x1 = vreinterpretq_f32_u32(vshll_high_n_u16(activation, 16));
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+        for (size_t group = 0; group < 4; ++group) {
+            const uint16x8x4_t w = ordered_bf16_weights8(weights + k + group * 4 * p->b_col_stride, p->b_col_stride);
+            float32x4_t sum = sums[group];
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w.val[0]), 16)), x0, 0);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_high_n_u16(w.val[0], 16)), x0, 1);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w.val[1]), 16)), x0, 2);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_high_n_u16(w.val[1], 16)), x0, 3);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w.val[2]), 16)), x1, 0);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_high_n_u16(w.val[2], 16)), x1, 1);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w.val[3]), 16)), x1, 2);
+            sum = vfmaq_laneq_f32(sum, vreinterpretq_f32_u32(vshll_high_n_u16(w.val[3], 16)), x1, 3);
+            sums[group] = sum;
+        }
+    }
+    for (size_t group = 0; group < 4; ++group) {
+        float values[4];
+        vst1q_f32(values, sums[group]);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            store(t, output + column + group * 4 + lane, values[lane]);
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus ordered_decode16(const Task *t, size_t a_base, size_t b_base, size_t output, size_t column) {
     const Parameters *p = t->p;
     if (p->a_dtype == TRILLIM_FP16 && p->b_dtype == TRILLIM_FP16) {
@@ -538,6 +602,15 @@ static TrillimStatus ordered_dot_tile(const Task *t, size_t a_base, size_t b_bas
         rows -= full_rows;
     }
     if (rows == 1) {
+        if (p->m == 1 && p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 &&
+            p->k >= 8 && p->k % 8 == 0 && p->b_col_stride == p->k) {
+            for (; last - first >= 16; first += 16) {
+                const TrillimStatus status = ordered_bf16_decode16(t, a_base, b_base, output, first);
+                if (status != TRILLIM_OK) {
+                    return status;
+                }
+            }
+        }
         for (; last - first >= 16; first += 16) {
             TrillimStatus status = ordered_decode16(t, a_base, b_base, output, first);
             if (status != TRILLIM_OK) {
