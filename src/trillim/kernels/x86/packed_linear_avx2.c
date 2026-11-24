@@ -131,9 +131,6 @@ static inline TrillimStatus packed_activation_prepare(
         return TRILLIM_OK;
     }
     size_t groups = width / group;
-    if (rows > PACKED_ACTIVATION_MAX_BYTES / (groups * sizeof(float) + width)) {
-        return TRILLIM_OK;
-    }
     float *scales = scratch;
     int8_t *codes = (int8_t *)(scales + rows * groups);
     *a = (PackedActivation){input, context, scales, codes, width, groups, stride, input_dtype};
@@ -636,7 +633,6 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_block_linear(
     if (columns < 16) {
         columns = 16;
     }
-    size_t rows = p->tokens / 4 + (p->tokens % 4 != 0);
     size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
     TrillimTask project;
     switch (p->input_dtype) {
@@ -645,17 +641,41 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_block_linear(
     case TRILLIM_FP16: project = project_fp16; break;
     default: return TRILLIM_ERROR;
     }
-    Task task = {outputs[0], inputs[0], inputs[1], p, columns, context, {0}};
-    TrillimStatus status = TRILLIM_OK;
-    if (p->output_dtype == TRILLIM_FP32) {
-        status = packed_activation_prepare(&task.activation, inputs[0], p->input_dtype, p->weight_dtype,
-            p->tokens, p->width, p->width, p->outputs, context, scratch);
+    size_t capacity = p->tokens;
+    size_t group = packed_activation_group(p->weight_dtype);
+    if (p->output_dtype == TRILLIM_FP32 && scratch != NULL && group != 0 &&
+        p->width >= group && p->width <= 65536 && p->width % group == 0 && p->outputs >= 16 &&
+        fegetround() == FE_TONEAREST) {
+        capacity = PACKED_ACTIVATION_MAX_BYTES / (p->width / group * sizeof(float) + p->width);
+        if (capacity < p->tokens) {
+            capacity = capacity / PACKED_ACTIVATION_TILE * PACKED_ACTIVATION_TILE;
+        }
     }
-    if (status == TRILLIM_OK) {
-        status = rows * tiles == 1 ? project(&task, 0, 0)
-            : context->thread_pool->run(context->thread_pool->context, rows * tiles, project, &task);
+    for (size_t first = 0; first < p->tokens;) {
+        Parameters panel = *p;
+        panel.tokens = p->tokens - first < capacity ? p->tokens - first : capacity;
+        Task task = {outputs[0], inputs[0], inputs[1], &panel, columns, context, {0}};
+        if (first != 0) {
+            task.input = (const uint8_t *)inputs[0] + first * p->width * trillim_itemsize(p->input_dtype);
+            task.output = (uint8_t *)outputs[0] + first * p->outputs * trillim_itemsize(p->output_dtype);
+        }
+        TrillimStatus status = TRILLIM_OK;
+        if (p->output_dtype == TRILLIM_FP32) {
+            status = packed_activation_prepare(&task.activation, task.input, p->input_dtype, p->weight_dtype,
+                panel.tokens, p->width, p->width, p->outputs, context, scratch);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        size_t panel_rows = panel.tokens / PACKED_ACTIVATION_TILE + (panel.tokens % PACKED_ACTIVATION_TILE != 0);
+        status = panel_rows * tiles == 1 ? project(&task, 0, 0)
+            : context->thread_pool->run(context->thread_pool->context, panel_rows * tiles, project, &task);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        first += panel.tokens;
     }
-    return status;
+    return TRILLIM_OK;
 }
 
 TRILLIM_KERNEL const char *trillim_x86_block_linear_tdl(void) {
