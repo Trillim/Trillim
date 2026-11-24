@@ -80,8 +80,23 @@ static size_t block_m(const Parameters *p) {
 }
 
 
+static bool bf16_blas_shape(const Parameters *p) {
+#if defined(__APPLE__)
+    return p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 &&
+        p->out_dtype == TRILLIM_BF16 &&
+        p->rank == 0 && p->batches == 1 &&
+        p->m >= 128 && p->n >= 128 && p->k >= 256;
+#else
+    (void)p;
+    return false;
+#endif
+}
+
 static bool blas_shape(const Parameters *p, size_t workers) {
-    if (precise(p) || p->n > INT32_MAX || p->n < 32 || p->k < 32) {
+    bool bf16_contiguous = bf16_blas_shape(p) &&
+        p->a_col_stride == 1 && p->a_row_stride == p->k &&
+        p->b_row_stride == 1 && p->b_col_stride == p->k;
+    if ((precise(p) && !bf16_contiguous) || p->n > INT32_MAX || p->n < 32 || p->k < 32) {
         return false;
     }
     bool large = p->m >= 64 && p->n > 65535 / p->k;
@@ -102,7 +117,8 @@ static bool blas_shape(const Parameters *p, size_t workers) {
 }
 
 static bool reserve_blas(const Parameters *p) {
-    if (precise(p) || p->n < 32 || p->k < 32) {
+    /* Runtime dimensions can make bounded strides contiguous. */
+    if ((precise(p) && !bf16_blas_shape(p)) || p->n < 32 || p->k < 32) {
         return false;
     }
     bool large = p->m >= 64 && p->n > 65535 / p->k;

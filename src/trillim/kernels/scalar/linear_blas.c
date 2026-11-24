@@ -85,9 +85,24 @@ static size_t block_m(const Parameters *p) {
 }
 
 
+static bool bf16_projection(const Parameters *p) {
+#if defined(__APPLE__)
+    return p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 &&
+        p->out_dtype == TRILLIM_BF16 &&
+        p->rank == 0 && p->batches == 1 &&
+        p->a_col_stride == 1 && p->a_row_stride == p->k &&
+        p->b_row_stride == 1 && p->b_col_stride == p->k;
+#else
+    (void)p;
+    return false;
+#endif
+}
+
 static bool small(const Parameters *p) {
-    return p->k == 0 || (p->n != 0 && p->m <= 4096 / p->n &&
-                         p->m * p->n <= 4096 / p->k);
+    bool small_bf16 = p->out_dtype == TRILLIM_BF16 &&
+        (p->m < 128 || p->n < 128 || p->k < 256);
+    return p->k == 0 || small_bf16 ||
+        (p->n != 0 && p->m <= 4096 / p->n && p->m * p->n <= 4096 / p->k);
 }
 
 static TrillimStatus requirements(const void *parameters, size_t *inputs,
@@ -95,7 +110,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
     if (!trillim_float(p->a_dtype) || !trillim_float(p->b_dtype) ||
-        p->out_dtype != TRILLIM_FP32) {
+        (p->out_dtype != TRILLIM_FP32 && !bf16_projection(p))) {
         return TRILLIM_ERROR;
     }
     if (p->batches == 0 || p->m == 0 || p->n == 0) {
@@ -553,7 +568,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_linear(void *const *outputs, co
 
 TRILLIM_KERNEL const char *trillim_scalar_blas_linear_tdl(void) {
     return "from trillim.tdl import *\n"
-           "from trillim.compiler.kernels.bindings import _linear as bind\n"
+           "from trillim.compiler.kernels.bindings import _linear, _contiguous_strides\n"
+           "def bind(c):\n"
+           "    x, weight = c.inputs['x'], c.inputs['weight']\n"
+           "    if c.outputs[0].dtype == 'bf16' and any(t.strides and t.strides != _contiguous_strides(t.shape) for t in (x, weight)):\n"
+           "        raise ValueError('BF16 BLAS linear requires contiguous operands')\n"
+           "    return _linear(c)\n"
            "def pattern(x: Tensor, weight: Tensor) -> tuple[Tensor, ...]:\n"
            "    return (Linear(x, weight),)\n";
 }
