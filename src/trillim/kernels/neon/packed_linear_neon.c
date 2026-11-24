@@ -1962,7 +1962,7 @@ static TrillimStatus project_int8_q6_sdot(void *opaque, size_t index, size_t wor
 
 #undef Q6_AQ_UNROLL
 
-enum { INT8_PREFILL_ROWS = 4, INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2, INT8_PREFILL_MAX_TOKENS = 128 };
+enum { INT8_PREFILL_ROWS = 4, INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2, INT8_PREFILL_MAX_TOKENS = 256 };
 
 typedef struct {
     int8x16_t values[32][INT8_PREFILL_PAIRS];
@@ -2664,7 +2664,7 @@ static TrillimStatus try_int8_prefill(
     const size_t tile_rows = q6 ? INT8_PREFILL_ROWS : Q8_PREFILL_ROWS;
     const size_t rows = p->tokens / tile_rows + (p->tokens % tile_rows != 0);
     const size_t activation_bytes = rows * groups * (q6 ? sizeof(Q6PrefillActivation) : sizeof(Q8PrefillActivation));
-    if (activation_bytes > 4 * 1024 * 1024) {
+    if (activation_bytes > 8 * 1024 * 1024) {
         return TRILLIM_OK;
     }
     void *activation = malloc(activation_bytes);
