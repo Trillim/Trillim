@@ -85,7 +85,7 @@ static bool bf16_blas_shape(const Parameters *p) {
     return p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 &&
         p->out_dtype == TRILLIM_BF16 &&
         p->rank == 0 && p->batches == 1 &&
-        p->m >= 128 && p->n >= 128 && p->k >= 256;
+        p->m >= 32 && p->n >= 128 && p->k >= 256;
 #else
     (void)p;
     return false;

@@ -104,7 +104,7 @@ static bool bf16_projection(const Parameters *p) {
 
 static bool small(const Parameters *p) {
     bool small_bf16 = p->out_dtype == TRILLIM_BF16 &&
-        (p->m < 128 || p->n < 128 || p->k < 256);
+        (p->m < 32 || p->n < 128 || p->k < 256);
     return p->k == 0 || small_bf16 ||
         (p->n != 0 && p->m <= 4096 / p->n && p->m * p->n <= 4096 / p->k);
 }
