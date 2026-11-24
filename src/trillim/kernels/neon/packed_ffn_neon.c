@@ -4194,7 +4194,7 @@ static TrillimStatus run_hidden(
 #if defined(__APPLE__)
 enum {
     PREFILL_GATE_BYTES = 8 * 1024 * 1024,
-    PREFILL_ROW_TILE = 64,
+    MAX_PREFILL_GATE_BYTES = 32 * 1024 * 1024,
     MIN_PREFILL_WEIGHTS = 1 << 21,
     GATE_TILE = 1024,
 };
@@ -4220,26 +4220,8 @@ static TrillimStatus apply_prefill_gate(void *opaque, size_t tile, size_t worker
     return TRILLIM_OK;
 }
 
-static TrillimStatus try_prefill(const Task *task, bool *handled) {
+static TrillimStatus run_prefill_panels(const Task *task, size_t panel_rows, bool *handled) {
     const Parameters *p = task->p;
-    *handled = false;
-    if (p->tokens < 32 || p->width < 256 || p->width % 32 != 0 ||
-        p->hidden_width < 1024 || p->hidden_width % 32 != 0 || p->outputs < 1024 || p->outputs > INT32_MAX ||
-        p->width * p->hidden_width < MIN_PREFILL_WEIGHTS || p->hidden_width * p->outputs < MIN_PREFILL_WEIGHTS ||
-        p->output_dtype != TRILLIM_FP32 || (uintptr_t)task->output % _Alignof(float) != 0 ||
-        p->up_dtype != p->gate_dtype || p->up_dtype != p->down_dtype || !packed_group_dtype(p->up_dtype) ||
-        !default_fpcr()) {
-        return TRILLIM_OK;
-    }
-    size_t panel_rows = PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
-    if (panel_rows == 0) {
-        return TRILLIM_OK;
-    }
-    if (panel_rows >= p->tokens) {
-        panel_rows = p->tokens;
-    } else if (panel_rows >= PREFILL_ROW_TILE) {
-        panel_rows = panel_rows / PREFILL_ROW_TILE * PREFILL_ROW_TILE;
-    }
     float *gate = malloc(panel_rows * p->hidden_width * sizeof(float));
     if (gate == NULL) {
         return TRILLIM_OK;
@@ -4283,6 +4265,43 @@ static TrillimStatus try_prefill(const Task *task, bool *handled) {
     *handled = row == p->tokens;
     return status;
 }
+static TrillimStatus try_prefill(const Task *task, bool *handled) {
+    const Parameters *p = task->p;
+    *handled = false;
+    if (p->tokens < 32 || p->width < 256 || p->width % 32 != 0 ||
+        p->hidden_width < 1024 || p->hidden_width % 32 != 0 || p->outputs < 1024 || p->outputs > INT32_MAX ||
+        p->width * p->hidden_width < MIN_PREFILL_WEIGHTS || p->hidden_width * p->outputs < MIN_PREFILL_WEIGHTS ||
+        p->output_dtype != TRILLIM_FP32 || (uintptr_t)task->output % _Alignof(float) != 0 ||
+        p->up_dtype != p->gate_dtype || p->up_dtype != p->down_dtype || !packed_group_dtype(p->up_dtype) ||
+        !default_fpcr()) {
+        return TRILLIM_OK;
+    }
+    size_t panel_rows = PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
+    if (panel_rows == 0) {
+        return TRILLIM_OK;
+    }
+    if (panel_rows >= p->tokens) {
+        panel_rows = p->tokens;
+    } else if (panel_rows >= PACKED_PREFILL_M) {
+        panel_rows = panel_rows / PACKED_PREFILL_M * PACKED_PREFILL_M;
+    }
+    size_t original_rows = panel_rows;
+    bool direct_input = p->input_dtype == TRILLIM_FP32 &&
+        (uintptr_t)task->inputs[0] % _Alignof(float) == 0;
+    if (panel_rows < p->tokens && panel_rows % PACKED_PREFILL_M == 0 &&
+        (direct_input || PACKED_PREFILL_ACTIVATION_ELEMENTS / p->width >= PACKED_PREFILL_M) &&
+        (uintptr_t)task->hidden % _Alignof(float) == 0) {
+        // Keep the same 64-row BLAS calls as the smaller panels.
+        size_t maximum = MAX_PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
+        panel_rows = maximum >= p->tokens ? p->tokens : maximum / PACKED_PREFILL_M * PACKED_PREFILL_M;
+    }
+    TrillimStatus status = run_prefill_panels(task, panel_rows, handled);
+    if (status != TRILLIM_OK || *handled || panel_rows == original_rows) {
+        return status;
+    }
+    return run_prefill_panels(task, original_rows, handled);
+}
+
 #endif
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
