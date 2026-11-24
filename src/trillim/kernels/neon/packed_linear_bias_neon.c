@@ -446,14 +446,14 @@ static inline __attribute__((always_inline)) void packed_group_decode32(
     }
 }
 
-#define DEFINE_PROJECT(NAME, DTYPE, MTILE, KSTEP) \
+#define DEFINE_PROJECT_TYPED(NAME, DTYPE, MTILE, KSTEP, INPUT_DTYPE, ROWS) \
 static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
     (void)worker; \
     const LinearTask *task = opaque; \
     const LinearParameters *p = task->p; \
     size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0); \
     size_t row = tile / tiles * MTILE, first = tile % tiles * task->columns; \
-    size_t rows = p->tokens - row < MTILE ? p->tokens - row : MTILE; \
+    size_t rows = ROWS; \
     size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns; \
     for (size_t column = first; column < end; column += 2) { \
         if (task->context->is_cancelled(task->context->cancellation_context)) { \
@@ -483,41 +483,41 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
                 decode16(task, second, k, DTYPE, w1); \
             } \
             for (size_t j = 0; j < KSTEP / 4; ++j) { \
-                float32x4_t x = load4(task->input, row * p->width + k + j * 4, p->input_dtype); \
+                float32x4_t x = load4(task->input, row * p->width + k + j * 4, INPUT_DTYPE); \
                 s00 = vfmaq_f32(s00, x, w0[j]); \
                 s01 = vfmaq_f32(s01, x, w1[j]); \
                 if (rows > 1) { \
-                    x = load4(task->input, (row + 1) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 1) * p->width + k + j * 4, INPUT_DTYPE); \
                     s10 = vfmaq_f32(s10, x, w0[j]); \
                     s11 = vfmaq_f32(s11, x, w1[j]); \
                 } \
                 if (rows > 2) { \
-                    x = load4(task->input, (row + 2) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 2) * p->width + k + j * 4, INPUT_DTYPE); \
                     s20 = vfmaq_f32(s20, x, w0[j]); \
                     s21 = vfmaq_f32(s21, x, w1[j]); \
                 } \
                 if (rows > 3) { \
-                    x = load4(task->input, (row + 3) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 3) * p->width + k + j * 4, INPUT_DTYPE); \
                     s30 = vfmaq_f32(s30, x, w0[j]); \
                     s31 = vfmaq_f32(s31, x, w1[j]); \
                 } \
                 if (rows > 4) { \
-                    x = load4(task->input, (row + 4) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 4) * p->width + k + j * 4, INPUT_DTYPE); \
                     s40 = vfmaq_f32(s40, x, w0[j]); \
                     s41 = vfmaq_f32(s41, x, w1[j]); \
                 } \
                 if (rows > 5) { \
-                    x = load4(task->input, (row + 5) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 5) * p->width + k + j * 4, INPUT_DTYPE); \
                     s50 = vfmaq_f32(s50, x, w0[j]); \
                     s51 = vfmaq_f32(s51, x, w1[j]); \
                 } \
                 if (rows > 6) { \
-                    x = load4(task->input, (row + 6) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 6) * p->width + k + j * 4, INPUT_DTYPE); \
                     s60 = vfmaq_f32(s60, x, w0[j]); \
                     s61 = vfmaq_f32(s61, x, w1[j]); \
                 } \
                 if (rows > 7) { \
-                    x = load4(task->input, (row + 7) * p->width + k + j * 4, p->input_dtype); \
+                    x = load4(task->input, (row + 7) * p->width + k + j * 4, INPUT_DTYPE); \
                     s70 = vfmaq_f32(s70, x, w0[j]); \
                     s71 = vfmaq_f32(s71, x, w1[j]); \
                 } \
@@ -548,6 +548,9 @@ static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
     return TRILLIM_OK; \
 }
 
+#define DEFINE_PROJECT(NAME, DTYPE, MTILE, KSTEP) \
+    DEFINE_PROJECT_TYPED(NAME, DTYPE, MTILE, KSTEP, p->input_dtype, p->tokens - row < MTILE ? p->tokens - row : MTILE)
+
 DEFINE_PROJECT(project_row_int8_4, TRILLIM_ROW_INT8, 4, 16)
 DEFINE_PROJECT(project_mat_ternary_4, TRILLIM_MAT_TERNARY, 4, 16)
 DEFINE_PROJECT(project_grp_int8_4, TRILLIM_GRP_INT8, 4, 16)
@@ -566,9 +569,11 @@ DEFINE_PROJECT(project_mxfp4_8, TRILLIM_MXFP4, 8, 16)
 
 DEFINE_PROJECT(project_grp_int4_group, TRILLIM_GRP_INT4, 4, 32)
 DEFINE_PROJECT(project_grp_int5_group, TRILLIM_GRP_INT5, 8, 32)
+DEFINE_PROJECT_TYPED(project_grp_int5_bf16_full, TRILLIM_GRP_INT5, 8, 32, TRILLIM_BF16, 8)
 DEFINE_PROJECT(project_dubgrp_int6_group, TRILLIM_DUBGRP_INT6, 8, 32)
 
 #undef DEFINE_PROJECT
+#undef DEFINE_PROJECT_TYPED
 
 #define DEFINE_GROUP_DECODE(NAME, DTYPE) \
 static TrillimStatus NAME(void *opaque, size_t tile, size_t worker) { \
@@ -984,14 +989,25 @@ static __attribute__((noinline)) TrillimStatus run_fhm_int4(const LinearTask *ta
     return pool->run(pool->context, tiles, project_fhm_int4, &fhm);
 }
 
-static TrillimTask group_projection(uint32_t dtype, size_t rows) {
+static TrillimStatus project_grp_int5_bf16_group(void *opaque, size_t tile, size_t worker) {
+    const LinearTask *task = opaque;
+    const LinearParameters *p = task->p;
+    const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
+    const size_t row = tile / tiles * 8;
+    if (p->tokens - row >= 8) {
+        return project_grp_int5_bf16_full(opaque, tile, worker);
+    }
+    return project_grp_int5_group(opaque, tile, worker);
+}
+
+static TrillimTask group_projection(uint32_t dtype, size_t rows, uint32_t input_dtype) {
     switch (dtype) {
     case TRILLIM_GRP_INT4: return rows == 1 ? project_grp_int4_decode : project_grp_int4_group;
     case TRILLIM_GRP_INT5:
         if (rows == 1) {
             return project_grp_int5_decode;
         }
-        return rows == 8 ? project_grp_int5_group : NULL;
+        return rows == 8 ? (input_dtype == TRILLIM_BF16 ? project_grp_int5_bf16_group : project_grp_int5_group) : NULL;
     case TRILLIM_DUBGRP_INT6:
         if (rows == 1) {
             return project_dubgrp_int6_decode;
@@ -2846,7 +2862,7 @@ static TrillimStatus run_linear(
     TrillimTask operation = p->output_dtype == TRILLIM_FP32 ? projection(p->weight_dtype, row_tile) : project_ordered;
     if (p->output_dtype == TRILLIM_FP32 && p->width != 0 && p->width % 32 == 0) {
         size_t group_rows = p->tokens == 1 ? 1 : row_tile;
-        TrillimTask groups = group_projection(p->weight_dtype, group_rows);
+        TrillimTask groups = group_projection(p->weight_dtype, group_rows, p->input_dtype);
         if (groups != NULL) {
             operation = groups;
             row_tile = group_rows;
