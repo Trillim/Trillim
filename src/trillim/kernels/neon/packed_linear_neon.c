@@ -1134,7 +1134,7 @@ enum {
     PACKED_PREFILL_N = 96,
     PACKED_PREFILL_K = 1536,
     PACKED_PREFILL_LANES = 32,
-    PACKED_PREFILL_ACTIVATIONS = 1 << 20,
+    PACKED_PREFILL_ACTIVATIONS = 1 << 21,
 };
 
 typedef void (*PackedPrefillSgemm)(int, int, int, int, int, int, float, const float *, int,

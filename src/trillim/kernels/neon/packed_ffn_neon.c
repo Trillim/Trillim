@@ -1333,7 +1333,7 @@ static TrillimStatus run_hidden(
 }
 
 #if defined(__APPLE__)
-enum { PREFILL_ELEMENTS = 1 << 20, MIN_PREFILL_WEIGHTS = 1 << 21, GATE_TILE = 1024 };
+enum { PREFILL_ELEMENTS = 1 << 21, MIN_PREFILL_WEIGHTS = 1 << 21, GATE_TILE = 1024 };
 
 typedef struct {
     float *hidden;
