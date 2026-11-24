@@ -710,6 +710,63 @@ static TrillimStatus trillim_mxfp4_gather(TrillimIndexTask *task) {
                       : pool->run(pool->context, tasks, trillim_mxfp4_copy_slice, task);
 }
 
+enum { TRANSPOSE_ITEMS = 32, TRANSPOSE_ROWS = 32 };
+
+static bool transpose_gather(const TrillimIndexParameters *p) {
+    return !p->masked && p->dtype == TRILLIM_FP32 && p->coordinates == 1 && p->index_rank == 1 &&
+        p->slice_rank == 1 && p->index_shape[0] == p->items && p->index_strides[0] == 1 &&
+        p->indexed_strides[0] == 1 && p->slice_strides[0] > 1 &&
+        p->slice_size == p->slice_shape[0] && p->items >= TRANSPOSE_ITEMS &&
+        p->slice_size >= TRANSPOSE_ROWS;
+}
+
+static TrillimStatus gather_transpose_task(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const TrillimIndexTask *task = opaque;
+    const TrillimIndexParameters *p = task->parameters;
+    const TrillimKernelContext *context = task->context;
+    const uint8_t *input = task->inputs[0], *indices = task->inputs[1];
+    uint8_t *output = task->output;
+    size_t begin = index * TRANSPOSE_ITEMS;
+    size_t width = p->items - begin < TRANSPOSE_ITEMS ? p->items - begin : TRANSPOSE_ITEMS;
+    size_t columns[TRANSPOSE_ITEMS];
+    bool contiguous = true;
+    for (size_t i = 0; i < width; ++i) {
+        int64_t column;
+        memcpy(&column, indices + (begin + i) * sizeof(column), sizeof(column));
+        if (column < 0 || (uint64_t)column >= p->indexed_shape[0]) {
+            return TRILLIM_ERROR;
+        }
+        columns[i] = (size_t)column;
+        contiguous &= columns[i] >= columns[0] && columns[i] - columns[0] == i;
+    }
+    for (size_t row = 0; row < p->slice_size; row += TRANSPOSE_ROWS) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t height = p->slice_size - row < TRANSPOSE_ROWS ? p->slice_size - row : TRANSPOSE_ROWS;
+        /* Read each slice row together before writing the gathered columns. */
+        uint32_t tile[TRANSPOSE_ROWS][TRANSPOSE_ITEMS];
+        for (size_t j = 0; j < height; ++j) {
+            const uint8_t *src = input + (row + j) * p->slice_strides[0] * sizeof(uint32_t);
+            if (contiguous) {
+                memcpy(tile[j], src + columns[0] * sizeof(uint32_t), width * sizeof(uint32_t));
+                continue;
+            }
+            for (size_t i = 0; i < width; ++i) {
+                memcpy(&tile[j][i], src + columns[i] * sizeof(uint32_t), sizeof(uint32_t));
+            }
+        }
+        for (size_t i = 0; i < width; ++i) {
+            uint8_t *dst = output + ((begin + i) * p->slice_size + row) * sizeof(uint32_t);
+            for (size_t j = 0; j < height; ++j) {
+                memcpy(dst + j * sizeof(uint32_t), &tile[j][i], sizeof(uint32_t));
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     TrillimStatus status = trillim_index_requirements(parameters, inputs, outputs, scratch, false, false);
     if (status == TRILLIM_OK && trillim_mxfp4_copyable(parameters)) {
@@ -729,6 +786,11 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
     TrillimIndexTask task = {outputs[0], inputs, (float *)scratch, p, context};
     if (trillim_mxfp4_copyable(p)) {
         return trillim_mxfp4_gather(&task);
+    }
+    if (transpose_gather(p)) {
+        const TrillimThreadPool *pool = context->thread_pool;
+        size_t tasks = p->items / TRANSPOSE_ITEMS + (p->items % TRANSPOSE_ITEMS != 0);
+        return pool->run(pool->context, tasks, gather_transpose_task, &task);
     }
     size_t size = gather_batch_size(p);
     size_t batches = p->items / size + (p->items % size != 0);

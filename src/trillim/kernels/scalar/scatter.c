@@ -499,6 +499,13 @@ static TrillimStatus copy_run(void *output, size_t destination, const void *inpu
             default:
                 return TRILLIM_ERROR;
             }
+        } else if (dtype == TRILLIM_FP32 || dtype == TRILLIM_UINT32 || dtype == TRILLIM_INT32) {
+            const uint8_t *from = (const uint8_t *)input + (source + begin * step) * 4;
+            for (size_t i = 0; i < length; ++i) {
+                uint32_t bits;
+                memcpy(&bits, from + i * step * 4, sizeof(bits));
+                memcpy(target + i * 4, &bits, sizeof(bits));
+            }
         } else {
             for (size_t i = 0; i < length; ++i) {
                 TrillimValue value = trillim_load(input, source + (begin + i) * step, dtype);
@@ -549,7 +556,7 @@ static bool disjoint(const void *a, size_t a_bytes, const void *b, size_t b_byte
 static bool parallel_replace(const void *output, const TrillimIndexTask *task) {
     const TrillimIndexParameters *p = task->parameters;
     size_t bytes = trillim_itemsize(p->dtype), count = p->slice_size;
-    if (p->mode || !bytes || !p->items || !p->slice_size || p->count < 32768 ||
+    if (p->masked || p->mode || !bytes || !p->items || !p->slice_size || p->count < 32768 ||
         p->items > SIZE_MAX / p->slice_size) {
         return false;
     }
@@ -627,15 +634,18 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {inputs, p, context};
     TrillimStatus status;
+    bool parallel = parallel_replace(outputs[0], &task);
+    /* Valid, distinct replacements cover every destination element. */
+    bool full_replace = parallel && p->items * p->slice_size == p->count;
     bool uniform;
     bool fast_initial = trillim_itemsize(p->dtype) != 0 && initial_layout(p, &uniform);
-    if (outputs[0] != inputs[0] && p->slice_size != 0 && fast_initial) {
+    if (!full_replace && outputs[0] != inputs[0] && p->slice_size != 0 && fast_initial) {
         status = copy_run(outputs[0], 0, inputs[0], 0, uniform ? 0 : 1,
                           p->count, p->dtype, context);
         if (status != TRILLIM_OK) {
             return status;
         }
-    } else if (outputs[0] != inputs[0] && p->slice_size != 0) {
+    } else if (!full_replace && outputs[0] != inputs[0] && p->slice_size != 0) {
         for (size_t begin = 0; begin < p->count; begin += 1024) {
             if (context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -663,7 +673,6 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
             memset(table + begin, 255, count * sizeof(size_t));
         }
     }
-    bool parallel = parallel_replace(outputs[0], &task);
     for (size_t item = 0; item < p->items; ++item) {
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;

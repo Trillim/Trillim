@@ -9,7 +9,7 @@
 #pragma GCC optimize("fp-contract=off")
 #endif
 
-enum { TILE = 32, LANES = 4 };
+enum { TILE = 32, DECODE_TILE = 64, LANES = 4, PACKED_KEYS = 128 };
 
 typedef struct {
     size_t rows, heads, keys, values;
@@ -44,14 +44,14 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     return TRILLIM_OK;
 }
 
-static TrillimStatus recurrence(void *opaque, size_t index, size_t worker) {
-    (void)worker;
-    const Task *task = opaque;
+static inline __attribute__((always_inline)) TrillimStatus recurrence(
+    const Task *task, size_t index, size_t columns, float *packed, bool single_row
+) {
     const Parameters *p = task->parameters;
     const TrillimKernelContext *context = task->context;
-    size_t tiles = p->values / TILE;
+    size_t tiles = p->values / columns;
     size_t head = index / tiles;
-    size_t column = index % tiles * TILE;
+    size_t column = index % tiles * columns;
     size_t state_offset = head * p->keys * p->values + column;
     float *state = task->state + state_offset;
     const float *source = task->initial + state_offset;
@@ -63,40 +63,48 @@ static TrillimStatus recurrence(void *opaque, size_t index, size_t worker) {
             if (i && (i & 127) == 0 && context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            memcpy(state + i * p->values, source + i * p->values,
-                   TILE * sizeof(float));
+            memcpy(state + i * p->values, source + i * p->values, columns * sizeof(float));
         }
         return TRILLIM_OK;
     }
 
+    float *working = packed ? packed : state;
+    size_t working_stride = packed ? columns : p->values;
+    size_t source_stride = p->values;
     for (size_t row = 0; row < p->rows; ++row) {
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
+        bool final_row = row + 1 == p->rows;
+        float *target = final_row ? state : working;
+        size_t target_stride = final_row ? p->values : working_stride;
         size_t element = row * p->heads + head;
         const float *query = task->q + element * p->keys;
         const float *key = task->k + element * p->keys;
         const float *value = task->v + element * p->values + column;
         float32x4_t decay = vdupq_n_f32(expf(task->log_decay[element]));
-        float32x4_t predicted[TILE / LANES], update[TILE / LANES];
-        for (size_t lane = 0; lane < TILE / LANES; ++lane) {
+        float32x4_t predicted[columns / LANES], update[columns / LANES];
+        for (size_t lane = 0; lane < columns / LANES; ++lane) {
             predicted[lane] = vdupq_n_f32(0.0f);
         }
         for (size_t i = 0; i < p->keys; ++i) {
             if (i && (i & 127) == 0 && context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            size_t offset = i * p->values;
+            const float *input = source + i * source_stride;
+            float *destination = working + i * working_stride;
             float32x4_t k = vdupq_n_f32(key[i]);
-            for (size_t lane = 0; lane < TILE / LANES; ++lane) {
-                size_t position = offset + lane * LANES;
-                float32x4_t memory = vmulq_f32(vld1q_f32(source + position), decay);
-                vst1q_f32(state + position, memory);
+            for (size_t lane = 0; lane < columns / LANES; ++lane) {
+                size_t offset = lane * LANES;
+                float32x4_t memory = vmulq_f32(vld1q_f32(input + offset), decay);
+                if (!single_row) {
+                    vst1q_f32(destination + offset, memory);
+                }
                 predicted[lane] = vaddq_f32(predicted[lane], vmulq_f32(memory, k));
             }
         }
-        float32x4_t result[TILE / LANES];
-        for (size_t lane = 0; lane < TILE / LANES; ++lane) {
+        float32x4_t result[columns / LANES];
+        for (size_t lane = 0; lane < columns / LANES; ++lane) {
             float32x4_t residual = vsubq_f32(vld1q_f32(value + lane * LANES),
                                             predicted[lane]);
             update[lane] = vmulq_n_f32(residual, task->beta[element]);
@@ -106,23 +114,46 @@ static TrillimStatus recurrence(void *opaque, size_t index, size_t worker) {
             if (i && (i & 127) == 0 && context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
-            size_t offset = i * p->values;
+            const float *input = single_row ? source + i * source_stride : working + i * working_stride;
+            float *destination = target + i * target_stride;
             float32x4_t k = vdupq_n_f32(key[i]), q = vdupq_n_f32(query[i]);
-            for (size_t lane = 0; lane < TILE / LANES; ++lane) {
-                float *position = state + offset + lane * LANES;
-                float32x4_t memory = vaddq_f32(vld1q_f32(position),
-                                               vmulq_f32(k, update[lane]));
-                vst1q_f32(position, memory);
+            for (size_t lane = 0; lane < columns / LANES; ++lane) {
+                size_t offset = lane * LANES;
+                float32x4_t memory = vld1q_f32(input + offset);
+                if (single_row) {
+                    memory = vmulq_f32(memory, decay);
+                }
+                memory = vaddq_f32(memory, vmulq_f32(k, update[lane]));
+                vst1q_f32(destination + offset, memory);
                 result[lane] = vaddq_f32(result[lane], vmulq_f32(memory, q));
             }
         }
         float *output = task->output + element * p->values + column;
-        for (size_t lane = 0; lane < TILE / LANES; ++lane) {
+        for (size_t lane = 0; lane < columns / LANES; ++lane) {
             vst1q_f32(output + lane * LANES, result[lane]);
         }
-        source = state;
+        source = working;
+        source_stride = working_stride;
     }
     return TRILLIM_OK;
+}
+
+static TrillimStatus recurrence_strided(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    return recurrence(opaque, index, TILE, NULL, false);
+}
+
+static TrillimStatus recurrence_packed(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    /* Keep both per-token passes in a dense, cache-resident tile. */
+    _Alignas(128) float packed[PACKED_KEYS * TILE];
+    return recurrence(opaque, index, TILE, packed, false);
+}
+
+static TrillimStatus recurrence_decode(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    /* Recompute the decay on the second pass to avoid an intermediate state write. */
+    return recurrence(opaque, index, DECODE_TILE, NULL, true);
 }
 
 TRILLIM_KERNEL TrillimStatus trillim_neon_gated_delta(
@@ -135,9 +166,18 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_gated_delta(
         inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
         outputs[1], outputs[2], p, context
     };
-    size_t tiles = p->heads * (p->values / TILE);
+    size_t columns = TILE;
+    TrillimTask compute = recurrence_strided;
+    if (p->rows == 1 && p->values % DECODE_TILE == 0 &&
+        p->heads * (p->values / DECODE_TILE) >= context->thread_pool->worker_count) {
+        columns = DECODE_TILE;
+        compute = recurrence_decode;
+    } else if (p->rows > 1 && p->keys <= PACKED_KEYS && p->values > TILE) {
+        compute = recurrence_packed;
+    }
+    size_t tiles = p->heads * (p->values / columns);
     TrillimStatus status = context->thread_pool->run(
-        context->thread_pool->context, tiles, recurrence, &task);
+        context->thread_pool->context, tiles, compute, &task);
     if (status == TRILLIM_OK) {
         *(int64_t *)outputs[0] = (int64_t)p->rows;
     }
