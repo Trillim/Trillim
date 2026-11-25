@@ -410,6 +410,131 @@ static inline TrillimStatus trillim_cast_task(void *opaque, size_t tile, size_t 
     return TRILLIM_OK;
 }
 
+enum { LAYOUT_ROWS = 8, LAYOUT_COLUMNS = 32, LAYOUT_CONTIGUOUS = 32768 };
+
+typedef struct {
+    TrillimCastTask task;
+    size_t rows, columns, stripe;
+} TrillimLayoutTask;
+
+static bool dense_layout(const TrillimCastParameters *p, size_t *rows, size_t *columns) {
+    size_t span;
+    if (trillim_contiguous(p->rank, p->shape, p->strides) &&
+        trillim_span(p->rank, p->shape, p->strides, &span) && span == p->count) {
+        *rows = 1;
+        *columns = p->count;
+        return true;
+    }
+    if (p->rank < 2) {
+        return false;
+    }
+    /* Flatten the dense leading axes into the rows of a transposed matrix. */
+    size_t outer_rank = p->rank - 1;
+    *columns = p->shape[outer_rank];
+    if (*columns < 2 || p->count % *columns != 0 ||
+        !trillim_contiguous(outer_rank, p->shape, p->strides) ||
+        !trillim_span(outer_rank, p->shape, p->strides, &span) ||
+        span != p->count / *columns || p->strides[outer_rank] != span) {
+        return false;
+    }
+    *rows = span;
+    return true;
+}
+
+static inline void cast_dense_run(uint8_t *output, const uint8_t *input, size_t count, bool narrow) {
+    if (narrow) {
+        for (size_t i = 0; i < count; ++i) {
+            float value;
+            memcpy(&value, input + i * sizeof(value), sizeof(value));
+            uint16_t bits = trillim_to_bf16(value);
+            memcpy(output + i * sizeof(bits), &bits, sizeof(bits));
+        }
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t bits;
+            memcpy(&bits, input + i * sizeof(bits), sizeof(bits));
+            uint32_t value = (uint32_t)bits << 16;
+            memcpy(output + i * sizeof(value), &value, sizeof(value));
+        }
+    }
+}
+
+static TrillimStatus cast_dense(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimLayoutTask *layout = opaque;
+    const TrillimCastTask *task = &layout->task;
+    const TrillimCastParameters *p = task->parameters;
+    size_t in_bytes = trillim_itemsize(p->input_dtype);
+    size_t out_bytes = trillim_itemsize(p->output_dtype);
+    const uint8_t *input = (const uint8_t *)task->input + p->source_offset * in_bytes;
+    uint8_t *output = task->output;
+    size_t first = tile * LAYOUT_CONTIGUOUS;
+    size_t remaining = p->count - first;
+    size_t length = remaining < LAYOUT_CONTIGUOUS ? remaining : LAYOUT_CONTIGUOUS;
+    for (size_t offset = 0; offset < length;) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t begin = first + offset;
+        size_t count = length - offset < 4096 ? length - offset : 4096;
+        cast_dense_run(output + begin * out_bytes, input + begin * in_bytes, count,
+                       p->input_dtype == TRILLIM_FP32);
+        offset += count;
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus cast_transpose(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimLayoutTask *layout = opaque;
+    const TrillimCastTask *task = &layout->task;
+    const TrillimCastParameters *p = task->parameters;
+    size_t rows = layout->rows, columns = layout->columns;
+    size_t in_bytes = trillim_itemsize(p->input_dtype);
+    const uint8_t *input = (const uint8_t *)task->input + p->source_offset * in_bytes;
+    uint8_t *output = task->output;
+    bool narrow = p->input_dtype == TRILLIM_FP32;
+    size_t first = tile * layout->stripe;
+    size_t row_end = rows - first < layout->stripe ? rows : first + layout->stripe;
+    for (size_t row = first; row < row_end;) {
+        size_t height = row_end - row < LAYOUT_ROWS ? row_end - row : LAYOUT_ROWS;
+        for (size_t column = 0; column < columns;) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t width = columns - column < LAYOUT_COLUMNS ? columns - column : LAYOUT_COLUMNS;
+            if (narrow) {
+                uint16_t values[LAYOUT_COLUMNS][LAYOUT_ROWS];
+                for (size_t c = 0; c < width; ++c) {
+                    const uint8_t *source = input + ((column + c) * rows + row) * sizeof(float);
+                    cast_dense_run((uint8_t *)values[c], source, height, true);
+                }
+                for (size_t r = 0; r < height; ++r) {
+                    uint8_t *target = output + ((row + r) * columns + column) * sizeof(uint16_t);
+                    for (size_t c = 0; c < width; ++c) {
+                        memcpy(target + c * sizeof(uint16_t), &values[c][r], sizeof(uint16_t));
+                    }
+                }
+            } else {
+                uint32_t values[LAYOUT_COLUMNS][LAYOUT_ROWS];
+                for (size_t c = 0; c < width; ++c) {
+                    const uint8_t *source = input + ((column + c) * rows + row) * sizeof(uint16_t);
+                    cast_dense_run((uint8_t *)values[c], source, height, false);
+                }
+                for (size_t r = 0; r < height; ++r) {
+                    uint8_t *target = output + ((row + r) * columns + column) * sizeof(uint32_t);
+                    for (size_t c = 0; c < width; ++c) {
+                        memcpy(target + c * sizeof(uint32_t), &values[c][r], sizeof(uint32_t));
+                    }
+                }
+            }
+            column += width;
+        }
+        row += height;
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_cast(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -419,6 +544,24 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_cast(
     }
     const TrillimCastParameters *p = (const TrillimCastParameters *)parameters;
     TrillimCastTask task = {outputs[0], inputs[0], (float *)scratch, p, context};
+    size_t rows, columns;
+    if (p->count >= 16 && ((p->input_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_BF16) ||
+         (p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_FP32)) &&
+        dense_layout(p, &rows, &columns)) {
+        /* Keep narrow transposes from dispatching a task per small tile. */
+        size_t row_tiles = 1 + (4096 / LAYOUT_ROWS - 1) / columns;
+        size_t stripe = p->count <= 4096 ? rows : LAYOUT_ROWS * row_tiles;
+        size_t work = rows == 1 ? p->count : rows;
+        size_t step = rows == 1 ? LAYOUT_CONTIGUOUS : stripe;
+        size_t tiles = work / step + (work % step != 0);
+        TrillimLayoutTask layout = {task, rows, columns, stripe};
+        TrillimTask operation = rows == 1 ? cast_dense : cast_transpose;
+        if (tiles == 1) {
+            return operation(&layout, 0, 0);
+        }
+        const TrillimThreadPool *pool = context->thread_pool;
+        return pool->run(pool->context, tiles, operation, &layout);
+    }
     TrillimStatus status = context->thread_pool->run(context->thread_pool->context,
         p->count / 1024 + (p->count % 1024 != 0), trillim_cast_task, &task);
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->output_dtype) != 0) {
