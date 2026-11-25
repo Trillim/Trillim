@@ -73,6 +73,56 @@ static float32x4_t exp4(float32x4_t x) {
     return vmulq_f32(p, vreinterpretq_f32_s32(exponent));
 }
 
+
+static bool bf16_default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return (fpcr & UINT64_C(0x03c80000)) == 0;
+}
+
+static float32x4_t round_bf16_4(float32x4_t value) {
+    uint32x4_t bits = vreinterpretq_u32_f32(value);
+    uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff),
+        vandq_u32(vshrq_n_u32(bits, 16), vdupq_n_u32(1)));
+    return vreinterpretq_f32_u32(vandq_u32(vaddq_u32(bits, bias), vdupq_n_u32(0xffff0000)));
+}
+
+static float32x4_t sigmoid_bf16_4(uint16x4_t bits) {
+    float32x4_t value = vreinterpretq_f32_u32(vshll_n_u16(bits, 16));
+    uint32x4_t magnitude = vandq_u32(vreinterpretq_u32_f32(value), vdupq_n_u32(0x7fffffff));
+    if (vminvq_u32(vcltq_u32(magnitude, vdupq_n_u32(0x7f800000))) != UINT32_MAX) {
+        float lanes[4];
+        vst1q_f32(lanes, value);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            lanes[lane] = sigmoid(lanes[lane], TRILLIM_BF16);
+        }
+        return vld1q_f32(lanes);
+    }
+    float32x4_t e = exp4(vnegq_f32(vabsq_f32(value)));
+    uint32x4_t low = vandq_u32(vreinterpretq_u32_f32(e), vdupq_n_u32(0xffff));
+    uint32x4_t near = vandq_u32(vcgeq_u32(low, vdupq_n_u32(0x7fc0)),
+        vcleq_u32(low, vdupq_n_u32(0x8040)));
+    if (vmaxvq_u32(near) != 0) {
+        /* Refine exponentials close to a BF16 rounding midpoint. */
+        float lanes[4], inputs[4];
+        uint32_t mask[4];
+        vst1q_f32(lanes, e);
+        vst1q_f32(inputs, value);
+        vst1q_u32(mask, near);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            if (mask[lane] != 0) {
+                lanes[lane] = expf(-fabsf(inputs[lane]));
+            }
+        }
+        e = vld1q_f32(lanes);
+    }
+    e = round_bf16_4(e);
+    float32x4_t denominator = round_bf16_4(vaddq_f32(e, vdupq_n_f32(1.0f)));
+    float32x4_t positive = vdivq_f32(vdupq_n_f32(1.0f), denominator);
+    float32x4_t negative = round_bf16_4(vdivq_f32(e, denominator));
+    return vbslq_f32(vcgeq_f32(value, vdupq_n_f32(0.0f)), positive, negative);
+}
+
 static float32x4_t sigmoid4(float32x4_t value) {
     float32x4_t e = exp4(vnegq_f32(vabsq_f32(value)));
     float32x4_t denominator = vaddq_f32(e, vdupq_n_f32(1.0f));
@@ -92,6 +142,11 @@ static TrillimStatus sigmoid_tile(
     if (dtype == TRILLIM_FP32) {
         for (; count - i >= 4; i += 4) {
             vst1q_f32(output + i, sigmoid4(vld1q_f32((const float *)input + i)));
+        }
+    }
+    if (dtype == TRILLIM_BF16 && bf16_default_fpcr()) {
+        for (; count - i >= 4; i += 4) {
+            vst1q_f32(output + i, sigmoid_bf16_4(vld1_u16((const uint16_t *)input + i)));
         }
     }
     for (; i < count; ++i) {
