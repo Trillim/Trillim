@@ -1397,8 +1397,8 @@ enum {
 };
 
 typedef struct {
-    uint16_t scale;
     int8_t values[INT8_ACTIVATION_Q8_0];
+    float scale;
 } Q8ActivationBlock;
 
 typedef struct {
@@ -1478,10 +1478,11 @@ static bool quantize_activation_q8(const void *input, size_t k, uint32_t dtype, 
     if (!isfinite(inverse) || !isfinite(maximum) || scale > 65504.0f) {
         return false;
     }
-    out->scale = trillim_to_fp16(scale);
-    if (maximum != 0 && out->scale == 0) {
+    const uint16_t rounded_scale = trillim_to_fp16(scale);
+    if (maximum != 0 && rounded_scale == 0) {
         return false;
     }
+    out->scale = (float)vreinterpret_f16_u16(vdup_n_u16(rounded_scale))[0];
     vst1q_s8(out->values, quantize_activation_16(x[0], x[1], x[2], x[3], inverse));
     vst1q_s8(out->values + 16, quantize_activation_16(x[4], x[5], x[6], x[7], inverse));
     return true;
@@ -1618,7 +1619,7 @@ static inline __attribute__((always_inline)) float dot_q8_activation(
             const int8x16_t a1 = vld1q_s8(x[block].values + 16);
             partial[p] = widening ? vaddq_s32(int8_dot_widen(w.val[0], a0), int8_dot_widen(w.val[1], a1))
                                   : vaddq_s32(int8_sdot(w.val[0], a0), int8_sdot(w.val[1], a1));
-            scale[p] = int8_weight_scale(scales, block) * (float) vreinterpret_f16_u16(vdup_n_u16(x[block].scale))[0];
+            scale[p] = int8_weight_scale(scales, block) * x[block].scale;
         }
         even = vfmaq_n_f32(even, vcvtq_f32_s32(partial[0]), scale[0]);
         odd = vfmaq_n_f32(odd, vcvtq_f32_s32(partial[1]), scale[1]);
@@ -1636,7 +1637,7 @@ static inline __attribute__((always_inline)) float dot_q8_activation(
         }
         const int32x4_t partial = vaddq_s32(int8_dot_widen(w.val[0], vld1q_s8(x[g].values)),
             int8_dot_widen(w.val[1], vld1q_s8(x[g].values + 16)));
-        result += (int8_weight_scale(scales, g) * trillim_fp16(x[g].scale)) * vaddvq_s32(partial);
+        result += (int8_weight_scale(scales, g) * x[g].scale) * vaddvq_s32(partial);
     }
     return result;
 }
@@ -1753,14 +1754,14 @@ static inline __attribute__((always_inline)) void dot_q8_activation_pair(
     size_t g = 0;
     for (; g + 1 < groups; g += 2) {
         const int8x16x2_t x0 = vld1q_s8_x2(x[g].values);
-        const float scale0 = (float)vreinterpret_f16_u16(vdup_n_u16(x[g].scale))[0];
+        const float scale0 = x[g].scale;
         const int32x4_t d00 = q8_activation_dot(w0, g, x0, dtype, widening);
         const int32x4_t d10 = q8_activation_dot(w1, g, x0, dtype, widening);
         even0 = vfmaq_n_f32(even0, vcvtq_f32_s32(d00), int8_weight_scale(w0.scales, g) * scale0);
         even1 = vfmaq_n_f32(even1, vcvtq_f32_s32(d10), int8_weight_scale(w1.scales, g) * scale0);
 
         const int8x16x2_t x1 = vld1q_s8_x2(x[g + 1].values);
-        const float scale1 = (float)vreinterpret_f16_u16(vdup_n_u16(x[g + 1].scale))[0];
+        const float scale1 = x[g + 1].scale;
         const int32x4_t d01 = q8_activation_dot(w0, g + 1, x1, dtype, widening);
         const int32x4_t d11 = q8_activation_dot(w1, g + 1, x1, dtype, widening);
         odd0 = vfmaq_n_f32(odd0, vcvtq_f32_s32(d01), int8_weight_scale(w0.scales, g + 1) * scale1);
@@ -1770,7 +1771,7 @@ static inline __attribute__((always_inline)) void dot_q8_activation_pair(
     result[1] = vaddvq_f32(even1) + vaddvq_f32(odd1);
     if (g < groups) {
         const int8x16x2_t values = vld1q_s8_x2(x[g].values);
-        const float scale = trillim_fp16(x[g].scale);
+        const float scale = x[g].scale;
         const int32x4_t d0 = q8_activation_dot(w0, g, values, dtype, widening);
         const int32x4_t d1 = q8_activation_dot(w1, g, values, dtype, widening);
         result[0] += (int8_weight_scale(w0.scales, g) * scale) * vaddvq_s32(d0);
@@ -2232,8 +2233,8 @@ static inline __attribute__((always_inline)) bool pack_q8_activation_cell(
         } else {
             memset(&second, 0, sizeof(second));
         }
-        const float scale0 = (float)vreinterpret_f16_u16(vdup_n_u16(first.scale))[0];
-        const float scale1 = (float)vreinterpret_f16_u16(vdup_n_u16(second.scale))[0];
+        const float scale0 = first.scale;
+        const float scale1 = second.scale;
         destination->scales[pair] = (float32x4_t){scale0, scale0, scale1, scale1};
         for (size_t k = 0; k < 4; ++k) {
             destination->values[k][pair] = vcombine_s8(
