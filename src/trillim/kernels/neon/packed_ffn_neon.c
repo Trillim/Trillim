@@ -7,6 +7,8 @@
 #include <sys/sysctl.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <pthread.h>
+#include <time.h>
 #elif defined(__linux__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
@@ -1298,6 +1300,9 @@ static TrillimStatus pack_prefill_activations(const LinearTask *task, float *pac
 }
 
 enum {
+    Q5_SHARED_MIN_ROWS = 96,
+    Q5_SHARED_MIN_THREADS = 4,
+    Q5_SHARED_MAX_WORKERS = 6,
     Q5_WIDE_MIN_ROWS = 128,
     Q5_WIDE_MAX_ROWS = 512,
     Q5_WIDE_WEIGHT_ELEMENTS = 64 * 1024 * 1024 / sizeof(float),
@@ -1360,11 +1365,26 @@ static TrillimStatus decode_wide_q5(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
+static TrillimStatus gemm_wide_q5(const Q5WideTask *job, size_t first, size_t columns) {
+    const LinearTask *task = job->task;
+    const LinearParameters *p = task->p;
+    for (size_t row = 0; row < p->tokens; row += Q5_WIDE_GEMM_ROWS) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const size_t rows = p->tokens - row < Q5_WIDE_GEMM_ROWS
+            ? p->tokens - row : Q5_WIDE_GEMM_ROWS;
+        packed_prefill_sgemm(101, 111, 112, (int)rows, (int)columns, (int)p->width, 1.0f,
+            job->activation + row * p->width, (int)p->width,
+            job->weights + first * p->width, (int)p->width, 0.0f,
+            (float *)task->output + row * p->outputs + job->first + first, (int)p->outputs);
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus project_wide_q5(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     Q5WideTask *job = opaque;
-    const LinearTask *task = job->task;
-    const LinearParameters *p = task->p;
     const size_t first = tile * job->grain;
     const size_t columns = job->columns - first < job->grain ? job->columns - first : job->grain;
     if (!default_fpcr() || !atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
@@ -1376,27 +1396,125 @@ static TrillimStatus project_wide_q5(void *opaque, size_t tile, size_t worker) {
         atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
-    TrillimStatus status = TRILLIM_OK;
-    for (size_t row = 0; row < p->tokens; row += Q5_WIDE_GEMM_ROWS) {
-        if (task->context->is_cancelled(task->context->cancellation_context)) {
-            status = TRILLIM_CANCELLED;
-            break;
-        }
-        const size_t rows = p->tokens - row < Q5_WIDE_GEMM_ROWS
-            ? p->tokens - row : Q5_WIDE_GEMM_ROWS;
-        packed_prefill_sgemm(101, 111, 112, (int)rows, (int)columns, (int)p->width, 1.0f,
-            job->activation + row * p->width, (int)p->width,
-            job->weights + first * p->width, (int)p->width, 0.0f,
-            (float *)task->output + row * p->outputs + job->first + first, (int)p->outputs);
-    }
+    const TrillimStatus status = gemm_wide_q5(job, first, columns);
     if (previous != 1) {
         (void)packed_prefill_set_threading(previous);
     }
     return status;
 }
 
+typedef struct {
+    Q5WideTask *project;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    uint64_t deadline;
+    size_t expected, arrived;
+    bool declined, done;
+} Q5SharedPrefill;
+
+static uint64_t q5_monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static TrillimStatus project_shared_q5(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    Q5SharedPrefill *share = opaque;
+    Q5WideTask *job = share->project;
+    const LinearTask *task = job->task;
+    const TrillimKernelContext *context = task->context;
+
+    pthread_mutex_lock(&share->mutex);
+    const uint64_t arrival = q5_monotonic_ns();
+    if (arrival == 0 || arrival >= share->deadline || !default_fpcr() ||
+        (tile == 0 && packed_prefill_get_threading() != 0)) {
+        share->declined = true;
+    }
+    if (++share->arrived == share->expected || share->declined) {
+        pthread_cond_broadcast(&share->changed);
+    }
+    /* A pool may claim fewer tasks concurrently than its requested worker count. */
+    while (!share->declined && share->arrived < share->expected) {
+        const uint64_t now = q5_monotonic_ns();
+        if (now == 0 || now >= share->deadline || context->is_cancelled(context->cancellation_context)) {
+            share->declined = true;
+            pthread_cond_broadcast(&share->changed);
+            break;
+        }
+        const struct timespec remaining = {.tv_sec = 0, .tv_nsec = (long)(share->deadline - now)};
+        if (pthread_cond_timedwait_relative_np(&share->changed, &share->mutex, &remaining) != 0 &&
+            share->arrived < share->expected) {
+            share->declined = true;
+            pthread_cond_broadcast(&share->changed);
+        }
+    }
+    if (share->declined) {
+        pthread_mutex_unlock(&share->mutex);
+        return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+    }
+    if (tile != 0) {
+        while (!share->done) {
+            pthread_cond_wait(&share->changed, &share->mutex);
+        }
+        pthread_mutex_unlock(&share->mutex);
+        return TRILLIM_OK;
+    }
+    pthread_mutex_unlock(&share->mutex);
+
+    const TrillimStatus status = gemm_wide_q5(job, 0, job->columns);
+
+    pthread_mutex_lock(&share->mutex);
+    share->done = true;
+    pthread_cond_broadcast(&share->changed);
+    pthread_mutex_unlock(&share->mutex);
+    return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : status;
+}
+
+static TrillimStatus try_project_shared_q5(Q5WideTask *job, const TrillimThreadPool *pool, bool *handled) {
+    *handled = false;
+    const uint64_t now = q5_monotonic_ns();
+    if (now == 0) {
+        return TRILLIM_OK;
+    }
+    Q5SharedPrefill share = {
+        .project = job, .mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER,
+        .deadline = now + UINT64_C(2000000), .expected = pool->worker_count,
+    };
+    const TrillimStatus status = pool->run(pool->context, pool->worker_count, project_shared_q5, &share);
+    pthread_cond_destroy(&share.changed);
+    pthread_mutex_destroy(&share.mutex);
+    *handled = status == TRILLIM_OK && share.done;
+    return status;
+}
+
+static bool shared_q5_requested(const TrillimThreadPool *pool) {
+    const size_t workers = pool->worker_count;
+    if (workers < Q5_SHARED_MIN_THREADS || workers > Q5_SHARED_MAX_WORKERS) {
+        return false;
+    }
+    /* Automatic Accelerate may ignore limits below four threads. */
+    const char *limit = getenv("VECLIB_MAXIMUM_THREADS");
+    if (limit == NULL) {
+        return false;
+    }
+    size_t threads = 0;
+    for (; *limit != '\0'; ++limit) {
+        if (*limit < '0' || *limit > '9') {
+            return false;
+        }
+        threads = threads * 10 + (size_t)(*limit - '0');
+        if (threads > workers) {
+            return false;
+        }
+    }
+    return threads >= Q5_SHARED_MIN_THREADS;
+}
+
 static TrillimStatus try_wide_q5_prefill(
-    const LinearTask *task, float *workspace, size_t workspace_elements, bool *handled
+    const LinearTask *task, float *workspace, size_t workspace_elements, bool shared, bool *handled
 ) {
     const LinearParameters *p = task->p;
     const TrillimThreadPool *pool = task->context->thread_pool;
@@ -1430,6 +1548,20 @@ static TrillimStatus try_wide_q5_prefill(
         if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
             return status;
         }
+        if (shared) {
+            bool projected;
+            status = try_project_shared_q5(&job, pool, &projected);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            if (projected) {
+                continue;
+            }
+            if (p->tokens < Q5_WIDE_MIN_ROWS || pool->worker_count > 4) {
+                return TRILLIM_OK;
+            }
+            shared = false;
+        }
         status = pool->run(pool->context, (count + grain - 1) / grain, project_wide_q5, &job);
         if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
             return status;
@@ -1456,11 +1588,14 @@ static TrillimStatus try_packed_prefill(
         return TRILLIM_OK;
     }
     if (workspace != NULL && p->weight_dtype == TRILLIM_GRP_INT5 &&
-        p->tokens >= Q5_WIDE_MIN_ROWS && p->tokens <= Q5_WIDE_MAX_ROWS && p->outputs % 32 == 0 &&
-        pool->worker_count > 1 && pool->worker_count <= 4) {
-        TrillimStatus status = try_wide_q5_prefill(task, workspace, workspace_elements, handled);
-        if (status != TRILLIM_OK || *handled) {
-            return status;
+        p->tokens >= Q5_SHARED_MIN_ROWS && p->tokens <= Q5_WIDE_MAX_ROWS &&
+        p->outputs % 32 == 0 && pool->worker_count > 1) {
+        const bool shared = shared_q5_requested(pool);
+        if (shared || (pool->worker_count <= 4 && p->tokens >= Q5_WIDE_MIN_ROWS)) {
+            const TrillimStatus status = try_wide_q5_prefill(task, workspace, workspace_elements, shared, handled);
+            if (status != TRILLIM_OK || *handled) {
+                return status;
+            }
         }
     }
     size_t columns = p->outputs / pool->worker_count / 16 * 16;
@@ -3569,7 +3704,7 @@ static bool prefill_shape(const Parameters *p) {
 static size_t q5_prefill_workspace(const Parameters *p) {
     if (p->up_dtype != TRILLIM_GRP_INT5 || p->gate_dtype != TRILLIM_GRP_INT5 ||
         p->down_dtype != TRILLIM_GRP_INT5 || p->output_dtype != TRILLIM_FP32 ||
-        p->tokens < Q5_WIDE_MIN_ROWS || p->width < 256 || p->hidden_width < 1024 || p->outputs < 1024) {
+        p->tokens < Q5_SHARED_MIN_ROWS || p->width < 256 || p->hidden_width < 1024 || p->outputs < 1024) {
         return 0;
     }
     /* Runtime shapes can be smaller than the bounds and have different group alignment. */
@@ -4575,8 +4710,12 @@ static TrillimStatus try_prefill(const Task *task, bool *handled) {
         size_t maximum = MAX_PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
         panel_rows = maximum >= p->tokens ? p->tokens : maximum / PACKED_PREFILL_M * PACKED_PREFILL_M;
     }
-    const size_t workers = task->context->thread_pool->worker_count;
-    const size_t workspace_elements = workers > 1 && workers <= 4 ? q5_prefill_workspace(p) : 0;
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    const size_t workers = pool->worker_count;
+    const bool shared = shared_q5_requested(pool);
+    const size_t minimum_rows = shared ? Q5_SHARED_MIN_ROWS : Q5_WIDE_MIN_ROWS;
+    const size_t workspace_elements = (shared || (workers > 1 && workers <= 4)) && p->tokens >= minimum_rows
+        ? q5_prefill_workspace(p) : 0;
     float *workspace = workspace_elements == 0 ? NULL : task->hidden;
     TrillimStatus status = run_prefill_panels(task, panel_rows, workspace, workspace_elements, handled);
     if (status != TRILLIM_OK || *handled || panel_rows == original_rows) {
