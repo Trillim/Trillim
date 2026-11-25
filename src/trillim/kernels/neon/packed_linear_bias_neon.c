@@ -1000,6 +1000,114 @@ static TrillimStatus project_grp_int5_bf16_group(void *opaque, size_t tile, size
     return project_grp_int5_group(opaque, tile, worker);
 }
 
+typedef struct {
+    const LinearTask *projection;
+    float *weights;
+} Q5Projection;
+
+static inline __attribute__((always_inline)) TrillimStatus project_unpacked_q5_rows(
+    const LinearTask *task, size_t row, size_t rows, size_t column, size_t second,
+    const float *weights0, const float *weights1
+) {
+    const LinearParameters *p = task->p;
+    float32x4_t sums0[8] = {0}, sums1[8] = {0};
+    for (size_t start = 0; start < p->width; start += 1024) {
+        if (task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const size_t limit = p->width - start < 1024 ? p->width : start + 1024;
+        for (size_t k = start; k < limit; k += 4) {
+            const float32x4_t w0 = vld1q_f32(weights0 + k);
+            const float32x4_t w1 = vld1q_f32(weights1 + k);
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+            for (size_t r = 0; r < 8; ++r) {
+                if (r < rows) {
+                    const float32x4_t x = load4(task->input, (row + r) * p->width + k, TRILLIM_BF16);
+                    sums0[r] = vfmaq_f32(sums0[r], x, w0);
+                    sums1[r] = vfmaq_f32(sums1[r], x, w1);
+                }
+            }
+        }
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        store_result(task->output, (row + r) * p->outputs + column, TRILLIM_FP32,
+            (TrillimValue){.f = vaddvq_f32(sums0[r])});
+        if (second != column) {
+            store_result(task->output, (row + r) * p->outputs + second, TRILLIM_FP32,
+                (TrillimValue){.f = vaddvq_f32(sums1[r])});
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus project_unpacked_q5_columns(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Q5Projection *job = opaque;
+    const LinearTask *task = job->projection;
+    const LinearParameters *p = task->p;
+    float *weights0 = job->weights + tile * p->width * 2;
+    float *weights1 = weights0 + p->width;
+    const size_t first = tile * task->columns;
+    const size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
+    for (size_t column = first; column < end; column += 2) {
+        const size_t second = column + 1 < end ? column + 1 : column;
+        const PackedGroupRow w0 = packed_group_row(task->weight, p->width, p->outputs, column, TRILLIM_GRP_INT5);
+        const PackedGroupRow w1 = packed_group_row(task->weight, p->width, p->outputs, second, TRILLIM_GRP_INT5);
+        for (size_t k = 0; k < p->width; k += 32) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t a[8], b[8];
+            packed_group_decode32(&w0, k, TRILLIM_GRP_INT5, false, a);
+            packed_group_decode32(&w1, k, TRILLIM_GRP_INT5, false, b);
+            for (size_t j = 0; j < 8; ++j) {
+                vst1q_f32(weights0 + k + j * 4, a[j]);
+                vst1q_f32(weights1 + k + j * 4, b[j]);
+            }
+        }
+        for (size_t row = 0; row < p->tokens; row += 8) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const TrillimStatus status = p->tokens - row >= 8
+                ? project_unpacked_q5_rows(task, row, 8, column, second, weights0, weights1)
+                : project_unpacked_q5_rows(task, row, p->tokens - row, column, second, weights0, weights1);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus try_unpacked_q5(const LinearTask *task, bool *handled) {
+    const LinearParameters *p = task->p;
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    *handled = false;
+    if (p->weight_dtype != TRILLIM_GRP_INT5 || p->input_dtype != TRILLIM_BF16 ||
+        p->output_dtype != TRILLIM_FP32 || p->tokens < 32 || p->width < 256 ||
+        p->width > 4096 || p->width % 32 != 0 || p->outputs < 128 || p->outputs >= 1024) {
+        return TRILLIM_OK;
+    }
+    LinearTask tiled = *task;
+    tiled.columns = p->outputs / pool->worker_count / 4 / 2 * 2;
+    if (tiled.columns < 4) {
+        tiled.columns = 4;
+    }
+    const size_t tiles = p->outputs / tiled.columns + (p->outputs % tiled.columns != 0);
+    float *weights = malloc(tiles * p->width * 2 * sizeof(float));
+    if (weights == NULL) {
+        return TRILLIM_OK;
+    }
+    Q5Projection job = {&tiled, weights};
+    *handled = true;
+    const TrillimStatus status = pool->run(pool->context, tiles, project_unpacked_q5_columns, &job);
+    free(weights);
+    return status;
+}
+
 static TrillimTask group_projection(uint32_t dtype, size_t rows, uint32_t input_dtype) {
     switch (dtype) {
     case TRILLIM_GRP_INT4: return rows == 1 ? project_grp_int4_decode : project_grp_int4_group;
@@ -2857,6 +2965,11 @@ static TrillimStatus run_linear(
         }
     }
 #endif
+    bool q5_handled;
+    const TrillimStatus q5 = try_unpacked_q5(&task, &q5_handled);
+    if (q5 != TRILLIM_OK || q5_handled) {
+        return q5;
+    }
     bool large_tile = p->tokens >= 16 && p->output_dtype == TRILLIM_FP32 &&
         (p->weight_dtype == TRILLIM_MAT_TERNARY || p->weight_dtype >= TRILLIM_GRP_INT5);
     size_t row_tile = large_tile ? 8 : 4;
