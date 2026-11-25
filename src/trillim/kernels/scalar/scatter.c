@@ -470,6 +470,8 @@ static TrillimStatus copy_run(void *output, size_t destination, const void *inpu
         uint8_t *target = (uint8_t *)output + (destination + begin) * bytes;
         if (bulk_copy) {
             memcpy(target, (const uint8_t *)input + (source + begin) * bytes, length * bytes);
+        } else if (broadcast && pattern == 0) {
+            memset(target, 0, length * bytes);
         } else if (broadcast) {
             switch (bytes) {
             case 1:
@@ -560,6 +562,10 @@ static bool parallel_replace(const void *output, const TrillimIndexTask *task) {
         p->items > SIZE_MAX / p->slice_size) {
         return false;
     }
+    if (p->items == 1 && p->slice_size < p->count && p->slice_size <= 65536 / bytes &&
+        trillim_contiguous(p->values_rank, p->values_shape, p->values_strides)) {
+        return false;
+    }
     for (size_t axis = p->coordinates; axis-- > 0;) {
         if (p->indexed_shape[axis] > 1 && p->output_indexed_strides[axis] != count) {
             return false;
@@ -587,6 +593,25 @@ static bool parallel_replace(const void *output, const TrillimIndexTask *task) {
     return indices <= SIZE_MAX / sizeof(int64_t) &&
         disjoint(output, count * bytes, task->inputs[1], indices * sizeof(int64_t)) &&
         disjoint(output, count * bytes, task->inputs[2], values * bytes);
+}
+
+enum { INITIAL_TILE = 32768 };
+
+typedef struct {
+    void *output;
+    const TrillimIndexTask *task;
+    size_t stride;
+} InitialTask;
+
+static TrillimStatus initialize_tile(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const InitialTask *copy = opaque;
+    const TrillimIndexTask *task = copy->task;
+    const TrillimIndexParameters *p = task->parameters;
+    size_t first = tile * INITIAL_TILE;
+    size_t count = p->count - first < INITIAL_TILE ? p->count - first : INITIAL_TILE;
+    return copy_run(copy->output, first, task->inputs[0], first * copy->stride, copy->stride,
+                    count, p->dtype, task->context);
 }
 
 static TrillimStatus replace_tile(void *opaque, size_t tile, size_t worker) {
@@ -640,8 +665,18 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     bool uniform;
     bool fast_initial = trillim_itemsize(p->dtype) != 0 && initial_layout(p, &uniform);
     if (!full_replace && outputs[0] != inputs[0] && p->slice_size != 0 && fast_initial) {
-        status = copy_run(outputs[0], 0, inputs[0], 0, uniform ? 0 : 1,
-                          p->count, p->dtype, context);
+        size_t bytes = trillim_itemsize(p->dtype);
+        const TrillimThreadPool *pool = context->thread_pool;
+        if (pool && pool->worker_count > 1 &&
+            p->count >= 524288 / bytes && p->count <= SIZE_MAX / bytes &&
+            disjoint(outputs[0], p->count * bytes, inputs[0], uniform ? bytes : p->count * bytes)) {
+            InitialTask initialize = {outputs[0], &task, uniform ? 0 : 1};
+            size_t tiles = p->count / INITIAL_TILE + (p->count % INITIAL_TILE != 0);
+            status = pool->run(pool->context, tiles, initialize_tile, &initialize);
+        } else {
+            status = copy_run(outputs[0], 0, inputs[0], 0, uniform ? 0 : 1,
+                              p->count, p->dtype, context);
+        }
         if (status != TRILLIM_OK) {
             return status;
         }

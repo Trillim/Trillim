@@ -781,6 +781,42 @@ static TrillimStatus gather_transpose_task(void *opaque, size_t index, size_t wo
     return TRILLIM_OK;
 }
 
+enum { SINGLETON_TILE = 4096, SINGLETON_COPY = 256 };
+
+static bool singleton_gather(const TrillimIndexParameters *p) {
+    return !p->masked && p->dtype == TRILLIM_FP32 && p->coordinates == 1 &&
+        p->index_rank == 1 && p->index_shape[0] == p->items && p->index_strides[0] == 1 &&
+        p->indexed_strides[0] == 1 && p->slice_size == 1 && p->items >= 16;
+}
+
+static TrillimStatus gather_singletons(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const TrillimIndexTask *task = opaque;
+    const TrillimIndexParameters *p = task->parameters;
+    const TrillimKernelContext *context = task->context;
+    const uint8_t *input = task->inputs[0], *indices = task->inputs[1];
+    uint8_t *output = task->output;
+    size_t first = tile * SINGLETON_TILE;
+    size_t end = p->items - first < SINGLETON_TILE ? p->items : first + SINGLETON_TILE;
+    for (; first < end;) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = end - first < SINGLETON_COPY ? end - first : SINGLETON_COPY;
+        size_t width = p->indexed_shape[0];
+        for (size_t i = 0; i < count; ++i) {
+            int64_t selected;
+            memcpy(&selected, indices + (first + i) * sizeof(selected), sizeof(selected));
+            if (selected < 0 || (uint64_t)selected >= width) {
+                return TRILLIM_ERROR;
+            }
+            memcpy(output + (first + i) * sizeof(float), input + (size_t)selected * sizeof(float), sizeof(float));
+        }
+        first += count;
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     TrillimStatus status = trillim_index_requirements(parameters, inputs, outputs, scratch, false, false);
     if (status == TRILLIM_OK && trillim_mxfp4_copyable(parameters)) {
@@ -805,6 +841,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
         const TrillimThreadPool *pool = context->thread_pool;
         size_t tasks = p->items / TRANSPOSE_ITEMS + (p->items % TRANSPOSE_ITEMS != 0);
         return pool->run(pool->context, tasks, gather_transpose_task, &task);
+    }
+    if (singleton_gather(p)) {
+        size_t tiles = p->items / SINGLETON_TILE + (p->items % SINGLETON_TILE != 0);
+        const TrillimThreadPool *pool = context->thread_pool;
+        return tiles == 1 ? gather_singletons(&task, 0, 0) :
+            pool->run(pool->context, tiles, gather_singletons, &task);
     }
     size_t size = gather_batch_size(p);
     size_t batches = p->items / size + (p->items % size != 0);
