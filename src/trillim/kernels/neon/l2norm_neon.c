@@ -188,6 +188,58 @@ static TrillimStatus normalize_rows(const Task *task, size_t start, size_t count
     return TRILLIM_OK;
 }
 
+static TrillimStatus normalize_contiguous_f32(const Task *task) {
+    const Parameters *p = task->p;
+    const TrillimKernelContext *context = task->context;
+    const float *input = task->input;
+    float *output = task->output;
+    size_t row = 0;
+    for (; p->rows - row >= 4; row += 4) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const float *a = input + row * p->width;
+        const float *b = a + p->width, *c = b + p->width, *d = c + p->width;
+        float32x4_t sums = vdupq_n_f32(0.0f);
+        for (size_t column = 0; column < p->width; column += 4) {
+            float32x4_t x0 = vld1q_f32(a + column), x1 = vld1q_f32(b + column);
+            float32x4_t x2 = vld1q_f32(c + column), x3 = vld1q_f32(d + column);
+            x0 = vmulq_f32(x0, x0);
+            x1 = vmulq_f32(x1, x1);
+            x2 = vmulq_f32(x2, x2);
+            x3 = vmulq_f32(x3, x3);
+            float32x4_t ab0 = vtrn1q_f32(x0, x1), ab1 = vtrn2q_f32(x0, x1);
+            float32x4_t cd0 = vtrn1q_f32(x2, x3), cd1 = vtrn2q_f32(x2, x3);
+            /* Lanes are independent rows, retaining each row's addition order. */
+            sums = vaddq_f32(sums, vcombine_f32(vget_low_f32(ab0), vget_low_f32(cd0)));
+            sums = vaddq_f32(sums, vcombine_f32(vget_low_f32(ab1), vget_low_f32(cd1)));
+            sums = vaddq_f32(sums, vcombine_f32(vget_high_f32(ab0), vget_high_f32(cd0)));
+            sums = vaddq_f32(sums, vcombine_f32(vget_high_f32(ab1), vget_high_f32(cd1)));
+        }
+        float32x4_t denominators = vsqrtq_f32(vaddq_f32(sums, vdupq_n_f32(p->eps)));
+        uint32x4_t ordinary = vandq_u32(vcgtq_f32(denominators, vdupq_n_f32(0.0f)),
+                                       vcltq_f32(denominators, vdupq_n_f32(INFINITY)));
+        if (vminvq_u32(ordinary) != UINT32_MAX) {
+            TrillimStatus status = normalize_rows(task, row, 4);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            continue;
+        }
+        float *target0 = output + row * p->width;
+        float *target1 = target0 + p->width, *target2 = target1 + p->width, *target3 = target2 + p->width;
+        float32x4_t d0 = vdupq_laneq_f32(denominators, 0), d1 = vdupq_laneq_f32(denominators, 1);
+        float32x4_t d2 = vdupq_laneq_f32(denominators, 2), d3 = vdupq_laneq_f32(denominators, 3);
+        for (size_t column = 0; column < p->width; column += 4) {
+            vst1q_f32(target0 + column, vdivq_f32(vld1q_f32(a + column), d0));
+            vst1q_f32(target1 + column, vdivq_f32(vld1q_f32(b + column), d1));
+            vst1q_f32(target2 + column, vdivq_f32(vld1q_f32(c + column), d2));
+            vst1q_f32(target3 + column, vdivq_f32(vld1q_f32(d + column), d3));
+        }
+    }
+    return normalize_rows(task, row, p->rows - row);
+}
+
 static TrillimStatus normalize_task(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const Task *task = opaque;
@@ -206,6 +258,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_l2norm(
         return TRILLIM_CANCELLED;
     }
     Task task = {outputs[0], inputs[0], p, context};
+    if (p->dtype == TRILLIM_FP32 && p->rows >= 4 && p->width <= 256 && p->width % 4 == 0 &&
+        p->rows <= 4096 / p->width && trillim_contiguous(p->rank, p->shape, p->strides)) {
+        return normalize_contiguous_f32(&task);
+    }
     if (p->rows <= 1 || p->rows <= 4096 / p->width) {
         return normalize_rows(&task, 0, p->rows);
     }

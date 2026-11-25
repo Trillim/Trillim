@@ -1,6 +1,9 @@
 #include "common.h"
 #include <math.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 static inline float trillim_packed_round_even(float value) {
     float integer;
@@ -442,15 +445,29 @@ static bool dense_layout(const TrillimCastParameters *p, size_t *rows, size_t *c
 }
 
 static inline void cast_dense_run(uint8_t *output, const uint8_t *input, size_t count, bool narrow) {
+    size_t i = 0;
     if (narrow) {
-        for (size_t i = 0; i < count; ++i) {
+#ifdef __ARM_NEON
+        for (; count - i >= 4; i += 4) {
+            uint32x4_t bits = vreinterpretq_u32_u8(vld1q_u8(input + i * 4));
+            uint32x4_t upper = vshrq_n_u32(bits, 16);
+            uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)),
+                                       vdupq_n_u32(0x7f800000));
+            uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+            uint32x4_t rounded = vshrq_n_u32(vaddq_u32(bits, bias), 16);
+            uint32x4_t quiet = vorrq_u32(upper, vdupq_n_u32(64));
+            uint16x4_t result = vmovn_u32(vbslq_u32(nan, quiet, rounded));
+            vst1_u8(output + i * 2, vreinterpret_u8_u16(result));
+        }
+#endif
+        for (; i < count; ++i) {
             float value;
             memcpy(&value, input + i * sizeof(value), sizeof(value));
             uint16_t bits = trillim_to_bf16(value);
             memcpy(output + i * sizeof(bits), &bits, sizeof(bits));
         }
     } else {
-        for (size_t i = 0; i < count; ++i) {
+        for (; i < count; ++i) {
             uint16_t bits;
             memcpy(&bits, input + i * sizeof(bits), sizeof(bits));
             uint32_t value = (uint32_t)bits << 16;

@@ -2855,7 +2855,10 @@ static __attribute__((noinline)) TrillimStatus linear_try_int8_projection(
         }
         linear_Int8ProjectionTask int8 = {task, activation, gate, silu};
         const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
-        if (p->width <= 65536 / p->outputs || workers == 1) {
+        /* A narrow projection would otherwise wake the entire pool for one or two tiles. */
+        const bool small_q4 = p->weight_dtype == TRILLIM_GRP_INT4 && workers >= 8 &&
+            tiles <= 2 && p->width <= 131072 / p->outputs;
+        if (small_q4 || p->width <= 65536 / p->outputs || workers == 1) {
             LinearTask serial = *task;
             serial.columns = p->outputs;
             linear_Int8ProjectionTask serial_int8 = {&serial, activation, gate, silu};
@@ -3096,7 +3099,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_grouped_linear_bf16(
     const PackedLinearParameters projection = {p->tokens, p->width, p->outputs, TRILLIM_BF16,
         p->weight_dtype, TRILLIM_FP32};
 #if defined(__APPLE__) || defined(__linux__)
-    if (p->tokens >= 4) {
+    if (p->tokens >= 4 || (p->tokens == 1 && p->weight_dtype == TRILLIM_GRP_INT4)) {
         bool handled;
         const TrillimStatus status = try_linear_bf16(
             outputs[0], inputs[0], inputs[1], &projection, context, &handled);

@@ -1277,10 +1277,12 @@ static TrillimTask packed_prefill_operation(uint32_t dtype) {
     }
 }
 
-static TrillimStatus pack_prefill_activations(const LinearTask *task, float *packed, bool *ordinary) {
+static TrillimStatus pack_prefill_activations(
+    const LinearTask *task, float *packed, unsigned min_exponent, bool *ordinary
+) {
     const LinearParameters *p = task->p;
-    const uint32x4_t minimum = vdupq_n_u32((uint32_t)linear_MIN_GROUP_EXPONENT << 23);
-    const uint32x4_t span = vdupq_n_u32(((uint32_t)(linear_MAX_GROUP_EXPONENT - linear_MIN_GROUP_EXPONENT + 1) << 23) - 1);
+    const uint32x4_t minimum = vdupq_n_u32(min_exponent << 23);
+    const uint32x4_t span = vdupq_n_u32(((linear_MAX_GROUP_EXPONENT - min_exponent + 1) << 23) - 1);
     uint32x4_t rejected = vdupq_n_u32(0);
     size_t elements = p->tokens * p->width;
     for (size_t i = 0; i < elements; i += 4) {
@@ -1302,14 +1304,13 @@ static TrillimStatus pack_prefill_activations(const LinearTask *task, float *pac
 enum {
     Q5_SHARED_MIN_ROWS = 96,
     Q5_SHARED_MIN_THREADS = 4,
-    Q5_SHARED_MAX_WORKERS = 6,
+    Q5_SHARED_MAX_WORKERS = 20,
     Q5_WIDE_MIN_ROWS = 128,
-    Q5_WIDE_MAX_ROWS = 512,
-    Q5_WIDE_WEIGHT_ELEMENTS = 64 * 1024 * 1024 / sizeof(float),
-    Q5_WIDE_ACTIVATION_ELEMENTS = 2 << 20,
+    Q5_WIDE_WEIGHT_ELEMENTS = 384 * 1024 * 1024 / sizeof(float),
+    Q5_WIDE_ACTIVATION_ELEMENTS = 32 * 1024 * 1024 / sizeof(float),
     Q5_WIDE_DECODE_COLUMNS = 32,
     Q5_WIDE_COLUMN_ALIGNMENT = 32,
-    Q5_WIDE_GEMM_ROWS = 256,
+    Q5_WIDE_GEMM_ROWS = 1024,
 };
 
 typedef struct {
@@ -1514,7 +1515,8 @@ static bool shared_q5_requested(const TrillimThreadPool *pool) {
 }
 
 static TrillimStatus try_wide_q5_prefill(
-    const LinearTask *task, float *workspace, size_t workspace_elements, bool shared, bool *handled
+    const LinearTask *task, float *workspace, size_t workspace_elements,
+    bool shared, unsigned min_exponent, bool *handled
 ) {
     const LinearParameters *p = task->p;
     const TrillimThreadPool *pool = task->context->thread_pool;
@@ -1532,7 +1534,7 @@ static TrillimStatus try_wide_q5_prefill(
         return TRILLIM_ERROR;
     }
     bool ordinary;
-    TrillimStatus status = pack_prefill_activations(task, direct ? NULL : workspace, &ordinary);
+    TrillimStatus status = pack_prefill_activations(task, direct ? NULL : workspace, min_exponent, &ordinary);
     if (status != TRILLIM_OK || !ordinary) {
         return status;
     }
@@ -1572,7 +1574,8 @@ static TrillimStatus try_wide_q5_prefill(
 }
 
 static TrillimStatus try_packed_prefill(
-    const LinearTask *task, float *workspace, size_t workspace_elements, bool *handled
+    const LinearTask *task, float *workspace, size_t workspace_elements,
+    bool down_projection, bool *handled
 ) {
     const LinearParameters *p = task->p;
     const TrillimThreadPool *pool = task->context->thread_pool;
@@ -1587,12 +1590,18 @@ static TrillimStatus try_packed_prefill(
     if (operation == NULL || !default_fpcr() || !initialize_packed_prefill_blas()) {
         return TRILLIM_OK;
     }
+    /* SGEMM multiplies materialized weights, so the factored-dot lower
+       bound is unnecessary for the Q5 down projection. Pass tiny SwiGLU
+       outputs unchanged and let FP32 GEMM handle underflow normally.
+       The upper magnitude limit still excludes huge and nonfinite inputs. */
+    const unsigned min_exponent = down_projection && p->weight_dtype == TRILLIM_GRP_INT5
+        ? 0 : linear_MIN_GROUP_EXPONENT;
     if (workspace != NULL && p->weight_dtype == TRILLIM_GRP_INT5 &&
-        p->tokens >= Q5_SHARED_MIN_ROWS && p->tokens <= Q5_WIDE_MAX_ROWS &&
+        p->tokens >= Q5_SHARED_MIN_ROWS &&
         p->outputs % 32 == 0 && pool->worker_count > 1) {
         const bool shared = shared_q5_requested(pool);
         if (shared || (pool->worker_count <= 4 && p->tokens >= Q5_WIDE_MIN_ROWS)) {
-            const TrillimStatus status = try_wide_q5_prefill(task, workspace, workspace_elements, shared, handled);
+            const TrillimStatus status = try_wide_q5_prefill(task, workspace, workspace_elements, shared, min_exponent, handled);
             if (status != TRILLIM_OK || *handled) {
                 return status;
             }
@@ -1636,7 +1645,7 @@ static TrillimStatus try_packed_prefill(
         panel.input = (const uint8_t *)task->input + first * p->width * trillim_itemsize(p->input_dtype);
         panel.output = (float *)task->output + first * p->outputs;
         bool ordinary;
-        status = pack_prefill_activations(&panel, direct ? NULL : workspace, &ordinary);
+        status = pack_prefill_activations(&panel, direct ? NULL : workspace, min_exponent, &ordinary);
         if (status != TRILLIM_OK || !ordinary) {
             free(allocated);
             return status;
@@ -3155,7 +3164,7 @@ static TrillimStatus run_linear(
 #if defined(__APPLE__)
     if (p->tokens >= 32) {
         bool prefill_handled;
-        TrillimStatus prefill = try_packed_prefill(&task, NULL, 0, &prefill_handled);
+        TrillimStatus prefill = try_packed_prefill(&task, NULL, 0, false, &prefill_handled);
         if (prefill != TRILLIM_OK || prefill_handled) {
             return prefill;
         }
@@ -3253,10 +3262,11 @@ static TrillimStatus try_hidden_int8_prefill(
 #if defined(__APPLE__)
 static TrillimStatus try_linear_prefill(
     void *output, const void *input, const void *weight, const LinearParameters *p,
-    const TrillimKernelContext *context, float *workspace, size_t workspace_elements, bool *handled
+    const TrillimKernelContext *context, float *workspace, size_t workspace_elements,
+    bool down_projection, bool *handled
 ) {
     const LinearTask task = {.output = output, .input = input, .weight = weight, .p = p, .context = context};
-    return try_packed_prefill(&task, workspace, workspace_elements, handled);
+    return try_packed_prefill(&task, workspace, workspace_elements, down_projection, handled);
 }
 #endif
 
@@ -3687,6 +3697,7 @@ static bool packed(uint32_t dtype) {
 enum {
     PREFILL_GATE_BYTES = 8 * 1024 * 1024,
     MAX_PREFILL_GATE_BYTES = 32 * 1024 * 1024,
+    Q5_MAX_PREFILL_GATE_BYTES = 64 * 1024 * 1024,
     MIN_PREFILL_WEIGHTS = 1 << 21,
     GATE_TILE = 1024,
 };
@@ -3711,9 +3722,10 @@ static size_t q5_prefill_workspace(const Parameters *p) {
     const size_t width = p->width > p->hidden_width ? p->width : p->hidden_width;
     const size_t depth = width < PACKED_PREFILL_K ? width : PACKED_PREFILL_K;
     const size_t activation_capacity = Q5_WIDE_ACTIVATION_ELEMENTS;
-    const size_t activation_elements = p->tokens > activation_capacity / width
-        ? activation_capacity : p->tokens * width;
-    const size_t panel_capacity = MAX_PREFILL_GATE_BYTES / sizeof(float);
+    /* Only the expansion input can need conversion. The down input is aligned FP32 scratch. */
+    const size_t activation_elements = p->tokens > activation_capacity / p->width
+        ? activation_capacity : p->tokens * p->width;
+    const size_t panel_capacity = Q5_MAX_PREFILL_GATE_BYTES / sizeof(float);
     const size_t panel_elements = p->tokens > panel_capacity / p->hidden_width
         ? panel_capacity : p->tokens * p->hidden_width;
     const size_t narrow_weights = PACKED_PREFILL_N * PACKED_PREFILL_LANES * depth;
@@ -4655,13 +4667,13 @@ static TrillimStatus run_prefill_panels(
         LinearParameters expand = {rows, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
         bool projected;
         status = try_linear_prefill(
-            hidden, input, task->inputs[1], &expand, context, workspace, workspace_elements, &projected
+            hidden, input, task->inputs[1], &expand, context, workspace, workspace_elements, false, &projected
         );
         if (status != TRILLIM_OK || !projected) {
             break;
         }
         status = try_linear_prefill(
-            gate, input, task->inputs[2], &expand, context, workspace, workspace_elements, &projected
+            gate, input, task->inputs[2], &expand, context, workspace, workspace_elements, false, &projected
         );
         if (status != TRILLIM_OK || !projected) {
             break;
@@ -4674,7 +4686,7 @@ static TrillimStatus run_prefill_panels(
         }
         LinearParameters down = {rows, p->hidden_width, p->outputs, TRILLIM_FP32, p->down_dtype, TRILLIM_FP32};
         status = try_linear_prefill(
-            output, hidden, task->inputs[3], &down, context, workspace, workspace_elements, &projected
+            output, hidden, task->inputs[3], &down, context, workspace, workspace_elements, true, &projected
         );
         if (status != TRILLIM_OK || !projected) {
             break;
@@ -4707,7 +4719,9 @@ static TrillimStatus try_prefill(const Task *task, bool *handled) {
         (direct_input || PACKED_PREFILL_ACTIVATION_ELEMENTS / p->width >= PACKED_PREFILL_M) &&
         (uintptr_t)task->hidden % _Alignof(float) == 0) {
         // Keep the same 64-row BLAS calls as the smaller panels.
-        size_t maximum = MAX_PREFILL_GATE_BYTES / sizeof(float) / p->hidden_width;
+        const size_t gate_bytes = p->up_dtype == TRILLIM_GRP_INT5
+            ? Q5_MAX_PREFILL_GATE_BYTES : MAX_PREFILL_GATE_BYTES;
+        size_t maximum = gate_bytes / sizeof(float) / p->hidden_width;
         panel_rows = maximum >= p->tokens ? p->tokens : maximum / PACKED_PREFILL_M * PACKED_PREFILL_M;
     }
     const TrillimThreadPool *pool = task->context->thread_pool;
@@ -4717,6 +4731,12 @@ static TrillimStatus try_prefill(const Task *task, bool *handled) {
     const size_t workspace_elements = (shared || (workers > 1 && workers <= 4)) && p->tokens >= minimum_rows
         ? q5_prefill_workspace(p) : 0;
     float *workspace = workspace_elements == 0 ? NULL : task->hidden;
+    if (workspace != NULL && !direct_input) {
+        const size_t activation_rows = Q5_WIDE_ACTIVATION_ELEMENTS / p->width;
+        if (activation_rows >= minimum_rows && panel_rows > activation_rows) {
+            panel_rows = activation_rows / PACKED_PREFILL_M * PACKED_PREFILL_M;
+        }
+    }
     TrillimStatus status = run_prefill_panels(task, panel_rows, workspace, workspace_elements, handled);
     if (status != TRILLIM_OK || *handled || panel_rows == original_rows) {
         return status;

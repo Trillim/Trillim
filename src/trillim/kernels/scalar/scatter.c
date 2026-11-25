@@ -1,6 +1,9 @@
 #include "common.h"
 #include <math.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
     size_t itemsize = trillim_itemsize(dtype);
@@ -503,7 +506,24 @@ static TrillimStatus copy_run(void *output, size_t destination, const void *inpu
             }
         } else if (dtype == TRILLIM_FP32 || dtype == TRILLIM_UINT32 || dtype == TRILLIM_INT32) {
             const uint8_t *from = (const uint8_t *)input + (source + begin * step) * 4;
-            for (size_t i = 0; i < length; ++i) {
+            size_t i = 0;
+#ifdef __ARM_NEON
+            if (step == 3) {
+                uintptr_t from_address = (uintptr_t)from;
+                uintptr_t to_address = (uintptr_t)target;
+                const size_t span = (length - 1) * 12 + sizeof(uint32_t);
+                const bool nonoverlap = from_address <= to_address ?
+                    to_address - from_address >= span : from_address - to_address >= length * 4;
+                if (nonoverlap) {
+                    /* A deinterleaved load also reads the two neighboring streams. */
+                    for (; length - i >= 5; i += 4) {
+                        uint32x4x3_t values = vld3q_u32((const uint32_t *)(from + i * 12));
+                        vst1q_u32((uint32_t *)(target + i * 4), values.val[0]);
+                    }
+                }
+            }
+#endif
+            for (; i < length; ++i) {
                 uint32_t bits;
                 memcpy(&bits, from + i * step * 4, sizeof(bits));
                 memcpy(target + i * 4, &bits, sizeof(bits));
@@ -649,6 +669,78 @@ static TrillimStatus replace_tile(void *opaque, size_t tile, size_t worker) {
     return TRILLIM_OK;
 }
 
+static bool consecutive_replace(const TrillimIndexTask *task, void *output,
+                                size_t *destination, bool *interleaved) {
+    const TrillimIndexParameters *p = task->parameters;
+    if (p->masked || p->mode || p->dtype != TRILLIM_FP32 || p->coordinates != 1 ||
+        p->index_rank != 1 || p->index_strides[0] != 1 || p->items < 2 ||
+        p->indexed_shape[0] < p->items || p->index_shape[0] != p->items ||
+        p->slice_size == 0 || p->output_indexed_strides[0] != p->slice_size ||
+        p->indexed_shape[0] != p->count / p->slice_size || p->count % p->slice_size != 0 ||
+        p->count > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    size_t length = p->items * p->slice_size;
+    *interleaved = false;
+#ifdef __ARM_NEON
+    *interleaved = p->items == 3 && p->values_rank == 2 && p->values_shape[0] == p->items &&
+        p->values_shape[1] == p->slice_size && p->values_strides[0] == 1 &&
+        p->values_strides[1] == p->items;
+#endif
+    if (!*interleaved && (!trillim_contiguous(p->values_rank, p->values_shape, p->values_strides) ||
+        p->items > 4096)) {
+        return false;
+    }
+    size_t span;
+    if (!trillim_span(p->values_rank, p->values_shape, p->values_strides, &span) || span != length ||
+        !disjoint(output, p->count * sizeof(float), task->inputs[2], length * sizeof(float)) ||
+        !disjoint(output, p->count * sizeof(float), task->inputs[1], p->items * sizeof(int64_t))) {
+        return false;
+    }
+    const uint8_t *indices = task->inputs[1];
+    int64_t first;
+    memcpy(&first, indices, sizeof(first));
+    if (first < 0 || (uint64_t)first > p->indexed_shape[0] - p->items ||
+        p->items - 1 > (uint64_t)INT64_MAX - (uint64_t)first) {
+        return false;
+    }
+    for (size_t item = 1; item < p->items; ++item) {
+        int64_t index;
+        memcpy(&index, indices + item * sizeof(index), sizeof(index));
+        if (index != first + (int64_t)item) {
+            return false;
+        }
+    }
+    *destination = (size_t)first * p->slice_size;
+    return true;
+}
+
+#ifdef __ARM_NEON
+static TrillimStatus replace_interleaved_three(void *output, const void *input,
+                                                size_t width, const TrillimKernelContext *context) {
+    const uint8_t *source = input;
+    uint8_t *target = output;
+    for (size_t first = 0; first < width;) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        const size_t end = width - first > 1024 ? first + 1024 : width;
+        for (; end - first >= 4; first += 4) {
+            const uint32x4x3_t values = vld3q_u32((const uint32_t *)(source + first * 12));
+            vst1q_u32((uint32_t *)(target + first * 4), values.val[0]);
+            vst1q_u32((uint32_t *)(target + (width + first) * 4), values.val[1]);
+            vst1q_u32((uint32_t *)(target + (2 * width + first) * 4), values.val[2]);
+        }
+        for (; first < end; ++first) {
+            memcpy(target + first * 4, source + first * 12, 4);
+            memcpy(target + (width + first) * 4, source + first * 12 + 4, 4);
+            memcpy(target + (2 * width + first) * 4, source + first * 12 + 8, 4);
+        }
+    }
+    return TRILLIM_OK;
+}
+#endif
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -659,9 +751,12 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
     const TrillimIndexParameters *p = (const TrillimIndexParameters *)parameters;
     TrillimIndexTask task = {inputs, p, context};
     TrillimStatus status;
-    bool parallel = parallel_replace(outputs[0], &task);
+    size_t destination;
+    bool interleaved;
+    bool consecutive = consecutive_replace(&task, outputs[0], &destination, &interleaved);
+    bool parallel = !consecutive && parallel_replace(outputs[0], &task);
     /* Valid, distinct replacements cover every destination element. */
-    bool full_replace = parallel && p->items * p->slice_size == p->count;
+    bool full_replace = (parallel || consecutive) && p->items * p->slice_size == p->count;
     bool uniform;
     bool fast_initial = trillim_itemsize(p->dtype) != 0 && initial_layout(p, &uniform);
     if (!full_replace && outputs[0] != inputs[0] && p->slice_size != 0 && fast_initial) {
@@ -693,6 +788,16 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_scatter(
                 trillim_store(outputs[0], i, p->dtype, value);
             }
         }
+    }
+    if (consecutive) {
+#ifdef __ARM_NEON
+        if (interleaved) {
+            return replace_interleaved_three((uint8_t *)outputs[0] + destination * sizeof(float),
+                                              inputs[2], p->slice_size, context);
+        }
+#endif
+        return copy_run(outputs[0], destination, inputs[2], 0, 1,
+                        p->items * p->slice_size, p->dtype, context);
     }
     size_t table_capacity = 0;
     size_t *table = (size_t *)scratch;

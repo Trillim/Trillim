@@ -610,7 +610,9 @@ static TrillimStatus project_i8mm_edges(const Task *task, size_t row, size_t row
 }
 
 I8MM __attribute__((always_inline))
-static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, size_t first, size_t end, uint32_t dtype) {
+static inline TrillimStatus project_i8mm_columns(
+    const Task *task, size_t row, size_t first, size_t end, uint32_t dtype, const int8x16_t *packed_input
+) {
     const Parameters *p = task->p;
     const bool ternary = dtype == TRILLIM_GRP_TERNARY;
     const bool q6 = dtype == TRILLIM_DUBGRP_INT6;
@@ -686,13 +688,19 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
                 if (q6 && chunk == 8 && task->context->is_cancelled(task->context->cancellation_context)) {
                     return TRILLIM_CANCELLED;
                 }
-                int8x16_t activations[2][I8MM_ROWS / 2];
-                for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
-                    const int8_t *a = input + r * 2 * p->width + chunk * 16;
-                    int8x16_t first = vld1q_s8(a);
-                    int8x16_t second = vld1q_s8(a + p->width);
-                    activations[0][r] = zip_low_s8(first, second);
-                    activations[1][r] = zip_high_s8(first, second);
+                int8x16_t local[I8MM_ROWS];
+                const int8x16_t *activations;
+                if (packed_input) {
+                    activations = packed_input + (g * (group_width / 16) + chunk) * I8MM_ROWS;
+                } else {
+                    for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
+                        const int8_t *a = input + r * 2 * p->width + chunk * 16;
+                        int8x16_t first = vld1q_s8(a);
+                        int8x16_t second = vld1q_s8(a + p->width);
+                        local[r] = zip_low_s8(first, second);
+                        local[I8MM_ROWS / 2 + r] = zip_high_s8(first, second);
+                    }
+                    activations = local;
                 }
                 if (q6) {
                     // Apply the shared subscale to each complete 16-element dot.
@@ -706,8 +714,8 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
                         int32x2_t subscales = {left->subscales[chunk], right->subscales[chunk]};
                         int32x4_t scales = vcombine_s32(subscales, subscales);
                         for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
-                            int32x4_t dot = matrix_product(vdupq_n_s32(0), activations[0][r], lo);
-                            dot = matrix_product(dot, activations[1][r], hi);
+                            int32x4_t dot = matrix_product(vdupq_n_s32(0), activations[r], lo);
+                            dot = matrix_product(dot, activations[I8MM_ROWS / 2 + r], hi);
                             dots[r][c] = vmlaq_s32(dots[r][c], dot, scales);
                         }
                     }
@@ -730,7 +738,7 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
                             weights = vreinterpretq_s8_u8(vornq_u8(one, vtstq_u8(bytes, sign_mask)));
                         }
                         for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
-                            dots[r][c] = matrix_product(dots[r][c], activations[part][r], weights);
+                            dots[r][c] = matrix_product(dots[r][c], activations[part * (I8MM_ROWS / 2) + r], weights);
                         }
                     }
                 }
@@ -767,6 +775,31 @@ static inline TrillimStatus project_i8mm_columns(const Task *task, size_t row, s
     return project_i8mm_edges(task, row, I8MM_ROWS, column, end);
 }
 
+enum { BINARY_PREFILL_MAX_WIDTH = 8192 };
+
+I8MM __attribute__((noinline))
+static TrillimStatus project_i8mm_binary(const Task *task, size_t row, size_t first, size_t end) {
+    const size_t width = task->p->width;
+    const size_t full_width = width / LOWBIT_WIDTH * LOWBIT_WIDTH;
+    const int8_t *input = task->input + row * width;
+    // Each group of output columns reuses the same interleaved token pairs.
+    int8x16_t packed_input[BINARY_PREFILL_MAX_WIDTH / 16 * I8MM_ROWS];
+    for (size_t k = 0; k < full_width; k += 16) {
+        if ((k & 511) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        int8x16_t *packed = packed_input + k / 16 * I8MM_ROWS;
+        for (size_t r = 0; r < I8MM_ROWS / 2; ++r) {
+            const int8_t *pair = input + r * 2 * width + k;
+            int8x16_t first_row = vld1q_s8(pair);
+            int8x16_t second_row = vld1q_s8(pair + width);
+            packed[r] = zip_low_s8(first_row, second_row);
+            packed[I8MM_ROWS / 2 + r] = zip_high_s8(first_row, second_row);
+        }
+    }
+    return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_BINARY, packed_input);
+}
+
 I8MM
 static TrillimStatus project_i8mm(void *opaque, size_t tile, size_t worker) {
     (void)worker;
@@ -781,17 +814,20 @@ static TrillimStatus project_i8mm(void *opaque, size_t tile, size_t worker) {
     }
     switch (p->weight_dtype) {
     case TRILLIM_GRP_INT4:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT4);
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT4, NULL);
     case TRILLIM_GRP_INT5:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT5);
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_INT5, NULL);
     case TRILLIM_DUBGRP_INT6:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_DUBGRP_INT6);
+        return project_i8mm_columns(task, row, first, end, TRILLIM_DUBGRP_INT6, NULL);
     case TRILLIM_GRP_BINARY:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_BINARY);
+        if (p->width <= BINARY_PREFILL_MAX_WIDTH && end - first >= PACKED_COLUMNS) {
+            return project_i8mm_binary(task, row, first, end);
+        }
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_BINARY, NULL);
     case TRILLIM_GRP_TERNARY:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_TERNARY);
+        return project_i8mm_columns(task, row, first, end, TRILLIM_GRP_TERNARY, NULL);
     case TRILLIM_MXFP4:
-        return project_i8mm_columns(task, row, first, end, TRILLIM_MXFP4);
+        return project_i8mm_columns(task, row, first, end, TRILLIM_MXFP4, NULL);
     default:
         return project_i8mm_edges(task, row, rows, first, end);
     }

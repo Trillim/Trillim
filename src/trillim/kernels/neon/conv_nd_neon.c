@@ -526,6 +526,58 @@ static TrillimStatus convolve_batch(void *opaque, size_t batch, size_t worker) {
     return TRILLIM_OK;
 }
 
+static void depthwise_weights(const Task *task, size_t channel, float32x4_t weights[4]) {
+    const uint32_t dtype = task->p->weight_dtype;
+    if (dtype == TRILLIM_FP32) {
+        const float32x4x4_t packed = vld4q_f32((const float *)task->weight + channel * 4);
+        for (size_t k = 0; k < 4; ++k) {
+            weights[k] = packed.val[k];
+        }
+    } else {
+        const uint16x4x4_t packed = vld4_u16((const uint16_t *)task->weight + channel * 4);
+        for (size_t k = 0; k < 4; ++k) {
+            weights[k] = dtype == TRILLIM_FP16 ?
+                vcvt_f32_f16(vreinterpret_f16_u16(packed.val[k])) :
+                vreinterpretq_f32_u32(vshll_n_u16(packed.val[k], 16));
+        }
+    }
+}
+
+enum { DEPTHWISE_SINGLE_CHANNELS = 1024 };
+
+static TrillimStatus depthwise_single(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const size_t channels = task->p->channels;
+    const float *input = task->input;
+    float *output = task->output;
+    size_t channel = tile * DEPTHWISE_SINGLE_CHANNELS;
+    const size_t remaining = channels - channel;
+    const size_t end = channel + (remaining < DEPTHWISE_SINGLE_CHANNELS ? remaining : DEPTHWISE_SINGLE_CHANNELS);
+    for (; end - channel >= 4; channel += 4) {
+        if ((channel & 127) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float32x4_t w[4];
+        depthwise_weights(task, channel, w);
+        const float *x = input + channel;
+        float32x4_t sum = vdupq_n_f32(0);
+        sum = vfmaq_f32(sum, vld1q_f32(x), w[0]);
+        sum = vfmaq_f32(sum, vld1q_f32(x + channels), w[1]);
+        sum = vfmaq_f32(sum, vld1q_f32(x + 2 * channels), w[2]);
+        sum = vfmaq_f32(sum, vld1q_f32(x + 3 * channels), w[3]);
+        vst1q_f32(output + channel, sum);
+    }
+    const size_t out[] = {0};
+    for (; channel < end; ++channel) {
+        TrillimStatus status = convolve1(task, channel, 0, out);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus depthwise_short(void *opaque, size_t tile, size_t worker) {
     const Task *task = opaque;
     const Parameters *p = task->p;
@@ -535,19 +587,7 @@ static TrillimStatus depthwise_short(void *opaque, size_t tile, size_t worker) {
             return TRILLIM_CANCELLED;
         }
         float32x4_t weights[4];
-        if (p->weight_dtype == TRILLIM_FP32) {
-            float32x4x4_t packed = vld4q_f32((const float *)task->weight + channel * 4);
-            for (size_t k = 0; k < 4; ++k) {
-                weights[k] = packed.val[k];
-            }
-        } else {
-            uint16x4x4_t packed = vld4_u16((const uint16_t *)task->weight + channel * 4);
-            for (size_t k = 0; k < 4; ++k) {
-                weights[k] = p->weight_dtype == TRILLIM_FP16 ?
-                    vcvt_f32_f16(vreinterpret_f16_u16(packed.val[k])) :
-                    vreinterpretq_f32_u32(vshll_n_u16(packed.val[k], 16));
-            }
-        }
+        depthwise_weights(task, channel, weights);
         float32x4_t first = vdupq_n_f32(0), second = vdupq_n_f32(0);
         for (size_t k = 0; k < 4; ++k) {
             const float *input = (const float *)task->input + channel + k * p->channels;
@@ -596,19 +636,7 @@ static TrillimStatus depthwise_time_major(void *opaque, size_t tile, size_t work
             return TRILLIM_CANCELLED;
         }
         float32x4_t w[4];
-        if (p->weight_dtype == TRILLIM_FP32) {
-            float32x4x4_t packed = vld4q_f32((const float *)task->weight + channel * 4);
-            for (size_t k = 0; k < 4; ++k) {
-                w[k] = packed.val[k];
-            }
-        } else {
-            uint16x4x4_t packed = vld4_u16((const uint16_t *)task->weight + channel * 4);
-            for (size_t k = 0; k < 4; ++k) {
-                w[k] = p->weight_dtype == TRILLIM_FP16 ?
-                    vcvt_f32_f16(vreinterpret_f16_u16(packed.val[k])) :
-                    vreinterpretq_f32_u32(vshll_n_u16(packed.val[k], 16));
-            }
-        }
+        depthwise_weights(task, channel, w);
         size_t position = first;
         for (; last - position >= 4; position += 4) {
             const float *x = input + position * p->channels + channel;
@@ -641,14 +669,10 @@ static TrillimStatus depthwise_time_major(void *opaque, size_t tile, size_t work
                 sum = vfmaq_f32(sum, vld1q_f32(x + k * p->channels), w[k]);
             }
             float *dst = output + channel * rows + position;
-            if (rows == 1) {
-                vst1q_f32(dst, sum);
-            } else {
-                vst1q_lane_f32(dst, sum, 0);
-                vst1q_lane_f32(dst + rows, sum, 1);
-                vst1q_lane_f32(dst + 2 * rows, sum, 2);
-                vst1q_lane_f32(dst + 3 * rows, sum, 3);
-            }
+            vst1q_lane_f32(dst, sum, 0);
+            vst1q_lane_f32(dst + rows, sum, 1);
+            vst1q_lane_f32(dst + 2 * rows, sum, 2);
+            vst1q_lane_f32(dst + 3 * rows, sum, 3);
         }
     }
     for (; channel < end; ++channel) {
@@ -708,6 +732,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_conv_nd(void *const *outputs, const vo
         trillim_float(p->weight_dtype) &&
         (uintptr_t)task.weight % trillim_itemsize(p->weight_dtype) == 0) {
         const TrillimThreadPool *pool = context->thread_pool;
+        if (task.output_volume == 1) {
+            const size_t tiles = p->channels / DEPTHWISE_SINGLE_CHANNELS +
+                (p->channels % DEPTHWISE_SINGLE_CHANNELS != 0);
+            return tiles == 1 ? depthwise_single(&task, 0, 0) :
+                pool->run(pool->context, tiles, depthwise_single, &task);
+        }
         if (task.output_volume == 2) {
             return pool->run(pool->context, p->outputs / 32 + (p->outputs % 32 != 0),
                              depthwise_short, &task);

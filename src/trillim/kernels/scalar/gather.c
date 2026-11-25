@@ -460,8 +460,20 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
     if (status != TRILLIM_OK) {
         return status;
     }
-    if (active && (p->dtype == TRILLIM_FP16 || p->dtype == TRILLIM_BF16) &&
-        trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
+    if (active && (p->dtype == TRILLIM_FP16 || p->dtype == TRILLIM_BF16)) {
+        size_t stride = 1;
+        if (!trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides)) {
+            size_t axes = 0;
+            for (size_t axis = 0; axis < p->slice_rank; ++axis) {
+                if (p->slice_shape[axis] > 1) {
+                    stride = p->slice_strides[axis];
+                    ++axes;
+                }
+            }
+            if (axes != 1) {
+                goto generic_gather;
+            }
+        }
         uint16_t infinity = p->dtype == TRILLIM_FP16 ? 0x7c00 : 0x7f80;
         uint16_t quiet = p->dtype == TRILLIM_FP16 ? 0x0200 : 0x0040;
         for (size_t begin = 0; begin < p->slice_size; begin += 1024) {
@@ -469,11 +481,11 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
                 return TRILLIM_CANCELLED;
             }
             size_t count = p->slice_size - begin < 1024 ? p->slice_size - begin : 1024;
-            const uint8_t *input = (const uint8_t *)task->inputs[0] + (source + begin) * 2;
+            const uint8_t *input = (const uint8_t *)task->inputs[0] + (source + begin * stride) * 2;
             uint8_t *output = (uint8_t *)task->output + (item * p->slice_size + begin) * 2;
             for (size_t i = 0; i < count; ++i) {
                 uint16_t bits;
-                memcpy(&bits, input + i * 2, sizeof(bits));
+                memcpy(&bits, input + i * stride * 2, sizeof(bits));
                 /* Native gather preserves payloads and quiets signaling NaNs. */
                 bits |= (bits & 0x7fff) > infinity ? quiet : 0;
                 memcpy(output + i * 2, &bits, sizeof(bits));
@@ -481,6 +493,7 @@ static inline TrillimStatus trillim_gather_task(void *opaque, size_t item, size_
         }
         return TRILLIM_OK;
     }
+generic_gather:;
     size_t bytes = trillim_itemsize(p->dtype);
     if (active && bytes && p->dtype > TRILLIM_BOOL &&
         p->dtype != TRILLIM_FP16 && p->dtype != TRILLIM_BF16) {
@@ -789,6 +802,53 @@ static bool singleton_gather(const TrillimIndexParameters *p) {
         p->indexed_strides[0] == 1 && p->slice_size == 1 && p->items >= 16;
 }
 
+static bool consecutive_indices(const uint8_t *indices, size_t count, size_t bound, size_t *first) {
+    int64_t start;
+    memcpy(&start, indices, sizeof(start));
+    if (start < 0 || (uint64_t)start >= bound || count > bound - (size_t)start ||
+        count - 1 > (uint64_t)INT64_MAX - (uint64_t)start) {
+        return false;
+    }
+    for (size_t i = 1; i < count; ++i) {
+        int64_t index;
+        memcpy(&index, indices + i * sizeof(index), sizeof(index));
+        if (index != start + (int64_t)i) {
+            return false;
+        }
+    }
+    *first = (size_t)start;
+    return true;
+}
+
+static bool nonoverlapping_spans(const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
+    const uintptr_t first = (uintptr_t)a, second = (uintptr_t)b;
+    return first <= second ? second - first >= a_bytes : first - second >= b_bytes;
+}
+
+static bool consecutive_slices(const TrillimIndexTask *task, size_t *source) {
+    const TrillimIndexParameters *p = task->parameters;
+    if (p->masked || p->dtype != TRILLIM_FP32 || p->coordinates != 1 ||
+        p->index_rank != 1 || p->index_shape[0] != p->items || p->index_strides[0] != 1 ||
+        p->items < 2 || p->items > 32 || p->slice_size < 1024 ||
+        p->indexed_strides[0] != p->slice_size ||
+        p->items > SIZE_MAX / p->slice_size || p->items * p->slice_size != p->count ||
+        p->count > SIZE_MAX / sizeof(float) ||
+        !trillim_contiguous(p->slice_rank, p->slice_shape, p->slice_strides) ||
+        !nonoverlapping_spans(task->output, p->count * sizeof(float),
+                              task->inputs[1], p->items * sizeof(int64_t))) {
+        return false;
+    }
+    size_t start;
+    if (!consecutive_indices(task->inputs[1], p->items, p->indexed_shape[0], &start) ||
+        start > SIZE_MAX / sizeof(float) / p->slice_size) {
+        return false;
+    }
+    *source = start * p->slice_size;
+    const size_t bytes = p->count * sizeof(float);
+    return nonoverlapping_spans(task->output, bytes,
+        (const uint8_t *)task->inputs[0] + *source * sizeof(float), bytes);
+}
+
 static TrillimStatus gather_singletons(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const TrillimIndexTask *task = opaque;
@@ -796,6 +856,8 @@ static TrillimStatus gather_singletons(void *opaque, size_t tile, size_t worker)
     const TrillimKernelContext *context = task->context;
     const uint8_t *input = task->inputs[0], *indices = task->inputs[1];
     uint8_t *output = task->output;
+    const bool independent_indices = p->items <= SIZE_MAX / sizeof(int64_t) &&
+        nonoverlapping_spans(output, p->items * sizeof(float), indices, p->items * sizeof(int64_t));
     size_t first = tile * SINGLETON_TILE;
     size_t end = p->items - first < SINGLETON_TILE ? p->items : first + SINGLETON_TILE;
     for (; first < end;) {
@@ -804,6 +866,18 @@ static TrillimStatus gather_singletons(void *opaque, size_t tile, size_t worker)
         }
         size_t count = end - first < SINGLETON_COPY ? end - first : SINGLETON_COPY;
         size_t width = p->indexed_shape[0];
+        size_t selected_start;
+        if (independent_indices &&
+            consecutive_indices(indices + first * sizeof(int64_t), count, width, &selected_start)) {
+            uint8_t *dst = output + first * sizeof(float);
+            const uint8_t *src = input + selected_start * sizeof(float);
+            size_t bytes = count * sizeof(float);
+            if (nonoverlapping_spans(dst, bytes, src, bytes)) {
+                memcpy(dst, src, bytes);
+                first += count;
+                continue;
+            }
+        }
         for (size_t i = 0; i < count; ++i) {
             int64_t selected;
             memcpy(&selected, indices + (first + i) * sizeof(selected), sizeof(selected));
@@ -837,6 +911,20 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
     if (trillim_mxfp4_copyable(p)) {
         return trillim_mxfp4_gather(&task);
     }
+    size_t source;
+    if (consecutive_slices(&task, &source)) {
+        const uint8_t *input = (const uint8_t *)inputs[0] + source * sizeof(float);
+        uint8_t *output = outputs[0];
+        for (size_t first = 0; first < p->count;) {
+            if (context->is_cancelled(context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t count = p->count - first < 4096 ? p->count - first : 4096;
+            memcpy(output + first * sizeof(float), input + first * sizeof(float), count * sizeof(float));
+            first += count;
+        }
+        return TRILLIM_OK;
+    }
     if (transpose_gather(p)) {
         const TrillimThreadPool *pool = context->thread_pool;
         size_t tasks = p->items / TRANSPOSE_ITEMS + (p->items % TRANSPOSE_ITEMS != 0);
@@ -850,8 +938,16 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_gather(
     }
     size_t size = gather_batch_size(p);
     size_t batches = p->items / size + (p->items % size != 0);
-    TrillimStatus status = batches == 1 ? gather_batch(&task, 0, 0) :
-        context->thread_pool->run(context->thread_pool->context, batches, gather_batch, &task);
+    TrillimStatus status = TRILLIM_OK;
+    if (trillim_itemsize(p->dtype) && p->count <= 8192) {
+        for (size_t batch = 0; batch < batches && status == TRILLIM_OK; ++batch) {
+            status = gather_batch(&task, batch, 0);
+        }
+    } else if (batches == 1) {
+        status = gather_batch(&task, 0, 0);
+    } else {
+        status = context->thread_pool->run(context->thread_pool->context, batches, gather_batch, &task);
+    }
     if (status != TRILLIM_OK || p->count == 0 || trillim_itemsize(p->dtype) != 0) {
         return status;
     }

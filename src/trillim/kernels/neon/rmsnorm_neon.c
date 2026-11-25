@@ -489,10 +489,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
     bool transposed = p->row_stride == 1 && p->column_stride != 1;
     TrillimTask worker = transposed ? normalize_transposed : normalize;
     size_t tasks = transposed ? p->rows / 4 + (p->rows % 4 != 0) : p->rows;
+    size_t workers = context->thread_pool->worker_count;
+    bool short_pairs = p->rows / 2 < workers && p->rows <= 4096 / p->width;
     if (p->input_dtype == TRILLIM_BF16 && trillim_float(p->weight_dtype) &&
         p->output_dtype == TRILLIM_BF16 && p->column_stride == 1 && p->row_stride == p->width &&
         p->width % 4 == 0 && p->rows >= 2 && isfinite(p->weight_offset) &&
-        p->rows / 2 >= context->thread_pool->worker_count) {
+        (short_pairs || p->rows / 2 >= workers)) {
         worker = normalize_pair;
         tasks = p->rows / 2 + (p->rows % 2 != 0);
     }
@@ -500,7 +502,7 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
     if (transposed) {
         serial_limit = 8192;
     }
-    if (p->rows == 1 || p->rows <= serial_limit / p->width) {
+    if (p->rows == 1 || p->rows <= serial_limit / p->width || (worker == normalize_pair && short_pairs)) {
         for (size_t tile = 0; tile < tasks; ++tile) {
             TrillimStatus status = worker(&task, tile, 0);
             if (status != TRILLIM_OK) {
@@ -509,7 +511,6 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_rmsnorm(
         }
         return TRILLIM_OK;
     }
-    size_t workers = context->thread_pool->worker_count;
     if (worker == normalize_pair && workers != 0) {
         size_t grain = tasks / workers / 2;
         if (grain > 1) {
