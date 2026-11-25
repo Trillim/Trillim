@@ -1426,7 +1426,27 @@ typedef struct {
     size_t count;
     size_t lanes;
     size_t row_reuse;
+    float *shared_activation;
 } BlasTask;
+
+static TrillimStatus pack_shared_activation(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const BlasTask *job = opaque;
+    const Task *task = &job->task;
+    const Parameters *p = task->p;
+    const size_t row = tile * BLOCK_M;
+    const size_t rows = p->m - row < BLOCK_M ? p->m - row : BLOCK_M;
+    const size_t depth = block_k(p);
+    for (size_t first = 0; first < p->k; first += depth) {
+        const size_t k = p->k - first < depth ? p->k - first : depth;
+        const TrillimStatus status = pack(task->a, p->a_dtype, row * p->a_row_stride + first,
+            rows, k, p->a_row_stride, 1, job->shared_activation + first * p->m + row * k, task->context);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
 
 static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t worker) {
     (void)worker;
@@ -1438,7 +1458,8 @@ static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t w
     size_t columns = p->n / width + (p->n % width != 0);
     size_t row_tiles = p->m / block_m(p) + (p->m % block_m(p) != 0);
     float *a_pack = job->scratch + index * WORKSPACE;
-    float *b_pack = a_pack + BLOCK_M * BLOCK_K;
+    float *b_pack = job->shared_activation != NULL
+        ? job->scratch + index * (WORKSPACE - BLOCK_M * BLOCK_K) : a_pack + BLOCK_M * BLOCK_K;
     float *c_pack = b_pack + BLOCK_K * BLOCK_N;
     for (size_t tile = index; tile < job->count; tile += job->lanes) {
         if (t->context->is_cancelled(t->context->cancellation_context)) {
@@ -1470,7 +1491,9 @@ static TrillimStatus ungrouped_project_impl(void *opaque, size_t index, size_t w
             const float *b = b_pack;
             int a_trans = 111, b_trans = 111, lda = (int)k, ldb = (int)n;
             TrillimStatus status;
-            if (p->a_dtype == TRILLIM_FP32 && p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
+            if (job->shared_activation != NULL) {
+                a = job->shared_activation + first * p->m + row * k;
+            } else if (p->a_dtype == TRILLIM_FP32 && p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
                 a = (const float *)t->a + a_index;
                 lda = (int)p->a_row_stride;
             } else if (p->a_dtype == TRILLIM_FP32 && p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX) {
@@ -1526,7 +1549,8 @@ static TrillimStatus grouped_project_impl(void *opaque, size_t index, size_t wor
     size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
     size_t groups = rows / job->row_reuse + (rows % job->row_reuse != 0);
     float *a_pack = job->scratch + index * WORKSPACE;
-    float *b_pack = a_pack + BLOCK_M * BLOCK_K;
+    float *b_pack = job->shared_activation != NULL
+        ? job->scratch + index * (WORKSPACE - BLOCK_M * BLOCK_K) : a_pack + BLOCK_M * BLOCK_K;
     for (size_t tile = index; tile < job->count; tile += job->lanes) {
         if (t->context->is_cancelled(t->context->cancellation_context)) {
             return TRILLIM_CANCELLED;
@@ -1567,7 +1591,9 @@ static TrillimStatus grouped_project_impl(void *opaque, size_t index, size_t wor
                 size_t a_index = a_base + row * p->a_row_stride + first * p->a_col_stride;
                 const float *a = a_pack;
                 int a_trans = 111, lda = (int)k;
-                if (p->a_dtype == TRILLIM_FP32 && p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
+                if (job->shared_activation != NULL) {
+                    a = job->shared_activation + first * p->m + row * k;
+                } else if (p->a_dtype == TRILLIM_FP32 && p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) {
                     a = (const float *)t->a + a_index;
                     lda = (int)p->a_row_stride;
                 } else if (p->a_dtype == TRILLIM_FP32 && p->a_row_stride == 1 && p->a_col_stride >= p->m && p->a_col_stride <= INT32_MAX) {
@@ -1733,8 +1759,20 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_dense_bias(void *const *outputs, const
         size_t groups = rows / reuse + (rows % reuse != 0);
         size_t count = p->batches * groups * columns;
         size_t lanes = count < LANES ? count : LANES;
-        BlasTask job = {task, scratch, count, lanes, reuse};
-        return context->thread_pool->run(context->thread_pool->context, lanes, blas_project, &job);
+        BlasTask job = {task, scratch, count, lanes, reuse, NULL};
+        const TrillimThreadPool *pool = context->thread_pool;
+        if (p->rank == 0 && p->batches == 1 && p->a_dtype != TRILLIM_FP32 &&
+            p->a_col_stride == 1 && p->m >= 32 && columns >= 4 && count >= pool->worker_count &&
+            p->k <= lanes * BLOCK_M * BLOCK_K / p->m) {
+            /* Share each depth panel without changing its BLAS stride. */
+            job.shared_activation = (float *)scratch + lanes * (WORKSPACE - BLOCK_M * BLOCK_K);
+            const size_t tiles = p->m / BLOCK_M + (p->m % BLOCK_M != 0);
+            const TrillimStatus status = pool->run(pool->context, tiles, pack_shared_activation, &job);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return pool->run(pool->context, lanes, blas_project, &job);
     }
     size_t height = tile_rows(p, context->thread_pool->worker_count);
     size_t rows = p->m / height + (p->m % height != 0);
