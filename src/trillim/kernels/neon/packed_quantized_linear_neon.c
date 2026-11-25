@@ -358,7 +358,8 @@ static bool has_dotprod(void) {
 
 DOTPROD __attribute__((always_inline))
 static inline TrillimStatus project_dotprod_columns(const Task *task, size_t row, size_t rows,
-                                                size_t first, size_t end, uint32_t dtype) {
+                                                size_t first, size_t end, uint32_t dtype,
+                                                const int16_t *activation_sums) {
     const Parameters *p = task->p;
     const bool ternary = dtype == TRILLIM_GRP_TERNARY;
     const bool q6 = dtype == TRILLIM_DUBGRP_INT6;
@@ -428,11 +429,13 @@ static inline TrillimStatus project_dotprod_columns(const Task *task, size_t row
                     } else if (ternary) {
                         int8x16_t shift = vdupq_n_s8((int)(chunk / 2) * 2 - 6);
                         uint8x16_t codes = vshlq_u8(packed[chunk % 2][c], shift);
-                        weights = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(codes, vdupq_n_u8(3)), one));
+                        codes = vandq_u8(codes, vdupq_n_u8(3));
+                        weights = vreinterpretq_s8_u8(activation_sums ? codes : vsubq_u8(codes, one));
                     } else {
                         uint8x16_t indices = vaddq_u8(first_pair, vdupq_n_u8((uint8_t)(chunk * 2)));
                         uint8x16_t bytes = vqtbl1q_u8(packed[0][c], indices);
-                        weights = vreinterpretq_s8_u8(vornq_u8(one, vtstq_u8(bytes, sign_mask)));
+                        uint8x16_t bits = vtstq_u8(bytes, sign_mask);
+                        weights = vreinterpretq_s8_u8(activation_sums ? bits : vornq_u8(one, bits));
                     }
                     for (size_t r = 0; r < rows; ++r) {
                         if (q6) {
@@ -450,6 +453,12 @@ static inline TrillimStatus project_dotprod_columns(const Task *task, size_t row
                 int32x4_t first_pair_sum = vpaddq_s32(dots[r][0], dots[r][1]);
                 int32x4_t second_pair_sum = vpaddq_s32(dots[r][2], dots[r][3]);
                 int32x4_t sums = vpaddq_s32(first_pair_sum, second_pair_sum);
+                if (activation_sums) {
+                    if (!ternary) {
+                        sums = vshlq_n_s32(vnegq_s32(sums), 1);
+                    }
+                    sums = vsubq_s32(sums, vdupq_n_s32(activation_sums[g]));
+                }
                 totals[r] = vfmaq_f32(totals[r], vcvtq_f32_s32(sums), scales);
             }
         }
@@ -477,20 +486,43 @@ DOTPROD __attribute__((always_inline))
 static inline TrillimStatus project_dotprod_dtype(const Task *task, size_t row, size_t rows, size_t first, size_t end) {
     switch (task->p->weight_dtype) {
     case TRILLIM_GRP_INT4:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT4);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT4, NULL);
     case TRILLIM_GRP_INT5:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT5);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_INT5, NULL);
     case TRILLIM_DUBGRP_INT6:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_DUBGRP_INT6);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_DUBGRP_INT6, NULL);
     case TRILLIM_GRP_BINARY:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_BINARY);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_BINARY, NULL);
     case TRILLIM_GRP_TERNARY:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_TERNARY);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_GRP_TERNARY, NULL);
     case TRILLIM_MXFP4:
-        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_MXFP4);
+        return project_dotprod_columns(task, row, rows, first, end, TRILLIM_MXFP4, NULL);
     default:
         return project_columns(task, row, rows, first, end);
     }
+}
+
+enum { MAX_SUM_GROUPS = 128 };
+
+DOTPROD
+static TrillimStatus project_lowbit_decode(const Task *task, size_t row, size_t first, size_t end) {
+    int16_t sums[MAX_SUM_GROUPS];
+    const int8_t *input = task->input + row * task->p->width;
+    const size_t groups = task->p->width / LOWBIT_WIDTH;
+    for (size_t g = 0; g < groups; ++g) {
+        if ((g & 15) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        int16x8_t sum = vdupq_n_s16(0);
+        for (size_t k = 0; k < LOWBIT_WIDTH; k += 16) {
+            sum = vpadalq_s8(sum, vld1q_s8(input + g * LOWBIT_WIDTH + k));
+        }
+        sums[g] = vaddvq_s16(sum);
+    }
+    if (task->p->weight_dtype == TRILLIM_GRP_BINARY) {
+        return project_dotprod_columns(task, row, 1, first, end, TRILLIM_GRP_BINARY, sums);
+    }
+    return project_dotprod_columns(task, row, 1, first, end, TRILLIM_GRP_TERNARY, sums);
 }
 
 DOTPROD
@@ -499,15 +531,20 @@ static TrillimStatus project_dotprod_rows(const Task *task, size_t row, size_t r
         return project_dotprod_dtype(task, row, PACKED_ROWS, first, end);
     }
     if (rows == 1) {
+        const uint32_t dtype = task->p->weight_dtype;
+        if ((dtype == TRILLIM_GRP_BINARY || dtype == TRILLIM_GRP_TERNARY) &&
+            task->groups <= MAX_SUM_GROUPS && end - first >= LOWBIT_COLUMNS * 2) {
+            return project_lowbit_decode(task, row, first, end);
+        }
         return project_dotprod_dtype(task, row, 1, first, end);
     }
     switch (task->p->weight_dtype) {
     case TRILLIM_GRP_BINARY:
-        return rows == 2 ? project_dotprod_columns(task, row, 2, first, end, TRILLIM_GRP_BINARY)
-                         : project_dotprod_columns(task, row, 3, first, end, TRILLIM_GRP_BINARY);
+        return rows == 2 ? project_dotprod_columns(task, row, 2, first, end, TRILLIM_GRP_BINARY, NULL)
+                         : project_dotprod_columns(task, row, 3, first, end, TRILLIM_GRP_BINARY, NULL);
     case TRILLIM_GRP_TERNARY:
-        return rows == 2 ? project_dotprod_columns(task, row, 2, first, end, TRILLIM_GRP_TERNARY)
-                         : project_dotprod_columns(task, row, 3, first, end, TRILLIM_GRP_TERNARY);
+        return rows == 2 ? project_dotprod_columns(task, row, 2, first, end, TRILLIM_GRP_TERNARY, NULL)
+                         : project_dotprod_columns(task, row, 3, first, end, TRILLIM_GRP_TERNARY, NULL);
     default:
         return project_columns(task, row, rows, first, end);
     }
