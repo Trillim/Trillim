@@ -1569,7 +1569,7 @@ enum {
 };
 
 typedef struct {
-    uint16_t scale;
+    float scale;
     int8_t values[linear_INT8_ACTIVATION_Q8_0];
 } linear_Q8ActivationBlock;
 
@@ -1584,6 +1584,7 @@ typedef struct {
     const void *activation;
     const uint8_t *gate;
     float (*silu)(float);
+    const int32x4_t *q4_bias;
 } linear_Int8ProjectionTask;
 
 __asm__(
@@ -1650,10 +1651,11 @@ static bool linear_quantize_activation_q8(const void *input, size_t k, uint32_t 
     if (!isfinite(inverse) || !isfinite(maximum) || scale > 65504.0f) {
         return false;
     }
-    out->scale = trillim_to_fp16(scale);
-    if (maximum != 0 && out->scale == 0) {
+    const uint16_t rounded = trillim_to_fp16(scale);
+    if (maximum != 0 && rounded == 0) {
         return false;
     }
+    out->scale = trillim_fp16(rounded);
     vst1q_s8(out->values, linear_quantize_activation_16(x[0], x[1], x[2], x[3], inverse));
     vst1q_s8(out->values + 16, linear_quantize_activation_16(x[4], x[5], x[6], x[7], inverse));
     return true;
@@ -1790,7 +1792,7 @@ static inline __attribute__((always_inline)) float linear_dot_q8_activation(
             const int8x16_t a1 = vld1q_s8(x[block].values + 16);
             partial[p] = widening ? vaddq_s32(linear_int8_dot_widen(w.val[0], a0), linear_int8_dot_widen(w.val[1], a1))
                                   : vaddq_s32(linear_int8_sdot(w.val[0], a0), linear_int8_sdot(w.val[1], a1));
-            scale[p] = linear_int8_weight_scale(scales, block) * (float) vreinterpret_f16_u16(vdup_n_u16(x[block].scale))[0];
+            scale[p] = linear_int8_weight_scale(scales, block) * x[block].scale;
         }
         even = vfmaq_n_f32(even, vcvtq_f32_s32(partial[0]), scale[0]);
         odd = vfmaq_n_f32(odd, vcvtq_f32_s32(partial[1]), scale[1]);
@@ -1808,7 +1810,7 @@ static inline __attribute__((always_inline)) float linear_dot_q8_activation(
         }
         const int32x4_t partial = vaddq_s32(linear_int8_dot_widen(w.val[0], vld1q_s8(x[g].values)),
             linear_int8_dot_widen(w.val[1], vld1q_s8(x[g].values + 16)));
-        result += (linear_int8_weight_scale(scales, g) * trillim_fp16(x[g].scale)) * vaddvq_s32(partial);
+        result += (linear_int8_weight_scale(scales, g) * x[g].scale) * vaddvq_s32(partial);
     }
     return result;
 }
@@ -1915,9 +1917,18 @@ static inline __attribute__((always_inline)) int32x4_t linear_q8_activation_dot(
     return linear_int8_sdot_add(linear_int8_sdot(w.val[0], x.val[0]), w.val[1], x.val[1]);
 }
 
+static inline __attribute__((always_inline)) int32x4_t linear_q4_biased_dot(
+    linear_Int8PackedWeight weight, size_t block, int8x16x2_t x, int32x4_t bias
+) {
+    const uint8x16_t packed = vld1q_u8(weight.low + block * 16);
+    const int8x16_t low = vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(15)));
+    const int8x16_t high = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+    return linear_int8_sdot_add(linear_int8_sdot_add(bias, low, x.val[0]), high, x.val[1]);
+}
+
 static inline __attribute__((always_inline)) void linear_dot_q8_activation_pair(
     linear_Int8PackedWeight w0, linear_Int8PackedWeight w1, const linear_Q8ActivationBlock *x, size_t groups,
-    uint32_t dtype, bool widening, float result[2]
+    uint32_t dtype, bool widening, const int32x4_t *q4_bias, float result[2]
 ) {
     /* Match the four lane sums for even and odd blocks in the reference DOT kernel. */
     float32x4_t even0 = vdupq_n_f32(0), odd0 = even0;
@@ -1925,16 +1936,24 @@ static inline __attribute__((always_inline)) void linear_dot_q8_activation_pair(
     size_t g = 0;
     for (; g + 1 < groups; g += 2) {
         const int8x16x2_t x0 = vld1q_s8_x2(x[g].values);
-        const float scale0 = (float)vreinterpret_f16_u16(vdup_n_u16(x[g].scale))[0];
-        const int32x4_t d00 = linear_q8_activation_dot(w0, g, x0, dtype, widening);
-        const int32x4_t d10 = linear_q8_activation_dot(w1, g, x0, dtype, widening);
+        const float scale0 = x[g].scale;
+        const int32x4_t d00 = dtype == TRILLIM_GRP_INT4 && !widening
+            ? linear_q4_biased_dot(w0, g, x0, q4_bias[g])
+            : linear_q8_activation_dot(w0, g, x0, dtype, widening);
+        const int32x4_t d10 = dtype == TRILLIM_GRP_INT4 && !widening
+            ? linear_q4_biased_dot(w1, g, x0, q4_bias[g])
+            : linear_q8_activation_dot(w1, g, x0, dtype, widening);
         even0 = vfmaq_n_f32(even0, vcvtq_f32_s32(d00), linear_int8_weight_scale(w0.scales, g) * scale0);
         even1 = vfmaq_n_f32(even1, vcvtq_f32_s32(d10), linear_int8_weight_scale(w1.scales, g) * scale0);
 
         const int8x16x2_t x1 = vld1q_s8_x2(x[g + 1].values);
-        const float scale1 = (float)vreinterpret_f16_u16(vdup_n_u16(x[g + 1].scale))[0];
-        const int32x4_t d01 = linear_q8_activation_dot(w0, g + 1, x1, dtype, widening);
-        const int32x4_t d11 = linear_q8_activation_dot(w1, g + 1, x1, dtype, widening);
+        const float scale1 = x[g + 1].scale;
+        const int32x4_t d01 = dtype == TRILLIM_GRP_INT4 && !widening
+            ? linear_q4_biased_dot(w0, g + 1, x1, q4_bias[g + 1])
+            : linear_q8_activation_dot(w0, g + 1, x1, dtype, widening);
+        const int32x4_t d11 = dtype == TRILLIM_GRP_INT4 && !widening
+            ? linear_q4_biased_dot(w1, g + 1, x1, q4_bias[g + 1])
+            : linear_q8_activation_dot(w1, g + 1, x1, dtype, widening);
         odd0 = vfmaq_n_f32(odd0, vcvtq_f32_s32(d01), linear_int8_weight_scale(w0.scales, g + 1) * scale1);
         odd1 = vfmaq_n_f32(odd1, vcvtq_f32_s32(d11), linear_int8_weight_scale(w1.scales, g + 1) * scale1);
     }
@@ -1942,7 +1961,7 @@ static inline __attribute__((always_inline)) void linear_dot_q8_activation_pair(
     result[1] = vaddvq_f32(even1) + vaddvq_f32(odd1);
     if (g < groups) {
         const int8x16x2_t values = vld1q_s8_x2(x[g].values);
-        const float scale = trillim_fp16(x[g].scale);
+        const float scale = x[g].scale;
         const int32x4_t d0 = linear_q8_activation_dot(w0, g, values, dtype, widening);
         const int32x4_t d1 = linear_q8_activation_dot(w1, g, values, dtype, widening);
         result[0] += (linear_int8_weight_scale(w0.scales, g) * scale) * vaddvq_s32(d0);
@@ -1993,7 +2012,8 @@ static inline __attribute__((always_inline)) TrillimStatus linear_project_int8(
         if (share_activation) {
             const linear_Int8PackedWeight first = linear_q8_activation_weight(weight, offset, dtype);
             const linear_Int8PackedWeight second = linear_q8_activation_weight(gate, offset + (next ? groups : 0), dtype);
-            linear_dot_q8_activation_pair(first, second, quantized->activation, groups, dtype, widening, result);
+            linear_dot_q8_activation_pair(first, second, quantized->activation, groups, dtype, widening,
+                quantized->q4_bias, result);
         } else {
             result[0] = linear_int8_dot_row(&weight, offset, quantized->activation, groups, dtype, widening);
         }
@@ -2404,8 +2424,8 @@ static inline __attribute__((always_inline)) bool linear_pack_q8_activation_cell
         } else {
             memset(&second, 0, sizeof(second));
         }
-        const float scale0 = (float)vreinterpret_f16_u16(vdup_n_u16(first.scale))[0];
-        const float scale1 = (float)vreinterpret_f16_u16(vdup_n_u16(second.scale))[0];
+        const float scale0 = first.scale;
+        const float scale1 = second.scale;
         destination->scales[pair] = (float32x4_t){scale0, scale0, scale1, scale1};
         for (size_t k = 0; k < 4; ++k) {
             destination->values[k][pair] = vcombine_s8(
@@ -2982,10 +3002,14 @@ static __attribute__((noinline)) TrillimStatus linear_try_int8_projection(
     }
     const size_t groups = p->width / width;
     const size_t storage = groups * (width == 256 ? sizeof(linear_Q8KActivationBlock) : sizeof(linear_Q8ActivationBlock));
-    void *activation = malloc(storage);
+    const bool q4_raw = operation == linear_project_int8_q4_sdot_pair || operation == linear_project_int8_q4_sdot_bf16;
+    const size_t extra = q4_raw ? groups * sizeof(int32x4_t) : 0;
+    const size_t aligned = (storage + 15) & ~(size_t)15;
+    void *activation = malloc(aligned + extra);
     if (activation == NULL) {
         return TRILLIM_OK;
     }
+    int32x4_t *q4_bias = q4_raw ? (int32x4_t *)((uint8_t *)activation + aligned) : NULL;
     TrillimStatus status = TRILLIM_OK;
     for (size_t g = 0; g < groups; ++g) {
         if (g % (1024 / width) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
@@ -2999,6 +3023,12 @@ static __attribute__((noinline)) TrillimStatus linear_try_int8_projection(
         if (!valid) {
             free(activation);
             return TRILLIM_OK;
+        }
+        if (q4_raw) {
+            const linear_Q8ActivationBlock *x = (const linear_Q8ActivationBlock *)activation + g;
+            const int8x16x2_t a = vld1q_s8_x2(x->values);
+            const int8x16_t factor = vdupq_n_s8(-8);
+            q4_bias[g] = linear_int8_sdot_add(linear_int8_sdot(factor, a.val[0]), factor, a.val[1]);
         }
     }
     if (status == TRILLIM_OK) {
@@ -3015,12 +3045,12 @@ static __attribute__((noinline)) TrillimStatus linear_try_int8_projection(
             }
             task = &scheduled;
         }
-        linear_Int8ProjectionTask int8 = {task, activation, gate, silu};
+        linear_Int8ProjectionTask int8 = {task, activation, gate, silu, q4_bias};
         const size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0);
         if (p->width <= 65536 / p->outputs || workers == 1) {
             LinearTask serial = *task;
             serial.columns = p->outputs;
-            linear_Int8ProjectionTask serial_int8 = {&serial, activation, gate, silu};
+            linear_Int8ProjectionTask serial_int8 = {&serial, activation, gate, silu, q4_bias};
             status = operation(&serial_int8, 0, 0);
         } else {
             status = task->context->thread_pool->run(task->context->thread_pool->context, tiles, operation, &int8);
