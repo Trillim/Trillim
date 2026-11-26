@@ -38,7 +38,10 @@ def test_qwen_cache_persists_between_requests(qwen_layer: ModelArtifact) -> None
             )
 
 
-@pytest.mark.parametrize("mode", ("api", "sigint", "sigterm"))
+@pytest.mark.parametrize(
+    "mode",
+    ("api", "parent_sigint", "parent_sigterm", "worker_sigint", "worker_sigterm"),
+)
 def test_qwen_cancellation_stops_promptly(qwen_layer: ModelArtifact, mode: str) -> None:
     if mode != "api" and os.name == "nt":
         pytest.skip("POSIX signal delivery requires a POSIX host")
@@ -49,15 +52,16 @@ def test_qwen_cancellation_stops_promptly(qwen_layer: ModelArtifact, mode: str) 
     child.close()
     try:
         assert parent.poll(30), "model did not start"
-        assert parent.recv() == "running"
-        # Allow the observed projection to enter native code before cancelling.
+        state, worker_pid = parent.recv()
+        assert state == "running"
         time.sleep(0.02)
         started = time.perf_counter()
-        if mode == "api":
-            parent.send("cancel")
-        else:
-            assert process.pid is not None
-            os.kill(process.pid, signal.SIGINT if mode == "sigint" else signal.SIGTERM)
+        if mode != "api":
+            target = process.pid if mode.startswith("parent_") else worker_pid
+            assert target is not None
+            signum = signal.SIGINT if mode.endswith("sigint") else signal.SIGTERM
+            os.kill(target, signum)
+        parent.send("cancel")
         assert parent.poll(0.25), "cancellation and worker shutdown exceeded 250 ms"
         assert parent.recv() == "cancelled"
         assert time.perf_counter() - started < 0.25

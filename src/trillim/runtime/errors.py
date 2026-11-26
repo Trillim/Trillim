@@ -1,3 +1,6 @@
-from ..backends._errors import CancelledError, ExecutionError
+class ExecutionError(RuntimeError):
+    """Execution failed; the model session must be closed."""
 
-__all__ = ["CancelledError", "ExecutionError"]
+
+class CancelledError(ExecutionError):
+    """Execution was cancelled; the model session must be closed."""

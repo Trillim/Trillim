@@ -1,0 +1,42 @@
+from trillim.tdl import (
+    Add,
+    Compare,
+    Constant,
+    FullLike,
+    Graph,
+    Input,
+    Iota,
+    Output,
+    Reshape,
+    Scatter,
+    Select,
+    Take,
+    Tensor,
+    While,
+)
+
+with Graph() as graph:
+    script = Input(name="script", shape=(8,), dtype="int32")
+    cap = Input(name="cap", shape=(), dtype="int64", minimum=0, maximum=8)
+    first = Take(script, Constant(0), index_rank=0)
+    initial_count = Select(Compare(cap, 0, predicate="gt"), 1, 0)
+    initial_tokens = Scatter(
+        FullLike(script), indices=Reshape(Constant(0), (1,)), values=first
+    )
+
+    def condition(state: tuple[Tensor, ...]) -> Tensor:
+        count, last, _ = state
+        cont = Compare(count, cap, predicate="lt")
+        cont = Select(Compare(last, 6, predicate="eq"), False, cont)
+        return Select(Compare(last, 7, predicate="eq"), False, cont)
+
+    def body(state: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        count, _, tokens = state
+        next_token = Take(script, count, index_rank=0)
+        tokens = Scatter(tokens, indices=Reshape(count, (1,)), values=next_token)
+        return Add(count, 1), next_token, tokens
+
+    count, _, tokens = While(
+        (initial_count, first, initial_tokens), condition=condition, body=body
+    )
+    Output(Take(tokens, Iota(count)), name="tokens")

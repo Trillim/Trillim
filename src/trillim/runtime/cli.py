@@ -32,9 +32,13 @@ def _run(arguments: list[str]) -> None:
     def terminate(signum: int, frame: object) -> None:
         raise KeyboardInterrupt
 
+    def write_text(chunk: str) -> None:
+        print(chunk, end="", flush=True)
+
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
         with Model[object, object](options.directory, threads=options.threads) as model:
+            on_text = write_text if model.supports_text_streaming else None
             index = 0
             for line in sys.stdin:
                 if not line.strip():
@@ -44,7 +48,7 @@ def _run(arguments: list[str]) -> None:
                     if line.lstrip().startswith(("{", "[", '"'))
                     else line.rstrip("\r\n")
                 )
-                result = model.run(value)
+                result = model.run(value, on_text=on_text)
                 if isinstance(result, (Audio, Image.Image)):
                     path = options.output or Path(
                         "output.wav" if isinstance(result, Audio) else "output.png"
@@ -57,7 +61,7 @@ def _run(arguments: list[str]) -> None:
                         result.save(path)
                     print(path, flush=True)
                 elif isinstance(result, str):
-                    print(result, flush=True)
+                    print(result if on_text is None else "", flush=True)
                 else:
                     print(
                         json.dumps(result, separators=(",", ":"), allow_nan=False),

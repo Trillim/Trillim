@@ -14,6 +14,15 @@ class TensorSpec:
     maximum_shape: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class TokenEvent:
+    """One generated token and its position in the named output."""
+
+    output: str
+    index: int
+    token: int
+
+
 @dataclass(slots=True)
 class _RunArguments(Namespace):
     directory: Path = field(init=False)

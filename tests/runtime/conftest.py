@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from textwrap import dedent
 from typing import cast
 
 import numpy as np
@@ -15,6 +17,40 @@ from trillim.compiler.weights.reader import _load_checkpoint
 from trillim.compiler.weights.resolve import _read_values
 
 from .runtime_dataclasses import ModelArtifact
+
+
+@pytest.fixture
+def compile_tdl(
+    scalar_kernels: tuple[_Kernel, ...], tmp_path: Path
+) -> Callable[[str], Path]:
+    def compile_source(source: str) -> Path:
+        model = tmp_path / "model.tdl"
+        model.write_text(dedent(source))
+        directory = tmp_path / "bundle"
+        _compile_model(
+            _CompileRequest(
+                tdl_path=model, output=directory, backend="scalar", threads=1
+            )
+        )
+        return directory
+
+    return compile_source
+
+
+@pytest.fixture(scope="session")
+def token_model(
+    scalar_kernels: tuple[_Kernel, ...], tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    directory = tmp_path_factory.mktemp("token-model") / "bundle"
+    _compile_model(
+        _CompileRequest(
+            tdl_path=Path(__file__).parent / "fixtures" / "token_model.tdl",
+            output=directory,
+            backend="scalar",
+            threads=1,
+        )
+    )
+    return directory
 
 
 @pytest.fixture(

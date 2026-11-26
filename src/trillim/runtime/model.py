@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from threading import Event, RLock
@@ -8,7 +9,9 @@ from typing import Self, cast
 
 from ..compiler.artifacts.artifact_pydantic_models import _ExecutableManifest
 from ..processing import Postprocessor, Preprocessor, postprocessing, preprocessing
+from ..processing.utils import _TextStream
 from .errors import CancelledError
+from .runtime_dataclasses import TokenEvent
 from .session import Runtime
 
 
@@ -67,6 +70,7 @@ class Model[Input, Output]:
                 Preprocessor[Input],
                 partial(functions[spec.pre], assets=assets, options=spec.options),
             )
+        self._text_stream: Callable[[], _TextStream] | None = None
         if postprocess is None:
             assert spec is not None and spec.post is not None
             processors = {
@@ -78,29 +82,81 @@ class Model[Input, Output]:
                 Postprocessor[Output],
                 partial(processors[spec.post], assets=assets, options=spec.options),
             )
+            if spec.post == "text":
+                self._text_stream = partial(
+                    _TextStream,
+                    assets["tokenizer"],
+                    skip_special_tokens=spec.options.get("skip_special_tokens", True)
+                    is True,
+                )
         self._preprocess, self._postprocess = preprocess, postprocess
         self._lock = RLock()
         self._cancelled = Event()
         self._closed = False
+        self._running = False
         self._runtime = Runtime(directory, threads=threads)
 
-    def run(self, value: Input) -> Output:
-        """Process one request; conversation history must be supplied explicitly."""
+    @property
+    def supports_text_streaming(self) -> bool:
+        return self._text_stream is not None
+
+    def run(
+        self, value: Input, *, on_text: Callable[[str], None] | None = None
+    ) -> Output:
+        """Process a request and optionally deliver decoded text chunks during execution."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("model is closed")
             if self._cancelled.is_set():
                 raise CancelledError("model execution cancelled")
-            inputs = self._preprocess(value)
-            if self._cancelled.is_set():
-                raise CancelledError("model execution cancelled")
-            outputs = self._runtime.run(inputs)
-            if self._cancelled.is_set():
-                raise CancelledError("model execution cancelled")
-            result = self._postprocess(outputs)
-            if self._cancelled.is_set():
-                raise CancelledError("model execution cancelled")
-            return result
+            if self._running:
+                raise RuntimeError("model is already running")
+            self._running = True
+            try:
+                stream = None
+                if on_text is not None:
+                    if not callable(on_text):
+                        raise TypeError("on_text must be callable")
+                    if self._text_stream is None:
+                        raise ValueError(
+                            "on_text requires the built-in text postprocessor"
+                        )
+                    stream = self._text_stream()
+                inputs = self._preprocess(value)
+                if self._cancelled.is_set():
+                    raise CancelledError("model execution cancelled")
+                if on_text is None:
+                    outputs = self._runtime.run(inputs)
+                else:
+                    assert stream is not None
+
+                    def emit_text(event: TokenEvent) -> None:
+                        if self._cancelled.is_set():
+                            raise CancelledError("model execution cancelled")
+                        if event.output == "tokens":
+                            chunk = stream.push(event.token)
+                            if chunk:
+                                on_text(chunk)
+
+                    outputs = self._runtime.run(inputs, on_token=emit_text)
+                if self._cancelled.is_set():
+                    raise CancelledError("model execution cancelled")
+                result = self._postprocess(outputs)
+                if self._cancelled.is_set():
+                    raise CancelledError("model execution cancelled")
+                if on_text is not None and stream is not None:
+                    try:
+                        tail = stream.finish(cast(str, result))
+                        if tail:
+                            on_text(tail)
+                    except BaseException:
+                        self.close()
+                        raise
+                    if self._cancelled.is_set():
+                        raise CancelledError("model execution cancelled")
+                return result
+            finally:
+                self._running = False
 
     def cancel(self) -> None:
         self._cancelled.set()
