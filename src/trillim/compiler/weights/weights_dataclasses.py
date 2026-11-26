@@ -29,7 +29,7 @@ _SourceDType = Literal[
     "F8_E4M3",
 ]
 _ImportMethod = Literal[
-    "native", "bitnet_absmean", "bitnet_packed", "mxfp4", "fp8_e4m3"
+    "native", "bitnet_absmean", "bitnet_packed", "mxfp4", "fp8_e4m3", "mlx_ternary"
 ]
 
 

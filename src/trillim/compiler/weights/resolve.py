@@ -111,6 +111,35 @@ def _entry(
     ):
         raise ValueError(f"tied checkpoint tensors disagree in shape or dtype: {name}")
     quantization = config.quantization_config
+    if source.dtype == "U32" and config.quantization is not None:
+        quantization = config.quantization
+        stem = canonical.removesuffix(".weight")
+        scales = checkpoint.tensors.get(stem + ".scales")
+        biases = checkpoint.tensors.get(stem + ".biases")
+        if (
+            quantization.bits != 2
+            or quantization.group_size != 128
+            or quantization.mode != "affine"
+            or len(source.shape) != 2
+            or source.shape[1] % 8
+            or scales is None
+            or biases is None
+            or scales.dtype not in {"F16", "BF16", "F32"}
+            or biases.dtype not in {"F16", "BF16", "F32"}
+            or scales.shape != (source.shape[0], source.shape[1] // 8)
+            or biases.shape != scales.shape
+        ):
+            raise ValueError(f"unsupported MLX ternary packing: {name}")
+        return _WeightEntry(
+            f"{checkpoint.name}.{canonical}",
+            (source.shape[0], source.shape[1] * 16),
+            "grp_ternary",
+            source,
+            "mlx_ternary",
+            (scales, biases),
+            aliases,
+            tied,
+        )
     if source.dtype == "F8_E4M3":
         scales = checkpoint.tensors.get(canonical + "_scale_inv")
         tied_scales = tuple(
@@ -355,6 +384,12 @@ def _effective(
 ) -> NDArray[np.generic]:
     if entry.method == "native":
         return _read_values(entry.source, start, count)
+    if entry.method == "mlx_ternary":
+        first, last = start // 128, (start + count + 127) // 128
+        mlx_codes, mlx_scales = _mlx_ternary(entry, first, last - first)
+        values = (mlx_codes.astype(np.float32) - 1) * mlx_scales[:, None]
+        offset = start % 128
+        return values.reshape(-1)[offset : offset + count]
     if entry.method == "fp8_e4m3":
         columns = entry.shape[1]
         groups = (columns + 127) // 128
@@ -412,6 +447,33 @@ def _effective(
     )
 
 
+def _mlx_ternary(
+    entry: _WeightEntry, first: int, groups: int
+) -> tuple[NDArray[np.uint8], NDArray[np.float32]]:
+    packed = (
+        _read_values(entry.source, first * 8, groups * 8)
+        .astype(np.uint32)
+        .reshape(groups, 8)
+    )
+    codes = (
+        ((packed[..., None] >> (np.arange(16, dtype=np.uint32) * 2)) & 3)
+        .astype(np.uint8)
+        .reshape(groups, 128)
+    )
+    scales = _read_values(entry.components[0], first, groups).astype(np.float32)
+    biases = _read_values(entry.components[1], first, groups).astype(np.float32)
+    if (
+        np.any(codes == 3)
+        or not np.isfinite(scales).all()
+        or np.any(scales < 0)
+        or not np.array_equal(biases, -scales)
+    ):
+        raise ValueError(
+            f"MLX weights must encode scaled ternary values: {entry.identity}"
+        )
+    return codes, scales
+
+
 def _chunks(entry: _WeightEntry, target: DType) -> Iterator[tuple[int, int, int, int]]:
     rows, columns = _matrix(entry.shape)
     if rows == 0 or columns == 0:
@@ -450,6 +512,21 @@ def _encoded_chunks(
         if entry.identity not in scales:
             scales[entry.identity] = _bitnet_scale(entry)
         scale = scales[entry.identity]
+    if (
+        packing == "canonical"
+        and target == "grp_ternary"
+        and entry.method == "mlx_ternary"
+    ):
+        groups = math.prod(entry.shape) // 128
+        for first in range(0, groups, max(1, _CHUNK_BYTES // 1024)):
+            count = min(groups - first, max(1, _CHUNK_BYTES // 1024))
+            codes, mlx_scales = _mlx_ternary(entry, first, count)
+            yield first * 32, _codec._pack_ternary(codes).tobytes()
+            yield (
+                groups * 32 + first * 2,
+                _codec._encode(mlx_scales, "bf16")[0].tobytes(),
+            )
+        return
     if packing == "canonical" and target == "fp8_e4m3":
         rows, columns = _matrix(entry.shape)
         if entry.method == "fp8_e4m3":

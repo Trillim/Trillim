@@ -27,6 +27,9 @@ class _QuantizationConfig(BaseModel):
     quant_method: str = ""
     quantization_mode: str = ""
     linear_class: str = ""
+    bits: _Nonnegative = 0
+    group_size: _Nonnegative = 0
+    mode: str = ""
     weight_block_size: list[_Nonnegative] | None = Field(
         default=None, min_length=2, max_length=2
     )
@@ -38,6 +41,7 @@ class _CheckpointConfig(BaseModel):
     architectures: list[str] = Field(default_factory=list)
     tie_word_embeddings: bool = False
     quantization_config: _QuantizationConfig | None = None
+    quantization: _QuantizationConfig | None = None
 
 
 class _SourceProvenance(BaseModel):
