@@ -516,7 +516,7 @@ def _pattern_pure(region: _Region, state: _MatchingState) -> bool:
             and not region.writes
             and all(
                 operator.op
-                not in {"cache", "cache_assign", "cache_read", "if", "random"}
+                not in {"cache", "cache_assign", "cache_read", "if"}
                 and all(_pattern_pure(body, state) for body in operator.regions)
                 for operator in region.operators
             )
@@ -684,7 +684,6 @@ def _captures(
                 "cache_assign",
                 "cache_read",
                 "if",
-                "random",
             }:
                 return
             if isinstance(t.args, _WhileArgs) and not _bounded_while(
