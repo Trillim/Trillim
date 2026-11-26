@@ -1,24 +1,46 @@
 # Running compiled models
 
-`trillim run PATH --threads 4` uses the public `Model` abstraction and reads one plain-text or JSON request per line. Model applies the processors declared in the executable manifest before and after Runtime. Text responses are printed directly; audio/image outputs are saved with `--output PATH`. See [processing.md](processing.md) for built-ins, TDL declarations and custom callbacks.
+`trillim run PATH --threads 4` reads one plain-text or JSON request per line. The Python `Model` API applies the processors declared in the executable manifest. Text is printed as stable decoded chunks arrive; audio and image outputs are saved with `--output PATH`. See [processing.md](processing.md) for processor declarations and custom callbacks.
 
-Python callers can use `with Model(...) as model` for processed inputs/outputs, or use Runtime directly for named tensors. The process retains caches between requests; model TDL defines reset and prefix reuse.
+```python
+from trillim.runtime import Model
+
+with Model[str, str]("compiled/model", threads=4) as model:
+    text = model.run(
+        "Explain why the sky is blue.",
+        on_text=lambda chunk: print(chunk, end="", flush=True),
+    )
+    print()
+```
+
+`Model.run` still returns the complete processed result. `on_text` requires the built-in text postprocessor. Incremental decoding retains incomplete Unicode bytes until they form stable text. Tokenizers with model-specific decoding that can revise earlier text deliver their final text as one chunk.
+
+For named tensors and raw token events, use `Runtime`:
 
 ```python
 from trillim.runtime import Runtime
 
-with Runtime("compiled/model", threads=4) as model:
-    print(model.inputs)
-    output = model.run({"tokens": [9707, 11, 358], "reset": True})
-    tokens = output["tokens"]
+with Runtime("compiled/model", threads=4) as runtime:
+    result = runtime.run(
+        {"tokens": [9707, 11, 358], "reset": True},
+        on_token=lambda event: print(event.index, event.token, flush=True),
+    )
 ```
 
-`Runtime.inputs` and `Runtime.outputs` describe logical dtypes, shapes and maximum shapes. Python inputs may be numeric NumPy arrays or JSON-compatible numeric values. The runtime checks names, ranks, fixed dimensions, upper bounds and integer ranges before executing. Returned arrays own their data and survive subsequent runs or closing the model. BF16 and packed numerical outputs decode to FP32 arrays.
+The example assumes a model with those inputs and a rank-one integer `tokens` output. `TokenEvent` contains `output`, `index` and `token`. Events follow the compiled model's output, including EOS when the model returns it. Callbacks run on the calling thread and should return promptly. Callback exceptions abort the request and close its worker. Reentering the same session during a callback is rejected.
 
-Runtime verifies the manifest and selects a private backend from `backends/scalar`, `backends/x86` or `backends/arm`. The ARM backend handles the compiler's `neon` target on ARM64. Each backend checks its device capabilities and uses the shared allocator, mappings, Python interpreter and persistent native thread pool in `backends/cpu`. Kernels run sequentially and can divide each invocation across the pool. The benchmark uses this same pool. Source installs build and cache the native helper on first use, using the kernel compiler hierarchy.
+## CPU execution
 
-The backend prepares manifest arithmetic as Python functions and retains unchanged kernel parameter structs. Cache positions, tensor dimensions, pointers and footprint checks still update as execution proceeds.
+Python validates the manifest and inputs and owns session and processing APIs. Each session starts one persistent C++ CPU worker. It maps the existing weights and constants, allocates memory, maintains caches, evaluates dynamic shapes and control flow, and calls the existing C kernel ABI through the native thread pool. Scalar, ARM NEON and x86 executables use this shared executor, with their own kernel libraries and capability checks.
 
-`Runtime.cancel()` can be called from another thread. During execution, native SIGINT/SIGTERM handlers signal cancellation directly so a long kernel can stop before returning to Python. Previous handlers are restored after the run. Cancellation and execution failures invalidate the session; close it and create another. `close()` requests cancellation before waiting for execution to finish and releases resources. V1 permits one active model execution per process.
+The C++ worker handles generation, EOS conditions and iteration limits from the manifest. Proven append-only token loops emit committed tokens immediately. Other graphs emit their final token output when it becomes available. A bounded pipe provides backpressure; generation does not require a Python acknowledgement for every token. Named output arrays are copied into independently owned NumPy arrays. BF16 and packed numerical outputs decode to FP32.
 
-`tests/runtime` compiles one full-width Qwen3-0.6B decoder layer and checks cache reuse against fresh prefills, plus cancellation and worker shutdown within 250 ms. The layer's original weights and eight input embedding rows are stored in `tests/runtime/fixtures/qwen3-layer0.safetensors`, making the tests self-contained. They run on scalar and the host CPU backend; signal checks require POSIX.
+Build the CPU worker explicitly with `uv run task build-cpu`, or `uv tool run --from taskipy task build-cpu` without installing the project's dependencies. The recipe lives in `pyproject.toml` and calls `scripts/build_cpu.py`, using a C++20 compiler in this default order: Zig, GCC, Clang, then host MinGW on Windows. `CXX` explicitly overrides that selection. Kernel builds use the same order with a `CC` override, and compiler benchmarks use the C++ selection. It creates `~/.trillim/1.0.0/backends/cpu/worker`, or `worker.exe` on Windows. `TRILLIM_HOME` changes this installation root. Runtime launches that executable without compiling or caching backend code. Set `TRILLIM_CPU_WORKER` to use a prebuilt executable at another location. The worker links its thread pool and JSON parser directly; only model kernel libraries are loaded dynamically. Distribution of the executable is separate from runtime execution.
+
+## State and cancellation
+
+Caches persist between requests; model TDL defines reset, prefix reuse and sliding behavior. `Runtime.inputs` and `Runtime.outputs` expose logical dtypes and bounded shapes. Inputs may be numeric NumPy arrays or JSON-compatible values. The runtime validates input names, ranks, fixed dimensions, bounds and integer ranges.
+
+`Runtime.cancel()` can be called from another thread. The worker is asked to stop and is killed and reaped if it does not exit within the cancellation grace period. Sessions opened on the main Python thread install SIGINT and SIGTERM forwarding for active inference, including inference on another thread. While idle, signals delegate to the application handlers. Closing the last session on the main thread restores those handlers. Explicit cancellation works from any thread. The worker also monitors its parent's pipe so an abrupt parent exit does not leave inference running. Cancellation and execution failures invalidate the session; close it and create another. Use context managers to close workers deterministically. V1 permits one active inference per Python process.
+
+`tests/runtime` covers scalar and host execution, Qwen decoder cache reuse, packed caches and outputs, dynamic control flow, integer precision, streaming before completion, malformed protocol messages, parent/worker signals, callback failures and process cleanup. The full-width Qwen layer fixture uses original weights bundled under `tests/runtime/fixtures`.

@@ -5,7 +5,6 @@ import hashlib
 import os
 import platform
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -15,17 +14,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ... import _VERSION_ROOT
+from ..toolchain import _compilers
 from .kernel_dataclasses import _Backend
 from .kernel_pydantic_models import _KernelIndex, _KernelRequest
 from .native import _read_capabilities, _read_schema
 
 _KERNEL_ROOT = Path(__file__).resolve().parents[2] / "kernels"
-_ARCH_FLAGS = {
-    "x86_64": ("-march=x86-64",),
-    "amd64": ("-march=x86-64",),
-    "aarch64": ("-march=armv8-a",),
-    "arm64": ("-march=armv8-a",),
-}
 _FLAGS = (
     "-O3",
     "-std=c11",
@@ -79,44 +73,6 @@ def _run(command: list[str]) -> None:
                     pass
                 process.wait()
         raise
-
-
-def _compilers() -> tuple[tuple[str, ...], ...]:
-    commands: list[tuple[str, ...]] = [("zig", "cc")]
-    if override := os.environ.get("CC"):
-        commands.append(tuple(shlex.split(override)))
-    commands.append(("cc",))
-    if sys.platform == "win32":
-        commands.extend(
-            (name,)
-            for name in (
-                "x86_64-w64-mingw32-gcc",
-                "aarch64-w64-mingw32-gcc",
-                "i686-w64-mingw32-gcc",
-                "mingw32-gcc",
-            )
-        )
-    commands.extend((("gcc",), ("clang",)))
-    result: list[tuple[str, ...]] = []
-    seen: set[tuple[str, ...]] = set()
-    for command in commands:
-        if not command:
-            continue
-        executable = shutil.which(command[0])
-        if executable is None:
-            continue
-        identity = (str(Path(executable).resolve()), *command[1:])
-        if identity not in seen:
-            seen.add(identity)
-            flags = (
-                ("-mcpu=baseline",)
-                if Path(executable).stem.lower() == "zig"
-                else _ARCH_FLAGS.get(platform.machine().lower(), ())
-            )
-            result.append((executable, *command[1:], *flags))
-    if not result:
-        raise RuntimeError("no C compiler found; install Zig, cc or MinGW")
-    return tuple(result)
 
 
 def _host_backend() -> _Backend:
@@ -338,17 +294,7 @@ def _build_cpu() -> Path:
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
-    for candidate in _compilers():
-        compiler = list(candidate)
-        if len(compiler) > 1 and compiler[1] == "cc":
-            compiler[1] = "c++"
-        else:
-            driver = Path(compiler[0])
-            name = driver.name
-            for old, new in (("clang", "clang++"), ("gcc", "g++"), ("cc", "c++")):
-                if name.endswith(old):
-                    compiler[0] = str(driver.with_name(name.removesuffix(old) + new))
-                    break
+    for compiler in _compilers(cxx=True):
         with tempfile.TemporaryDirectory(
             prefix=".cpu-", dir=destination.parent
         ) as name:
