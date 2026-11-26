@@ -588,6 +588,8 @@ def _captures(
             "sub",
             "mul",
             "floor_div",
+            "div",
+            "sqrt",
             "mod",
             "min",
             "max",
@@ -621,6 +623,12 @@ def _captures(
                     target, state.inference, state
                 ):
                     yield _PatternBindings(bindings, pairs)
+                producer = target._producer
+                if producer is not None and isinstance(producer.args, _CastArgs):
+                    # Typed replay must recreate any cast crossed during discovery.
+                    yield from value(
+                        pattern, producer.args.x, bindings, parameters, pairs
+                    )
                 return
             if pattern in parameters:
                 if _canonical(

@@ -47,6 +47,11 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     return TRILLIM_OK;
 }
 
+static bool can_alias(const void *parameters, size_t output, size_t input) {
+    (void)parameters;
+    return output == 1 && input == 5;
+}
+
 static float decay_value(const Task *task, size_t element) {
     uint32_t dtype = task->parameters->decay_dtype;
     float value = expf(trillim_load(task->log_decay, element, dtype).f);
@@ -71,6 +76,9 @@ static TrillimStatus recurrence(void *opaque, size_t index, size_t worker) {
     float *state = task->state + state_offset;
     const float *source = task->initial + state_offset;
     if (!p->rows) {
+        if (state == source) {
+            return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+        }
         for (size_t i = 0; i < p->keys; ++i) {
             if ((i & 31) == 0 && context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
@@ -203,7 +211,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_scalar_gated_delta_paramete
     static const size_t outputs[] = {8, 4, 4};
     static const TrillimParameterSchema schema = {
         sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), 5, fields, 6, 3,
-        requirements, NULL, inputs, outputs, 1
+        requirements, can_alias, inputs, outputs, 1
     };
     return &schema;
 }

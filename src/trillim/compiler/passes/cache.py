@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.core_pydantic_models import (
     _BroadcastArgs,
     _CacheAssignArgs,
     _CacheReadArgs,
+    _ConstructArgs,
     _PermuteArgs,
     _ReshapeArgs,
 )
@@ -13,6 +15,7 @@ from ...tdl.core.graph import Graph
 from ...tdl.core.operator import _Operator
 from ..artifacts.artifact_dataclasses import _Layout
 from ..artifacts.expressions import _byte_size
+from ..artifacts.parameters import _can_alias, _requirements
 from ..compiler_dataclasses import _ShapeExpression
 from ..dtype import _QUANTIZED_DTYPES
 from ..kernels.bindings import (
@@ -21,6 +24,7 @@ from ..kernels.bindings import (
     _product,
     _reshape_strides,
 )
+from ..kernels.kernel_dataclasses import _KernelBindingContext
 from .infer import _constant_expression, _expression
 from .passes_dataclasses import _Selection
 from .walk import _walk
@@ -30,9 +34,8 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
     """Use persistent storage directly only when snapshot and alias safety are proved."""
     if graph._region is None:
         raise ValueError("graph is not complete")
-    operators = [
-        operator for _, operator in _walk(graph._region) if operator in layout.positions
-    ]
+    regions = {operator: region for region, operator in _walk(graph._region)}
+    operators = [operator for operator in regions if operator in layout.positions]
     writes: dict[str, list[_Operator]] = {}
     for operator in operators:
         if isinstance(operator.args, _CacheAssignArgs):
@@ -42,8 +45,10 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
     def scopes(
         region_operators: tuple[_Operator, ...],
         enclosing: list[tuple[int, int, set[str]]],
+        scope: _Region,
     ) -> None:
         for operator in region_operators:
+            regions[operator] = scope
             loop_ends[operator] = enclosing
             nested = enclosing
             if operator.op == "while" and operator in layout.positions:
@@ -61,9 +66,13 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
                     ),
                 ]
             for body in operator.regions:
-                scopes(body.operators, nested)
+                scopes(
+                    body.operators,
+                    nested,
+                    scope if isinstance(operator.args, _ConstructArgs) else body,
+                )
 
-    scopes(graph._region.operators, [])
+    scopes(graph._region.operators, [], graph._region)
     by_name = {buffer.name: buffer for buffer in layout.buffers.values()}
     for operator in operators:
         args = operator.args
@@ -148,7 +157,11 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
         output = tensors_by_name[buffer.name]
         producer = output._producer
         call = selection.calls.get(producer) if producer is not None else None
-        if call is None or buffer.last > layout.positions[operator][0]:
+        if (
+            call is None
+            or buffer.last > layout.positions[operator][0]
+            or regions[call.anchor] is not regions[operator]
+        ):
             continue
         if (
             buffer.storage != "arena"
@@ -184,17 +197,51 @@ def _bind_caches(graph: Graph, layout: _Layout, selection: _Selection) -> None:
                 or _byte_size(args.cache.dtype, capacity_shape[axis + 1 :]) % alignment
             ):
                 continue
-        if any(
-            cache_source(layout.buffers[tensor].name) == args.cache.name
-            for tensor in call.inputs
-        ):
-            continue
         start, stop = layout.positions[call.anchor][0], layout.positions[operator][0]
+        overlapping = [
+            slot
+            for slot, tensor in enumerate(call.inputs)
+            if cache_source(layout.buffers[tensor].name) == args.cache.name
+        ]
+        if overlapping:
+            if args.action != "assign" or args.cache.mode != "overwrite":
+                continue
+            parameters = call.kernel.bind(
+                _KernelBindingContext(
+                    {
+                        name: layout.buffers[tensor]._binding()
+                        for name, tensor in call.bindings.items()
+                    },
+                    tuple(layout.buffers[tensor]._binding() for tensor in call.outputs),
+                    call.attributes,
+                )
+            )
+            output_slot = call.outputs.index(output)
+            schema = call.kernel.parameter_schema
+            if schema.output_alignments[output_slot] > 64 or _requirements(
+                schema, parameters
+            ).outputs[output_slot] > _byte_size(args.cache.dtype, capacity_shape):
+                continue
+            compatible = True
+            for input_slot in overlapping:
+                original = layout.buffers[call.inputs[input_slot]]
+                if (
+                    original.dtype != buffer.dtype
+                    or original.shape != buffer.shape
+                    or original.strides != _contiguous_strides(original.shape)
+                    or original.byte_offset not in (None, _constant_expression(0))
+                    or not _can_alias(schema, parameters, output_slot, input_slot)
+                ):
+                    compatible = False
+                    break
+            if not compatible:
+                continue
         if any(
             other.storage == "cache"
             and other.source == args.cache.name
             and other.first <= stop
             and other.last >= start
+            and (not overlapping or other.last > start)
             for other in layout.buffers.values()
         ):
             continue

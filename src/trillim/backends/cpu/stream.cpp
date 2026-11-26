@@ -194,7 +194,11 @@ void Runtime::begin_token_stream(TokenSink sink) {
         return;
     }
     auto [loop, tokens] = produced_tensor(*this, *active_program, tensor);
-    if (call_is(loop, "_scalar_gather") && prefix_gather(*this, *loop, length)) {
+    const bool fused_prefix = call_is(loop, "_scalar_take_iota_prefix") &&
+        loop->at("parameters").at("width") == 1 &&
+        unref(*this, loop->at("parameters").at("rows")) == length;
+    if (fused_prefix ||
+        (call_is(loop, "_scalar_gather") && prefix_gather(*this, *loop, length))) {
         const auto &input = name(loop->at("inputs").at(0));
         if (buffer(input).at("strides") != Json::array({1})) {
             return;

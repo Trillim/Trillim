@@ -1341,7 +1341,8 @@ def _joined_shape(
         raise ValueError("control-flow results must have a stable tensor rank")
     dimensions = []
     for axis, (a, b) in enumerate(zip(left.shape, right.shape, strict=True)):
-        if a == b:
+        # An unchanged loop parameter dimension retains its initializer's expression.
+        if a == b or b.op == "dimension" and b.tensor is output and b.axis == axis:
             dimensions.append(a)
         else:
             low = (
@@ -1844,13 +1845,14 @@ def _control(
             _cast(state, body, value, dtype, True)
             for value, dtype in zip(body.outputs, dtypes, strict=True)
         )
-    for output, final_shape, dtype, interval in zip(
-        operator.outputs, output_shape, dtypes, ranges, strict=True
+    for initial_value, output, final_shape, dtype, interval in zip(
+        initial, operator.outputs, output_shape, dtypes, ranges, strict=True
     ):
         if isinstance(args, _WhileArgs) and final_shape is not None:
+            initial_shape = _shape(state, initial_value)
             final_shape = tuple(
                 value
-                if value.op == "const"
+                if value.op == "const" or value == initial_shape[axis]
                 else _ShapeExpression(
                     "dimension",
                     tensor=output,
