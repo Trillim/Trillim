@@ -660,7 +660,7 @@ uint32_t dtype_id(const std::string &name) {
         {"grp_int8", TRILLIM_GRP_INT8}, {"grp_int4", TRILLIM_GRP_INT4},
         {"grp_int5", TRILLIM_GRP_INT5}, {"dubgrp_int6", TRILLIM_DUBGRP_INT6},
         {"grp_binary", TRILLIM_GRP_BINARY}, {"grp_ternary", TRILLIM_GRP_TERNARY},
-        {"mxfp4", TRILLIM_MXFP4},
+        {"mxfp4", TRILLIM_MXFP4}, {"fp8_e4m3", TRILLIM_FP8_E4M3},
     };
     return types.at(name);
 }

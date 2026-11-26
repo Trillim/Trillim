@@ -617,7 +617,7 @@ static TrillimStatus trillim_attention_blocks(void *opaque, size_t slot, size_t 
 static inline void attention_load16(
     const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns, float32x4_t values[4]
 ) {
-    if (dtype >= TRILLIM_ROW_INT8 && columns != 0) {
+    if (dtype >= TRILLIM_ROW_INT8 && dtype <= TRILLIM_MXFP4 && columns != 0) {
         size_t column = index % columns;
         if (column % 16 == 0 && columns - column >= 16) {
             TrillimPackedNeonRow row = trillim_packed_neon_row(data, dtype, index / columns, columns, rows);

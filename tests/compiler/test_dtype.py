@@ -37,6 +37,7 @@ GROUP = {
     "grp_binary": 128,
     "grp_ternary": 128,
     "mxfp4": 32,
+    "fp8_e4m3": 128,
 }
 
 
@@ -62,7 +63,21 @@ def reference_row(values: list[float], dtype: str) -> list[float]:
         valid = len(block)
         block += [0.0] * (size - len(block))
         maximum = max(map(abs, block))
-        if dtype == "mxfp4":
+        if dtype == "fp8_e4m3":
+            scale = float(np.float32(maximum / 448)) if maximum else 1.0
+            levels = [
+                math.ldexp(code & 7, -9)
+                if code < 8
+                else math.ldexp(1 + (code & 7) / 8, (code >> 3) - 7)
+                for code in range(127)
+            ]
+            for value in block:
+                magnitude = float(np.float32(abs(value) / scale))
+                index = min(
+                    range(127), key=lambda i: (abs(magnitude - levels[i]), i % 2)
+                )
+                result.append(math.copysign(levels[index] * scale, value))
+        elif dtype == "mxfp4":
             exponent = (
                 max(-127, min(127, math.floor(math.log2(maximum)) - 2))
                 if maximum
@@ -357,6 +372,20 @@ def test_representable_packed_values_round_trip(dtype: str, seed: int) -> None:
             else struct.pack("<H", 0x3F80)
         )
         expected = [float(x - 1) for x in codes]
+    elif dtype == "fp8_e4m3":
+        codes = [int(x) for x in rng.integers(0, 254, size=size)]
+        codes = [code + 1 if code >= 127 else code for code in codes]
+        codes[0] = 126
+        wire = bytes(codes) + struct.pack("<f", 1.0)
+        expected = [
+            math.copysign(
+                math.ldexp(code & 7, -9)
+                if (code & 127) < 8
+                else math.ldexp(1 + (code & 7) / 8, ((code & 127) >> 3) - 7),
+                -1 if code & 128 else 1,
+            )
+            for code in codes
+        ]
     else:
         codes = [int(x) for x in rng.integers(0, 16, size=size)]
         codes[0] = 6

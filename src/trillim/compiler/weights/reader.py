@@ -24,6 +24,7 @@ _SOURCE_DTYPES: dict[_SourceDType, str] = {
     "F16": "<f2",
     "BF16": "<u2",
     "F32": "<f4",
+    "F8_E4M3": "u1",
 }
 _OBJECT = TypeAdapter(dict[str, JsonValue], config=ConfigDict(strict=True))
 _METADATA = TypeAdapter(dict[str, str], config=ConfigDict(strict=True))

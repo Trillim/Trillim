@@ -231,6 +231,37 @@ void encode_mxfp4(const float *source, uint8_t *output, uint8_t *scale) {
     }
 }
 
+void encode_fp8(const float *source, size_t rows, size_t columns, uint8_t *output,
+                const Runtime &runtime) {
+    constexpr size_t block_size = 128;
+    auto *scales = output + rows * columns;
+    for (size_t row_start = 0; row_start < rows;) {
+        const size_t row_count = std::min(rows - row_start, block_size);
+        for (size_t column_start = 0; column_start < columns;) {
+            const size_t column_count = std::min(columns - column_start, block_size);
+            const size_t start = row_start * columns + column_start;
+            float maximum = 0.0f;
+            for (size_t row = 0; row < row_count; ++row) {
+                runtime.check_cancelled();
+                const auto *values = source + start + row * columns;
+                maximum = std::max(maximum, max_abs(values, column_count));
+            }
+            const float scale = trillim_fp8_e4m3_scale(maximum);
+            std::memcpy(scales, &scale, sizeof(scale));
+            scales += sizeof(scale);
+            for (size_t row = 0; row < row_count; ++row) {
+                runtime.check_cancelled();
+                const size_t offset = start + row * columns;
+                for (size_t column = 0; column < column_count; ++column) {
+                    output[offset + column] = trillim_to_fp8_e4m3(source[offset + column] / scale);
+                }
+            }
+            column_start += column_count;
+        }
+        row_start += row_count;
+    }
+}
+
 float read_int6(const uint8_t *payload, size_t blocks, size_t block, size_t offset) {
     const auto *scales = payload + blocks * 128;
     const auto *low = payload + block * 128 + offset / 128 * 64;
@@ -273,6 +304,10 @@ Allocation encode_packed(const float *source, uint32_t dtype, size_t rows, size_
     }
     if (dtype == TRILLIM_ROW_INT8) {
         encode_rows(source, rows, columns, output.data, runtime);
+        return output;
+    }
+    if (dtype == TRILLIM_FP8_E4M3) {
+        encode_fp8(source, rows, columns, output.data, runtime);
         return output;
     }
 

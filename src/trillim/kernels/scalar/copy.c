@@ -3,6 +3,9 @@
 #include <string.h>
 
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
+    if (dtype == TRILLIM_FP8_E4M3) {
+        return trillim_packed_payload_size(rows, columns, dtype, bytes);
+    }
     size_t itemsize = trillim_itemsize(dtype);
     if (columns != 0 && rows > SIZE_MAX / columns) {
         return false;
@@ -52,6 +55,9 @@ static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dt
 static inline float trillim_read_float(
     const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
 ) {
+    if (dtype == TRILLIM_FP8_E4M3) {
+        return trillim_packed_read_float(data, index, dtype, rows, columns);
+    }
     if (trillim_itemsize(dtype) != 0) {
         TrillimValue value = trillim_load(data, index, dtype);
         if (trillim_float(dtype)) {
@@ -146,6 +152,43 @@ static inline int32_t trillim_quantize(float value, float scale, int32_t bound) 
     return (int32_t)trillim_round_even(normalized);
 }
 
+static TrillimStatus trillim_encode_fp8(
+    const float *source, size_t rows, size_t columns, uint8_t *output,
+    const TrillimKernelContext *context
+) {
+    uint8_t *scales = output + rows * columns;
+    for (size_t row_start = 0; row_start < rows;) {
+        const size_t row_end = rows - row_start < 128 ? rows : row_start + 128;
+        for (size_t column_start = 0; column_start < columns;) {
+            const size_t column_end = columns - column_start < 128 ? columns : column_start + 128;
+            float maximum = 0.0f;
+            for (size_t row = row_start; row < row_end; ++row) {
+                if (context->is_cancelled(context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                for (size_t column = column_start; column < column_end; ++column) {
+                    maximum = fmaxf(maximum, fabsf(source[row * columns + column]));
+                }
+            }
+            float scale = trillim_fp8_e4m3_scale(maximum);
+            memcpy(scales, &scale, sizeof(scale));
+            scales += sizeof(scale);
+            for (size_t row = row_start; row < row_end; ++row) {
+                if (context->is_cancelled(context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                for (size_t column = column_start; column < column_end; ++column) {
+                    const size_t index = row * columns + column;
+                    output[index] = trillim_to_fp8_e4m3(source[index] / scale);
+                }
+            }
+            column_start = column_end;
+        }
+        row_start = row_end;
+    }
+    return TRILLIM_OK;
+}
+
 static inline TrillimStatus trillim_encode_quant(
     const float *source, size_t rows, size_t columns, uint32_t dtype,
     void *output, const TrillimKernelContext *context
@@ -174,6 +217,9 @@ static inline TrillimStatus trillim_encode_quant(
             }
             gamma = fmaxf(gamma, fabsf(source[index]));
         }
+    }
+    if (dtype == TRILLIM_FP8_E4M3) {
+        return trillim_encode_fp8(source, rows, columns, values, context);
     }
     if (dtype == TRILLIM_ROW_INT8) {
         for (size_t row = 0; row < rows; ++row) {

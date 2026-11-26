@@ -39,9 +39,6 @@ static TrillimStatus requirements(
             return p->count == 0 ? TRILLIM_OK : TRILLIM_ERROR;
         }
     }
-    if (p->rank && p->strides[p->rank - 1] != 1) {
-        return TRILLIM_ERROR;
-    }
     size_t count = 1;
     for (size_t axis = 0; axis < p->rank; ++axis) {
         if (count > SIZE_MAX / p->shape[axis]) {
@@ -164,6 +161,7 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
         }
         size_t length = limit - index < CHUNK_ELEMENTS ? limit - index : CHUNK_ELEMENTS;
         size_t source = index;
+        size_t stride = 1;
         if (!task->contiguous) {
             size_t width = p->shape[p->rank - 1];
             size_t remaining = width - index % width;
@@ -171,8 +169,16 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
                 length = remaining;
             }
             source = trillim_offset(index, p->rank, p->shape, p->strides);
+            stride = p->strides[p->rank - 1];
         }
-        convert_chunk(task, index, source, length, vectorize);
+        if (stride == 1) {
+            convert_chunk(task, index, source, length, vectorize);
+        } else {
+            for (size_t i = 0; i < length; ++i) {
+                TrillimValue value = trillim_load(task->input, source + i * stride, p->input_dtype);
+                trillim_store(task->output, index + i, p->output_dtype, value);
+            }
+        }
         index += length;
     }
     return TRILLIM_OK;
@@ -211,15 +217,12 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_cast(
 TRILLIM_KERNEL const char *trillim_neon_cast_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _cast\n"
-           "from trillim.compiler.passes.infer import _constant_expression\n"
            "def bind(context):\n"
            "    source, output = context.inputs['x'], context.outputs[0]\n"
            "    floats = ('fp16', 'bf16', 'fp32')\n"
            "    if source.dtype not in floats or output.dtype not in floats or source.dtype == output.dtype:\n"
            "        raise ValueError('NEON cast requires different floating dtypes')\n"
            "    p = _cast(context)\n"
-           "    if source.strides and source.strides[-1] != _constant_expression(1):\n"
-           "        raise ValueError('NEON cast requires contiguous input rows')\n"
            "    return {name: p[name] for name in ('count', 'rank', 'shape', 'strides', 'input_dtype', 'output_dtype')}\n"
            "def pattern(x: Tensor, *, dtype: DType) -> tuple[Tensor, ...]:\n"
            "    return (Cast(x, dtype),)\n";

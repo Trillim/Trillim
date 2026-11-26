@@ -43,4 +43,6 @@ BitNet projection tensors are imported using their pretrained semantics. Floatin
 
 MXFP4 `_blocks` and `_scales` imports preserve checkpoint codes and E8M0 scales when the requested dtype remains MXFP4. Conversion to another dtype decodes those blocks in bounded chunks.
 
+FP8 `F8_E4M3` projections with `weight_scale_inv` and `quantization_config.weight_block_size=[128,128]` import as `fp8_e4m3`. The payload retains row-major E4M3FN codes followed by the row-major FP32 scale grid for 128-by-128 tiles. Source FP16/BF16 scales widen exactly to FP32. Native import preserves codes without requantization; dtype overrides decode scaled values in bounded chunks. Tied FP8 copies must agree in both codes and effective scales, and provenance records both source tensors.
+
 Safetensors headers and shard indices are validated before binding. Duplicate names, invalid extents, overlapping data, missing shards and conflicting declared ties fail compilation. Source size or modification-time changes during conversion also fail compilation.

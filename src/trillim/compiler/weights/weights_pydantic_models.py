@@ -27,6 +27,9 @@ class _QuantizationConfig(BaseModel):
     quant_method: str = ""
     quantization_mode: str = ""
     linear_class: str = ""
+    weight_block_size: list[_Nonnegative] | None = Field(
+        default=None, min_length=2, max_length=2
+    )
 
 
 class _CheckpointConfig(BaseModel):

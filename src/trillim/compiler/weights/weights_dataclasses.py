@@ -14,9 +14,23 @@ if TYPE_CHECKING:
     from .weights_pydantic_models import _WeightRecord
 
 _SourceDType = Literal[
-    "BOOL", "I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F16", "BF16", "F32"
+    "BOOL",
+    "I8",
+    "U8",
+    "I16",
+    "U16",
+    "I32",
+    "U32",
+    "I64",
+    "U64",
+    "F16",
+    "BF16",
+    "F32",
+    "F8_E4M3",
 ]
-_ImportMethod = Literal["native", "bitnet_absmean", "bitnet_packed", "mxfp4"]
+_ImportMethod = Literal[
+    "native", "bitnet_absmean", "bitnet_packed", "mxfp4", "fp8_e4m3"
+]
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ from trillim.tdl import (
     Cache,
     Cast,
     Constant,
+    Dim,
     Graph,
     If,
     Input,
@@ -24,6 +25,7 @@ from trillim.tdl import (
     Permute,
     Reshape,
     RMSNorm,
+    Shape,
     Silu,
     Softmax,
     Tensor,
@@ -111,6 +113,83 @@ def test_dynamic_token_bound_propagates_through_projection(bound: int | None) ->
     assert info.shape[0].maximum == bound
     assert info.maximum_shape == (bound, 32)
     assert info.dtype == "fp32"
+
+
+@pytest.mark.parametrize("bound", [None, 17])
+@pytest.mark.parametrize("middle", [0, 5])
+def test_shape_round_trip_preserves_dimension_identity(
+    bound: int | None, middle: int
+) -> None:
+    with Graph() as graph:
+        hidden = Input(name="hidden", shape=(None, middle, 6), dtype="fp32")
+        dimensions = Shape(hidden)
+        restored = Reshape(hidden, dimensions)
+        restored_dimensions = Shape(restored)
+        result = Reshape(hidden, restored_dimensions)
+        Output(result, name="result")
+
+    inference = _infer(graph, max_input_size=bound)
+    _validate(graph)
+    expected_maximum = bound if bound is not None else (1 << 63) - 1
+    values = inference.tensors[dimensions].values
+    assert values is not None
+    dynamic, fixed, width = values
+    assert dynamic.op == "dimension"
+    assert dynamic.tensor is hidden
+    assert dynamic.axis == 0
+    assert dynamic.minimum == 0
+    assert dynamic.maximum == expected_maximum
+    assert fixed.value == middle
+    assert width.value == 6
+    assert inference.tensors[dimensions].dtype == "int64"
+    assert inference.tensors[restored_dimensions].values == values
+    assert inference.tensors[restored].shape == values
+    assert inference.tensors[result].shape == values
+    assert inference.tensors[result].maximum_shape == (expected_maximum, middle, 6)
+    assert (
+        _infer(graph, max_input_size=bound).tensors[result] == inference.tensors[result]
+    )
+
+
+def test_dynamic_reshape_bounds_keep_zero_and_fractional_divisor_guards() -> None:
+    with Graph() as graph:
+        hidden = Input(name="hidden", shape=(None,), maximum_shape=(91,), dtype="fp32")
+        groups = Input(name="groups", shape=(None,), maximum_shape=(7,), dtype="fp32")
+        grouped = Reshape(hidden, (Dim(groups, 0), -1))
+        dimensions = Shape(grouped)
+        result = Reshape(hidden, dimensions)
+        Output(result, name="result")
+
+    inference = _infer(graph)
+    _validate(graph)
+    source_shape = inference.tensors[hidden].shape
+    group_shape = inference.tensors[groups].shape
+    shape = inference.tensors[grouped].shape
+    assert source_shape is not None and group_shape is not None and shape is not None
+    divisor, quotient = shape
+    assert divisor == group_shape[0]
+    assert divisor.minimum == 0
+    assert quotient.op == "floor_div"
+    assert quotient.args == (source_shape[0], divisor)
+    # One group can contain all 91 elements; dividing the upper bounds gives 13.
+    assert (quotient.minimum, quotient.maximum) == (0, 91)
+    assert inference.tensors[dimensions].values == shape
+    assert inference.tensors[result].shape == shape
+    assert inference.tensors[result].maximum_shape == (7, 91)
+
+    guards = [c for c in inference.constraints if c.operator is grouped._producer]
+    positive, exact = guards
+    assert positive.predicate == "ge"
+    assert positive.left == divisor
+    assert positive.right.value == 1
+    assert exact.predicate == "eq"
+    assert exact.left == source_shape[0]
+    assert exact.right.op == "mul"
+    assert exact.right.args == (divisor, quotient)
+    # This equality must survive: 91 // 2 fits the bounds but loses an element.
+    repeated = _infer(graph)
+    assert repeated.tensors[result] == inference.tensors[result]
+    assert repeated.constraints == inference.constraints
 
 
 def test_projection_inner_dimension_contradiction_is_rejected() -> None:

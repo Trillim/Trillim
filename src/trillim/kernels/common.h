@@ -99,6 +99,7 @@ typedef enum {
     TRILLIM_GRP_BINARY,
     TRILLIM_GRP_TERNARY,
     TRILLIM_MXFP4,
+    TRILLIM_FP8_E4M3,
 } TrillimDType;
 
 typedef union {
@@ -114,6 +115,56 @@ static inline size_t trillim_itemsize(uint32_t dtype) {
 
 static inline bool trillim_float(uint32_t dtype) {
     return dtype >= TRILLIM_FP16 && dtype <= TRILLIM_FP32;
+}
+
+static inline float trillim_fp8_e4m3(uint8_t code) {
+    uint32_t magnitude = code & 127;
+    if (magnitude == 127) {
+        return NAN;
+    }
+    uint32_t exponent = magnitude >> 3;
+    float value;
+    if (exponent == 0) {
+        value = (float)(magnitude & 7) * 0.001953125f;
+    } else {
+        uint32_t bits = ((exponent + 120) << 23) | ((magnitude & 7) << 20);
+        memcpy(&value, &bits, sizeof(value));
+    }
+    return (code & 128) ? -value : value;
+}
+
+static inline float trillim_fp8_e4m3_scale(float maximum) {
+    if (maximum == 0.0f) {
+        return 1.0f;
+    }
+    float scale = maximum / 448.0f;
+    return scale == 0.0f ? 0x1p-149f : scale;
+}
+
+static inline uint8_t trillim_to_fp8_e4m3(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint8_t sign = (uint8_t)((bits >> 24) & 128);
+    uint32_t magnitude = bits & UINT32_C(0x7fffffff);
+    int32_t exponent = (int32_t)(magnitude >> 23) - 127;
+    uint32_t fraction = magnitude & UINT32_C(0x7fffff);
+    if (exponent == 128 && fraction != 0) {
+        return (uint8_t)(sign | 127);
+    }
+    if (fabsf(value) >= 448.0f) {
+        return (uint8_t)(sign | 126);
+    }
+    if (exponent < -10) {
+        return sign;
+    }
+    if (exponent < -6) {
+        uint32_t mantissa = fraction | UINT32_C(0x800000);
+        uint32_t shift = (uint32_t)(14 - exponent);
+        uint32_t half = UINT32_C(1) << (shift - 1);
+        return (uint8_t)(sign | ((mantissa + half - 1 + ((mantissa >> shift) & 1)) >> shift));
+    }
+    uint32_t rounded = fraction + UINT32_C(0x7ffff) + ((fraction >> 20) & 1);
+    return (uint8_t)(sign | (((uint32_t)(exponent + 7) << 3) + (rounded >> 20)));
 }
 
 static inline bool trillim_unsigned(uint32_t dtype) {
@@ -339,6 +390,15 @@ static inline bool trillim_packed_payload_size(size_t rows, size_t columns, uint
         return false;
     }
     size_t count = rows * columns;
+    if (dtype == TRILLIM_FP8_E4M3) {
+        size_t block_rows = rows / 128 + (rows % 128 != 0);
+        size_t block_columns = columns / 128 + (columns % 128 != 0);
+        if (block_rows != 0 && block_columns > (SIZE_MAX - count) / sizeof(float) / block_rows) {
+            return false;
+        }
+        *bytes = count + block_rows * block_columns * sizeof(float);
+        return true;
+    }
     if (itemsize != 0) {
         if (count > SIZE_MAX / itemsize) {
             return false;
@@ -400,6 +460,12 @@ static inline float trillim_packed_read_float(
     const uint8_t *values = (const uint8_t *)data;
     size_t row = index / columns;
     size_t column = index % columns;
+    if (dtype == TRILLIM_FP8_E4M3) {
+        size_t groups = columns / 128 + (columns % 128 != 0);
+        float scale;
+        memcpy(&scale, values + rows * columns + ((row / 128) * groups + column / 128) * sizeof(float), sizeof(scale));
+        return trillim_fp8_e4m3(values[index]) * scale;
+    }
     if (dtype == TRILLIM_ROW_INT8) {
         uint16_t bits;
         int8_t code;

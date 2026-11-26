@@ -123,8 +123,9 @@ def test_aliases_and_declared_ties(tmp_path: Path) -> None:
         },
     )
     cp = _load_checkpoint("Model", path)
-    cp.aliases = {"head": "embedding", "alias": "embedding"}
+    cp.aliases = {"head": "alias", "alias": "embedding"}
     entry = _entry(cp, "head", _CheckpointConfig())
+    assert _entry(cp, "embedding", _CheckpointConfig()) == entry
     assert entry.identity == "Model.embedding"
     assert len(entry.tied_sources) == 1
     assert entry.aliases == ("Model.head", "Model.alias")
@@ -164,6 +165,43 @@ def test_mxfp4_import_with_source_derived_official_codes(tmp_path: Path) -> None
     np.testing.assert_array_equal(
         np.frombuffer(payload(entry), "<f4").reshape(32, 32), expected
     )
+
+
+def test_fp8_import_preserves_partial_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from trillim.compiler.weights import resolve
+
+    selection = np.indices((129, 259)).sum(axis=0) % 3
+    codes = np.array([56, 184, 64], dtype=np.uint8)[selection]
+    scales = np.array([[0.5, 2, 4], [8, 16, 32]], dtype="<f4")
+    path = checkpoint(
+        tmp_path / "fp8.safetensors",
+        {
+            "projection.weight": ("F8_E4M3", codes.shape, codes.tobytes()),
+            "projection.weight_scale_inv": (
+                "BF16",
+                scales.shape,
+                (scales.view("<u4") >> 16).astype("<u2").tobytes(),
+            ),
+        },
+    )
+    config = _CheckpointConfig.model_validate(
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+        }
+    )
+    entry = _entry(_load_checkpoint("Model", path), "projection.weight", config)
+    monkeypatch.setattr(resolve, "_CHUNK_BYTES", 1000)
+    assert payload(entry, "fp8_e4m3") == codes.tobytes() + scales.tobytes()
+    expected = (
+        np.array([1, -1, 2], dtype="<f4")[selection]
+        * scales.repeat(128, axis=0).repeat(128, axis=1)[:129, :259]
+    )
+    assert payload(entry) == expected.tobytes()
 
 
 @pytest.mark.parametrize(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import reduce
 from itertools import zip_longest
 from typing import cast
@@ -549,9 +550,17 @@ def _reshape_quotient(
             remaining.remove(factor)
         else:
             divisors.append(factor)
-    return _expression(
+    quotient = _expression(
         "floor_div", _product(tuple(remaining)), _product(tuple(divisors))
     )
+    # The reshape guard requires a positive divisor, so the element count bounds the quotient.
+    if (
+        quotient.maximum is None
+        and numerator.maximum is not None
+        and numerator.maximum >= 0
+    ):
+        return replace(quotient, minimum=0, maximum=numerator.maximum)
+    return quotient
 
 
 def _dimensions(
@@ -1296,7 +1305,21 @@ def _ordinary(
     elif isinstance(args, _UnaryArgs):
         shape = _shape(state, args.x)
         if op == "shape":
-            _store(state, output, (_constant_expression(len(shape)),), "int64", shape)
+            # Shape values are nonnegative int64 dimensions, even when their arithmetic has loose bounds.
+            values = tuple(
+                replace(
+                    value,
+                    minimum=max(0, value.minimum if value.minimum is not None else 0),
+                    maximum=min(
+                        (1 << 63) - 1,
+                        value.maximum if value.maximum is not None else (1 << 63) - 1,
+                    ),
+                )
+                if value.minimum is None or value.maximum is None
+                else value
+                for value in shape
+            )
+            _store(state, output, (_constant_expression(len(shape)),), "int64", values)
         elif op in {"exp", "log", "sqrt", "sin", "cos", "erf"}:
             dtype = _dtype(state, args.x)
             if dtype not in _FLOATS:

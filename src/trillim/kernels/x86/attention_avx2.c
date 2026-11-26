@@ -97,7 +97,8 @@ TRILLIM_AVX2 static inline __m256 trillim_avx2_load8(
         __m128i values = _mm_loadu_si128((const __m128i *)((const uint8_t *)data + index * 2));
         return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(values), 16));
     }
-    if (dtype >= TRILLIM_ROW_INT8 && columns && columns - index % columns >= 8) {
+    if (dtype >= TRILLIM_ROW_INT8 && dtype <= TRILLIM_MXFP4 &&
+        columns && columns - index % columns >= 8) {
         return trillim_packed_decode8(data, rows, columns, dtype, index / columns, index % columns);
     }
     float values[8];

@@ -25,6 +25,9 @@ typedef struct {
 } TrillimMatmulParameters;
 
 static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dtype, size_t *bytes) {
+    if (dtype == TRILLIM_FP8_E4M3) {
+        return trillim_packed_payload_size(rows, columns, dtype, bytes);
+    }
     size_t itemsize = trillim_itemsize(dtype);
     if (columns != 0 && rows > SIZE_MAX / columns) {
         return false;
@@ -74,6 +77,9 @@ static inline bool trillim_payload_size(size_t rows, size_t columns, uint32_t dt
 static inline float trillim_read_float(
     const void *data, size_t index, uint32_t dtype, size_t rows, size_t columns
 ) {
+    if (dtype == TRILLIM_FP8_E4M3) {
+        return trillim_packed_read_float(data, index, dtype, rows, columns);
+    }
     if (trillim_itemsize(dtype) != 0) {
         TrillimValue value = trillim_load(data, index, dtype);
         if (trillim_float(dtype)) {

@@ -13,10 +13,13 @@ enum { TILE = 32, DECODE_TILE = 64, LANES = 4, PACKED_KEYS = 128 };
 
 typedef struct {
     size_t rows, heads, keys, values;
+    uint32_t decay_dtype;
 } Parameters;
 
 typedef struct {
-    const float *q, *k, *v, *beta, *log_decay, *initial;
+    const float *q, *k, *v, *beta;
+    const void *log_decay;
+    const float *initial;
     float *state, *output;
     const Parameters *parameters;
     const TrillimKernelContext *context;
@@ -25,7 +28,7 @@ typedef struct {
 static TrillimStatus requirements(const void *parameters, size_t *inputs,
                                   size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
-    if (!p->heads || !p->keys || !p->values || p->values % TILE ||
+    if (!trillim_float(p->decay_dtype) || !p->heads || !p->keys || !p->values || p->values % TILE ||
         p->heads > SIZE_MAX / sizeof(float) / p->keys / p->values) {
         return TRILLIM_ERROR;
     }
@@ -37,11 +40,24 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     size_t scalar_bytes = p->rows * head_bytes;
     inputs[0] = inputs[1] = scalar_bytes * p->keys;
     inputs[2] = outputs[2] = scalar_bytes * p->values;
-    inputs[3] = inputs[4] = scalar_bytes;
+    inputs[3] = scalar_bytes;
+    inputs[4] = scalar_bytes / sizeof(float) * trillim_itemsize(p->decay_dtype);
     inputs[5] = outputs[1] = head_bytes * p->keys * p->values;
     outputs[0] = sizeof(int64_t);
     *scratch = 0;
     return TRILLIM_OK;
+}
+
+static float decay_value(const Task *task, size_t element) {
+    uint32_t dtype = task->parameters->decay_dtype;
+    float value = expf(trillim_load(task->log_decay, element, dtype).f);
+    if (dtype == TRILLIM_FP16) {
+        return trillim_fp16(trillim_to_fp16(value));
+    }
+    if (dtype == TRILLIM_BF16) {
+        return trillim_bf16(trillim_to_bf16(value));
+    }
+    return value;
 }
 
 static inline __attribute__((always_inline)) TrillimStatus recurrence(
@@ -82,7 +98,7 @@ static inline __attribute__((always_inline)) TrillimStatus recurrence(
         const float *query = task->q + element * p->keys;
         const float *key = task->k + element * p->keys;
         const float *value = task->v + element * p->values + column;
-        float32x4_t decay = vdupq_n_f32(expf(task->log_decay[element]));
+        float32x4_t decay = vdupq_n_f32(decay_value(task, element));
         float32x4_t predicted[columns / LANES], update[columns / LANES];
         for (size_t lane = 0; lane < columns / LANES; ++lane) {
             predicted[lane] = vdupq_n_f32(0.0f);
@@ -193,9 +209,11 @@ TRILLIM_KERNEL const char *trillim_neon_gated_delta_tdl(void) {
            "def bind(context):\n"
            "    q, k, v, beta, log_decay, memory = (context.inputs[name] for name in physical_inputs)\n"
            "    counter, state, output = context.outputs\n"
-           "    for tensor in (q, k, v, beta, log_decay, memory, state, output):\n"
+           "    for tensor in (q, k, v, beta, memory, state, output):\n"
            "        if tensor.dtype != 'fp32' or tensor.strides != _contiguous_strides(tensor.shape):\n"
            "            raise ValueError('GatedDelta requires contiguous FP32 tensors')\n"
+           "    if log_decay.dtype not in {'fp16', 'bf16', 'fp32'} or log_decay.strides != _contiguous_strides(log_decay.shape):\n"
+           "        raise ValueError('GatedDelta requires contiguous floating decay values')\n"
            "    rows, heads, keys = q.shape\n"
            "    values = v.shape[2]\n"
            "    # The loop replaces every row in the initial output buffer.\n"
@@ -205,14 +223,16 @@ TRILLIM_KERNEL const char *trillim_neon_gated_delta_tdl(void) {
            "        memory.shape != (heads, keys, values) or state.shape != memory.shape or\n"
            "        output.shape[1:] != v.shape[1:] or counter.shape or counter.dtype != 'int64'):\n"
            "        raise ValueError('GatedDelta requires matching sequence and state dimensions')\n"
-           "    return {'rows': rows, 'heads': heads, 'keys': keys, 'values': values}\n"
+           "    return {'rows': rows, 'heads': heads, 'keys': keys, 'values': values, 'decay_dtype': {'fp16': 9, 'bf16': 10, 'fp32': 11}[log_decay.dtype]}\n"
            "\n"
            "# The matcher seeds the three loop initials before its captures.\n"
            "def pattern(initial: tuple, _index_seed: Tensor, _state_seed: Tensor,\n"
            "            _output_seed: Tensor, v: Tensor, q: Tensor, k: Tensor,\n"
            "            beta: Tensor, log_decay: Tensor) -> tuple[Tensor, ...]:\n"
-           "    if len(initial) != 3 or any(x.dtype != 'fp32' for x in (initial[1], q, k, v, beta, log_decay)):\n"
+           "    if len(initial) != 3 or any(x.dtype != 'fp32' for x in (initial[1], q, k, v, beta)):\n"
            "        raise ValueError('GatedDelta requires an FP32 recurrence')\n"
+           "    if log_decay.dtype not in {'fp16', 'bf16', 'fp32'}:\n"
+           "        raise ValueError('GatedDelta requires floating decay values')\n"
            "    rows, heads, values = v.shape.dimensions\n"
            "    if heads is None or values is None:\n"
            "        raise ValueError('GatedDelta requires fixed head and value widths')\n"
@@ -245,12 +265,13 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_gated_delta_parameters
         {"rows", "size_t", offsetof(Parameters, rows), NULL},
         {"heads", "size_t", offsetof(Parameters, heads), NULL},
         {"keys", "size_t", offsetof(Parameters, keys), NULL},
-        {"values", "size_t", offsetof(Parameters, values), NULL}
+        {"values", "size_t", offsetof(Parameters, values), NULL},
+        {"decay_dtype", "uint32_t", offsetof(Parameters, decay_dtype), NULL}
     };
-    static const size_t inputs[] = {4, 4, 4, 4, 4, 4};
+    static const size_t inputs[] = {4, 4, 4, 4, 2, 4};
     static const size_t outputs[] = {8, 4, 4};
     static const TrillimParameterSchema schema = {
-        sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), 4, fields, 6, 3,
+        sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), 5, fields, 6, 3,
         requirements, NULL, inputs, outputs, 1
     };
     return &schema;

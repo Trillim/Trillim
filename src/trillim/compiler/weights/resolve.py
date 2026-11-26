@@ -48,12 +48,11 @@ _LOGICAL_DTYPES: dict[_SourceDType, DType] = {
     "F16": "fp16",
     "BF16": "bf16",
     "F32": "fp32",
+    "F8_E4M3": "fp8_e4m3",
 }
 
 
-def _entry(
-    checkpoint: _Checkpoint, name: str, config: _CheckpointConfig
-) -> _WeightEntry:
+def _canonical_name(checkpoint: _Checkpoint, name: str) -> str:
     canonical = name
     visited = set()
     while canonical in checkpoint.aliases:
@@ -61,11 +60,22 @@ def _entry(
             raise ValueError(f"cyclic checkpoint weight aliases: {name}")
         visited.add(canonical)
         canonical = checkpoint.aliases[canonical]
-    aliases = tuple(
-        f"{checkpoint.name}.{alias}"
-        for alias, target in checkpoint.aliases.items()
-        if target == canonical
-    )
+    return canonical
+
+
+def _entry(
+    checkpoint: _Checkpoint, name: str, config: _CheckpointConfig
+) -> _WeightEntry:
+    canonical = _canonical_name(checkpoint, name)
+    related = {canonical}
+    pending = [canonical]
+    for target in pending:
+        for alias, destination in checkpoint.aliases.items():
+            if destination == target and alias not in related:
+                related.add(alias)
+                pending.append(alias)
+    alias_names = tuple(alias for alias in checkpoint.aliases if alias in related)
+    aliases = tuple(f"{checkpoint.name}.{alias}" for alias in alias_names)
     source = checkpoint.tensors.get(canonical)
     if source is None:
         stem = canonical.removesuffix(".weight")
@@ -93,14 +103,49 @@ def _entry(
         )
     tied = tuple(
         checkpoint.tensors[alias]
-        for alias, target in checkpoint.aliases.items()
-        if target == canonical and alias in checkpoint.tensors
+        for alias in alias_names
+        if alias in checkpoint.tensors
     )
     if any(
         other.shape != source.shape or other.dtype != source.dtype for other in tied
     ):
         raise ValueError(f"tied checkpoint tensors disagree in shape or dtype: {name}")
     quantization = config.quantization_config
+    if source.dtype == "F8_E4M3":
+        scales = checkpoint.tensors.get(canonical + "_scale_inv")
+        tied_scales = tuple(
+            checkpoint.tensors[alias + "_scale_inv"]
+            for alias in alias_names
+            if alias + "_scale_inv" in checkpoint.tensors
+        )
+        if (
+            len(source.shape) != 2
+            or quantization is None
+            or quantization.quant_method != "fp8"
+            or quantization.weight_block_size != [128, 128]
+            or scales is None
+            or scales.dtype not in {"F16", "BF16", "F32"}
+            or scales.shape
+            != tuple((dimension + 127) // 128 for dimension in source.shape)
+        ):
+            raise ValueError(
+                f"FP8 weight requires E4M3 128x128 blocks and matching floating scales: {name}"
+            )
+        if any(
+            other.shape != scales.shape or other.dtype not in {"F16", "BF16", "F32"}
+            for other in tied_scales
+        ):
+            raise ValueError(f"tied FP8 scales disagree in shape or dtype: {name}")
+        return _WeightEntry(
+            f"{checkpoint.name}.{canonical}",
+            source.shape,
+            "fp8_e4m3",
+            source,
+            "fp8_e4m3",
+            (scales, *tied_scales),
+            aliases,
+            tied,
+        )
     bitnet = (
         config.model_type == "bitnet"
         or any(
@@ -237,6 +282,8 @@ def _read_values(source: _WeightSource, start: int, count: int) -> NDArray[np.ge
     )
     if source.dtype == "BF16":
         return (values.astype(np.uint32) << 16).view(np.float32)
+    if source.dtype == "F8_E4M3":
+        return _codec._FP8_E4M3_VALUES[values.astype(np.uint8)]
     return cast(NDArray[np.generic], values)
 
 
@@ -308,6 +355,24 @@ def _effective(
 ) -> NDArray[np.generic]:
     if entry.method == "native":
         return _read_values(entry.source, start, count)
+    if entry.method == "fp8_e4m3":
+        columns = entry.shape[1]
+        groups = (columns + 127) // 128
+        source_scales = entry.components[0]
+        block_scales = _read_values(
+            source_scales, 0, math.prod(source_scales.shape)
+        ).astype(np.float32)
+        if not np.isfinite(block_scales).all() or np.any(block_scales <= 0):
+            raise ValueError(
+                f"FP8 scales must be finite and positive: {entry.identity}"
+            )
+        indices = np.arange(start, start + count, dtype=np.int64)
+        scale_indices = (indices // columns // 128) * groups + indices % columns // 128
+        return cast(
+            NDArray[np.float32],
+            _read_values(entry.source, start, count).astype(np.float32)
+            * block_scales[scale_indices],
+        )
     if entry.method == "bitnet_absmean":
         assert scale is not None
         values = _read_values(entry.source, start, count).astype(np.float32)
@@ -385,6 +450,32 @@ def _encoded_chunks(
         if entry.identity not in scales:
             scales[entry.identity] = _bitnet_scale(entry)
         scale = scales[entry.identity]
+    if packing == "canonical" and target == "fp8_e4m3":
+        rows, columns = _matrix(entry.shape)
+        if entry.method == "fp8_e4m3":
+            yield from _raw_chunks(entry.source)
+            source_scales = entry.components[0]
+            values = _read_values(
+                source_scales, 0, math.prod(source_scales.shape)
+            ).astype("<f4")
+            if not np.isfinite(values).all() or np.any(values <= 0):
+                raise ValueError(
+                    f"FP8 scales must be finite and positive: {entry.identity}"
+                )
+            yield rows * columns, values.tobytes()
+        else:
+            groups = (columns + 127) // 128
+            for row in range(0, rows, 128):
+                count_rows = min(128, rows - row)
+                values = _effective(entry, row * columns, count_rows * columns, scale)
+                encoded = _codec._encode(values.reshape(count_rows, columns), target)[0]
+                extent = count_rows * columns
+                yield row * columns, encoded[:extent].tobytes()
+                yield (
+                    rows * columns + (row // 128) * groups * 4,
+                    encoded[extent:].tobytes(),
+                )
+        return
     if packing != "canonical":
         _validate_packing(target, entry.shape, packing)
         rows, columns = entry.shape
@@ -515,6 +606,19 @@ def _resolve_payloads(
                 raise ValueError(
                     f"tied checkpoint weights have different values: {entry.identity}"
                 )
+        if entry.method == "fp8_e4m3" and len(entry.components) > 1:
+            canonical_scales = entry.components[0]
+            values = _read_values(
+                canonical_scales, 0, math.prod(canonical_scales.shape)
+            ).astype(np.float32)
+            for tied_scales in entry.components[1:]:
+                other = _read_values(
+                    tied_scales, 0, math.prod(tied_scales.shape)
+                ).astype(np.float32)
+                if not np.array_equal(values, other):
+                    raise ValueError(
+                        f"tied checkpoint FP8 scales have different values: {entry.identity}"
+                    )
         record = _WeightRecord(
             name=request.name or request.logical,
             logical=request.logical,

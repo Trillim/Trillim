@@ -24,6 +24,7 @@ DType = Literal[
     "grp_binary",
     "grp_ternary",
     "mxfp4",
+    "fp8_e4m3",
 ]
 
 

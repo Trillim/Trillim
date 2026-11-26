@@ -67,6 +67,11 @@ values occupy the low and high nibbles of each byte. The scale is 2**(byte-127);
 255 denotes NaN. Encoding uses floor(log2(absmax))-2, clamped to [-127,127],
 and round-to-nearest-even E2M1 with saturation. Zero groups use scale byte 127.
 ``import_mxfp4`` preserves checkpoint blocks and scales without requantization.
+
+``fp8_e4m3``: Row-major E4M3FN bytes followed by a row-major FP32 scale grid,
+one scale for each 128-by-128 tile. Decode multiplies each code by its tile
+scale. Codes 0x7f and 0xff are NaN. Encoding uses absmax/448 per tile and
+round-to-nearest-even; importing native checkpoint codes preserves them.
 """
 
 from __future__ import annotations
@@ -109,7 +114,61 @@ _GROUP_SIZES: dict[DType, int] = {
     "mxfp4": 32,
 }
 
-_QUANTIZED_DTYPES: frozenset[DType] = frozenset({"row_int8", *_GROUP_SIZES})
+_QUANTIZED_DTYPES: frozenset[DType] = frozenset({"row_int8", "fp8_e4m3", *_GROUP_SIZES})
+
+_FP8_CODES = np.arange(256, dtype=np.uint8)
+_FP8_EXPONENTS = ((_FP8_CODES & 127) >> 3).astype(np.int32)
+_FP8_MANTISSAS = (_FP8_CODES & 7).astype(np.float32)
+_FP8_E4M3_VALUES: NDArray[np.float32] = np.where(
+    _FP8_EXPONENTS == 0,
+    _FP8_MANTISSAS * np.float32(2**-9),
+    np.ldexp(np.float32(1) + _FP8_MANTISSAS / np.float32(8), _FP8_EXPONENTS - 7),
+).astype(np.float32)
+_FP8_E4M3_VALUES = np.copysign(
+    _FP8_E4M3_VALUES, np.where(_FP8_CODES & 128, -1, 1)
+).astype(np.float32)
+_FP8_E4M3_VALUES[127] = _FP8_E4M3_VALUES[255] = np.nan
+_FP8_MIDPOINTS = (_FP8_E4M3_VALUES[:126] + _FP8_E4M3_VALUES[1:127]) / np.float32(2)
+
+
+def _encode_fp8_e4m3(tensor: NDArray[np.generic]) -> _Encoded:
+    source = tensor.astype(np.float32, copy=False)
+    rows, columns = source.shape
+    values = np.empty((rows, columns), dtype=np.uint8)
+    scales = np.empty(((rows + 127) // 128, (columns + 127) // 128), dtype=np.float32)
+    for row in range(0, rows, 128):
+        for column in range(0, columns, 128):
+            block = source[row : row + 128, column : column + 128]
+            maximum = np.max(np.abs(block))
+            scale = np.float32(maximum / np.float32(448)) if maximum else np.float32(1)
+            if scale == 0:
+                scale = np.nextafter(np.float32(0), np.float32(1))
+            scales[row // 128, column // 128] = scale
+            magnitude = np.minimum(np.abs(block) / scale, np.float32(448))
+            codes = np.searchsorted(_FP8_MIDPOINTS, magnitude).astype(np.uint8)
+            tied = magnitude == _FP8_MIDPOINTS[np.minimum(codes, 125)]
+            codes += tied & (codes & 1 != 0)
+            values[row : row + 128, column : column + 128] = codes | (
+                np.signbit(block).astype(np.uint8) << 7
+            )
+    return _pack("fp8_e4m3", values, scales)
+
+
+def _decode_fp8_e4m3(
+    payload: NDArray[np.uint8], rows: int, columns: int
+) -> NDArray[np.generic]:
+    grid_rows, grid_columns = (rows + 127) // 128, (columns + 127) // 128
+    codes, raw_scales = _split(payload, (rows * columns, grid_rows * grid_columns * 4))
+    scales = _view(raw_scales, np.dtype("float32"), (grid_rows, grid_columns)).astype(
+        np.float32
+    )
+    row_index = np.arange(rows) // 128
+    column_index = np.arange(columns) // 128
+    return (
+        _FP8_E4M3_VALUES[codes.reshape(rows, columns)]
+        * scales[row_index[:, None], column_index[None, :]]
+    )
+
 
 _MXFP4_MAGNITUDES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
 _MXFP4_VALUES = np.concatenate((_MXFP4_MAGNITUDES, -_MXFP4_MAGNITUDES))
@@ -437,6 +496,11 @@ def _payload_sections(
         return (("values", rows * columns * 2),)
     if rows == 0 or columns == 0:
         raise ValueError("packed dtypes require nonempty tensor dimensions")
+    if target == "fp8_e4m3":
+        return (
+            ("values", rows * columns),
+            ("scales", ((rows + 127) // 128) * ((columns + 127) // 128) * 4),
+        )
     if target == "row_int8":
         return (("values", rows * columns), ("scales", rows * 2))
     if target == "mat_ternary":
@@ -620,6 +684,7 @@ _ENCODERS.update(
         "grp_binary": _encode_grp_binary,
         "grp_ternary": _encode_grp_ternary,
         "mxfp4": _encode_mxfp4,
+        "fp8_e4m3": _encode_fp8_e4m3,
     }
 )
 _DECODERS: dict[DType, _Decoder] = {
@@ -637,6 +702,7 @@ _DECODERS.update(
         "grp_binary": _decode_grp_binary,
         "grp_ternary": _decode_grp_ternary,
         "mxfp4": _decode_mxfp4,
+        "fp8_e4m3": _decode_fp8_e4m3,
     }
 )
 
