@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
+from shutil import copyfile
 from typing import cast
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 from pydantic import ValidationError
+from tokenizers import Tokenizer, decoders
+from tokenizers.models import BPE
 
-from trillim.processing import postprocessing, preprocessing
-from trillim.processing.utils import decode_tokens, tokenize
+from trillim.compiler.artifacts.artifact_pydantic_models import _ExecutableManifest
+from trillim.processing import (
+    TensorInputs,
+    TensorOutputs,
+    postprocessing,
+    preprocessing,
+)
+from trillim.processing.processing_pydantic_models import _ProcessingSpec
+from trillim.processing.utils import _TextStream, _tokenizer, decode_tokens, tokenize
+from trillim.runtime import Model, TokenEvent
+from trillim.runtime import model as model_module
 
 
 @pytest.mark.parametrize(
@@ -207,6 +220,133 @@ def test_text_postprocessing(
             assets=arguments,
             options={},
         )
+
+
+def test_streamed_text_waits_for_split_utf8(assets: dict[str, Path]) -> None:
+    directory = assets["qwen3"]
+    tokens = tokenize("Hello 🦄!", assets=directory, chat=False)
+    eos = _tokenizer(directory).convert_tokens_to_ids("<|im_end|>")
+    tokens = np.append(tokens, np.int32(eos))
+    decoder = _TextStream(directory, skip_special_tokens=True)
+
+    chunks = [decoder.push(int(token)) for token in tokens]
+    text = decode_tokens(tokens, assets=directory)
+    assert chunks == ["Hello", "", "", " 🦄", "!", ""]
+    assert "".join(chunks) + decoder.finish(text) == text
+
+
+@pytest.mark.parametrize("skip_special_tokens", [False, True])
+def test_streamed_text_waits_for_byte_fallback_run(
+    tmp_path: Path, skip_special_tokens: bool
+) -> None:
+    pieces = ["▁hello", "<0xC3>", "<0xA9>", "<eos>", "!", "?"]
+    backend = Tokenizer(
+        BPE(vocab={piece: index for index, piece in enumerate(pieces)}, merges=[])
+    )
+    backend.decoder = decoders.Sequence(
+        [
+            decoders.Replace("▁", " "),
+            decoders.ByteFallback(),
+            decoders.Fuse(),
+            decoders.Strip(" ", 1, 0),
+        ]
+    )
+    backend.add_special_tokens(["<eos>"])
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"tokenizer_class": "PreTrainedTokenizerFast"}', encoding="utf-8"
+    )
+    tokens = np.asarray([0, 1, 2, 3, 1, 4, 1, 2, 5, 1], dtype=np.int32)
+    decoder = _TextStream(tmp_path, skip_special_tokens=skip_special_tokens)
+
+    chunks = [decoder.push(int(token)) for token in tokens]
+    text = decode_tokens(
+        tokens, assets=tmp_path, skip_special_tokens=skip_special_tokens
+    )
+    assert chunks[:3] == ["hello", "", ""]
+    assert chunks[3] == ("" if skip_special_tokens else "é<eos>")
+    assert chunks[5] == ("���!" if skip_special_tokens else "�!")
+    assert chunks[8:] == ["é?", ""]
+    tail = decoder.finish(text)
+    assert tail == "�"
+    assert "".join(chunks) + tail == text
+
+
+def test_final_text_callback_blocks_reentry_and_closes_on_failure(
+    assets: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    copyfile(assets["pocket"] / "tokenizer.model", tokenizer / "tokenizer.model")
+    tokens = tokenize("Hello world", assets=tokenizer, chat=False)
+    manifest = _ExecutableManifest(
+        backend="scalar",
+        threads=1,
+        arena_size=0,
+        cache_size=0,
+        inputs={},
+        outputs={},
+        buffers={},
+        caches={},
+        kernels={},
+        program=[],
+        processing=_ProcessingSpec(post="text", assets={"tokenizer": "tokenizer"}),
+    )
+    (tmp_path / "executable.json").write_text(
+        manifest.model_dump_json(), encoding="utf-8"
+    )
+
+    class ScriptedRuntime:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def run(
+            self,
+            inputs: TensorInputs,
+            *,
+            on_token: Callable[[TokenEvent], None] | None = None,
+        ) -> TensorOutputs:
+            if on_token is not None:
+                for index, token in enumerate(tokens):
+                    on_token(TokenEvent("tokens", index, int(token)))
+            return {"tokens": tokens}
+
+        def cancel(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    worker = ScriptedRuntime()
+    monkeypatch.setattr(model_module, "Runtime", lambda directory, *, threads: worker)
+    preprocessed: list[str] = []
+
+    def preprocess(value: str) -> TensorInputs:
+        preprocessed.append(value)
+        return {}
+
+    with Model[str, str](tmp_path, preprocess=preprocess) as model:
+
+        def reenter(text: str) -> None:
+            assert text == "Hello world"
+            with pytest.raises(RuntimeError, match="model is already running"):
+                model.run("nested")
+
+        assert model.run("first", on_text=reenter) == "Hello world"
+        assert preprocessed == ["first"]
+
+        error = LookupError("text callback failed")
+
+        def fail(text: str) -> None:
+            raise error
+
+        with pytest.raises(LookupError) as failure:
+            model.run("second", on_text=fail)
+        assert failure.value is error
+        assert worker.closed
+        with pytest.raises(RuntimeError, match="model is closed"):
+            model.run("after failure")
+        assert preprocessed == ["first", "second"]
 
 
 @pytest.mark.parametrize(

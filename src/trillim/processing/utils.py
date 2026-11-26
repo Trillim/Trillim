@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import re
 from functools import lru_cache
 from math import gcd
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 import soundfile as sf  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 from PIL import Image
+from pydantic import JsonValue
 from scipy.signal import resample_poly  # type: ignore[import-untyped]
 
 from .processing_dataclasses import Audio
+
+if TYPE_CHECKING:
+    from tokenizers import AddedToken, Tokenizer
+    from tokenizers.decoders import DecodeStream
+
+
+_BYTE_TOKEN = re.compile(r"<0x[0-9a-fA-F]{2}>")
 
 
 class _Tokenizer(Protocol):
@@ -61,6 +71,13 @@ def _sentencepiece(assets: Path) -> object:
     return SentencePieceProcessor(model_file=str(assets / "tokenizer.model"))
 
 
+def _sentencepiece_only(directory: Path) -> bool:
+    return (directory / "tokenizer.model").is_file() and not any(
+        (directory / name).is_file()
+        for name in ("tokenizer.json", "tokenizer_config.json")
+    )
+
+
 def tokenize(
     text: str | list[dict[str, str]],
     *,
@@ -70,10 +87,7 @@ def tokenize(
 ) -> NDArray[np.int32]:
     """Tokenize locally bundled assets, applying their chat template when requested."""
     directory = Path(assets).resolve()
-    if (directory / "tokenizer.model").is_file() and not any(
-        (directory / name).is_file()
-        for name in ("tokenizer.json", "tokenizer_config.json")
-    ):
+    if _sentencepiece_only(directory):
         from sentencepiece import SentencePieceProcessor
 
         if not isinstance(text, str):
@@ -112,16 +126,87 @@ def decode_tokens(
     if tokens.dtype.kind not in "iu" or tokens.ndim != 1:
         raise ValueError("token output must be a rank-one integer array")
     ids = [int(value) for value in tokens]
-    if (directory / "tokenizer.model").is_file() and not any(
-        (directory / name).is_file()
-        for name in ("tokenizer.json", "tokenizer_config.json")
-    ):
+    if _sentencepiece_only(directory):
         from sentencepiece import SentencePieceProcessor
 
         return str(cast(SentencePieceProcessor, _sentencepiece(directory)).decode(ids))
     return _tokenizer(directory).decode(
         ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False
     )
+
+
+class _TextStream:
+    def __init__(self, assets: Path, *, skip_special_tokens: bool) -> None:
+        from tokenizers.decoders import ByteLevel, DecodeStream, Sequence
+        from transformers import PreTrainedTokenizerFast
+
+        self._backend: Tokenizer | None = None
+        self._stream: DecodeStream | None = None
+        self._byte_fallback = False
+        self._skip: set[int] = set()
+        self._pending: list[int] = []
+        self._chunks: list[str] = []
+        directory = assets.resolve()
+        if _sentencepiece_only(directory):
+            return
+        tokenizer = _tokenizer(directory)
+        if (
+            not isinstance(tokenizer, PreTrainedTokenizerFast)
+            or type(tokenizer).decode is not PreTrainedTokenizerFast.decode
+            or type(tokenizer)._decode is not PreTrainedTokenizerFast._decode
+        ):
+            # Wrappers can rewrite earlier text, for example when stripping timestamps.
+            return
+        backend: Tokenizer = tokenizer.backend_tokenizer
+        decoder = backend.decoder
+        if isinstance(decoder, Sequence):
+            config = cast(JsonValue, json.loads(decoder.__getstate__()))
+            match config:
+                case {
+                    "decoders": [
+                        {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                        {"type": "ByteFallback"},
+                        {"type": "Fuse"},
+                        *tail,
+                    ]
+                } if not tail or tail == [
+                    {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+                ]:
+                    self._byte_fallback = True
+                case _:
+                    return
+        elif not isinstance(decoder, ByteLevel):
+            return
+        if self._byte_fallback and skip_special_tokens:
+            added: dict[int, AddedToken] = backend.get_added_tokens_decoder()
+            self._skip = {index for index, token in added.items() if token.special}
+        self._backend = backend
+        self._stream = DecodeStream(skip_special_tokens=skip_special_tokens)
+
+    def push(self, token: int) -> str:
+        if self._backend is None or self._stream is None or token in self._skip:
+            return ""
+        ids: int | list[int] = token
+        if self._byte_fallback:
+            piece: str | None = self._backend.id_to_token(token)
+            if piece is None:
+                return ""
+            self._pending.append(token)
+            # An invalid byte can change an entire fallback run into replacement characters.
+            if _BYTE_TOKEN.fullmatch(piece):
+                return ""
+            ids = self._pending
+            self._pending = []
+        chunk: str | None = self._stream.step(self._backend, ids)
+        if chunk:
+            self._chunks.append(chunk)
+        return chunk or ""
+
+    def finish(self, text: str) -> str:
+        prefix = "".join(self._chunks)
+        if not text.startswith(prefix):
+            raise ValueError("streamed text does not match the decoded token output")
+        return text[len(prefix) :]
 
 
 def load_audio(value: str | Path | Audio, *, sample_rate: int = 16000) -> Audio:
