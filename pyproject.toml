@@ -59,6 +59,7 @@ check = "task lint && mypy --strict src tests && task test"
 clean = "rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache .mypy_cache"
 licenses = "uvx --from pip-licenses pip-licenses --python=.venv/bin/python --from=mixed --format=plain-vertical --with-license-file --with-notice-file --no-license-path --output-file THIRD_PARTY_LICENSES"
 build = "uv build"
+build-cpu = "python scripts/build_cpu.py"
 rebuild = "task clean && task build"
 
 [tool.ruff.lint]
