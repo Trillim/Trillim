@@ -319,9 +319,10 @@ def _build_backend(
 
 
 def _build_cpu() -> Path:
-    source = Path(__file__).resolve().parents[2] / "backends/cpu/native.c"
+    source = Path(__file__).resolve().parents[2] / "backends/cpu/native.cpp"
     flags = (
-        *_FLAGS,
+        *(flag for flag in _FLAGS if flag != "-std=c11"),
+        "-std=c++20",
         *(("-pthread",) if sys.platform != "win32" else ()),
         "-dynamiclib" if sys.platform == "darwin" else "-shared",
     )
@@ -337,7 +338,17 @@ def _build_cpu() -> Path:
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
-    for compiler in _compilers():
+    for candidate in _compilers():
+        compiler = list(candidate)
+        if len(compiler) > 1 and compiler[1] == "cc":
+            compiler[1] = "c++"
+        else:
+            driver = Path(compiler[0])
+            name = driver.name
+            for old, new in (("clang", "clang++"), ("gcc", "g++"), ("cc", "c++")):
+                if name.endswith(old):
+                    compiler[0] = str(driver.with_name(name.removesuffix(old) + new))
+                    break
         with tempfile.TemporaryDirectory(
             prefix=".cpu-", dir=destination.parent
         ) as name:
@@ -350,11 +361,6 @@ def _build_cpu() -> Path:
                         "-I",
                         str(_KERNEL_ROOT),
                         str(source),
-                        *(
-                            ["-Wl,-Bstatic", "-lwinpthread", "-Wl,-Bdynamic"]
-                            if sys.platform == "win32"
-                            else []
-                        ),
                         "-o",
                         str(temporary),
                     ]
@@ -366,4 +372,6 @@ def _build_cpu() -> Path:
                 return destination
             except (OSError, subprocess.CalledProcessError, AttributeError) as error:
                 failures.append(f"{' '.join(compiler)}: {error}")
-    raise RuntimeError("all C compilers failed for CPU helper:\n" + "\n".join(failures))
+    raise RuntimeError(
+        "all C++ compilers failed for CPU benchmark helper:\n" + "\n".join(failures)
+    )

@@ -2,30 +2,32 @@
 #define TRILLIM_CPU_NATIVE_H
 
 #include "common.h"
-#include <pthread.h>
-#include <stdatomic.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <signal.h>
 
-typedef struct TrillimCpuContext TrillimCpuContext;
-typedef struct {
-    _Alignas(64) atomic_size_t generation;
+struct TrillimCpuContext;
+struct TrillimCpuWorker {
+    alignas(64) std::atomic_size_t generation;
     TrillimStatus status;
     TrillimCpuContext *backend;
-    pthread_t thread;
+    std::thread thread;
     size_t index;
-} TrillimCpuWorker;
+};
 
 struct TrillimCpuContext {
     TrillimThreadPool pool;
     TrillimKernelContext context;
     TrillimCpuWorker *workers;
-    pthread_mutex_t mutex;
-    pthread_cond_t work_ready;
-    atomic_bool cancelled;
-    atomic_bool shutdown;
+    std::mutex mutex;
+    std::condition_variable work_ready;
+    std::atomic_bool cancelled;
+    std::atomic_bool shutdown;
     size_t sleepers;
-    _Alignas(64) atomic_size_t generation;
-    _Alignas(64) atomic_size_t next_task;
+    alignas(64) std::atomic_size_t generation;
+    alignas(64) std::atomic_size_t next_task;
     size_t task_count;
     TrillimTask task;
     void *task_context;

@@ -1,24 +1,22 @@
-#define _POSIX_C_SOURCE 200809L
 #include "native.h"
 
+#include <new>
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
 #endif
 #include <signal.h>
-#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <malloc.h>
 #else
 #include <time.h>
 #endif
 
-_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "cancellation requires lock-free atomics");
-static atomic_bool signal_cancelled;
-static atomic_flag executing = ATOMIC_FLAG_INIT;
+static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "cancellation requires lock-free atomics");
+static std::atomic_bool signal_cancelled;
+static std::atomic_flag executing = ATOMIC_FLAG_INIT;
 
 uint64_t trillim_cpu_features(void) {
     uint64_t features = 0;
@@ -50,33 +48,13 @@ uint64_t trillim_cpu_features(void) {
 
 static void cancel_signal(int signal_number) {
     (void)signal_number;
-    atomic_store_explicit(&signal_cancelled, true, memory_order_relaxed);
-}
-
-static void *allocate(size_t size, size_t alignment) {
-#ifdef _WIN32
-    return _aligned_malloc(size, alignment);
-#else
-    void *address = NULL;
-    if (posix_memalign(&address, alignment, size) != 0) {
-        return NULL;
-    }
-    return address;
-#endif
-}
-
-static void release(void *address) {
-#ifdef _WIN32
-    _aligned_free(address);
-#else
-    free(address);
-#endif
+    std::atomic_store_explicit(&signal_cancelled, true, std::memory_order_relaxed);
 }
 
 static bool is_cancelled(void *context) {
-    TrillimCpuContext *backend = context;
-    return atomic_load_explicit(&signal_cancelled, memory_order_relaxed) ||
-        atomic_load_explicit(&backend->cancelled, memory_order_relaxed);
+    auto *backend = static_cast<TrillimCpuContext *>(context);
+    return std::atomic_load_explicit(&signal_cancelled, std::memory_order_relaxed) ||
+        std::atomic_load_explicit(&backend->cancelled, std::memory_order_relaxed);
 }
 
 static void spin_pause(void) {
@@ -85,7 +63,7 @@ static void spin_pause(void) {
 #elif defined(__aarch64__)
     __asm__ __volatile__("yield");
 #else
-    atomic_signal_fence(memory_order_seq_cst);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
 }
 
@@ -118,7 +96,7 @@ static TrillimStatus execute_tasks(
     TrillimStatus status = TRILLIM_OK;
     while (!is_cancelled(backend)) {
         size_t index = parallel
-            ? atomic_fetch_add_explicit(&backend->next_task, 1, memory_order_relaxed)
+            ? std::atomic_fetch_add_explicit(&backend->next_task, 1, std::memory_order_relaxed)
             : completed;
         if (index >= task_count) {
             break;
@@ -126,25 +104,25 @@ static TrillimStatus execute_tasks(
         status = task(task_context, index, worker->index);
         ++completed;
         if (status != TRILLIM_OK) {
-            atomic_store_explicit(&backend->cancelled, true, memory_order_relaxed);
+            std::atomic_store_explicit(&backend->cancelled, true, std::memory_order_relaxed);
             break;
         }
     }
     return status == TRILLIM_OK || status == TRILLIM_CANCELLED ? status : TRILLIM_ERROR;
 }
 
-static void *worker_main(void *context) {
-    TrillimCpuWorker *worker = context;
+static void worker_main(void *context) {
+    auto *worker = static_cast<TrillimCpuWorker *>(context);
     TrillimCpuContext *backend = worker->backend;
     size_t generation = 0;
     for (;;) {
         uint64_t start = monotonic_nanoseconds();
-        size_t next = atomic_load_explicit(&backend->generation, memory_order_acquire);
-        while (!atomic_load_explicit(&backend->shutdown, memory_order_relaxed)
+        size_t next = std::atomic_load_explicit(&backend->generation, std::memory_order_acquire);
+        while (!std::atomic_load_explicit(&backend->shutdown, std::memory_order_relaxed)
                && generation == next) {
             for (size_t pause = 0; pause < 1024 && generation == next; ++pause) {
                 spin_pause();
-                next = atomic_load_explicit(&backend->generation, memory_order_acquire);
+                next = std::atomic_load_explicit(&backend->generation, std::memory_order_acquire);
             }
             if (generation != next) {
                 break;
@@ -152,19 +130,18 @@ static void *worker_main(void *context) {
             uint64_t now = monotonic_nanoseconds();
             if (now == 0 || now - start >= 10000000) {
                 /* Register and recheck under the dispatcher's wake-up mutex. */
-                pthread_mutex_lock(&backend->mutex);
+                std::unique_lock lock(backend->mutex);
                 ++backend->sleepers;
-                while (!atomic_load_explicit(&backend->shutdown, memory_order_relaxed)
-                       && generation == atomic_load_explicit(
-                           &backend->generation, memory_order_acquire)) {
-                    pthread_cond_wait(&backend->work_ready, &backend->mutex);
+                while (!std::atomic_load_explicit(&backend->shutdown, std::memory_order_relaxed)
+                       && generation == std::atomic_load_explicit(
+                           &backend->generation, std::memory_order_acquire)) {
+                    backend->work_ready.wait(lock);
                 }
                 --backend->sleepers;
-                next = atomic_load_explicit(&backend->generation, memory_order_acquire);
-                pthread_mutex_unlock(&backend->mutex);
+                next = std::atomic_load_explicit(&backend->generation, std::memory_order_acquire);
             }
         }
-        if (atomic_load_explicit(&backend->shutdown, memory_order_relaxed)) {
+        if (std::atomic_load_explicit(&backend->shutdown, std::memory_order_relaxed)) {
             break;
         }
         generation = next;
@@ -173,51 +150,50 @@ static void *worker_main(void *context) {
         size_t task_count = backend->task_count;
         worker->status = execute_tasks(worker, task, task_context, task_count, true);
         /* Publish task status and output writes before acknowledging this dispatch. */
-        atomic_store_explicit(&worker->generation, generation, memory_order_release);
+        std::atomic_store_explicit(&worker->generation, generation, std::memory_order_release);
     }
-    return NULL;
 }
 
 static TrillimStatus run(
     void *context, size_t task_count, TrillimTask task, void *task_context
 ) {
-    TrillimCpuContext *backend = context;
+    auto *backend = static_cast<TrillimCpuContext *>(context);
     if (task_count == 0) {
         return TRILLIM_OK;
     }
-    pthread_mutex_lock(&backend->mutex);
+    backend->mutex.lock();
     /* Every worker can claim one index past the end. */
-    if (backend->task != NULL || task == NULL ||
-        atomic_load_explicit(&backend->shutdown, memory_order_relaxed) ||
+    if (backend->task != nullptr || task == nullptr ||
+        std::atomic_load_explicit(&backend->shutdown, std::memory_order_relaxed) ||
         task_count > SIZE_MAX - backend->pool.worker_count) {
-        pthread_mutex_unlock(&backend->mutex);
+        backend->mutex.unlock();
         return TRILLIM_ERROR;
     }
     if (is_cancelled(backend)) {
-        pthread_mutex_unlock(&backend->mutex);
+        backend->mutex.unlock();
         return TRILLIM_CANCELLED;
     }
-    atomic_store_explicit(&backend->next_task, 0, memory_order_relaxed);
+    std::atomic_store_explicit(&backend->next_task, 0, std::memory_order_relaxed);
     backend->task_count = task_count;
     backend->task = task;
     backend->task_context = task_context;
     bool parallel = task_count > 1 && backend->pool.worker_count > 1;
     size_t generation = 0;
     if (parallel) {
-        generation = atomic_load_explicit(&backend->generation, memory_order_relaxed) + 1;
-        atomic_store_explicit(&backend->generation, generation, memory_order_release);
+        generation = std::atomic_load_explicit(&backend->generation, std::memory_order_relaxed) + 1;
+        std::atomic_store_explicit(&backend->generation, generation, std::memory_order_release);
         if (backend->sleepers != 0) {
-            pthread_cond_broadcast(&backend->work_ready);
+            backend->work_ready.notify_all();
         }
     }
-    pthread_mutex_unlock(&backend->mutex);
+    backend->mutex.unlock();
     TrillimStatus status = execute_tasks(
         &backend->workers[0], task, task_context, task_count, parallel);
     if (parallel) {
         /* Cancellation still drains every worker before releasing borrowed task data. */
         for (size_t index = 1; index < backend->pool.worker_count; ++index) {
             TrillimCpuWorker *worker = &backend->workers[index];
-            while (atomic_load_explicit(&worker->generation, memory_order_acquire) != generation) {
+            while (std::atomic_load_explicit(&worker->generation, std::memory_order_acquire) != generation) {
                 spin_pause();
             }
             if (worker->status == TRILLIM_ERROR) {
@@ -230,75 +206,56 @@ static TrillimStatus run(
     if (status == TRILLIM_OK && is_cancelled(backend)) {
         status = TRILLIM_CANCELLED;
     }
-    pthread_mutex_lock(&backend->mutex);
-    backend->task = NULL;
-    backend->task_context = NULL;
-    pthread_mutex_unlock(&backend->mutex);
+    backend->mutex.lock();
+    backend->task = nullptr;
+    backend->task_context = nullptr;
+    backend->mutex.unlock();
     return status;
 }
 
 TrillimCpuContext *trillim_cpu_create(size_t worker_count) {
     if (worker_count == 0 || worker_count > SIZE_MAX / sizeof(TrillimCpuWorker)) {
-        return NULL;
+        return nullptr;
     }
-    TrillimCpuContext *backend = allocate(sizeof(*backend), 64);
-    if (backend == NULL) {
-        return NULL;
-    }
-    memset(backend, 0, sizeof(*backend));
-    atomic_init(&backend->cancelled, false);
-    atomic_init(&backend->shutdown, false);
-    atomic_init(&backend->generation, 0);
-    atomic_init(&backend->next_task, 0);
-    if (pthread_mutex_init(&backend->mutex, NULL) != 0) {
-        release(backend);
-        return NULL;
-    }
-    if (pthread_cond_init(&backend->work_ready, NULL) != 0) {
-        pthread_mutex_destroy(&backend->mutex);
-        release(backend);
-        return NULL;
-    }
-    backend->pool = (TrillimThreadPool){backend, worker_count, run};
-    backend->context = (TrillimKernelContext){&backend->pool, is_cancelled, backend};
-    backend->workers = allocate(worker_count * sizeof(*backend->workers), 64);
-    if (backend->workers == NULL) {
-        backend->pool.worker_count = 0;
-        trillim_cpu_destroy(backend);
-        return NULL;
-    }
-    memset(backend->workers, 0, worker_count * sizeof(*backend->workers));
-    for (size_t index = 0; index < worker_count; ++index) {
-        TrillimCpuWorker *worker = &backend->workers[index];
-        worker->backend = backend;
-        worker->index = index;
-        atomic_init(&worker->generation, 0);
-        if (index != 0 && pthread_create(&worker->thread, NULL, worker_main, worker) != 0) {
-            backend->pool.worker_count = index;
-            trillim_cpu_destroy(backend);
-            return NULL;
+    TrillimCpuContext *backend = nullptr;
+    try {
+        backend = new TrillimCpuContext{};
+        backend->pool = {backend, 0, run};
+        backend->context = {&backend->pool, is_cancelled, backend};
+        backend->workers = new TrillimCpuWorker[worker_count]{};
+        for (size_t index = 0; index < worker_count; ++index) {
+            auto &worker = backend->workers[index];
+            worker.backend = backend;
+            worker.index = index;
+            if (index != 0) {
+                worker.thread = std::thread(worker_main, &worker);
+            }
+            ++backend->pool.worker_count;
         }
+    } catch (...) {
+        if (backend) {
+            trillim_cpu_destroy(backend);
+        }
+        return nullptr;
     }
     return backend;
 }
 
 void trillim_cpu_destroy(TrillimCpuContext *backend) {
-    pthread_mutex_lock(&backend->mutex);
-    atomic_store_explicit(&backend->shutdown, true, memory_order_relaxed);
-    atomic_store(&backend->cancelled, true);
-    pthread_cond_broadcast(&backend->work_ready);
-    pthread_mutex_unlock(&backend->mutex);
+    backend->mutex.lock();
+    backend->shutdown.store(true, std::memory_order_relaxed);
+    backend->cancelled.store(true, std::memory_order_relaxed);
+    backend->work_ready.notify_all();
+    backend->mutex.unlock();
     for (size_t index = 1; index < backend->pool.worker_count; ++index) {
-        pthread_join(backend->workers[index].thread, NULL);
+        backend->workers[index].thread.join();
     }
-    release(backend->workers);
-    pthread_cond_destroy(&backend->work_ready);
-    pthread_mutex_destroy(&backend->mutex);
-    release(backend);
+    delete[] backend->workers;
+    delete backend;
 }
 
 void trillim_cpu_cancel(TrillimCpuContext *context) {
-    atomic_store_explicit(&context->cancelled, true, memory_order_relaxed);
+    std::atomic_store_explicit(&context->cancelled, true, std::memory_order_relaxed);
 }
 
 bool trillim_cpu_cancelled(TrillimCpuContext *context) {
@@ -306,20 +263,20 @@ bool trillim_cpu_cancelled(TrillimCpuContext *context) {
 }
 
 TrillimStatus trillim_cpu_enter(TrillimCpuContext *context) {
-    if (atomic_flag_test_and_set(&executing)) {
+    if (std::atomic_flag_test_and_set(&executing)) {
         return TRILLIM_ERROR;
     }
-    atomic_store_explicit(&signal_cancelled, false, memory_order_relaxed);
+    std::atomic_store_explicit(&signal_cancelled, false, std::memory_order_relaxed);
 #ifdef _WIN32
     context->previous_interrupt = signal(SIGINT, cancel_signal);
     if (context->previous_interrupt == SIG_ERR) {
-        atomic_flag_clear(&executing);
+        std::atomic_flag_clear(&executing);
         return TRILLIM_ERROR;
     }
     context->previous_terminate = signal(SIGTERM, cancel_signal);
     if (context->previous_terminate == SIG_ERR) {
         signal(SIGINT, context->previous_interrupt);
-        atomic_flag_clear(&executing);
+        std::atomic_flag_clear(&executing);
         return TRILLIM_ERROR;
     }
 #else
@@ -328,12 +285,12 @@ TrillimStatus trillim_cpu_enter(TrillimCpuContext *context) {
     action.sa_handler = cancel_signal;
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGINT, &action, &context->previous_interrupt) != 0) {
-        atomic_flag_clear(&executing);
+        std::atomic_flag_clear(&executing);
         return TRILLIM_ERROR;
     }
     if (sigaction(SIGTERM, &action, &context->previous_terminate) != 0) {
-        sigaction(SIGINT, &context->previous_interrupt, NULL);
-        atomic_flag_clear(&executing);
+        sigaction(SIGINT, &context->previous_interrupt, nullptr);
+        std::atomic_flag_clear(&executing);
         return TRILLIM_ERROR;
     }
 #endif
@@ -345,10 +302,10 @@ void trillim_cpu_leave(TrillimCpuContext *context) {
     signal(SIGINT, context->previous_interrupt);
     signal(SIGTERM, context->previous_terminate);
 #else
-    sigaction(SIGINT, &context->previous_interrupt, NULL);
-    sigaction(SIGTERM, &context->previous_terminate, NULL);
+    sigaction(SIGINT, &context->previous_interrupt, nullptr);
+    sigaction(SIGTERM, &context->previous_terminate, nullptr);
 #endif
-    atomic_flag_clear(&executing);
+    std::atomic_flag_clear(&executing);
 }
 
 TrillimStatus trillim_cpu_invoke(
@@ -376,11 +333,11 @@ TrillimStatus trillim_cpu_run(
     memset(&action, 0, sizeof(action));
     action.sa_handler = cancel_signal;
     sigemptyset(&action.sa_mask);
-    if (sigaction(SIGTERM, &action, NULL) != 0) {
+    if (sigaction(SIGTERM, &action, nullptr) != 0) {
         return TRILLIM_ERROR;
     }
 #endif
-    atomic_store_explicit(&signal_cancelled, false, memory_order_relaxed);
+    std::atomic_store_explicit(&signal_cancelled, false, std::memory_order_relaxed);
     for (size_t index = 0; index < samples; ++index) {
         uint64_t start = monotonic_nanoseconds();
         if (start == 0) {
