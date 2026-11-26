@@ -1,5 +1,7 @@
 #include "common.h"
 #include <arm_neon.h>
+
+#define ROWS_PER_TASK 8
 #if defined(__APPLE__)
 #define HADAMARD_CAPS 0
 #else
@@ -27,31 +29,51 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     return TRILLIM_OK;
 }
 
-static TrillimStatus transform(void *opaque, size_t row, size_t worker) {
+static TrillimStatus transform(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
-    if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-    const float *x = task->input + row * task->p->row_stride;
-    float *y = task->output + row * 1024;
-    if (x != y) memcpy(y, x, 1024 * sizeof(float));
-    for (size_t half = 1; half < 1024; half *= 2) {
+    size_t first = tile * ROWS_PER_TASK;
+    size_t count = task->p->rows - first;
+    if (count > ROWS_PER_TASK) count = ROWS_PER_TASK;
+    for (size_t row = first; row < first + count; ++row) {
         if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        for (size_t group = 0; group < 1024; group += half * 2) {
-            size_t lane = 0;
-            for (; lane + 4 <= half; lane += 4) {
-                float32x4_t a = vld1q_f32(y + group + lane);
-                float32x4_t b = vld1q_f32(y + group + half + lane);
-                vst1q_f32(y + group + lane, vaddq_f32(a, b));
-                vst1q_f32(y + group + half + lane, vsubq_f32(a, b));
-            }
-            for (; lane < half; ++lane) {
-                float a = y[group + lane], b = y[group + half + lane];
-                y[group + lane] = a + b;
-                y[group + half + lane] = a - b;
+        const float *x = task->input + row * task->p->row_stride;
+        float *y = task->output + row * 1024;
+        for (size_t lane = 0; lane < 1024; lane += 4) {
+            float32x4_t input = vld1q_f32(x + lane);
+            float32x4_t even = vtrn1q_f32(input, input);
+            float32x4_t odd = vtrn2q_f32(input, input);
+            float32x4_t pairs = vtrn1q_f32(vaddq_f32(even, odd), vsubq_f32(even, odd));
+            float32x2_t a = vget_low_f32(pairs);
+            float32x2_t b = vget_high_f32(pairs);
+            vst1q_f32(y + lane, vcombine_f32(vadd_f32(a, b), vsub_f32(a, b)));
+        }
+        for (size_t half = 4; half < 1024; half *= 4) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
+            for (size_t group = 0; group < 1024; group += half * 4) {
+                for (size_t lane = group; lane < group + half; lane += 4) {
+                    float32x4_t a = vld1q_f32(y + lane);
+                    float32x4_t b = vld1q_f32(y + lane + half);
+                    float32x4_t c = vld1q_f32(y + lane + 2 * half);
+                    float32x4_t d = vld1q_f32(y + lane + 3 * half);
+                    float32x4_t ab_sum = vaddq_f32(a, b), ab_difference = vsubq_f32(a, b);
+                    float32x4_t cd_sum = vaddq_f32(c, d), cd_difference = vsubq_f32(c, d);
+                    float32x4_t y0 = vaddq_f32(ab_sum, cd_sum), y1 = vaddq_f32(ab_difference, cd_difference);
+                    float32x4_t y2 = vsubq_f32(ab_sum, cd_sum), y3 = vsubq_f32(ab_difference, cd_difference);
+                    if (half == 256) {
+                        y0 = vmulq_n_f32(y0, 0.03125f);
+                        y1 = vmulq_n_f32(y1, 0.03125f);
+                        y2 = vmulq_n_f32(y2, 0.03125f);
+                        y3 = vmulq_n_f32(y3, 0.03125f);
+                    }
+                    vst1q_f32(y + lane, y0);
+                    vst1q_f32(y + lane + half, y1);
+                    vst1q_f32(y + lane + 2 * half, y2);
+                    vst1q_f32(y + lane + 3 * half, y3);
+                }
             }
         }
     }
-    for (size_t lane = 0; lane < 1024; ++lane) y[lane] *= 0.03125f;
     return TRILLIM_OK;
 }
 
@@ -64,8 +86,9 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_hadamard_matmul(
     const Parameters *p = parameters;
     if (p->rows == 0) return TRILLIM_OK;
     Task task = {inputs[0], outputs[0], p, context};
-    return p->rows == 1 ? transform(&task, 0, 0) :
-        context->thread_pool->run(context->thread_pool->context, p->rows, transform, &task);
+    size_t tiles = p->rows / ROWS_PER_TASK + (p->rows % ROWS_PER_TASK != 0);
+    return tiles == 1 ? transform(&task, 0, 0) :
+        context->thread_pool->run(context->thread_pool->context, tiles, transform, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_neon_hadamard_matmul_tdl(void) {

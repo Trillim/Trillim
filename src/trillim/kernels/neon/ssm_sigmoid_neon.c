@@ -46,16 +46,7 @@ static float apply(float value, uint32_t dtype) {
     return sigmoid(value, dtype);
 }
 
-static float32x4_t exp4(float32x4_t x) {
-    if (vminvq_u32(vandq_u32(vcgeq_f32(x, vdupq_n_f32(-87.0f)),
-                              vcleq_f32(x, vdupq_n_f32(0.0f)))) != UINT32_MAX) {
-        float lanes[4];
-        vst1q_f32(lanes, x);
-        for (size_t lane = 0; lane < 4; ++lane) {
-            lanes[lane] = expf(lanes[lane]);
-        }
-        return vld1q_f32(lanes);
-    }
+static float32x4_t exp_reduced4(float32x4_t x) {
     /* Cody-Waite reduction leaves |r| <= log(2)/2 for the degree-seven series. */
     int32x4_t power = vcvtnq_s32_f32(vmulq_n_f32(x, 1.4426950408889634f));
     float32x4_t integer = vcvtq_f32_s32(power);
@@ -73,11 +64,23 @@ static float32x4_t exp4(float32x4_t x) {
     return vmulq_f32(p, vreinterpretq_f32_s32(exponent));
 }
 
+static float32x4_t exp4(float32x4_t x) {
+    if (vminvq_u32(vandq_u32(vcgeq_f32(x, vdupq_n_f32(-87.0f)),
+                              vcleq_f32(x, vdupq_n_f32(0.0f)))) != UINT32_MAX) {
+        float lanes[4];
+        vst1q_f32(lanes, x);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            lanes[lane] = expf(lanes[lane]);
+        }
+        return vld1q_f32(lanes);
+    }
+    return exp_reduced4(x);
+}
 
-static bool bf16_default_fpcr(void) {
+static bool default_fpcr(void) {
     uint64_t fpcr;
     __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
-    return (fpcr & UINT64_C(0x03c80000)) == 0;
+    return (fpcr & UINT64_C(0x07c80003)) == 0;
 }
 
 static float32x4_t round_bf16_4(float32x4_t value) {
@@ -123,6 +126,42 @@ static float32x4_t sigmoid_bf16_4(uint16x4_t bits) {
     return vbslq_f32(vcgeq_f32(value, vdupq_n_f32(0.0f)), positive, negative);
 }
 
+static float32x4_t sigmoid_fp16_4(uint16x4_t bits) {
+    float32x4_t value = vcvt_f32_f16(vreinterpret_f16_u16(bits));
+    float32x4_t x = vnegq_f32(vabsq_f32(value));
+    /* Below -18, exp(x) rounds to zero in FP16. */
+    float32x4_t e = exp_reduced4(vmaxnmq_f32(x, vdupq_n_f32(-18.0f)));
+
+    /* Check both sides of the approximation, including half subnormal midpoints. */
+    uint32x4_t approximation = vreinterpretq_u32_f32(e);
+    uint32x4_t margin = vdupq_n_u32(8);
+    uint16x4_t lo = vreinterpret_u16_f16(vcvt_f16_f32(
+        vreinterpretq_f32_u32(vsubq_u32(approximation, margin))));
+    uint16x4_t hi = vreinterpret_u16_f16(vcvt_f16_f32(
+        vreinterpretq_f32_u32(vaddq_u32(approximation, margin))));
+    uint16x4_t special = vcgt_u16(vand_u16(bits, vdup_n_u16(0x7fff)), vdup_n_u16(0x7c00));
+    uint16x4_t refine = vorr_u16(vmvn_u16(vceq_u16(lo, hi)), special);
+    e = vcvt_f32_f16(vcvt_f16_f32(e));
+    float32x4_t denominator = vcvt_f32_f16(vcvt_f16_f32(vaddq_f32(e, vdupq_n_f32(1.0f))));
+    uint32x4_t positive = vcgeq_f32(value, vdupq_n_f32(0.0f));
+    float32x4_t quotient = vdivq_f32(vbslq_f32(positive, vdupq_n_f32(1.0f), e), denominator);
+    float32x4_t result = vbslq_f32(positive, quotient, vcvt_f32_f16(vcvt_f16_f32(quotient)));
+    if (vmaxv_u16(refine)) {
+        float lanes[4];
+        uint16_t input[4], mask[4];
+        vst1q_f32(lanes, result);
+        vst1_u16(input, bits);
+        vst1_u16(mask, refine);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            if (mask[lane]) {
+                lanes[lane] = sigmoid(trillim_fp16(input[lane]), TRILLIM_FP16);
+            }
+        }
+        result = vld1q_f32(lanes);
+    }
+    return result;
+}
+
 static float32x4_t sigmoid4(float32x4_t value) {
     float32x4_t e = exp4(vnegq_f32(vabsq_f32(value)));
     float32x4_t denominator = vaddq_f32(e, vdupq_n_f32(1.0f));
@@ -151,10 +190,16 @@ static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
                        apply4(vld1q_f32((const float *)task->input + i)));
         }
     }
-    if (p->dtype == TRILLIM_BF16 && bf16_default_fpcr()) {
+    if (p->dtype == TRILLIM_BF16 && default_fpcr()) {
         for (; end - i >= 4; i += 4) {
             vst1q_f32((float *)task->output + i,
                 sigmoid_bf16_4(vld1_u16((const uint16_t *)task->input + i)));
+        }
+    }
+    if (p->dtype == TRILLIM_FP16 && default_fpcr()) {
+        for (; end - i >= 4; i += 4) {
+            vst1q_f32((float *)task->output + i,
+                sigmoid_fp16_4(vld1_u16((const uint16_t *)task->input + i)));
         }
     }
     for (; i < end; ++i) {

@@ -199,9 +199,9 @@ BF16 static inline float32x4_t dot_bf16(float32x4_t sum, uint16x8_t a, uint16x8_
 #endif
 
 #define BLAS_MAX_QUERIES 128
-#define BLAS_BF16_QUERIES 64
-#define BLAS_BF16_KEYS 128
-#define BLAS_BF16_SLOTS 32
+#define BLAS_16BIT_QUERIES 64
+#define BLAS_16BIT_KEYS 128
+#define BLAS_16BIT_SLOTS 32
 #define BF16_DECODE_STAGED_MIN_KEYS 256
 #define BF16_DECODE_STAGED_KEY_TILE 32
 #define BF16_DECODE_STAGED_VALUE_TILE 32
@@ -318,20 +318,20 @@ static size_t legacy_query_tile(const TrillimAttentionParameters *p, size_t work
     return 16;
 }
 
-static bool attention_bf16_types(const TrillimAttentionParameters *p) {
-    return p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_BF16 &&
-        p->k_dtype == TRILLIM_BF16 && p->v_dtype == TRILLIM_BF16;
+static bool attention_16bit_types(const TrillimAttentionParameters *p) {
+    return (p->q_dtype == TRILLIM_BF16 || p->q_dtype == TRILLIM_FP16) &&
+        p->k_dtype == p->q_dtype && p->v_dtype == p->q_dtype && p->output_dtype == p->q_dtype;
 }
 
 #ifdef __APPLE__
-static bool blas_bf16_layout(const TrillimAttentionParameters *p) {
-    return attention_bf16_types(p) && p->key_dim >= 64 && p->key_dim <= 256 &&
+static bool blas_16bit_layout(const TrillimAttentionParameters *p) {
+    return attention_16bit_types(p) && p->key_dim >= 64 && p->key_dim <= 256 &&
         p->value_dim >= 64 && p->value_dim <= 256 &&
         p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->v_strides[2] == 1;
 }
 
 #endif
-static size_t blas_bf16_stride(size_t key_dim, size_t value_dim, size_t queries, size_t keys) {
+static size_t blas_16bit_stride(size_t key_dim, size_t value_dim, size_t queries, size_t keys) {
     size_t channels = key_dim > value_dim ? key_dim : value_dim;
     return queries * (key_dim + value_dim + keys) + keys * channels;
 }
@@ -381,7 +381,7 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
     outputs[0] = p->heads * p->queries * p->value_dim * trillim_itemsize(p->output_dtype);
     *scratch = p->heads * tiles * (p->value_dim + 64) * sizeof(float);
     size_t fallback_bytes = *scratch;
-    if (attention_bf16_types(p) && p->length >= BF16_DECODE_STAGED_MIN_KEYS) {
+    if (p->q_dtype == TRILLIM_BF16 && attention_16bit_types(p) && p->length >= BF16_DECODE_STAGED_MIN_KEYS) {
         /* Ignore window and layout for the maximum-shape decode reservation. */
         if (p->heads > SIZE_MAX / sizeof(float) / p->length) {
             return TRILLIM_ERROR;
@@ -438,14 +438,14 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         }
     }
 #ifdef __APPLE__
-    if (attention_bf16_types(p) && p->queries >= BLAS_BF16_QUERIES && p->length >= 64 &&
+    if (attention_16bit_types(p) && p->queries >= BLAS_16BIT_QUERIES && p->length >= 64 &&
         p->key_dim >= 64 && p->value_dim >= 64) {
         /* Maximum shapes must cover smaller eligible widths and strides. */
         size_t key_dim = p->key_dim < 256 ? p->key_dim : 256;
         size_t value_dim = p->value_dim < 256 ? p->value_dim : 256;
-        size_t groups = p->queries / BLAS_BF16_QUERIES + (p->queries % BLAS_BF16_QUERIES != 0);
-        size_t slots = p->heads * groups < BLAS_BF16_SLOTS ? p->heads * groups : BLAS_BF16_SLOTS;
-        size_t bytes = slots * blas_bf16_stride(key_dim, value_dim, BLAS_BF16_QUERIES, BLAS_BF16_KEYS) * sizeof(float);
+        size_t groups = p->queries / BLAS_16BIT_QUERIES + (p->queries % BLAS_16BIT_QUERIES != 0);
+        size_t slots = p->heads * groups < BLAS_16BIT_SLOTS ? p->heads * groups : BLAS_16BIT_SLOTS;
+        size_t bytes = slots * blas_16bit_stride(key_dim, value_dim, BLAS_16BIT_QUERIES, BLAS_16BIT_KEYS) * sizeof(float);
         if (bytes > *scratch) {
             *scratch = bytes;
         }
@@ -1107,20 +1107,28 @@ static TrillimStatus attention_short_queries(
 
 static bool attention_default_fpcr(void);
 
-static bool grouped_bf16_layout(const TrillimAttentionTask *task) {
+static bool grouped_16bit_layout(const TrillimAttentionTask *task) {
     const TrillimAttentionParameters *p = task->parameters;
-    return p->q_dtype == TRILLIM_BF16 && p->k_dtype == TRILLIM_BF16 &&
-        p->v_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_BF16 &&
-        p->key_dim <= 256 && p->key_dim % 4 == 0 &&
+    return attention_16bit_types(p) && p->key_dim <= 256 && p->key_dim % 4 == 0 &&
         p->value_dim <= 256 && p->value_dim % 8 == 0 &&
         p->q_strides[2] == 1 && p->k_strides[2] == 1 && p->v_strides[2] == 1 &&
         (((uintptr_t)task->query | (uintptr_t)task->keys | (uintptr_t)task->values) & 1) == 0;
 }
 
+static inline float32x4_t widen_16bit(uint16x4_t bits, bool fp16) {
+    return fp16 ? vcvt_f32_f16(vreinterpret_f16_u16(bits)) :
+        vreinterpretq_f32_u32(vshll_n_u16(bits, 16));
+}
+
+static inline float32x4_t widen_high_16bit(uint16x8_t bits, bool fp16) {
+    return fp16 ? vcvt_high_f32_f16(vreinterpretq_f16_u16(bits)) :
+        vreinterpretq_f32_u32(vshll_high_n_u16(bits, 16));
+}
+
 static inline __attribute__((always_inline)) float32x4_t grouped_score_channels(
-    float32x4_t sum, float32x4x4_t q, const uint16_t *key
+    float32x4_t sum, float32x4x4_t q, const uint16_t *key, bool fp16
 ) {
-    float32x4_t k = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(key), 16));
+    float32x4_t k = widen_16bit(vld1_u16(key), fp16);
     sum = vfmaq_laneq_f32(sum, q.val[0], k, 0);
     sum = vfmaq_laneq_f32(sum, q.val[1], k, 1);
     sum = vfmaq_laneq_f32(sum, q.val[2], k, 2);
@@ -1140,22 +1148,22 @@ static inline void grouped_store_scores(
 
 static inline __attribute__((always_inline)) void grouped_scores(
     const float *queries, const uint16_t *keys, size_t width, size_t stride,
-    float *const scores[4], size_t offset, bool eight_keys
+    float *const scores[4], size_t offset, bool eight_keys, bool fp16
 ) {
     float32x4_t a = vdupq_n_f32(0), b = a, c = a, d = a;
     float32x4_t e = a, f = a, g = a, h = a;
     for (size_t channel = 0; channel < width; channel += 4) {
         float32x4x4_t q = vld1q_f32_x4(queries + 4 * channel);
         const uint16_t *k = keys + channel;
-        a = grouped_score_channels(a, q, k);
-        b = grouped_score_channels(b, q, k + stride);
-        c = grouped_score_channels(c, q, k + 2 * stride);
-        d = grouped_score_channels(d, q, k + 3 * stride);
+        a = grouped_score_channels(a, q, k, fp16);
+        b = grouped_score_channels(b, q, k + stride, fp16);
+        c = grouped_score_channels(c, q, k + 2 * stride, fp16);
+        d = grouped_score_channels(d, q, k + 3 * stride, fp16);
         if (eight_keys) {
-            e = grouped_score_channels(e, q, k + 4 * stride);
-            f = grouped_score_channels(f, q, k + 5 * stride);
-            g = grouped_score_channels(g, q, k + 6 * stride);
-            h = grouped_score_channels(h, q, k + 7 * stride);
+            e = grouped_score_channels(e, q, k + 4 * stride, fp16);
+            f = grouped_score_channels(f, q, k + 5 * stride, fp16);
+            g = grouped_score_channels(g, q, k + 6 * stride, fp16);
+            h = grouped_score_channels(h, q, k + 7 * stride, fp16);
         }
     }
     grouped_store_scores(scores, offset, a, b, c, d);
@@ -1169,16 +1177,17 @@ static void grouped_pack_queries(
 ) {
     const TrillimAttentionParameters *p = task->parameters;
     const uint16_t *query[4];
+    bool fp16 = p->q_dtype == TRILLIM_FP16;
     for (size_t row = 0; row < 4; ++row) {
         query[row] = (const uint16_t *)task->query + queries[row];
     }
     /* SIMD lanes are independent queries, preserving each dot product's channel order. */
     for (size_t channel = 0; channel < p->key_dim; channel += 4) {
         float32x4x4_t q = {{
-            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[0] + channel), 16)),
-            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[1] + channel), 16)),
-            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[2] + channel), 16)),
-            vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(query[3] + channel), 16))
+            widen_16bit(vld1_u16(query[0] + channel), fp16),
+            widen_16bit(vld1_u16(query[1] + channel), fp16),
+            widen_16bit(vld1_u16(query[2] + channel), fp16),
+            widen_16bit(vld1_u16(query[3] + channel), fp16)
         }};
         vst4q_f32(transposed + channel * 4, q);
     }
@@ -1208,12 +1217,13 @@ static bool grouped_normalize_scores(
     return true;
 }
 
-static TrillimStatus grouped_bf16_attention(
+static TrillimStatus grouped_16bit_attention(
     const TrillimAttentionTask *task, size_t kv_head, size_t begin,
     const size_t queries[4], const size_t outputs[4], const size_t ends[4], size_t rows
 ) {
     const TrillimAttentionParameters *p = task->parameters;
     const TrillimKernelContext *context = task->context;
+    bool fp16 = p->q_dtype == TRILLIM_FP16;
     size_t key_base = kv_head * p->k_strides[0];
     size_t value_base = kv_head * p->v_strides[0];
     float score_rows[4][64], accumulator_rows[4][256];
@@ -1245,14 +1255,14 @@ static TrillimStatus grouped_bf16_attention(
                 return TRILLIM_CANCELLED;
             }
             const uint16_t *keys = (const uint16_t *)task->keys + key_base + (block + key) * p->k_strides[1];
-            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, key, true);
+            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, key, true, fp16);
         }
         if (max_count - key >= 4) {
             if (context->is_cancelled(context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
             }
             const uint16_t *keys = (const uint16_t *)task->keys + key_base + (block + key) * p->k_strides[1];
-            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, key, false);
+            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, key, false, fp16);
             key += 4;
         }
         for (; key < max_count; ++key) {
@@ -1289,8 +1299,8 @@ static TrillimStatus grouped_bf16_attention(
             for (size_t key = 0; key < common_count; ++key) {
                 const uint16_t *value = (const uint16_t *)task->values + value_base + (block + key) * p->v_strides[1] + channel;
                 uint16x8_t bits = vld1q_u16(value);
-                float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16));
-                float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bits), 16));
+                float32x4_t v0 = widen_16bit(vget_low_u16(bits), fp16);
+                float32x4_t v1 = widen_high_16bit(bits, fp16);
                 a0 = vfmaq_n_f32(a0, v0, scores[0][key]);
                 b0 = vfmaq_n_f32(b0, v1, scores[0][key]);
                 a1 = vfmaq_n_f32(a1, v0, scores[1][key]);
@@ -1321,8 +1331,8 @@ static TrillimStatus grouped_bf16_attention(
                         const uint16_t *value = (const uint16_t *)task->values +
                             value_base + (block + key) * p->v_strides[1] + channel;
                         uint16x8_t bits = vld1q_u16(value);
-                        float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16));
-                        float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bits), 16));
+                        float32x4_t v0 = widen_16bit(vget_low_u16(bits), fp16);
+                        float32x4_t v1 = widen_high_16bit(bits, fp16);
                         a = vfmaq_n_f32(a, v0, scores[row][key]);
                         b = vfmaq_n_f32(b, v1, scores[row][key]);
                     }
@@ -1342,7 +1352,7 @@ static TrillimStatus grouped_bf16_attention(
             if (isnan(value)) {
                 return TRILLIM_ERROR;
             }
-            trillim_store(task->output, outputs[row] + channel, TRILLIM_BF16, (TrillimValue){.f = value});
+            trillim_store(task->output, outputs[row] + channel, p->output_dtype, (TrillimValue){.f = value});
         }
     }
     return TRILLIM_OK;
@@ -1360,7 +1370,7 @@ static TrillimStatus grouped_prefill(
         int64_t end = (int64_t)p->length - (int64_t)(p->queries - position) + 1;
         ends[row] = p->causal ? (end < 0 ? 0 : (size_t)end) : p->length;
     }
-    return grouped_bf16_attention(task, kv_head, 0, queries, outputs, ends, 4);
+    return grouped_16bit_attention(task, kv_head, 0, queries, outputs, ends, 4);
 }
 
 static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, size_t worker) {
@@ -1402,7 +1412,7 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
         }
     }
     if (last - first >= 4 && p->length >= 64 &&
-        grouped_bf16_layout(task) && (!p->windowed || p->window >= p->length) &&
+        grouped_16bit_layout(task) && (!p->windowed || p->window >= p->length) &&
         attention_default_fpcr()) {
         for (; last - first >= 4; first += 4) {
             TrillimStatus status = grouped_prefill(task, head, kv_head, first);
@@ -2025,18 +2035,20 @@ static size_t blas_first_key(const TrillimAttentionParameters *p) {
     return 0;
 }
 
-static void convert_bf16(float *dst, const uint16_t *src, size_t rows, size_t width, size_t stride) {
+static void convert_16bit(float *dst, const uint16_t *src, size_t rows, size_t width, size_t stride,
+                          uint32_t dtype) {
+    bool fp16 = dtype == TRILLIM_FP16;
     for (size_t row = 0; row < rows; ++row) {
         const uint16_t *input = src + row * stride;
         float *output = dst + row * width;
         size_t channel = 0;
         for (; width - channel >= 8; channel += 8) {
             uint16x8_t bits = vld1q_u16(input + channel);
-            vst1q_f32(output + channel, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits), 16)));
-            vst1q_f32(output + channel + 4, vreinterpretq_f32_u32(vshll_high_n_u16(bits, 16)));
+            vst1q_f32(output + channel, widen_16bit(vget_low_u16(bits), fp16));
+            vst1q_f32(output + channel + 4, widen_high_16bit(bits, fp16));
         }
         for (; channel < width; ++channel) {
-            output[channel] = trillim_bf16(input[channel]);
+            output[channel] = fp16 ? trillim_fp16(input[channel]) : trillim_bf16(input[channel]);
         }
     }
 }
@@ -2058,7 +2070,10 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
     size_t first = index * 128;
     size_t last = total - first < 128 ? total : first + 128;
     uint32x4_t minimum = vdupq_n_u32(UINT32_MAX), maximum = vdupq_n_u32(0);
-    uint16x8_t min_bf16 = vdupq_n_u16(UINT16_MAX), max_bf16 = vdupq_n_u16(0);
+    uint16x8_t min_16bit = vdupq_n_u16(UINT16_MAX), max_16bit = vdupq_n_u16(0);
+    bool fp16 = p->q_dtype == TRILLIM_FP16;
+    uint16_t low = fp16 ? 0 : 0x2f80;
+    uint16_t high = fp16 ? 0x5c00 : 0x4380;  /* 256 in either format */
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : fabsf(p->scale);
     for (size_t row = first; row < last; ++row) {
         if ((row & 7) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
@@ -2079,31 +2094,31 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
             channels = values ? p->value_dim : p->key_dim;
         }
         size_t channel = 0;
-        if (p->q_dtype == TRILLIM_BF16) {
+        if (p->q_dtype != TRILLIM_FP32) {
             const uint16_t *bits = (const uint16_t *)data + base;
             bool score_operand = row < queries || row - queries < keys;
             float32x4_t energy0 = vdupq_n_f32(0), energy1 = energy0;
             for (; channels - channel >= 8; channel += 8) {
                 uint16x8_t value = vandq_u16(vld1q_u16(bits + channel), vdupq_n_u16(0x7fff));
-                max_bf16 = vmaxq_u16(max_bf16, value);
+                max_16bit = vmaxq_u16(max_16bit, value);
                 if (score_operand) {
-                    float32x4_t lo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(value), 16));
-                    float32x4_t hi = vreinterpretq_f32_u32(vshll_high_n_u16(value, 16));
+                    float32x4_t lo = widen_16bit(vget_low_u16(value), fp16);
+                    float32x4_t hi = widen_high_16bit(value, fp16);
                     energy0 = vfmaq_f32(energy0, lo, lo);
                     energy1 = vfmaq_f32(energy1, hi, hi);
                 }
                 value = vbslq_u16(vceqq_u16(value, vdupq_n_u16(0)), vdupq_n_u16(UINT16_MAX), value);
-                min_bf16 = vminq_u16(min_bf16, value);
+                min_16bit = vminq_u16(min_16bit, value);
             }
             float energy = vaddvq_f32(vaddq_f32(energy0, energy1));
             for (; channel < channels; ++channel) {
                 uint16_t value = bits[channel] & 0x7fff;
-                if (value && (value < 0x2f80 || value >= 0x4380)) {
+                if (value && (value < low || value >= high)) {
                     atomic_store_explicit(task->ordinary, false, memory_order_relaxed);
                     return TRILLIM_OK;
                 }
                 if (score_operand) {
-                    float x = trillim_bf16(value);
+                    float x = fp16 ? trillim_fp16(value) : trillim_bf16(value);
                     energy += x * x;
                 }
             }
@@ -2131,8 +2146,8 @@ static TrillimStatus ordinary_inputs(void *opaque, size_t index, size_t worker) 
             }
         }
     }
-    /* Keep large BF16 cancellation cases on the channel-ordered fallback. */
-    if (vminvq_u16(min_bf16) < 0x2f80 || vmaxvq_u16(max_bf16) >= 0x4380 ||
+    /* Keep large low-precision cancellation cases on the channel-ordered fallback. */
+    if (vminvq_u16(min_16bit) < low || vmaxvq_u16(max_16bit) >= high ||
         vminvq_u32(minimum) < UINT32_C(0x2f800000) || vmaxvq_u32(maximum) >= UINT32_C(0x4f800000)) {
         atomic_store_explicit(task->ordinary, false, memory_order_relaxed);
     }
@@ -2148,14 +2163,14 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
     size_t rows = p->queries - first < task->blas_queries ? p->queries - first : task->blas_queries;
     size_t fallback_groups = p->queries / 16 + (p->queries % 16 != 0);
     size_t fallback_size = p->heads * fallback_groups * (p->value_dim + 64);
-    bool bf16 = p->q_dtype == TRILLIM_BF16;
-    size_t stride = bf16 ? blas_bf16_stride(p->key_dim, p->value_dim, task->blas_queries, task->blas_keys) :
+    bool packed = p->q_dtype != TRILLIM_FP32;
+    size_t stride = packed ? blas_16bit_stride(p->key_dim, p->value_dim, task->blas_queries, task->blas_keys) :
         task->blas_queries * (p->value_dim + task->blas_keys);
-    float *workspace = task->scratch + (bf16 ? 0 : fallback_size);
+    float *workspace = task->scratch + (packed ? 0 : fallback_size);
     float *scores = workspace + slot * stride;
     float *accumulator = scores + task->blas_queries * task->blas_keys;
     float *packed_query = accumulator + task->blas_queries * p->value_dim;
-    float *packed_kv = packed_query + (bf16 ? task->blas_queries * p->key_dim : 0);
+    float *packed_kv = packed_query + (packed ? task->blas_queries * p->key_dim : 0);
     float maximum[BLAS_MAX_QUERIES], denominator[BLAS_MAX_QUERIES];
     size_t begin[BLAS_MAX_QUERIES], end[BLAS_MAX_QUERIES];
     size_t first_key = p->length, last_key = 0;
@@ -2180,8 +2195,8 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
     }
     size_t query_start = head * p->q_strides[0] + first * p->q_strides[1];
     const float *query;
-    if (bf16) {
-        convert_bf16(packed_query, (const uint16_t *)task->query + query_start, rows, p->key_dim, p->q_strides[1]);
+    if (packed) {
+        convert_16bit(packed_query, (const uint16_t *)task->query + query_start, rows, p->key_dim, p->q_strides[1], p->q_dtype);
         query = packed_query;
     } else {
         query = (const float *)task->query + query_start;
@@ -2193,15 +2208,15 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
         size_t count = last_key - block < task->blas_keys ? last_key - block : task->blas_keys;
         size_t key_start = kv_head * p->k_strides[0] + block * p->k_strides[1];
         const float *keys;
-        if (bf16) {
-            convert_bf16(packed_kv, (const uint16_t *)task->keys + key_start, count, p->key_dim, p->k_strides[1]);
+        if (packed) {
+            convert_16bit(packed_kv, (const uint16_t *)task->keys + key_start, count, p->key_dim, p->k_strides[1], p->k_dtype);
             keys = packed_kv;
         } else {
             keys = (const float *)task->keys + key_start;
         }
         sgemm(101, 111, 112, (int)rows, (int)count, (int)p->key_dim, scale,
-              query, (int)(bf16 ? p->key_dim : p->q_strides[1]), keys,
-              (int)(bf16 ? p->key_dim : p->k_strides[1]), 0, scores, task->blas_keys);
+              query, (int)(packed ? p->key_dim : p->q_strides[1]), keys,
+              (int)(packed ? p->key_dim : p->k_strides[1]), 0, scores, task->blas_keys);
         if (context->is_cancelled(context->cancellation_context)) {
             return TRILLIM_CANCELLED;
         }
@@ -2255,14 +2270,14 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
         }
         size_t value_start = kv_head * p->v_strides[0] + block * p->v_strides[1];
         const float *values;
-        if (bf16) {
-            convert_bf16(packed_kv, (const uint16_t *)task->values + value_start, count, p->value_dim, p->v_strides[1]);
+        if (packed) {
+            convert_16bit(packed_kv, (const uint16_t *)task->values + value_start, count, p->value_dim, p->v_strides[1], p->v_dtype);
             values = packed_kv;
         } else {
             values = (const float *)task->values + value_start;
         }
         sgemm(101, 111, 111, (int)rows, (int)p->value_dim, (int)count, 1, scores, task->blas_keys,
-              values, (int)(bf16 ? p->value_dim : p->v_strides[1]), 1, accumulator, (int)p->value_dim);
+              values, (int)(packed ? p->value_dim : p->v_strides[1]), 1, accumulator, (int)p->value_dim);
     }
     for (size_t row = 0; row < rows; ++row) {
         if (context->is_cancelled(context->cancellation_context)) {
@@ -2271,7 +2286,19 @@ static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, s
         float reciprocal = 1.0f / (denominator[row] > 0 ? denominator[row] : 1.0f);
         size_t output_start = ((first + row) * p->heads + head) * p->value_dim;
         const float *input = accumulator + row * p->value_dim;
-        if (bf16) {
+        if (p->output_dtype == TRILLIM_FP16) {
+            uint16_t *output = (uint16_t *)task->output + output_start;
+            size_t channel = 0;
+            for (; p->value_dim - channel >= 4; channel += 4) {
+                vst1_u16(output + channel, vreinterpret_u16_f16(vcvt_f16_f32(
+                    vmulq_n_f32(vld1q_f32(input + channel), reciprocal))));
+            }
+            for (; channel < p->value_dim; ++channel) {
+                output[channel] = trillim_to_fp16(input[channel] * reciprocal);
+            }
+            continue;
+        }
+        if (packed) {
             for (size_t channel = 0; channel < p->value_dim; ++channel) {
                 TrillimValue result = {.f = input[channel] * reciprocal};
                 trillim_store(task->output, output_start + channel, TRILLIM_BF16, result);
@@ -2314,8 +2341,8 @@ static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
     size_t slots = task->blas_slots;
     bool enabled = true;
 #ifdef __APPLE__
-    bool bf16 = p->q_dtype == TRILLIM_BF16;
-    if (bf16 && !attention_default_fpcr()) {
+    bool packed = p->q_dtype != TRILLIM_FP32;
+    if (packed && !attention_default_fpcr()) {
         atomic_store_explicit(task->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
@@ -2323,7 +2350,7 @@ static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
     if (previous != 1) {
         enabled = set_threading(1) == 0;
     }
-    if (bf16 && !enabled) {
+    if (packed && !enabled) {
         atomic_store_explicit(task->ordinary, false, memory_order_relaxed);
         return TRILLIM_OK;
     }
@@ -2331,7 +2358,7 @@ static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
     TrillimStatus status = TRILLIM_OK;
     for (size_t index = slot; index < tiles;) {
 #ifdef __APPLE__
-        if (bf16 && !atomic_load_explicit(task->ordinary, memory_order_relaxed)) {
+        if (packed && !atomic_load_explicit(task->ordinary, memory_order_relaxed)) {
             break;
         }
 #endif
@@ -2373,7 +2400,7 @@ static TrillimStatus grouped_decode(void *opaque, size_t index, size_t worker) {
             outputs[row] = head * p->value_dim;
             ends[row] = p->length;
         }
-        TrillimStatus status = grouped_bf16_attention(task, kv_head, begin, queries, outputs, ends, heads);
+        TrillimStatus status = grouped_16bit_attention(task, kv_head, begin, queries, outputs, ends, heads);
         if (status != TRILLIM_ERROR) {
             return status;
         }
@@ -2443,10 +2470,10 @@ static TrillimStatus staged_decode_scores(void *opaque, size_t index, size_t wor
         size_t count = last - key;
         const uint16_t *keys = (const uint16_t *)task->keys + start;
         if (count >= 8) {
-            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, 0, true);
+            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, 0, true, false);
             key += 8;
         } else if (count >= 4) {
-            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, 0, false);
+            grouped_scores(transposed, keys, p->key_dim, p->k_strides[1], scores, 0, false, false);
             key += 4;
         } else {
             for (size_t row = 0; row < heads; ++row) {
@@ -2558,11 +2585,11 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     }
     size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
     size_t ratio = p->heads / p->kv_heads;
-    if (p->queries == 1 && ratio >= 3 && visible >= 8 && grouped_bf16_layout(&task) &&
+    if (p->queries == 1 && ratio >= 3 && visible >= 8 && grouped_16bit_layout(&task) &&
         attention_default_fpcr()) {
         size_t workers = context->thread_pool->worker_count;
         size_t groups = p->kv_heads * (ratio / 4 + (ratio % 4 != 0));
-        if (visible >= BF16_DECODE_STAGED_MIN_KEYS && workers / groups >= 3 &&
+        if (p->q_dtype == TRILLIM_BF16 && visible >= BF16_DECODE_STAGED_MIN_KEYS && workers / groups >= 3 &&
             ratio % 4 != 1 && p->heads <= SIZE_MAX / sizeof(float) / p->length) {
             size_t parts = workers / groups + (workers % groups != 0);
             size_t tiles = visible / BF16_DECODE_STAGED_KEY_TILE + (visible % BF16_DECODE_STAGED_KEY_TILE != 0);
@@ -2601,21 +2628,21 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     task.blas_keys = visible >= 256 ? 256 : 128;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
     bool blas_rows = !p->length || p->kv_heads <= (SIZE_MAX - p->heads * p->queries) / 2 / p->length;
-    bool blas_bf16 = false;
+    bool blas_16bit = false;
 #ifdef __APPLE__
-    blas_bf16 = blas_bf16_layout(p) && p->queries >= BLAS_BF16_QUERIES && attention_default_fpcr() &&
+    blas_16bit = blas_16bit_layout(p) && p->queries >= BLAS_16BIT_QUERIES && attention_default_fpcr() &&
         (((uintptr_t)inputs[0] | (uintptr_t)inputs[1] | (uintptr_t)inputs[2] | (uintptr_t)outputs[0]) & 1) == 0;
 #endif
-    if (blas_bf16) {
-        task.blas_queries = BLAS_BF16_QUERIES;
-        task.blas_keys = BLAS_BF16_KEYS;
+    if (blas_16bit) {
+        task.blas_queries = BLAS_16BIT_QUERIES;
+        task.blas_keys = BLAS_16BIT_KEYS;
     }
-    if ((blas_bf16 || (optimized && p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 && p->v_dtype == TRILLIM_FP32)) &&
+    if ((blas_16bit || (optimized && p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 && p->v_dtype == TRILLIM_FP32)) &&
         p->queries >= 32 && visible >= 64 && p->key_dim >= 64 && p->key_dim <= 256 &&
         p->value_dim >= 64 && p->value_dim <= 256 && p->q_strides[1] >= p->key_dim &&
         p->k_strides[1] >= p->key_dim && p->v_strides[1] >= p->value_dim && p->q_strides[1] <= INT32_MAX &&
         p->k_strides[1] <= INT32_MAX && p->v_strides[1] <= INT32_MAX && blas_rows &&
-        isfinite(scale) && fabsf(scale) <= (blas_bf16 ? 0.25f : 1.0f) && initialize_blas(context)) {
+        isfinite(scale) && fabsf(scale) <= (blas_16bit ? 0.25f : 1.0f) && initialize_blas(context)) {
         size_t rows = p->heads * p->queries + 2 * p->kv_heads * (p->length - blas_first_key(p));
         size_t groups = rows / 128 + (rows % 128 != 0);
         TrillimStatus status = context->thread_pool->run(context->thread_pool->context, groups, ordinary_inputs, &task);
@@ -2624,10 +2651,10 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
         }
         if (atomic_load_explicit(&ordinary, memory_order_relaxed)) {
             size_t groups = p->queries / task.blas_queries + (p->queries % task.blas_queries != 0);
-            size_t max_slots = blas_bf16 ? BLAS_BF16_SLOTS : 128;
+            size_t max_slots = blas_16bit ? BLAS_16BIT_SLOTS : 128;
             task.blas_slots = p->heads * groups < max_slots ? p->heads * groups : max_slots;
             status = context->thread_pool->run(context->thread_pool->context, task.blas_slots, blas_task, &task);
-            if (status != TRILLIM_OK || !blas_bf16 ||
+            if (status != TRILLIM_OK || !blas_16bit ||
                 atomic_load_explicit(&ordinary, memory_order_relaxed)) {
                 return status;
             }
