@@ -76,12 +76,6 @@ TRILLIM_KERNEL const char *trillim_scalar_topk_mask_tdl(void) {
            "    return dict(rows=out.shape[0], width=out.shape[1], index_stride=index_stride,\n"
            "                mask_row_stride=mask_row_stride, mask_column_stride=mask_column_stride)\n"
            "def pattern(columns: Tensor, selected: Tensor, when_false: Tensor, when_true: Tensor) -> tuple[Tensor, ...]:\n"
-           "    if any(not isinstance(x, Tensor) for x in (columns, selected, when_false, when_true)):\n"
-           "        raise ValueError('mask update requires tensor inputs')\n"
-           "    if (columns.dtype, selected.dtype, when_false.dtype, when_true.dtype) != ('int64', 'int64', 'bool', 'bool'):\n"
-           "        raise ValueError('expected two indices and a mask')\n"
-           "    if tuple(len(x.shape.dimensions) for x in (columns, selected, when_false, when_true)) != (1, 2, 2, 0):\n"
-           "        raise ValueError('expected columns, per-row indices, a matrix mask and a scalar replacement')\n"
            "    return (Select(Compare(columns, selected, predicate='eq'), when_true, when_false),)\n";
 }
 

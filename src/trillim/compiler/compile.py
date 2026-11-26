@@ -15,8 +15,7 @@ from .kernels.kernel_dataclasses import _Backend
 from .passes.allocate import _allocate
 from .passes.emit import _emit
 from .passes.infer import _infer
-from .passes.loop_match import _selected_loop_inference
-from .passes.match import _match
+from .passes.match import _match, _selected_loop_inference
 from .passes.optimize import _optimize
 from .passes.packing import _set_packings
 from .passes.processing import _processing

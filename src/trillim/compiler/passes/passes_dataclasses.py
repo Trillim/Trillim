@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 
+from ...tdl.core.core_dataclasses import _Region
 from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
 from ..compiler_dataclasses import _Inference, _ShapeExpression
@@ -30,6 +31,20 @@ class _KernelPattern:
     inputs: dict[Tensor, str]
     outputs: tuple[Tensor, ...]
     inference: _Inference
+
+
+@dataclass(slots=True)
+class _SymbolicPattern:
+    inputs: dict[Tensor, str]
+    outputs: tuple[Tensor, ...]
+    region: _Region
+    roots: tuple[frozenset[str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PatternBindings:
+    values: dict[str, Tensor]
+    pairs: frozenset[tuple[Tensor, Tensor]] = frozenset()
 
 
 @dataclass(slots=True)
@@ -67,6 +82,9 @@ class _MatchingState:
     canonical: bool = False
     remaining: int = 0
     purity: dict[int, bool] = field(default_factory=dict)
+    pattern_purity: dict[int, bool] = field(default_factory=dict)
+    pattern_values: dict[Tensor, Tensor] = field(default_factory=dict)
+    pattern_roots: dict[Tensor, frozenset[str]] = field(default_factory=dict)
     unwrapped: dict[Tensor, tuple[Tensor, tuple[_Operator, ...]]] = field(
         default_factory=dict
     )

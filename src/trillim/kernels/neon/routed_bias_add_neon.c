@@ -173,10 +173,6 @@ TRILLIM_KERNEL const char *trillim_neon_routed_bias_add_tdl(void) {
            "                a_token_stride=a_token_stride, a_route_stride=a_route_stride,\n"
            "                index_token_stride=index_token_stride, index_route_stride=index_route_stride, bias_dtype=_DTYPE_IDS[bias.dtype])\n"
            "def pattern(a: Tensor, bias: Tensor, indices: Tensor) -> tuple[Tensor, ...]:\n"
-           "    if any(not isinstance(x, Tensor) for x in (a, bias, indices)):\n"
-           "        raise ValueError('routed bias addition requires tensor inputs')\n"
-           "    if tuple(len(x.shape.dimensions) for x in (a, bias, indices)) != (3, 2, 3) or indices.dtype != 'int64' or a.dtype != 'fp32':\n"
-           "        raise ValueError('expected projected rows, expert biases and routed indices')\n"
            "    return (Add(a, Cast(Gather(bias, indices=indices), 'fp32')),)\n";
 }
 
