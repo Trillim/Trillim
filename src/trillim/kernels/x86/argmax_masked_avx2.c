@@ -150,9 +150,17 @@ TRILLIM_AVX2 static TrillimStatus apply(void *opaque,size_t row,size_t worker) {
     size_t column = 0;
     for (; p->width - column >= 8; column += 8) {
         if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        uint32_t masks[8];
-        for (size_t lane = 0; lane < 8; ++lane) masks[lane] = task->mask[mask_base + (column + lane) * mask_step] ? UINT32_MAX : 0;
-        __m256i active = loadi8(masks);
+        __m256i active;
+        if (mask_step == 1) {
+            __m128i bytes = _mm_loadl_epi64((const __m128i *)(task->mask + mask_base + column));
+            active = _mm256_cmpgt_epi32(_mm256_cvtepu8_epi32(bytes), _mm256_setzero_si256());
+        } else if (mask_step == 0) {
+            active = _mm256_set1_epi32(task->mask[mask_base] ? -1 : 0);
+        } else {
+            uint32_t masks[8];
+            for (size_t lane = 0; lane < 8; ++lane) masks[lane] = task->mask[mask_base + (column + lane) * mask_step] ? UINT32_MAX : 0;
+            active = loadi8(masks);
+        }
         __m256 value = load8(task->input,base + column,p->input_dtype);
         nan |= any8(andnot8(active,eq8(value,value))) != 0;
         __m256i choose = _mm256_and_si256(active,_mm256_or_si256(not8(valid),gt8(value,best)));

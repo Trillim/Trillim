@@ -208,6 +208,22 @@ TRILLIM_AVX2 static TrillimStatus sum_columns(void *opaque, size_t tile, size_t 
     return TRILLIM_OK;
 }
 
+enum { SUM_BATCH = 64 };
+
+static TrillimStatus sum_batch(void *opaque, size_t tile, size_t worker) {
+    const TrillimReductionTask *task = opaque;
+    size_t outputs = task->parameters->outputs;
+    size_t first = tile * SUM_BATCH;
+    size_t end = outputs - first < SUM_BATCH ? outputs : first + SUM_BATCH;
+    for (size_t i = first; i < end; ++i) {
+        TrillimStatus status = sum_float(opaque, i, worker);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_x86_reduce_sum_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -228,8 +244,12 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_reduce_sum_avx2(
         return tasks == 1 ? sum_columns(&task, 0, 0) :
             context->thread_pool->run(context->thread_pool->context, tasks, sum_columns, &task);
     }
-    return p->outputs == 1 ? sum_float(&task, 0, 0) :
-        context->thread_pool->run(context->thread_pool->context, p->outputs, sum_float, &task);
+    const TrillimThreadPool *pool=context->thread_pool;
+    if (p->outputs>=SUM_BATCH && p->reduce_count<=1024 && p->outputs/SUM_BATCH>=pool->worker_count) {
+        size_t count=p->outputs/SUM_BATCH+(p->outputs%SUM_BATCH!=0);
+        return pool->run(pool->context,count,sum_batch,&task);
+    }
+    return p->outputs==1 ? sum_float(&task,0,0) : pool->run(pool->context,p->outputs,sum_float,&task);
 }
 
 TRILLIM_KERNEL const char *trillim_x86_reduce_sum_avx2_tdl(void) {

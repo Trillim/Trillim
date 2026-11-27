@@ -77,7 +77,14 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_bf16_add(void *const *outputs, const vo
     const Parameters *p = opaque;
     Task task = {outputs[0],inputs[0],inputs[1],p,context};
     size_t count = p->count / 4096 + (p->count % 4096 != 0);
-    return count == 1 ? apply(&task,0,0) : context->thread_pool->run(context->thread_pool->context,count,apply,&task);
+    if (p->count <= 16384) {
+        for (size_t tile = 0; tile < count; ++tile) {
+            TrillimStatus status = apply(&task,tile,0);
+            if (status != TRILLIM_OK) return status;
+        }
+        return TRILLIM_OK;
+    }
+    return context->thread_pool->run(context->thread_pool->context,count,apply,&task);
 }
 TRILLIM_KERNEL const char *trillim_x86_bf16_add_tdl(void) {
     return "from trillim.tdl import *\n"

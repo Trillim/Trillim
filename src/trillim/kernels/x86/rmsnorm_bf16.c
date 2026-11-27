@@ -132,6 +132,13 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_bf16_rmsnorm(void *const *outputs, cons
     if (!p->width || !p->rows) return TRILLIM_OK;
     Task task = {inputs[0], inputs[1], outputs[0], p, context};
     size_t count = p->rows / 2 + (p->rows % 2 != 0);
+    if (p->rows <= 2048 / p->width) {
+        for (size_t i = 0; i < count; ++i) {
+            TrillimStatus status = normalize(&task,i,0);
+            if (status != TRILLIM_OK) return status;
+        }
+        return TRILLIM_OK;
+    }
     return count == 1 ? normalize(&task, 0, 0) : context->thread_pool->run(context->thread_pool->context, count, normalize, &task);
 }
 TRILLIM_KERNEL const char *trillim_x86_bf16_rmsnorm_tdl(void) {

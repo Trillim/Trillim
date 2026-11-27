@@ -960,6 +960,87 @@ __attribute__((target("avx2"))) static TrillimStatus depthwise(void *opaque, siz
     return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+enum { DEPTHWISE_TIME_TILE = 32, DEPTHWISE_CHANNEL_TILE = 64, DEPTHWISE_DECODE_CHANNELS = 512 };
+
+__attribute__((target("avx2"))) static TrillimStatus depthwise_time_major(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t rows = task->output_volume, channels = p->channels;
+    size_t temporal = rows / DEPTHWISE_TIME_TILE + (rows % DEPTHWISE_TIME_TILE != 0);
+    size_t first = tile % temporal * DEPTHWISE_TIME_TILE;
+    size_t last = rows - first < DEPTHWISE_TIME_TILE ? rows : first + DEPTHWISE_TIME_TILE;
+    size_t width = rows == 1 ? DEPTHWISE_DECODE_CHANNELS : DEPTHWISE_CHANNEL_TILE;
+    size_t channel = tile / temporal * width;
+    size_t end = channels - channel < width ? channels : channel + width;
+    for (; end - channel >= 4; channel += 4) {
+        if ((channel & 31) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        __m256 lo = load8(task->weight, channel * 4, p->weight_dtype, task->f16c);
+        __m256 hi = load8(task->weight, channel * 4 + 8, p->weight_dtype, task->f16c);
+        __m128 w0 = _mm256_castps256_ps128(lo), w1 = _mm256_extractf128_ps(lo, 1);
+        __m128 w2 = _mm256_castps256_ps128(hi), w3 = _mm256_extractf128_ps(hi, 1);
+        _MM_TRANSPOSE4_PS(w0, w1, w2, w3);
+#if BIASED
+        __m128 bias = _mm_setr_ps(trillim_load(task->bias, channel, p->bias_dtype).f,
+                                  trillim_load(task->bias, channel + 1, p->bias_dtype).f,
+                                  trillim_load(task->bias, channel + 2, p->bias_dtype).f,
+                                  trillim_load(task->bias, channel + 3, p->bias_dtype).f);
+#endif
+        size_t position = first;
+        while (position < last) {
+            size_t count = last - position < 4 ? last - position : 4;
+            const float *input = (const float *)task->input + position * channels + channel;
+            __m128 x[7], sums[4];
+            for (size_t t = 0; t < count + 3; ++t) {
+                x[t] = _mm_loadu_ps(input + t * channels);
+            }
+            for (size_t t = 0; t < count; ++t) {
+                __m128 sum = _mm_add_ps(_mm_setzero_ps(), _mm_mul_ps(x[t], w0));
+                sum = _mm_add_ps(sum, _mm_mul_ps(x[t + 1], w1));
+                sum = _mm_add_ps(sum, _mm_mul_ps(x[t + 2], w2));
+                sum = _mm_add_ps(sum, _mm_mul_ps(x[t + 3], w3));
+#if BIASED
+                sum = _mm_add_ps(sum, bias);
+#endif
+                sums[t] = sum;
+            }
+            float *output = (float *)task->output + channel * rows + position;
+            if (count == 4) {
+                _MM_TRANSPOSE4_PS(sums[0], sums[1], sums[2], sums[3]);
+                for (size_t lane = 0; lane < 4; ++lane) {
+                    _mm_storeu_ps(output + lane * rows, sums[lane]);
+                }
+            } else if (rows == 1) {
+                _mm_storeu_ps(output, sums[0]);
+            } else if (rows == 2) {
+                _mm_storeu_ps(output, _mm_unpacklo_ps(sums[0], sums[1]));
+                _mm_storeu_ps(output + 4, _mm_unpackhi_ps(sums[0], sums[1]));
+            } else {
+                for (size_t t = 0; t < count; ++t) {
+                    float values[4];
+                    _mm_storeu_ps(values, sums[t]);
+                    for (size_t lane = 0; lane < 4; ++lane) {
+                        output[lane * rows + t] = values[lane];
+                    }
+                }
+            }
+            position += count;
+        }
+    }
+    for (; channel < end; ++channel) {
+        for (size_t position = first; position < last; ++position) {
+            const size_t out[] = {position};
+            TrillimStatus status = convolve1(task, channel, position, out);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+    }
+    return TRILLIM_OK;
+}
+
 static TrillimStatus convolve_batch(void *opaque, size_t batch, size_t worker) {
     const Task *task = opaque;
     size_t tiles = task->output_volume / 64 + (task->output_volume % 64 != 0);
@@ -1001,6 +1082,22 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_conv_nd_bias(void *const *outputs, cons
     WinogradLayout layout;
     if (fma_available() && winograd_layout(p, &layout)) {
         return winograd(&task, scratch, &layout);
+    }
+    if (p->dimensions == 1 && p->groups == p->channels && p->outputs == p->channels &&
+        p->input_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32 && trillim_float(p->weight_dtype) &&
+        p->input_shape[0] > 3 && task.output_volume == p->input_shape[0] - 3 && task.kernel_volume == 4 &&
+        p->stride[0] == 1 && p->padding[0] == 0 && p->dilation[0] == 1 &&
+        p->channel_stride == 1 && p->input_strides[0] == p->channels &&
+        (task.output_volume == 1 || p->output_strides[0] == 1) &&
+        (p->outputs == 1 || p->output_channel_stride == task.output_volume) &&
+        (uintptr_t)task.input % sizeof(float) == 0 && (uintptr_t)task.output % sizeof(float) == 0 &&
+        (uintptr_t)task.weight % trillim_itemsize(p->weight_dtype) == 0) {
+        size_t temporal = task.output_volume / DEPTHWISE_TIME_TILE + (task.output_volume % DEPTHWISE_TIME_TILE != 0);
+        size_t width = task.output_volume == 1 ? DEPTHWISE_DECODE_CHANNELS : DEPTHWISE_CHANNEL_TILE;
+        size_t channels = p->channels / width + (p->channels % width != 0);
+        size_t tiles = temporal * channels;
+        return tiles == 1 ? depthwise_time_major(&task, 0, 0) :
+            context->thread_pool->run(context->thread_pool->context, tiles, depthwise_time_major, &task);
     }
     size_t tiles = task.output_volume / 64 + (task.output_volume % 64 != 0);
     size_t count = p->outputs * tiles;

@@ -247,8 +247,15 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_bf16_rotary_frequencies(void *const *ou
                        : context->thread_pool->run(context->thread_pool->context, p->tokens, prepare_angles, &task);
     if (status != TRILLIM_OK) return status;
     size_t rows = p->heads * p->tokens, block = rows >= 128 ? 8 : 1;
-    return context->thread_pool->run(context->thread_pool->context, rows / block + (rows % block != 0),
-                                     trillim_rotary_task_avx2, &task);
+    size_t tiles = rows / block + (rows % block != 0);
+    if (p->tokens == 1) {
+        for (size_t tile = 0; tile < tiles; ++tile) {
+            TrillimStatus result = trillim_rotary_task_avx2(&task,tile,0);
+            if (result != TRILLIM_OK) return result;
+        }
+        return TRILLIM_OK;
+    }
+    return context->thread_pool->run(context->thread_pool->context,tiles,trillim_rotary_task_avx2,&task);
 }
 
 TRILLIM_KERNEL const char *trillim_x86_bf16_rotary_frequencies_tdl(void) {

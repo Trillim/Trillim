@@ -33,9 +33,6 @@ static TrillimStatus requirements(
             return p->count == 0 ? TRILLIM_OK : TRILLIM_ERROR;
         }
     }
-    if (p->rank && p->strides[p->rank - 1] != 1) {
-        return TRILLIM_ERROR;
-    }
     size_t count = 1;
     for (size_t axis = 0; axis < p->rank; ++axis) {
         if (count > SIZE_MAX / p->shape[axis]) {
@@ -131,6 +128,22 @@ static void convert_chunk(
     }
 }
 
+SIMD static void convert_strided(const Task *task, size_t output_index, size_t input_index, size_t count, size_t stride) {
+    const Parameters *p = task->p;
+    size_t i=0;
+    if (p->input_dtype == TRILLIM_FP32 && stride <= INT32_MAX / 7) {
+        __m256i offsets=_mm256_mullo_epi32(_mm256_setr_epi32(0,1,2,3,4,5,6,7),_mm256_set1_epi32((int32_t)stride));
+        const float *input=(const float *)task->input+input_index;
+        for (;count-i>=8;i+=8) {
+            store8(task->output,output_index+i,p->output_dtype,_mm256_i32gather_ps(input+i*stride,offsets,4));
+        }
+    }
+    for (;i<count;++i) {
+        TrillimValue value=trillim_load(task->input,input_index+i*stride,p->input_dtype);
+        trillim_store(task->output,output_index+i,p->output_dtype,value);
+    }
+}
+
 static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *task = opaque;
@@ -143,7 +156,7 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
             return TRILLIM_CANCELLED;
         }
         size_t length = limit - index < CHUNK_ELEMENTS ? limit - index : CHUNK_ELEMENTS;
-        size_t source = index;
+        size_t source = index, stride = 1;
         if (!task->contiguous) {
             size_t width = p->shape[p->rank - 1];
             size_t remaining = width - index % width;
@@ -151,8 +164,10 @@ static TrillimStatus apply(void *opaque, size_t tile, size_t worker) {
                 length = remaining;
             }
             source = trillim_offset(index, p->rank, p->shape, p->strides);
+            stride = p->strides[p->rank - 1];
         }
-        convert_chunk(task, index, source, length, vectorize);
+        if (stride == 1) convert_chunk(task,index,source,length,vectorize);
+        else convert_strided(task,index,source,length,stride);
         index += length;
     }
     return TRILLIM_OK;
@@ -191,15 +206,12 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_cast_avx2(
 TRILLIM_KERNEL const char *trillim_x86_cast_avx2_tdl(void) {
     return "from trillim.tdl import *\n"
            "from trillim.compiler.kernels.bindings import _cast\n"
-           "from trillim.compiler.passes.infer import _constant_expression\n"
            "def bind(context):\n"
            "    source, output = context.inputs['x'], context.outputs[0]\n"
            "    floats = ('fp16', 'bf16', 'fp32')\n"
            "    if source.dtype not in floats or output.dtype not in floats or source.dtype == output.dtype:\n"
            "        raise ValueError('floating cast requires different floating dtypes')\n"
            "    p = _cast(context)\n"
-           "    if source.strides and source.strides[-1] != _constant_expression(1):\n"
-           "        raise ValueError('floating cast requires contiguous input rows')\n"
            "    return {name: p[name] for name in ('count', 'rank', 'shape', 'strides', 'input_dtype', 'output_dtype')}\n"
            "def pattern(x: Tensor, *, dtype: DType) -> tuple[Tensor, ...]:\n"
            "    return (Cast(x, dtype),)\n";
