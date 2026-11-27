@@ -17,7 +17,7 @@ from ... import _VERSION_ROOT
 from ..toolchain import _compilers
 from .kernel_dataclasses import _Backend
 from .kernel_pydantic_models import _KernelIndex, _KernelRequest
-from .native import _read_capabilities, _read_schema
+from .native import _load_library, _read_capabilities, _read_schema
 
 _KERNEL_ROOT = Path(__file__).resolve().parents[2] / "kernels"
 _FLAGS = (
@@ -30,6 +30,24 @@ _FLAGS = (
     "-fPIC",
     "-fvisibility=hidden",
 )
+
+
+@contextmanager
+def _locked(destination: Path) -> Iterator[None]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with (destination.parent / f".{destination.name}.lock").open("a+b") as lock:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock.write(b"\0")
+            lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def _run(command: list[str], *, workspace: Path | None = None) -> None:
@@ -124,25 +142,32 @@ def _build_backend(
         )
     parent = _VERSION_ROOT / "kernels"
     destination = parent / backend
-    parent.mkdir(parents=True, exist_ok=True)
-    with (parent / f".{backend}.lock").open("a+b") as lock:
-        if sys.platform == "win32":
-            import msvcrt
-
-            lock.write(b"\0")
-            lock.flush()
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        previous = destination.resolve() if destination.exists() else None
-        installed: tuple[str, ...] = ()
-        if sources and previous is not None:
+    with _locked(destination):
+        destination.mkdir(exist_ok=True)
+        directory = destination.resolve()
+        shipped: set[str] = set()
+        if (directory / "index.json").is_file() != (directory / "kernels.so").is_file():
+            raise ValueError(f"incomplete shipped kernel installation: {destination}")
+        if (directory / "index.json").is_file():
+            shipped.update(
+                _KernelIndex.model_validate_json(
+                    (directory / "index.json").read_bytes()
+                ).symbols
+            )
+        installed: _KernelIndex | None = None
+        if sources and (directory / "custom_index.json").is_file():
             installed = _KernelIndex.model_validate_json(
-                (previous / "index.json").read_bytes()
-            ).symbols
+                (directory / "custom_index.json").read_bytes()
+            )
+            conflicts = shipped.intersection(installed.symbols)
+            if conflicts:
+                raise ValueError(
+                    f"custom kernels conflict with shipped kernels: {', '.join(sorted(conflicts))}"
+                )
+        objects = directory / "custom"
+        had_objects = objects.is_dir()
+        library_new = directory / "custom_kernel_new.so"
+        index_new = directory / "custom_index_new.json"
         failures: list[str] = []
         for compiler in compilers:
             progress(f"Building {backend} kernels with {' '.join(compiler)}")
@@ -150,16 +175,9 @@ def _build_backend(
             if Path(compiler[0]).stem.lower() == "zig":
                 # Zig reports an internal -c as unused in assembly-output mode.
                 emit_flags.append("-Wno-unused-command-line-argument")
-            temporary = Path(tempfile.mkdtemp(prefix=f".{backend}-", dir=parent))
+            temporary = Path(tempfile.mkdtemp(prefix=".build-", dir=directory))
             try:
-                objects = temporary / "objects"
-                if sources and previous is not None:
-                    shutil.copytree(
-                        previous / "objects", objects, copy_function=os.link
-                    )
-                else:
-                    objects.mkdir()
-                symbols = set(installed)
+                symbols = set(installed.symbols if installed is not None else ())
                 updated: set[str] = set()
                 for source in selected:
                     compiled_source = source
@@ -210,15 +228,20 @@ def _build_backend(
                             f"{source}: expected one kernel with four exported functions"
                         )
                     name = roots[0]
+                    if name in shipped:
+                        raise RuntimeError(
+                            f"kernel '{name}' is supplied by shipped kernels.so; "
+                            "shipped kernels cannot be replaced"
+                        )
                     if name in updated:
                         raise ValueError(f"duplicate kernel symbol: {name}")
-                    output = temporary / "kernel.o"
+                    objects.mkdir(exist_ok=True)
+                    output = objects / f".{name}.new.o"
+                    updated.add(name)
                     _run(
                         [*compiler, "-c", str(assembly), "-o", str(output)],
                         workspace=temporary,
                     )
-                    output.replace(objects / f"{name}.o")
-                    updated.add(name)
                     symbols.add(name)
                 (temporary / "source.c").unlink(missing_ok=True)
                 (temporary / "kernel.s").unlink()
@@ -228,13 +251,18 @@ def _build_backend(
                     [
                         *compiler,
                         "-r",
-                        *(str(objects / f"{name}.o") for name in index.symbols),
+                        *(
+                            str(
+                                objects
+                                / (f".{name}.new.o" if name in updated else f"{name}.o")
+                            )
+                            for name in index.symbols
+                        ),
                         "-o",
                         str(backend_object),
                     ],
                     workspace=temporary,
                 )
-                library_path = temporary / "kernels.so"
                 _run(
                     [
                         *compiler,
@@ -242,19 +270,25 @@ def _build_backend(
                         str(backend_object),
                         "-lm",
                         "-o",
-                        str(library_path),
+                        str(library_new),
                     ],
                     workspace=temporary,
                 )
-                library = c.CDLL(str(library_path))
+                library = _load_library(library_new)
                 for name in index.symbols:
                     _read_capabilities(library, name)
                     _read_schema(library, name)
-                (temporary / "index.json").write_text(index.model_dump_json() + "\n")
+                index_new.write_text(index.model_dump_json() + "\n")
                 shutil.rmtree(temporary / ".zig", ignore_errors=True)
-                backend_object.unlink()
+                backend_object.unlink(missing_ok=True)
             except BaseException as error:
                 shutil.rmtree(temporary)
+                for name in updated:
+                    (objects / f".{name}.new.o").unlink(missing_ok=True)
+                library_new.unlink(missing_ok=True)
+                index_new.unlink(missing_ok=True)
+                if not had_objects and objects.is_dir() and not any(objects.iterdir()):
+                    objects.rmdir()
                 if not isinstance(
                     error, (OSError, ValueError, subprocess.CalledProcessError)
                 ):
@@ -264,26 +298,39 @@ def _build_backend(
             break
         else:
             raise RuntimeError("all C compilers failed:\n" + "\n".join(failures))
+        targets = [
+            (objects / f".{name}.new.o", objects / f"{name}.o")
+            for name in sorted(updated)
+        ] + [
+            (library_new, directory / "custom_kernels.so"),
+            (index_new, directory / "custom_index.json"),
+        ]
+        backups: dict[Path, Path] = {}
         try:
-            publication = temporary / "publish"
-            publication.symlink_to(temporary.name, target_is_directory=True)
-            backup = temporary / "previous"
+            for i, (_, target) in enumerate(targets):
+                if target.exists():
+                    backup = temporary / f"backup-{i}"
+                    os.link(target, backup)
+                    backups[target] = backup
             try:
-                if destination.exists() and not destination.is_symlink():
-                    destination.rename(backup)
-                publication.replace(destination)
+                for staged, target in targets:
+                    staged.replace(target)
             except BaseException:
-                if backup.exists() and (
-                    not destination.is_symlink() or destination.resolve() != temporary
-                ):
-                    backup.rename(destination)
+                for _, target in reversed(targets):
+                    if target in backups:
+                        backups[target].replace(target)
+                    else:
+                        target.unlink(missing_ok=True)
                 raise
-            if backup.exists():
-                shutil.rmtree(backup)
-        except BaseException:
-            if not destination.is_symlink() or destination.resolve() != temporary:
-                shutil.rmtree(temporary)
-            raise
+            for path in objects.glob("*.o"):
+                if path.stem not in symbols:
+                    path.unlink()
+        finally:
+            for staged, _ in targets:
+                staged.unlink(missing_ok=True)
+            shutil.rmtree(temporary)
+            if not had_objects and objects.is_dir() and not any(objects.iterdir()):
+                objects.rmdir()
     return destination
 
 

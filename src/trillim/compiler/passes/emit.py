@@ -318,7 +318,7 @@ def _emit(
         if kernel.library not in libraries:
             filename = f"kernels/{kernel.backend}.so"
             if filename in libraries.values():
-                raise ValueError("different libraries claim the same backend")
+                filename = f"kernels/{kernel.backend}-{len(libraries)}.so"
             shutil.copyfile(kernel.library, destination / filename)
             libraries[kernel.library] = filename
         schema = kernel.parameter_schema

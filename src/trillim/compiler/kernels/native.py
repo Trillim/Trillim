@@ -1,9 +1,36 @@
 from __future__ import annotations
 
+import atexit
 import ctypes as c
+import shutil
+import sys
+from contextlib import ExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import cast
 
 from .kernel_dataclasses import _Backend, _ParameterField, _ParameterSchema
+
+_LOADED_FILES = ExitStack()
+atexit.register(_LOADED_FILES.close)
+
+
+def _load_library(path: Path) -> c.CDLL:
+    # dlopen caches filenames; a private copy permits rebuilding the custom library.
+    with ExitStack() as temporary:
+        directory = Path(
+            temporary.enter_context(TemporaryDirectory(prefix="trillim-kernel-load-"))
+        )
+        copy = directory / path.name
+        shutil.copyfile(path, copy)
+        library = c.CDLL(str(copy))
+        if sys.platform == "win32":
+            release = c.WinDLL("kernel32").FreeLibrary
+            release.argtypes, release.restype = [c.c_void_p], c.c_int
+            _LOADED_FILES.enter_context(temporary.pop_all())
+            _LOADED_FILES.callback(release, library._handle)
+        return library
+
 
 _SOFTWARE_CAPABILITIES = {
     "m": 1 << 32,

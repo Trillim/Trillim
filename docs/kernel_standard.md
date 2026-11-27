@@ -1,10 +1,24 @@
 # Kernel ABI 1
 
-`trillim kernels` rebuilds all built-in kernels for the host backend and the scalar reference backend. `--backend scalar|x86|neon` selects one backend instead. The source build currently targets the host architecture; cross-platform release builds are separate.
+`trillim kernels` compiles the source checkout's kernels for the host backend and scalar reference backend into the custom store. `--backend scalar|x86|neon` selects one backend. The source build targets the host architecture; cross-platform release builds are separate.
 
-`trillim kernels path/to/kernel.c --backend x86` compiles that kernel and relinks it with the installed objects. Multiple source paths are accepted. An existing kernel with the same exported name is replaced; a new name is added. No source paths means a full rebuild, removing previously added custom kernels from that backend.
+`trillim kernels path/to/kernel.c --backend x86` compiles the supplied C sources and relinks the custom library from its objects. Existing custom names can be rebuilt. A name already provided by the shipped library is an error; shipped kernels cannot be replaced. With no source paths, the custom store is rebuilt from the source checkout rather than retaining previously added kernels.
 
-Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containing `kernels.so`, `index.json` and an `objects/` directory. The index lists kernel symbols and has format version 1. Individual objects are retained for incremental linking; packages must include them to support updates without the original sources. Kernel discovery loads the library and index without invoking a C compiler or reading kernel sources.
+Each backend is stored at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`:
+
+```text
+kernels.so              # Shipped library, unchanged by local builds
+index.json              # Shipped index
+custom_kernels.so       # All locally compiled kernels
+custom_index.json       # Custom index
+custom/                 # One .o file per custom kernel
+```
+
+Both indices have format version 1 and list kernel `symbols`. Discovery searches both stores and rejects duplicate names across them. Either store can exist on its own. Custom compilation needs the installed `common.h` header and a C compiler, but no shipped objects or sources. Objects in `custom/` are retained for incremental relinking; rebuilding a custom kernel replaces its object rather than accumulating copies.
+
+Installing the shipped `kernels.so` and `index.json` is the responsibility of packaging or a post-install script. Kernel discovery and compilation never install, copy, link, rename or modify those files. When developing an alternative to a shipped kernel, give it a distinct exported name.
+
+Compiled model bundles copy the libraries used by their plan and do not depend on the original installation. Recompile a model to use updated custom kernels; existing bundles keep their original copies.
 
 The runtime worker and benchmark use the same CPU thread-pool implementation. The worker executable is built separately; compilation builds a temporary benchmark helper and removes it after tuning. Neither benchmark measurements nor helper builds are cached.
 
@@ -14,7 +28,7 @@ Compilers are tried in order: Zig, GCC, Clang, then host MinGW on Windows. An ex
 
 Kernels compile with `-O3` for the architecture's baseline CPU, including `-mcpu=baseline` with Zig. Optional instructions belong in functions with explicit target attributes and corresponding capability bits; building on a newer CPU must not silently add undeclared instruction requirements.
 
-Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. Toolchain scratch, including Zig caches, is confined to temporary build directories and removed after use.
+Builds and kernel discovery for one backend share a lock. Objects are compiled in `custom/`; the linker writes `custom_kernel_new.so` and the index writer creates `custom_index_new.json`. After validation, each file is atomically renamed to its final path. These are two separate renames, so discovery holds the lock while reading the pair. A failed rename restores the previous custom library, index and objects. There are no storage symlinks or generation directories. The shipped files stay in place. Toolchain scratch and validation copies are temporary and removed after use.
 
 A backend has no dependency on another backend's library. Portable scalar kernels are compiled into each backend's own library.
 
