@@ -1,5 +1,11 @@
 #include "common.h"
 #include <stdatomic.h>
+#ifdef __APPLE__
+#include <fenv.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <time.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -69,6 +75,9 @@ static size_t block_k(const Parameters *p) {
 }
 
 static size_t block_m(const Parameters *p) {
+    if (p->out_dtype != TRILLIM_FP32) {
+        return BLOCK_M;
+    }
     bool direct_f32 = p->a_dtype == TRILLIM_FP32 && p->b_dtype == TRILLIM_FP32 &&
         p->out_dtype == TRILLIM_FP32 && p->m >= 1024 && p->n >= 512 && p->n <= 2048 &&
         ((p->a_col_stride == 1 && p->a_row_stride >= p->k && p->a_row_stride <= INT32_MAX) ||
@@ -90,12 +99,53 @@ static bool small(const Parameters *p) {
                          p->m * p->n <= 4096 / p->k);
 }
 
+#if defined(__APPLE__)
+enum { WIDE_BF16_ROWS = 512, WIDE_BF16_PACK_ROWS = 16 };
+
+static size_t wide_bf16_rows(const Parameters *p) {
+    if (p->rank != 0 || p->batches != 1 || p->m < 64 || p->k < 512 || p->n < 1024 ||
+        (p->a_dtype != TRILLIM_BF16 && p->a_dtype != TRILLIM_FP32) ||
+        (p->out_dtype != TRILLIM_BF16 && p->out_dtype != TRILLIM_FP32) ||
+        (p->out_dtype == TRILLIM_BF16 && p->a_dtype != TRILLIM_BF16) ||
+        p->b_dtype != TRILLIM_BF16 || p->a_col_stride != 1 || p->a_row_stride != p->k ||
+        p->b_row_stride != 1 || p->b_col_stride != p->k ||
+        p->n > (1 << 27) / p->k ||
+        (1 << 23) / p->k < 64) {
+        return 0;
+    }
+    size_t rows = (1 << 23) / p->k;
+    if (rows > WIDE_BF16_ROWS) {
+        rows = WIDE_BF16_ROWS;
+    }
+    return rows < p->m ? rows : p->m;
+}
+
+static size_t wide_bf16_workspace(const Parameters *p) {
+    if (p->rank != 0 || p->batches != 1 || p->m < 64 || p->k < 512 || p->n < 1024 ||
+        (p->a_dtype != TRILLIM_BF16 && p->a_dtype != TRILLIM_FP32) ||
+        (p->out_dtype != TRILLIM_BF16 && p->out_dtype != TRILLIM_FP32) ||
+        (p->out_dtype == TRILLIM_BF16 && p->a_dtype != TRILLIM_BF16) || p->b_dtype != TRILLIM_BF16) {
+        return 0;
+    }
+    /* Maximum dimensions must also cover smaller eligible widths and layouts. */
+    size_t rows = p->m < WIDE_BF16_ROWS ? p->m : WIDE_BF16_ROWS;
+    size_t weights = p->n > (1 << 27) / p->k ? (1 << 27) : p->n * p->k;
+    size_t width = p->k < (1 << 17) ? p->k : (1 << 17);
+    size_t columns = p->n < (1 << 18) ? p->n : (1 << 18);
+    size_t activation = rows * width < (1 << 23) ? rows * width : (1 << 23);
+    size_t output = rows * columns;
+    return (weights + (p->a_dtype == TRILLIM_FP32 ? 0 : activation) +
+        (p->out_dtype == TRILLIM_FP32 ? 0 : output)) * sizeof(float);
+}
+
+#endif
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs,
                                   size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
     if (!trillim_float(p->a_dtype) || !trillim_float(p->b_dtype) ||
-        p->out_dtype != TRILLIM_FP32) {
+        !trillim_float(p->out_dtype)) {
         return TRILLIM_ERROR;
     }
     if (p->batches == 0 || p->m == 0 || p->n == 0) {
@@ -143,6 +193,12 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs,
     size_t columns = p->n / 64 + (p->n % 64 != 0);
     size_t count = p->batches * rows * columns;
     *scratch = (count < LANES ? count : LANES) * WORKSPACE * sizeof(float);
+#ifdef __APPLE__
+    size_t wide = wide_bf16_workspace(p);
+    if (wide > *scratch) {
+        *scratch = wide;
+    }
+#endif
     return TRILLIM_OK;
 }
 
@@ -521,6 +577,245 @@ static TrillimStatus project(void *opaque, size_t index, size_t worker) {
     return project_impl(opaque, index, worker);
 }
 
+#ifdef __APPLE__
+typedef struct {
+    const Task *task;
+    const float *activation;
+    float *weight, *accumulator;
+    size_t row, rows;
+    atomic_bool ordinary;
+} WideBf16Task;
+
+static bool default_fpcr(void) {
+    return fegetround() == FE_TONEAREST;
+}
+
+static TrillimStatus pack_wide_range(
+    WideBf16Task *job, const void *input, uint32_t dtype, size_t first, size_t count, float *output
+) {
+    if (!atomic_load_explicit(&job->ordinary, memory_order_relaxed)) {
+        return TRILLIM_OK;
+    }
+    for (size_t k = 0; k < count; ++k) {
+        if ((k & 1023) == 0 && job->task->context->is_cancelled(job->task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float value = load(input, first + k, dtype);
+        float magnitude = fabsf(value);
+        if (magnitude != 0.0f && !(magnitude >= 0x1p-48f && magnitude < 0x1p48f)) {
+            atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+            return TRILLIM_OK;
+        }
+        if (output != NULL) {
+            output[k] = value;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus pack_wide_bf16(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    WideBf16Task *job = opaque;
+    const Task *task = job->task;
+    const Parameters *p = task->p;
+    size_t first = tile * WIDE_BF16_PACK_ROWS;
+    size_t rows = p->n - first < WIDE_BF16_PACK_ROWS ? p->n - first : WIDE_BF16_PACK_ROWS;
+    size_t offset = first * p->k;
+    return pack_wide_range(job, task->b, p->b_dtype, offset, rows * p->k, job->weight + offset);
+}
+
+typedef struct {
+    WideBf16Task *job;
+    float *output;
+} WideBf16Activation;
+
+static TrillimStatus pack_wide_bf16_activation(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const WideBf16Activation *activation = opaque;
+    WideBf16Task *job = activation->job;
+    const Task *task = job->task;
+    const Parameters *p = task->p;
+    float *output = activation->output == NULL ? NULL : activation->output + row * p->k;
+    return pack_wide_range(job, task->a, p->a_dtype, (job->row + row) * p->k, p->k, output);
+}
+
+static TrillimStatus cast_wide_bf16(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const WideBf16Task *job = opaque;
+    const Task *task = job->task;
+    const Parameters *p = task->p;
+    const float *value = job->accumulator + row * p->n;
+    size_t offset = (job->row + row) * p->n;
+    for (size_t column = 0; column < p->n; ++column) {
+        if ((column & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        trillim_store(task->output, offset + column, p->out_dtype, (TrillimValue){.f = value[column]});
+    }
+    return TRILLIM_OK;
+}
+
+static bool blas_thread_limit(size_t workers) {
+    const char *limit = getenv("VECLIB_MAXIMUM_THREADS");
+    if (limit == NULL || workers < 4 || workers > 32) {
+        return false;
+    }
+    size_t threads = 0;
+    for (; *limit != '\0'; ++limit) {
+        if (*limit < '0' || *limit > '9') {
+            return false;
+        }
+        threads = threads * 10 + (size_t)(*limit - '0');
+        if (threads > workers) {
+            return false;
+        }
+    }
+    return threads >= 4;
+}
+
+typedef struct {
+    const WideBf16Task *job;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    uint64_t deadline;
+    size_t workers, arrived;
+    bool declined, done;
+} SharedBlas;
+
+static TrillimStatus multiply_blas(const WideBf16Task *job) {
+    const Parameters *p = job->task->p;
+    const TrillimKernelContext *context = job->task->context;
+    // Bound the work between cancellation checks inside a large projection.
+    size_t columns = UINT64_C(16000000000) / (job->rows * p->k);
+    columns = columns / 128 * 128;
+    if (columns < 128) {
+        columns = 128;
+    }
+    for (size_t first = 0; first < p->n; first += columns) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = p->n - first < columns ? p->n - first : columns;
+        sgemm(101, 111, 112, (int)job->rows, (int)count, (int)p->k, 1.0f,
+            job->activation, (int)p->k, job->weight + first * p->k, (int)p->k,
+            0.0f, job->accumulator + first, (int)p->n);
+    }
+    return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+static TrillimStatus run_shared_blas(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    SharedBlas *shared = opaque;
+    const TrillimKernelContext *context = shared->job->task->context;
+    pthread_mutex_lock(&shared->mutex);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!now || now >= shared->deadline || (tile == 0 && (!default_fpcr() || get_threading() != 0))) {
+        shared->declined = true;
+    }
+    if (++shared->arrived == shared->workers || shared->declined) {
+        pthread_cond_broadcast(&shared->changed);
+    }
+    // The pool may provide fewer concurrent workers than it advertises.
+    while (!shared->declined && shared->arrived < shared->workers) {
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!now || now >= shared->deadline || context->is_cancelled(context->cancellation_context)) {
+            shared->declined = true;
+        } else {
+            const struct timespec remaining = {.tv_sec = 0, .tv_nsec = (long)(shared->deadline - now)};
+            if (pthread_cond_timedwait_relative_np(&shared->changed, &shared->mutex, &remaining) != 0 &&
+                shared->arrived < shared->workers) {
+                shared->declined = true;
+            }
+        }
+        if (shared->declined) {
+            pthread_cond_broadcast(&shared->changed);
+        }
+    }
+    if (shared->declined) {
+        pthread_mutex_unlock(&shared->mutex);
+        return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+    }
+    if (tile != 0) {
+        while (!shared->done) {
+            pthread_cond_wait(&shared->changed, &shared->mutex);
+        }
+        pthread_mutex_unlock(&shared->mutex);
+        return TRILLIM_OK;
+    }
+    pthread_mutex_unlock(&shared->mutex);
+    const TrillimStatus status = multiply_blas(shared->job);
+    pthread_mutex_lock(&shared->mutex);
+    shared->done = true;
+    pthread_cond_broadcast(&shared->changed);
+    pthread_mutex_unlock(&shared->mutex);
+    return status;
+}
+
+static TrillimStatus try_shared_blas(const WideBf16Task *job, bool *completed) {
+    const TrillimThreadPool *pool = job->task->context->thread_pool;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!now) {
+        *completed = false;
+        return TRILLIM_OK;
+    }
+    SharedBlas shared = {
+        .job = job, .mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER,
+        .deadline = now + UINT64_C(2000000), .workers = pool->worker_count,
+    };
+    const TrillimStatus status = pool->run(pool->context, pool->worker_count, run_shared_blas, &shared);
+    pthread_cond_destroy(&shared.changed);
+    pthread_mutex_destroy(&shared.mutex);
+    *completed = status == TRILLIM_OK && shared.done;
+    return status;
+}
+
+static TrillimStatus try_wide_bf16(const Task *task, float *scratch, bool *handled) {
+    *handled = false;
+    const Parameters *p = task->p;
+    const TrillimThreadPool *pool = task->context->thread_pool;
+    size_t rows = wide_bf16_rows(p);
+    if (!rows || !blas_thread_limit(pool->worker_count) || !initialize_blas() ||
+        get_threading == NULL || !default_fpcr()) {
+        return TRILLIM_OK;
+    }
+    float *activation = p->a_dtype == TRILLIM_FP32 ? NULL : scratch + p->n * p->k;
+    float *accumulator = scratch + p->n * p->k + (activation != NULL ? rows * p->k : 0);
+    WideBf16Task job = {task, activation, scratch, accumulator, 0, 0, ATOMIC_VAR_INIT(true)};
+    size_t weight_tiles = p->n / WIDE_BF16_PACK_ROWS + (p->n % WIDE_BF16_PACK_ROWS != 0);
+    TrillimStatus status = pool->run(pool->context, weight_tiles, pack_wide_bf16, &job);
+    if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
+        return status;
+    }
+    while (job.row < p->m) {
+        job.rows = p->m - job.row < rows ? p->m - job.row : rows;
+        WideBf16Activation pack_job = {&job, activation};
+        status = pool->run(pool->context, job.rows, pack_wide_bf16_activation, &pack_job);
+        if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
+            return status;
+        }
+        if (activation == NULL) {
+            job.activation = (const float *)task->a + job.row * p->k;
+        }
+        if (p->out_dtype == TRILLIM_FP32) {
+            job.accumulator = (float *)task->output + job.row * p->n;
+        }
+        bool completed;
+        status = try_shared_blas(&job, &completed);
+        if (status != TRILLIM_OK || !completed) {
+            return status;
+        }
+        if (p->out_dtype == TRILLIM_BF16) {
+            status = pool->run(pool->context, job.rows, cast_wide_bf16, &job);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        job.row += job.rows;
+    }
+    *handled = true;
+    return TRILLIM_OK;
+}
+#endif
 TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_matmul(void *const *outputs, const void *const *inputs,
                                   void *scratch, const void *parameters,
                                   const TrillimKernelContext *context) {
@@ -541,6 +836,14 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_blas_matmul(void *const *outputs, co
     if (!initialize_blas()) {
         return TRILLIM_ERROR;
     }
+#ifdef __APPLE__
+    Task input = {outputs[0], inputs[0], inputs[1], p, context};
+    bool handled;
+    TrillimStatus status = try_wide_bf16(&input, scratch, &handled);
+    if (status != TRILLIM_OK || handled) {
+        return status;
+    }
+#endif
     size_t rows = p->m / block_m(p) + (p->m % block_m(p) != 0);
     size_t columns = p->n / block_n(p) + (p->n % block_n(p) != 0);
     size_t reuse = row_reuse(p, context);

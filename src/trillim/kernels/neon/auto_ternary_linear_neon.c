@@ -4,7 +4,12 @@
 #include <stdatomic.h>
 
 #if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #elif defined(__linux__)
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
@@ -978,6 +983,435 @@ static TrillimStatus quantize(void *opaque, size_t row, size_t worker) {
     return TRILLIM_OK;
 }
 
+#if defined(__APPLE__)
+enum { BLAS_ROWS = 512, BLAS_DECODE_COLUMNS = 16 };
+
+typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
+                      const float *, int, float, float *, int);
+typedef unsigned (*GetThreading)(void);
+
+static Sgemm sgemm;
+static GetThreading get_threading;
+typedef ssize_t (*MatmulWorkspace)(bool, bool, float, const BNNSNDArrayDescriptor *,
+    const BNNSNDArrayDescriptor *, const BNNSNDArrayDescriptor *, const BNNSFilterParameters *);
+typedef int (*Matmul)(bool, bool, float, const BNNSNDArrayDescriptor *,
+    const BNNSNDArrayDescriptor *, const BNNSNDArrayDescriptor *, void *, const BNNSFilterParameters *);
+static MatmulWorkspace matmul_workspace;
+static Matmul matmul;
+
+static bool initialize_blas(void) {
+    static atomic_uint state;
+    unsigned expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&state, &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+        void *library = dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", RTLD_LOCAL | RTLD_LAZY);
+        if (library != NULL) {
+            void *gemm = dlsym(library, "cblas_sgemm$NEWLAPACK");
+            void *getter = dlsym(library, "BLASGetThreading");
+            if (gemm == NULL) {
+                gemm = dlsym(library, "cblas_sgemm");
+            }
+            if (gemm != NULL && getter != NULL) {
+                memcpy(&sgemm, &gemm, sizeof(sgemm));
+                memcpy(&get_threading, &getter, sizeof(get_threading));
+                void *size = dlsym(library, "BNNSMatMulWorkspaceSize");
+                void *multiply = dlsym(library, "BNNSMatMul");
+                if (size != NULL && multiply != NULL) {
+                    memcpy(&matmul_workspace, &size, sizeof(matmul_workspace));
+                    memcpy(&matmul, &multiply, sizeof(matmul));
+                }
+            } else {
+                dlclose(library);
+            }
+        }
+        atomic_store_explicit(&state, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&state, memory_order_acquire) == 1) {
+            atomic_signal_fence(memory_order_acquire);
+        }
+    }
+    return sgemm != NULL;
+}
+
+static size_t blas_rows(const Parameters *p) {
+    if (p->tokens < 64 || p->outputs < 1024 || p->width < 512 ||
+        p->width < (1 << 20) / p->outputs || p->width % LOWBIT_WIDTH != 0) {
+        return 0;
+    }
+    size_t rows = (1 << 23) / p->width;
+    if (rows < 32) {
+        return 0;
+    }
+    if (rows > BLAS_ROWS) {
+        rows = BLAS_ROWS;
+    }
+    return p->tokens < rows ? p->tokens : rows;
+}
+
+static size_t blas_workspace(const Parameters *p) {
+    size_t rows = blas_rows(p);
+    if (!rows || p->outputs > (1 << 27) / p->width) {
+        return 0;
+    }
+    return (rows * p->width + p->outputs * (p->width + rows)) * sizeof(float);
+}
+
+static size_t blas_reservation(const Parameters *p) {
+    if (p->tokens < 64 || p->outputs < 1024 || p->width < 512) {
+        return 0;
+    }
+    /* Bounds also cover smaller aligned widths and shapes below the work limit. */
+    size_t rows = p->tokens < BLAS_ROWS ? p->tokens : BLAS_ROWS;
+    size_t weights = p->outputs > (1 << 27) / p->width ? (1 << 27) : p->outputs * p->width;
+    size_t width = p->width < (1 << 18) ? p->width : (1 << 18);
+    size_t columns = p->outputs < (1 << 18) ? p->outputs : (1 << 18);
+    size_t activation = rows * width < (1 << 23) ? rows * width : (1 << 23);
+    return (weights + activation + rows * columns) * sizeof(float);
+}
+
+typedef struct {
+    const Parameters *p;
+    const TrillimKernelContext *context;
+    const int8_t *codes;
+    const float *scales;
+    const uint8_t *weights, *weight_scales;
+    void *output;
+    float *activation, *expanded_weights, *accumulator;
+    size_t row, rows;
+    atomic_bool ordinary;
+    bool compact;
+    void *workspace;
+    size_t workspace_size;
+} BlasTask;
+
+static bool default_fpcr(void) {
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr == 0;
+}
+
+static inline void widen8(float *output, int16x8_t value) {
+    vst1q_f32(output, vcvtq_f32_s32(vmovl_s16(vget_low_s16(value))));
+    vst1q_f32(output + 4, vcvtq_f32_s32(vmovl_high_s16(value)));
+}
+
+static TrillimStatus widen_activation(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const BlasTask *job = opaque;
+    size_t width = job->p->width;
+    const int8_t *codes = job->codes + (job->row + row) * width;
+    float *output = job->activation + row * width;
+    uint16_t *halves = (uint16_t *)job->activation + row * width;
+    for (size_t k = 0; k < width; k += 16) {
+        if ((k & 1023) == 0 && job->context->is_cancelled(job->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        int8x16_t values = vld1q_s8(codes + k);
+        if (job->compact) {
+            int16x8_t a = vmovl_s8(vget_low_s8(values)), b = vmovl_high_s8(values);
+            uint16x4_t c0 = vshrn_n_u32(vreinterpretq_u32_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a)))), 16);
+            uint16x4_t c1 = vshrn_n_u32(vreinterpretq_u32_f32(vcvtq_f32_s32(vmovl_high_s16(a))), 16);
+            uint16x4_t c2 = vshrn_n_u32(vreinterpretq_u32_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(b)))), 16);
+            uint16x4_t c3 = vshrn_n_u32(vreinterpretq_u32_f32(vcvtq_f32_s32(vmovl_high_s16(b))), 16);
+            vst1q_u16(halves + k, vcombine_u16(c0, c1));
+            vst1q_u16(halves + k + 8, vcombine_u16(c2, c3));
+        } else {
+            widen8(output + k, vmovl_s8(vget_low_s8(values)));
+            widen8(output + k + 8, vmovl_high_s8(values));
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static inline void store_weights(void *output, uint8x16_t codes, uint8x16_t low_table, uint8x16_t high_table, bool compact) {
+    uint8x16_t low = vqtbl1q_u8(low_table, codes);
+    uint8x16_t high = vqtbl1q_u8(high_table, codes);
+    uint16x8_t a = vreinterpretq_u16_u8(vzip1q_u8(low, high));
+    uint16x8_t b = vreinterpretq_u16_u8(vzip2q_u8(low, high));
+    if (compact) {
+        vst1q_u16(output, a);
+        vst1q_u16((uint16_t *)output + 8, b);
+    } else {
+        vst1q_f32(output, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16)));
+        vst1q_f32((float *)output + 4, vreinterpretq_f32_u32(vshll_high_n_u16(a, 16)));
+        vst1q_f32((float *)output + 8, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16)));
+        vst1q_f32((float *)output + 12, vreinterpretq_f32_u32(vshll_high_n_u16(b, 16)));
+    }
+}
+
+static bool widen_weight_row(const BlasTask *job, size_t block, size_t groups, void *output) {
+    uint8x16_t invalid = vdupq_n_u8(0);
+    for (size_t g = 0; g < groups; ++g) {
+        uint16_t bits;
+        memcpy(&bits, job->weight_scales + (block + g) * 2, 2);
+        uint16_t magnitude = bits & 0x7fff;
+        // Keep scales normal with room for FP32 accumulation.
+        if (magnitude && (magnitude < 0x1000 || magnitude > 0x6b80)) {
+            return false;
+        }
+        uint32_t low = bits & 0xff;
+        uint32_t high = bits >> 8;
+        // The ternary codes select -scale, zero, or scale.
+        uint8x16_t low_table = vreinterpretq_u8_u32(vdupq_n_u32(low | (low << 16)));
+        uint8x16_t high_table = vreinterpretq_u8_u32(vdupq_n_u32((high ^ 0x80) | (high << 16)));
+        const uint8_t *packed = job->weights + (block + g) * 32;
+        for (size_t h = 0; h < 2; ++h) {
+            uint8x16_t data = vld1q_u8(packed + h * 16);
+            invalid = vorrq_u8(invalid, vandq_u8(data, vshrq_n_u8(data, 1)));
+            size_t bytes = job->compact ? sizeof(uint16_t) : sizeof(float);
+            uint8_t *destination = (uint8_t *)output + (g * LOWBIT_WIDTH + h * 16) * bytes;
+            store_weights(destination, vshrq_n_u8(data, 6), low_table, high_table, job->compact);
+            store_weights(destination + 32 * bytes, vandq_u8(vshrq_n_u8(data, 4), vdupq_n_u8(3)), low_table, high_table, job->compact);
+            store_weights(destination + 64 * bytes, vandq_u8(vshrq_n_u8(data, 2), vdupq_n_u8(3)), low_table, high_table, job->compact);
+            store_weights(destination + 96 * bytes, vandq_u8(data, vdupq_n_u8(3)), low_table, high_table, job->compact);
+        }
+    }
+    return vmaxvq_u8(vandq_u8(invalid, vdupq_n_u8(0x55))) == 0;
+}
+
+static TrillimStatus prepare_weights(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    BlasTask *job = opaque;
+    size_t width = job->p->width, groups = width / LOWBIT_WIDTH;
+    size_t begin = tile * BLAS_DECODE_COLUMNS;
+    size_t end = job->p->outputs - begin < BLAS_DECODE_COLUMNS ? job->p->outputs : begin + BLAS_DECODE_COLUMNS;
+    if (!default_fpcr()) {
+        atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+        return TRILLIM_OK;
+    }
+    for (size_t c = begin; c < end && atomic_load_explicit(&job->ordinary, memory_order_relaxed); ++c) {
+        if (job->context->is_cancelled(job->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        if (!widen_weight_row(job, c * groups, groups, (uint8_t *)job->expanded_weights + c * width * (job->compact ? sizeof(uint16_t) : sizeof(float)))) {
+            atomic_store_explicit(&job->ordinary, false, memory_order_relaxed);
+            break;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus finish_output(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const BlasTask *job = opaque;
+    const size_t columns = job->p->outputs;
+    if (job->context->is_cancelled(job->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    const float *values = job->accumulator + row * columns;
+    size_t start = (job->row + row) * columns;
+    float scale = job->scales[job->row + row];
+    size_t c = 0;
+    if (job->p->output_dtype == TRILLIM_FP16) {
+        float32x4_t divisor = vdupq_n_f32(scale);
+        for (; columns - c >= 8; c += 8) {
+            if ((c & 1023) == 0 && job->context->is_cancelled(job->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            float32x4_t a = vdivq_f32(vld1q_f32(values + c), divisor);
+            float32x4_t b = vdivq_f32(vld1q_f32(values + c + 4), divisor);
+            float16x8_t halves = vcvt_high_f16_f32(vcvt_f16_f32(a), b);
+            vst1q_u16((uint16_t *)job->output + start + c, vreinterpretq_u16_f16(halves));
+        }
+    }
+    for (; c < columns; ++c) {
+        if ((c & 1023) == 0 && job->context->is_cancelled(job->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        trillim_store(job->output, start + c, job->p->output_dtype, (TrillimValue){.f = values[c] / scale});
+    }
+    return TRILLIM_OK;
+}
+
+static bool blas_thread_limit(size_t workers) {
+    const char *limit = getenv("VECLIB_MAXIMUM_THREADS");
+    if (limit == NULL || workers < 4 || workers > 32) {
+        return false;
+    }
+    size_t threads = 0;
+    for (; *limit != '\0'; ++limit) {
+        if (*limit < '0' || *limit > '9') {
+            return false;
+        }
+        threads = threads * 10 + (size_t)(*limit - '0');
+        if (threads > workers) {
+            return false;
+        }
+    }
+    return threads >= 4;
+}
+
+typedef struct {
+    const BlasTask *job;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    uint64_t deadline;
+    size_t workers, arrived;
+    bool declined, done;
+} SharedBlas;
+
+static TrillimStatus multiply_blas(const BlasTask *job) {
+    const Parameters *p = job->p;
+    const TrillimKernelContext *context = job->context;
+    // Bound the work between cancellation checks inside a large projection.
+    size_t columns = UINT64_C(16000000000) / (job->rows * p->width);
+    columns = columns / 128 * 128;
+    if (columns < 128) {
+        columns = 128;
+    }
+    for (size_t first = 0; first < p->outputs; first += columns) {
+        if (context->is_cancelled(context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        size_t count = p->outputs - first < columns ? p->outputs - first : columns;
+        if (job->compact) {
+            BNNSNDArrayDescriptor a = {.layout = BNNSDataLayoutRowMajorMatrix,
+                .size = {p->width, job->rows}, .data = job->activation, .data_type = BNNSDataTypeBFloat16};
+            BNNSNDArrayDescriptor b = {.layout = BNNSDataLayoutRowMajorMatrix,
+                .size = {p->width, count}, .data = (uint16_t *)job->expanded_weights + first * p->width,
+                .data_type = BNNSDataTypeBFloat16};
+            BNNSNDArrayDescriptor c = {.layout = BNNSDataLayoutRowMajorMatrix,
+                .size = {count, job->rows}, .stride = {1, p->outputs},
+                .data = job->accumulator + first, .data_type = BNNSDataTypeFloat32};
+            BNNSFilterParameters options = {.n_threads = context->thread_pool->worker_count};
+            ssize_t needed = matmul_workspace(false, true, 1.0f, &a, &b, &c, &options);
+            if (needed < 0 || (size_t)needed > job->workspace_size ||
+                matmul(false, true, 1.0f, &a, &b, &c, job->workspace, &options) != 0) {
+                return TRILLIM_ERROR;
+            }
+        } else {
+            sgemm(101, 111, 112, (int)job->rows, (int)count, (int)p->width, 1.0f,
+                job->activation, (int)p->width, job->expanded_weights + first * p->width, (int)p->width,
+                0.0f, job->accumulator + first, (int)p->outputs);
+        }
+    }
+    return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
+static TrillimStatus run_shared_blas(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    SharedBlas *shared = opaque;
+    const TrillimKernelContext *context = shared->job->context;
+    pthread_mutex_lock(&shared->mutex);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!now || now >= shared->deadline || (tile == 0 && (!default_fpcr() || (!shared->job->compact && get_threading() != 0)))) {
+        shared->declined = true;
+    }
+    if (++shared->arrived == shared->workers || shared->declined) {
+        pthread_cond_broadcast(&shared->changed);
+    }
+    // The pool may provide fewer concurrent workers than it advertises.
+    while (!shared->declined && shared->arrived < shared->workers) {
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!now || now >= shared->deadline || context->is_cancelled(context->cancellation_context)) {
+            shared->declined = true;
+        } else {
+            const struct timespec remaining = {.tv_sec = 0, .tv_nsec = (long)(shared->deadline - now)};
+            if (pthread_cond_timedwait_relative_np(&shared->changed, &shared->mutex, &remaining) != 0 &&
+                shared->arrived < shared->workers) {
+                shared->declined = true;
+            }
+        }
+        if (shared->declined) {
+            pthread_cond_broadcast(&shared->changed);
+        }
+    }
+    if (shared->declined) {
+        pthread_mutex_unlock(&shared->mutex);
+        return context->is_cancelled(context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+    }
+    if (tile != 0) {
+        while (!shared->done) {
+            pthread_cond_wait(&shared->changed, &shared->mutex);
+        }
+        pthread_mutex_unlock(&shared->mutex);
+        return TRILLIM_OK;
+    }
+    pthread_mutex_unlock(&shared->mutex);
+    const TrillimStatus status = multiply_blas(shared->job);
+    pthread_mutex_lock(&shared->mutex);
+    shared->done = true;
+    pthread_cond_broadcast(&shared->changed);
+    pthread_mutex_unlock(&shared->mutex);
+    return status;
+}
+
+static TrillimStatus try_shared_blas(const BlasTask *job, bool *completed) {
+    const TrillimThreadPool *pool = job->context->thread_pool;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!now) {
+        *completed = false;
+        return TRILLIM_OK;
+    }
+    SharedBlas shared = {
+        .job = job, .mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER,
+        .deadline = now + UINT64_C(2000000), .workers = pool->worker_count,
+    };
+    const TrillimStatus status = pool->run(pool->context, pool->worker_count, run_shared_blas, &shared);
+    pthread_cond_destroy(&shared.changed);
+    pthread_mutex_destroy(&shared.mutex);
+    *completed = status == TRILLIM_OK && shared.done;
+    return status;
+}
+
+static TrillimStatus try_blas(
+    const Parameters *p, const TrillimKernelContext *context, void *output, const void *weights,
+    const int8_t *codes, const float *scales, float *scratch, bool compact, bool *handled
+) {
+    *handled = false;
+    const size_t rows = blas_rows(p);
+    const TrillimThreadPool *pool = context->thread_pool;
+    if (!blas_workspace(p) || !initialize_blas() || !default_fpcr() ||
+        (compact ? (matmul == NULL || pool->worker_count < 4 || pool->worker_count > 32) :
+                   !blas_thread_limit(pool->worker_count))) {
+        return TRILLIM_OK;
+    }
+    /* INT8 codes and BF16 weight scales are exact in the compact BF16 operands. */
+    float *expanded = scratch + rows * p->width;
+    size_t blocks = p->outputs * (p->width / LOWBIT_WIDTH);
+    BlasTask job = {
+        p, context, codes, scales, weights, (const uint8_t *)weights + blocks * 32,
+        output, scratch, expanded, expanded + p->outputs * p->width,
+        0, 0, ATOMIC_VAR_INIT(true), compact, NULL, 0,
+    };
+    if (compact) {
+        job.expanded_weights = (float *)((uint16_t *)scratch + rows * p->width);
+        job.accumulator = (float *)((uint16_t *)job.expanded_weights + p->outputs * p->width);
+        uintptr_t end = (uintptr_t)(job.accumulator + rows * p->outputs);
+        uintptr_t aligned = (end + 63) & ~(uintptr_t)63;
+        uintptr_t limit = (uintptr_t)scratch + blas_workspace(p);
+        if (aligned >= limit) {
+            return TRILLIM_OK;
+        }
+        job.workspace = (void *)aligned;
+        job.workspace_size = limit - aligned;
+    }
+    size_t tiles = p->outputs / BLAS_DECODE_COLUMNS + (p->outputs % BLAS_DECODE_COLUMNS != 0);
+    TrillimStatus status = pool->run(pool->context, tiles, prepare_weights, &job);
+    if (status != TRILLIM_OK || !atomic_load_explicit(&job.ordinary, memory_order_relaxed)) {
+        return status;
+    }
+    while (job.row < p->tokens) {
+        job.rows = p->tokens - job.row < rows ? p->tokens - job.row : rows;
+        status = pool->run(pool->context, job.rows, widen_activation, &job);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        bool completed;
+        status = try_shared_blas(&job, &completed);
+        if (status != TRILLIM_OK || !completed) {
+            return compact && status == TRILLIM_ERROR ? TRILLIM_OK : status;
+        }
+        status = pool->run(pool->context, job.rows, finish_output, &job);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        job.row += job.rows;
+    }
+    *handled = true;
+    return TRILLIM_OK;
+}
+#endif
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     inputs[0] = inputs[1] = outputs[0] = *scratch = 0;
@@ -995,6 +1429,13 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[0] = count * itemsize;
     inputs[1] = internal_inputs[1];
     *scratch = ((count + 3) & ~(size_t)3) + p->tokens * sizeof(float);
+#if defined(__APPLE__)
+    size_t workspace = blas_reservation(p);
+    if (*scratch > SIZE_MAX - workspace) {
+        return TRILLIM_ERROR;
+    }
+    *scratch += workspace;
+#endif
     return TRILLIM_OK;
 }
 
@@ -1061,6 +1502,17 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_auto_ternary_linear(
         return context->thread_pool->run(context->thread_pool->context,
             p->tokens * tiles, floating_projection, &fallback);
     }
+#if defined(__APPLE__)
+    bool handled;
+    status = try_blas(p, context, outputs[0], inputs[1], codes, scales, scales + p->tokens, true, &handled);
+    if (status != TRILLIM_OK || handled) {
+        return status;
+    }
+    status = try_blas(p, context, outputs[0], inputs[1], codes, scales, scales + p->tokens, false, &handled);
+    if (status != TRILLIM_OK || handled) {
+        return status;
+    }
+#endif
     const void *quantized_inputs[] = {codes, inputs[1], scales};
     return run_quantized(outputs, quantized_inputs, NULL, parameters, context);
 }

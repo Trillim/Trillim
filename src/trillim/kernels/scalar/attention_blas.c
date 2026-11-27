@@ -156,9 +156,6 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     }
     if (p->queries > INT64_MAX || p->length > INT64_MAX ||
         p->key_dim < 64 || p->key_dim > CHANNELS || p->value_dim < 64 || p->value_dim > CHANNELS ||
-        p->q_strides[2] != 1 || p->k_strides[2] != 1 || p->v_strides[2] != 1 ||
-        p->q_strides[1] < p->key_dim || p->k_strides[1] < p->key_dim || p->v_strides[1] < p->value_dim ||
-        p->q_strides[1] > INT32_MAX || p->k_strides[1] > INT32_MAX || p->v_strides[1] > INT32_MAX ||
         p->heads > SIZE_MAX / p->queries ||
         p->heads * p->queries > SIZE_MAX / sizeof(float) / p->value_dim ||
         (p->length && p->kv_heads > (SIZE_MAX - p->heads * p->queries) / 2 / p->length)) {
@@ -181,6 +178,12 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     size_t slots = jobs < 128 ? jobs : 128;
     outputs[0] = p->heads * p->queries * p->value_dim * sizeof(float);
     *scratch = slots * WORKSPACE * sizeof(float);
+    size_t rows = p->heads * p->queries + 2 * p->kv_heads * p->length;
+    size_t width = p->key_dim > p->value_dim ? p->key_dim : p->value_dim;
+    if (rows > (SIZE_MAX - *scratch) / sizeof(float) / width) {
+        return TRILLIM_ERROR;
+    }
+    *scratch += rows * width * sizeof(float);
     return TRILLIM_OK;
 }
 
@@ -428,6 +431,33 @@ static TrillimStatus execute_tiles(void *opaque, size_t slot, size_t worker) {
     return status;
 }
 
+typedef struct {
+    const Parameters *p;
+    const float *inputs[3];
+    float *packed[3];
+    const TrillimKernelContext *context;
+} Packing;
+
+static TrillimStatus pack_row(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const Packing *job = opaque;
+    const Parameters *p = job->p;
+    if (job->context->is_cancelled(job->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t queries = p->heads * p->queries, keys = p->kv_heads * p->length;
+    size_t input = row < queries ? 0 : (row - queries < keys ? 1 : 2);
+    row -= input ? queries + (input == 2 ? keys : 0) : 0;
+    size_t length = input ? p->length : p->queries;
+    size_t width = input == 2 ? p->value_dim : p->key_dim;
+    const size_t *strides = input == 0 ? p->q_strides : (input == 1 ? p->k_strides : p->v_strides);
+    size_t offset = row / length * strides[0] + row % length * strides[1];
+    for (size_t c = 0; c < width; ++c) {
+        job->packed[input][row * width + c] = job->inputs[input][offset + c * strides[2]];
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_scalar_accelerated_attention(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -439,10 +469,41 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_accelerated_attention(
     if (!p->heads || !p->queries) {
         return TRILLIM_OK;
     }
+    Parameters packed;
+    size_t strides[3][3];
+    const void *query = inputs[0], *key = inputs[1], *value = inputs[2];
+    if (p->length && (p->q_strides[2] != 1 || p->k_strides[2] != 1 || p->v_strides[2] != 1 ||
+        p->q_strides[1] < p->key_dim || p->k_strides[1] < p->key_dim || p->v_strides[1] < p->value_dim ||
+        p->q_strides[1] > INT32_MAX || p->k_strides[1] > INT32_MAX || p->v_strides[1] > INT32_MAX)) {
+        size_t q_count = p->heads * p->queries * p->key_dim;
+        size_t k_count = p->kv_heads * p->length * p->key_dim;
+        float *q = scratch, *k = q + q_count, *v = k + k_count;
+        Packing job = {p, {query, key, value}, {q, k, v}, context};
+        size_t rows = p->heads * p->queries + 2 * p->kv_heads * p->length;
+        TrillimStatus status = context->thread_pool->run(context->thread_pool->context, rows, pack_row, &job);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        packed = *p;
+        for (size_t input = 0; input < 3; ++input) {
+            size_t width = input == 2 ? p->value_dim : p->key_dim;
+            strides[input][0] = (input ? p->length : p->queries) * width;
+            strides[input][1] = width;
+            strides[input][2] = 1;
+        }
+        packed.q_strides = strides[0];
+        packed.k_strides = strides[1];
+        packed.v_strides = strides[2];
+        query = q;
+        key = k;
+        value = v;
+        scratch = v + p->kv_heads * p->length * p->value_dim;
+        p = &packed;
+    }
     size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
     bool available = visible >= 64 && (p->queries == 1 || p->queries >= 32) && initialize_blas();
     atomic_bool ordinary = ATOMIC_VAR_INIT(available);
-    Task task = {outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context, &ordinary};
+    Task task = {outputs[0], query, key, value, scratch, p, context, &ordinary};
     size_t rows = p->heads * p->queries + 2 * p->kv_heads * (p->length - first_key(p));
     size_t scans = rows / 128 + (rows % 128 != 0);
     if (available) {

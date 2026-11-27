@@ -2268,7 +2268,12 @@ static TrillimStatus project_int8_q6_sdot(void *opaque, size_t index, size_t wor
 
 #undef Q6_AQ_UNROLL
 
-enum { INT8_PREFILL_ROWS = 4, INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2, INT8_PREFILL_PANEL_TOKENS = 128 };
+enum {
+    INT8_PREFILL_ROWS = 4,
+    INT8_PREFILL_PAIRS = INT8_PREFILL_ROWS / 2,
+    INT8_PREFILL_PANEL_TOKENS = 128,
+    Q5_I8MM_MIN_WORKERS = 16,
+};
 
 typedef struct {
     int8x16_t values[32][INT8_PREFILL_PAIRS];
@@ -2586,10 +2591,17 @@ static inline __attribute__((always_inline)) void pack_q8_prefill_group(
         const size_t a = offsets[c][0] + g, b = offsets[c][1] + g;
         scales[2 * c] = int8_weight_scale(first.scales, a);
         scales[2 * c + 1] = int8_weight_scale(second.scales, b);
-        const int8x16x2_t w0 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(first.low + a * 16) :
-            vld1q_s8_x2((const int8_t *)first.low + a * 32);
-        const int8x16x2_t w1 = dtype == TRILLIM_GRP_INT4 ? int8_decode_q4(second.low + b * 16) :
-            vld1q_s8_x2((const int8_t *)second.low + b * 32);
+        int8x16x2_t w0, w1;
+        if (dtype == TRILLIM_GRP_INT5) {
+            w0 = int8_decode_q5(first.low + a * 16, first.high + a * 4);
+            w1 = int8_decode_q5(second.low + b * 16, second.high + b * 4);
+        } else if (dtype == TRILLIM_GRP_INT4) {
+            w0 = int8_decode_q4(first.low + a * 16);
+            w1 = int8_decode_q4(second.low + b * 16);
+        } else {
+            w0 = vld1q_s8_x2((const int8_t *)first.low + a * 32);
+            w1 = vld1q_s8_x2((const int8_t *)second.low + b * 32);
+        }
         packed->values[0][c] = vcombine_s8(vget_low_s8(w0.val[0]), vget_low_s8(w1.val[0]));
         packed->values[1][c] = vcombine_s8(vget_high_s8(w0.val[0]), vget_high_s8(w1.val[0]));
         packed->values[2][c] = vcombine_s8(vget_low_s8(w0.val[1]), vget_low_s8(w1.val[1]));
@@ -2942,6 +2954,10 @@ static TrillimStatus project_q4_prefill(void *opaque, size_t index, size_t worke
     return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT4, false);
 }
 
+static TrillimStatus project_q5_prefill(void *opaque, size_t index, size_t worker) {
+    return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT5, false);
+}
+
 static TrillimStatus project_q4_bias_prefill(void *opaque, size_t index, size_t worker) {
     return project_int8_prefill(opaque, index, worker, TRILLIM_GRP_INT4, true);
 }
@@ -2959,8 +2975,10 @@ static TrillimStatus try_int8_prefill(
     const LinearParameters *p = task->p;
     const bool q6 = p->weight_dtype == TRILLIM_DUBGRP_INT6;
     const size_t group = q6 ? INT8_ACTIVATION_Q8_K : INT8_ACTIVATION_Q8_0;
-    if ((!q6 && p->weight_dtype != TRILLIM_GRP_INT8 &&
-        p->weight_dtype != TRILLIM_GRP_INT4) ||
+    // Q5 prefill uses the Q8_0 activation arithmetic already used for decode.
+    const bool q5 = p->weight_dtype == TRILLIM_GRP_INT5;
+    if ((!q6 && !q5 && p->weight_dtype != TRILLIM_GRP_INT8 &&
+        p->weight_dtype != TRILLIM_GRP_INT4) || (q5 && (output_bf16 || bias != NULL || workers < Q5_I8MM_MIN_WORKERS)) ||
         p->tokens < 4 || p->width < group || p->width % group != 0 ||
         p->width > INT8_ACTIVATION_MAX_WIDTH || p->outputs < 16 || p->output_dtype != TRILLIM_FP32 ||
         (!output_bf16 && (uintptr_t)task->output % _Alignof(float) != 0) || !trillim_float(p->input_dtype) ||
@@ -2986,11 +3004,17 @@ static TrillimStatus try_int8_prefill(
         return TRILLIM_OK;
     }
     capacity *= tile_rows;
-    const size_t chunk = q6 ? p->outputs / workers / 2 : p->outputs / workers;
+    size_t chunk = p->outputs / workers;
+    if (q6) {
+        chunk /= 2;
+    } else if (q5) {
+        chunk /= 4;
+    }
     const size_t columns = chunk < 16 ? 16 : (chunk + 15) / 16 * 16;
     const size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
     const TrillimThreadPool *pool = task->context->thread_pool;
-    TrillimTask project = q6 ? project_q6_prefill : (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill);
+    TrillimTask project = q6 ? project_q6_prefill : (q5 ? project_q5_prefill :
+        (p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_prefill : project_q8_prefill));
     if (bias != NULL) {
         project = p->weight_dtype == TRILLIM_GRP_INT4 ? project_q4_bias_prefill : project_q8_bias_prefill;
     }
@@ -4764,7 +4788,8 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_ffn(
 #if defined(__APPLE__) || defined(__linux__)
     const bool int8_prefill = p->tokens >= 4 && p->output_dtype == TRILLIM_FP32 &&
         p->up_dtype == p->gate_dtype && p->up_dtype == p->down_dtype &&
-        (p->up_dtype == TRILLIM_DUBGRP_INT6 || p->up_dtype == TRILLIM_GRP_INT4 || p->up_dtype == TRILLIM_GRP_INT8);
+        (p->up_dtype == TRILLIM_DUBGRP_INT6 || p->up_dtype == TRILLIM_GRP_INT4 || p->up_dtype == TRILLIM_GRP_INT8 ||
+         (p->up_dtype == TRILLIM_GRP_INT5 && context->thread_pool->worker_count >= Q5_I8MM_MIN_WORKERS));
     if (scratch_size != 0 && p->up_dtype == p->gate_dtype && (p->tokens == 1 || int8_prefill)) {
         LinearParameters expand = {p->tokens, p->width, p->hidden_width, p->input_dtype, p->up_dtype, TRILLIM_FP32};
         status = p->tokens == 1

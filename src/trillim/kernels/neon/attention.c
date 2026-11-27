@@ -308,6 +308,13 @@ static bool optimized_layout(const TrillimAttentionParameters *p) {
         p->key_dim <= 4096 && p->value_dim <= 4096;
 }
 
+static bool pack_attention_layout(const TrillimAttentionParameters *p) {
+    return p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 &&
+        p->v_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32 &&
+        p->queries >= 4 && p->length >= 8 && p->key_dim <= 4096 && p->value_dim <= 4096 &&
+        p->v_strides[2] == 1 && (p->q_strides[2] != 1 || p->k_strides[2] != 1);
+}
+
 static size_t legacy_query_tile(const TrillimAttentionParameters *p, size_t workers) {
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
     if (p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_BF16 &&
@@ -451,7 +458,10 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         }
     }
 #endif
-    if (trillim_attention_blocked(p)) {
+    if (p->heads && p->kv_heads && p->queries >= 4 && p->length >= 8 &&
+        p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 &&
+        p->v_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32 &&
+        !p->causal && !p->windowed && p->key_dim >= 64 && p->value_dim >= 64) {
         size_t width = (p->length + 7) & ~(size_t)7;
         size_t query_tiles = p->queries / 4 + (p->queries % 4 != 0);
         if (p->kv_heads > SIZE_MAX / 128 || p->heads > SIZE_MAX / 4 / query_tiles) {
@@ -467,6 +477,22 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
         if (blocked > *scratch) {
             *scratch = blocked;
         }
+    }
+    /* Strides may change at smaller execution shapes, so reserve packing for either layout. */
+    if (p->q_dtype == TRILLIM_FP32 && p->k_dtype == TRILLIM_FP32 &&
+        p->v_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32 &&
+        p->queries >= 4 && p->length >= 8) {
+        size_t width = p->key_dim < 4096 ? p->key_dim : 4096;
+        size_t query_rows = p->heads * p->queries;
+        if (p->kv_heads > (SIZE_MAX - query_rows) / p->length ||
+            query_rows + p->kv_heads * p->length > SIZE_MAX / sizeof(float) / width) {
+            return TRILLIM_ERROR;
+        }
+        size_t bytes = (query_rows + p->kv_heads * p->length) * width * sizeof(float);
+        if (bytes > SIZE_MAX - *scratch) {
+            return TRILLIM_ERROR;
+        }
+        *scratch += bytes;
     }
     return TRILLIM_OK;
 }
@@ -2559,6 +2585,39 @@ static TrillimStatus staged_decode_values(void *opaque, size_t index, size_t wor
     return TRILLIM_OK;
 }
 
+typedef struct {
+    const TrillimAttentionParameters *p;
+    const float *query, *key;
+    float *packed_query, *packed_key;
+    const TrillimKernelContext *context;
+} TrillimAttentionPacking;
+
+static TrillimStatus pack_attention_row(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const TrillimAttentionPacking *job = opaque;
+    const TrillimAttentionParameters *p = job->p;
+    if (job->context->is_cancelled(job->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t query_rows = p->heads * p->queries;
+    bool key = row >= query_rows;
+    size_t index = key ? row - query_rows : row;
+    size_t length = key ? p->length : p->queries;
+    const size_t *strides = key ? p->k_strides : p->q_strides;
+    const float *source = key ? job->key : job->query;
+    float *destination = (key ? job->packed_key : job->packed_query) + index * p->key_dim;
+    size_t offset = index / length * strides[0] + index % length * strides[1];
+    if (strides[2] == 1) {
+        memcpy(destination, source + offset, p->key_dim * sizeof(float));
+    } else {
+        for (size_t c = 0; c < p->key_dim; ++c) {
+            memcpy(destination + c, (const uint8_t *)source +
+                (offset + c * strides[2]) * sizeof(float), sizeof(float));
+        }
+    }
+    return TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -2570,9 +2629,41 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_attention(
     if (!p->heads || !p->queries) {
         return TRILLIM_OK;
     }
+    TrillimAttentionParameters packed;
+    size_t query_strides[3], key_strides[3];
+    const void *query = inputs[0], *key = inputs[1];
+    if (pack_attention_layout(p)) {
+        size_t query_rows = p->heads * p->queries, key_rows = p->kv_heads * p->length;
+        float *packed_query = scratch;
+        float *packed_key = packed_query + query_rows * p->key_dim;
+        TrillimAttentionPacking job = {p, query, key, packed_query, packed_key, context};
+        TrillimStatus status = context->thread_pool->run(
+            context->thread_pool->context, query_rows + key_rows, pack_attention_row, &job
+        );
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        packed = *p;
+        query_strides[0] = p->queries * p->key_dim;
+        query_strides[1] = p->key_dim;
+        query_strides[2] = 1;
+        key_strides[0] = p->length * p->key_dim;
+        key_strides[1] = p->key_dim;
+        key_strides[2] = 1;
+        packed.q_strides = query_strides;
+        packed.k_strides = key_strides;
+        packed.q_rows = query_rows;
+        packed.q_columns = p->key_dim;
+        packed.k_rows = key_rows;
+        packed.k_columns = p->key_dim;
+        scratch = packed_key + key_rows * p->key_dim;
+        query = packed_query;
+        key = packed_key;
+        p = &packed;
+    }
     atomic_bool ordinary = ATOMIC_VAR_INIT(true);
     TrillimAttentionTask task = {
-        outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context, false, &ordinary, 64, 128, 0
+        outputs[0], query, key, inputs[2], scratch, p, context, false, &ordinary, 64, 128, 0
     };
     if (trillim_attention_blocked(p)) {
         TrillimStatus status = context->thread_pool->run(context->thread_pool->context, p->kv_heads, trillim_attention_pack, &task);

@@ -1,6 +1,7 @@
 #include "common.h"
 #include <math.h>
 #include <arm_neon.h>
+#include <stdatomic.h>
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -17,6 +18,7 @@ typedef struct {
 typedef struct {
     void *output;
     const void *input;
+    const float *table;
     const Parameters *p;
     const TrillimKernelContext *context;
 } Task;
@@ -44,6 +46,26 @@ static float gelu_tanh(float x, uint32_t dtype) {
     float cdf = probability * 2.0f - 1.0f;
     float half = round_dtype(x * 0.5f, dtype);
     return half * (cdf + 1.0f);
+}
+
+static float bf16_gelu[UINT16_MAX + 1];
+static atomic_uint table_state;
+
+static TrillimStatus prepare_table(const TrillimKernelContext *context) {
+    unsigned empty = 0;
+    if (!atomic_compare_exchange_strong_explicit(&table_state, &empty, 1,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        return TRILLIM_OK;
+    }
+    for (size_t i = 0; i <= UINT16_MAX; ++i) {
+        if ((i & 1023) == 0 && context->is_cancelled(context->cancellation_context)) {
+            atomic_store_explicit(&table_state, 0, memory_order_release);
+            return TRILLIM_CANCELLED;
+        }
+        bf16_gelu[i] = gelu_tanh(trillim_bf16((uint16_t)i), TRILLIM_BF16);
+    }
+    atomic_store_explicit(&table_state, 2, memory_order_release);
+    return TRILLIM_OK;
 }
 
 static TrillimStatus requirements(
@@ -117,6 +139,14 @@ static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
     }
     size_t begin = tile * 1024;
     size_t end = p->count - begin < 1024 ? p->count : begin + 1024;
+    if (task->table) {
+        for (size_t i = begin; i < end; ++i) {
+            uint16_t bits;
+            memcpy(&bits, (const uint8_t *)task->input + i * sizeof(bits), sizeof(bits));
+            memcpy((uint8_t *)task->output + i * sizeof(float), &task->table[bits], sizeof(float));
+        }
+        return TRILLIM_OK;
+    }
     size_t i = begin;
     if (p->input_dtype == TRILLIM_FP32 && p->output_dtype == TRILLIM_FP32) {
         for (; end - i >= 4; i += 4) {
@@ -152,7 +182,22 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_gelu_tanh(
     if (p->count == 0) {
         return TRILLIM_OK;
     }
-    Task task = {outputs[0], inputs[0], p, context};
+    const float *table = NULL;
+    if (p->input_dtype == TRILLIM_BF16 && p->output_dtype == TRILLIM_FP32) {
+        unsigned state = atomic_load_explicit(&table_state, memory_order_acquire);
+        if (state == 0 && p->count >= 4 * (UINT16_MAX + 1)) {
+            /* Amortize the exact lookup table across a large activation. */
+            TrillimStatus status = prepare_table(context);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+            state = atomic_load_explicit(&table_state, memory_order_acquire);
+        }
+        if (state == 2) {
+            table = bf16_gelu;
+        }
+    }
+    Task task = {outputs[0], inputs[0], table, p, context};
     size_t tiles = p->count / 1024 + (p->count % 1024 != 0);
     if (tiles == 1) {
         return activate(&task, 0, 0);
