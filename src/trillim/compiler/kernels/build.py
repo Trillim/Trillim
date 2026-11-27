@@ -171,7 +171,8 @@ def _build_backend(
         failures: list[str] = []
         for compiler in compilers:
             progress(f"Building {backend} kernels with {' '.join(compiler)}")
-            emit_flags = list(_FLAGS)
+            # Zig can emit literal NUL bytes in verbose assembly comments.
+            emit_flags = [*_FLAGS, "-fno-verbose-asm"]
             if Path(compiler[0]).stem.lower() == "zig":
                 # Zig reports an internal -c as unused in assembly-output mode.
                 emit_flags.append("-Wno-unused-command-line-argument")
