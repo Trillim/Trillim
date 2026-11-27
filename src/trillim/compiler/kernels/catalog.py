@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as c
 import ctypes.util
+import platform
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -26,16 +27,97 @@ from .native import (
 _LIBRARIES: dict[Path, c.CDLL] = {}
 
 
-def _available_capabilities(backend: _Backend) -> int:
-    features: set[str] = set()
+def _hardware_capabilities(backend: _Backend) -> int:
+    machine = platform.machine().lower()
+    if (
+        backend == "scalar"
+        or (backend == "neon" and machine not in {"aarch64", "arm64"})
+        or (
+            backend == "x86"
+            and machine not in {"x86_64", "amd64", "i386", "i686", "x86"}
+        )
+    ):
+        return 0
+    flags = _CAPABILITY_FLAGS[backend]
+    available = 0
+    if sys.platform == "darwin":
+        query = c.CDLL(None).sysctlbyname
+        query.argtypes = [
+            c.c_char_p,
+            c.c_void_p,
+            c.POINTER(c.c_size_t),
+            c.c_void_p,
+            c.c_size_t,
+        ]
+        query.restype = c.c_int
+        names = (
+            {"neon": "neon", "dotprod": "arm.FEAT_DotProd"}
+            if backend == "neon"
+            else {name: name for name in flags if name not in _SOFTWARE_CAPABILITIES}
+        )
+        if backend == "x86":
+            names["avx2"] = "avx2_0"
+            names["avx512_vnni"] = "avx512vnni"
+        for name, suffix in names.items():
+            value = c.c_int()
+            size = c.c_size_t(c.sizeof(value))
+            if (
+                query(
+                    f"hw.optional.{suffix}".encode(),
+                    c.byref(value),
+                    c.byref(size),
+                    None,
+                    0,
+                )
+                == 0
+                and size.value == c.sizeof(value)
+                and value.value != 0
+            ):
+                available |= flags[name]
+        return available
+    if sys.platform == "linux" and backend == "neon":
+        try:
+            query = c.CDLL(None).getauxval
+        except AttributeError:
+            return 0
+        query.argtypes, query.restype = [c.c_ulong], c.c_ulong
+        hwcap = int(query(16))  # AT_HWCAP; Linux AArch64 HWCAP_ASIMD and ASIMDDP.
+        if hwcap & (1 << 1):
+            available |= flags["neon"]
+        if hwcap & (1 << 20):
+            available |= flags["dotprod"]
+        return available
+    if sys.platform == "win32":
+        query = c.WinDLL("kernel32", use_last_error=True).IsProcessorFeaturePresent
+        query.argtypes, query.restype = [c.c_uint32], c.c_int
+        identifiers = (
+            {"neon": 19, "dotprod": 43}
+            if backend == "neon"
+            else {"avx2": 40, "avx512f": 41}
+        )
+        for name, identifier in identifiers.items():
+            if query(identifier):
+                available |= flags[name]
+        return available
+    if sys.platform != "linux":
+        return 0
+    # Linux reports instruction sets enabled by the OS, including AVX state support.
+    features: set[str] | None = None
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith(("flags", "Features")):
-                features.update(line.partition(":")[2].split())
+            if line.partition(":")[0].strip() == "flags":
+                current = set(line.partition(":")[2].split())
+                features = current if features is None else features & current
     except OSError:
-        pass
-    aliases = {"neon": "asimd", "dotprod": "asimddp"}
-    available = 0
+        return 0
+    for name, flag in flags.items():
+        if features is not None and name in features:
+            available |= flag
+    return available
+
+
+def _available_capabilities(backend: _Backend) -> int:
+    available = _hardware_capabilities(backend)
     for name, flag in _CAPABILITY_FLAGS[backend].items():
         if name == "m" and sys.platform == "win32":
             # Loaded Windows kernels resolve standard math through their CRT.
@@ -48,8 +130,6 @@ def _available_capabilities(backend: _Backend) -> int:
                 c.CDLL(library)
             except OSError:
                 continue
-            available |= flag
-        elif name in features or aliases.get(name) in features:
             available |= flag
     return available
 

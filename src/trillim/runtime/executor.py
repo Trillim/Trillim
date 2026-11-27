@@ -24,7 +24,6 @@ from .. import _VERSION_ROOT
 from ..compiler.artifacts.artifact_pydantic_models import _ExecutableManifest
 from ..compiler.dtype import _NATIVE_DTYPES, _QUANTIZED_DTYPES, _encode
 from ..compiler.kernels.catalog import _available_capabilities
-from ..compiler.kernels.native import _CAPABILITY_FLAGS
 from .errors import CancelledError, ExecutionError
 from .runtime_dataclasses import TokenEvent
 from .runtime_pydantic_models import _Response
@@ -136,8 +135,6 @@ class _CPU:
         if manifest.backend == "neon" and machine not in {"aarch64", "arm64"}:
             raise ValueError("ARM backend requires an ARM64 device")
         capabilities = _available_capabilities(manifest.backend)
-        if manifest.backend == "neon":
-            capabilities |= _CAPABILITY_FLAGS["neon"]["neon"]
 
         self.manifest = manifest
         self.last_stats: dict[str, JsonValue] = {}

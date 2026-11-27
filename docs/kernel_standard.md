@@ -31,6 +31,8 @@ A kernel exports four functions:
 
 The compiler builds one available-capabilities mask per backend and accepts a kernel when `(required & available) == required`. Missing or unknown bits make a kernel unavailable. Metadata exports must be safe on the baseline CPU. The executable records the required mask and readable feature names.
 
+Hardware detection uses macOS `sysctlbyname`, Linux AArch64 `getauxval(AT_HWCAP)`, and Windows `IsProcessorFeaturePresent`. Linux x86 uses the intersection of the OS-reported CPU flags. Unknown features remain unavailable. The CPU worker independently checks hardware capabilities before loading a plan, using CPUID and OS vector-state checks on x86 and the same OS interfaces on ARM. Python supplies software-library availability, but cannot enable hardware features in the worker.
+
 These four native exports define the kernel API. The Python helpers used by built-in parameter binders are compiler-private.
 
 Logical tensors use ordinary mathematical shapes. Contiguous storage uses the last dimension as the fastest changing axis. Views may use permuted or zero strides; kernels receive the strides they need in their own parameter structs. Packed weights retain their logical dtype while the compiler selects their physical layout.

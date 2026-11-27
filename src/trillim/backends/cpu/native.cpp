@@ -1,6 +1,12 @@
 #include "native.h"
 
 #include <new>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/sysctl.h>
+#elif defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
 #endif
@@ -42,6 +48,28 @@ uint64_t trillim_cpu_features(void) {
     if (a >= 1 && __get_cpuid_count(7, 1, &a, &b, &c, &d) && (a & (1U << 4))) {
         features |= TRILLIM_CAP_X86_AVX_VNNI;
     }
+#elif defined(__aarch64__)
+#if defined(__APPLE__)
+    int value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname("hw.optional.neon", &value, &size, nullptr, 0) == 0 &&
+        size == sizeof(value) && value != 0) {
+        features |= TRILLIM_CAP_NEON;
+    }
+    value = 0;
+    size = sizeof(value);
+    if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &size, nullptr, 0) == 0 &&
+        size == sizeof(value) && value != 0) {
+        features |= TRILLIM_CAP_NEON_DOTPROD;
+    }
+#elif defined(__linux__)
+    const unsigned long hwcap = getauxval(AT_HWCAP);
+    if (hwcap & HWCAP_ASIMD) features |= TRILLIM_CAP_NEON;
+    if (hwcap & HWCAP_ASIMDDP) features |= TRILLIM_CAP_NEON_DOTPROD;
+#elif defined(_WIN32)
+    if (IsProcessorFeaturePresent(19)) features |= TRILLIM_CAP_NEON;
+    if (IsProcessorFeaturePresent(43)) features |= TRILLIM_CAP_NEON_DOTPROD;
+#endif
 #endif
     return features;
 }

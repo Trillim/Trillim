@@ -754,7 +754,9 @@ Runtime::Runtime(
             throw std::invalid_argument("weight bundle data_start disagrees with header");
         }
 
-        if (base.at("backend") == "x86") {
+        // Software availability comes from Python; hardware is checked in this process.
+        capabilities &= UINT64_C(0xffffffff00000000);
+        if (base.at("backend") != "scalar") {
             capabilities |= trillim_cpu_features();
         }
 
