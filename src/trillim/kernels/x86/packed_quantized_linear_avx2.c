@@ -4,7 +4,12 @@
 
 #define PACKED_TARGET __attribute__((target("avx2")))
 
-enum { PACKED_ROWS = 4, PACKED_COLUMNS = 16 };
+enum {
+    PACKED_ROWS = 4,
+    PACKED_PREFILL_ROWS = 8,
+    PACKED_COLUMNS = 16,
+    PACKED_SUM_MAX_BYTES = 2 * 1024 * 1024,
+};
 
 typedef struct {
     size_t tokens, width, outputs;
@@ -27,11 +32,27 @@ typedef struct {
     const uint8_t *values, *scales, *high;
     const int8_t *subscales;
     const float *activation_scales;
+    int16_t *activation_sums;
     const Parameters *p;
     const Layout *layout;
-    size_t groups, columns, column_tiles;
+    size_t groups, columns, column_tiles, rows_per_tile;
     const TrillimKernelContext *context;
 } Task;
+
+static bool centered_codes(uint32_t dtype) {
+    return dtype == TRILLIM_GRP_INT4 || dtype == TRILLIM_GRP_INT5;
+}
+
+static size_t activation_sum_space(size_t tokens, size_t groups, uint32_t dtype) {
+    if (!centered_codes(dtype)) {
+        return 0;
+    }
+    if (groups > PACKED_SUM_MAX_BYTES / sizeof(int16_t)) {
+        return tokens == 0 ? 0 : PACKED_SUM_MAX_BYTES;
+    }
+    size_t row_bytes = groups * sizeof(int16_t);
+    return tokens > PACKED_SUM_MAX_BYTES / row_bytes ? PACKED_SUM_MAX_BYTES : tokens * row_bytes;
+}
 
 static const Layout *packed_layout(uint32_t dtype) {
     static const Layout layouts[] = {
@@ -64,6 +85,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     inputs[1] = p->outputs * groups * record;
     inputs[2] = p->tokens * sizeof(float);
     outputs[0] = p->tokens * p->outputs * bytes;
+    *scratch = activation_sum_space(p->tokens, groups, p->weight_dtype);
     return TRILLIM_OK;
 }
 
@@ -82,55 +104,6 @@ static float weight_scale(const Task *task, size_t block) {
     uint16_t bits;
     memcpy(&bits, task->scales + block * 2, sizeof(bits));
     return trillim_bf16(bits);
-}
-
-static inline bool scalar_tail(const Block *block, const int8_t *input, size_t stride, size_t rows,
-                               size_t begin, size_t end, int32_t *sums) {
-    const uint8_t *values = block->values;
-    for (size_t i = begin; i < end; ++i) {
-        int32_t code;
-        switch (block->dtype) {
-        case TRILLIM_GRP_BINARY:
-            code = ((values[i / 8] >> (7 - i % 8)) & 1) * 2 - 1;
-            break;
-        case TRILLIM_GRP_TERNARY:
-            code = (values[i % 32] >> (6 - (i / 32) * 2)) & 3;
-            if (code == 3) {
-                return false;
-            }
-            code -= 1;
-            break;
-        case TRILLIM_GRP_INT4:
-            code = ((values[i % 16] >> ((i / 16) * 4)) & 15) - 8;
-            break;
-        case TRILLIM_GRP_INT5:
-            code = (values[i % 16] >> ((i / 16) * 4)) & 15;
-            code |= ((block->high[i / 8] >> (i % 8)) & 1) << 4;
-            code -= 16;
-            break;
-        case TRILLIM_DUBGRP_INT6: {
-            size_t half = i / 128;
-            size_t lane = i % 128 / 32;
-            size_t low = half * 64 + lane / 2 * 32 + i % 32;
-            size_t high = half * 32 + i % 32;
-            code = (values[low] >> ((lane % 2) * 4)) & 15;
-            code |= ((block->high[high] >> (lane * 2)) & 3) << 4;
-            code = (code - 32) * block->subscales[i / 16];
-            break;
-        }
-        case TRILLIM_MXFP4: {
-            static const int8_t e2m1[] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-            code = e2m1[(values[i / 2] >> ((i % 2) * 4)) & 15];
-            break;
-        }
-        default:
-            return false;
-        }
-        for (size_t row = 0; row < rows; ++row) {
-            sums[row] += input[row * stride + i] * code;
-        }
-    }
-    return true;
 }
 
 static PACKED_TARGET __m256i expand_bits(const uint8_t *data, __m128i mask) {
@@ -152,15 +125,59 @@ static PACKED_TARGET int32_t sum_lanes(__m256i value) {
     return _mm_cvtsi128_si32(sum);
 }
 
+static PACKED_TARGET TrillimStatus sum_activation(void *opaque, size_t row, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const int8_t *input = task->input + row * task->p->width;
+    int16_t *sums = task->activation_sums + row * task->groups;
+    const __m256i bytes = _mm256_set1_epi8(1);
+    const __m256i words = _mm256_set1_epi16(1);
+    for (size_t g = 0; g < task->groups; ++g) {
+        if ((g & 31) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        __m256i x = _mm256_loadu_si256((const __m256i *)(input + g * 32));
+        __m256i pairs = _mm256_maddubs_epi16(bytes, x);
+        sums[g] = (int16_t)sum_lanes(_mm256_madd_epi16(pairs, words));
+    }
+    return TRILLIM_OK;
+}
+
+static PACKED_TARGET __m256i unpack_q4_q5(const Block *block) {
+    const __m128i mask = _mm_set1_epi8(15);
+    __m128i packed = _mm_loadu_si128((const __m128i *)block->values);
+    __m256i codes = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(packed, 4), mask), _mm_and_si128(packed, mask));
+    if (block->dtype == TRILLIM_GRP_INT5) {
+        __m128i bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
+        __m256i high = _mm256_and_si256(expand_bits(block->high, bits), _mm256_set1_epi8(16));
+        codes = _mm256_or_si256(codes, high);
+    }
+    return codes;
+}
+
+static PACKED_TARGET void packed_centered_dot(
+    const Block *block, const int8_t *input, size_t stride, const int16_t *activation_sums,
+    size_t groups, size_t rows, int32_t *sums
+) {
+    int center = block->dtype == TRILLIM_GRP_INT4 ? 8 : 16;
+    __m256i weight = unpack_q4_q5(block);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (size_t row = 0; row < rows; ++row) {
+        __m256i x = _mm256_loadu_si256((const __m256i *)(input + row * stride));
+        __m256i pairs = _mm256_maddubs_epi16(weight, x);
+        sums[row] = sum_lanes(_mm256_madd_epi16(pairs, ones)) - center * activation_sums[row * groups];
+    }
+}
+
 static PACKED_TARGET bool packed_dot(const Block *block, const int8_t *input, size_t stride, size_t rows,
-                                     size_t count, int32_t *sums) {
+                                     size_t count, const int8_t *tail, int32_t *sums) {
     const uint8_t *values = block->values;
     __m256i acc[PACKED_ROWS] = {0};
     const __m256i nibbles = _mm256_set1_epi8(15);
     const __m256i two_bits = _mm256_set1_epi8(3);
     const __m256i one = _mm256_set1_epi8(1);
-    size_t full = count / 32 * 32;
-    for (size_t k = 0; k < full; k += 32) {
+    for (size_t k = 0; k < count; k += 32) {
+        size_t valid = count - k;
         __m256i weight;
         __m256i subscale = _mm256_set1_epi16(1);
         switch (block->dtype) {
@@ -172,33 +189,30 @@ static PACKED_TARGET bool packed_dot(const Block *block, const int8_t *input, si
         case TRILLIM_GRP_TERNARY: {
             __m256i packed = _mm256_loadu_si256((const __m256i *)values);
             __m256i codes = _mm256_and_si256(_mm256_srli_epi16(packed, 6 - (int)(k / 32) * 2), two_bits);
-            if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(codes, two_bits))) {
+            uint32_t invalid = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(codes, two_bits));
+            if (valid < 32) {
+                invalid &= (UINT32_C(1) << valid) - 1;
+            }
+            if (invalid) {
                 return false;
             }
             weight = _mm256_sub_epi8(codes, one);
             break;
         }
         case TRILLIM_GRP_INT4:
-        case TRILLIM_GRP_INT5:
+        case TRILLIM_GRP_INT5: {
+            int center = block->dtype == TRILLIM_GRP_INT4 ? 8 : 16;
+            weight = _mm256_sub_epi8(unpack_q4_q5(block), _mm256_set1_epi8((char)center));
+            break;
+        }
         case TRILLIM_MXFP4: {
             const __m128i mask = _mm_set1_epi8(15);
             __m128i packed = _mm_loadu_si128((const __m128i *)values);
             __m128i lo = _mm_and_si128(packed, mask);
             __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
-            if (block->dtype == TRILLIM_MXFP4) {
-                __m128i palette = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
-                __m256i codes = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
-                weight = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(palette), codes);
-            } else {
-                __m256i codes = _mm256_set_m128i(hi, lo);
-                if (block->dtype == TRILLIM_GRP_INT5) {
-                    __m128i bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128);
-                    __m256i high = _mm256_and_si256(expand_bits(block->high, bits), _mm256_set1_epi8(16));
-                    weight = _mm256_sub_epi8(_mm256_or_si256(codes, high), _mm256_set1_epi8(16));
-                } else {
-                    weight = _mm256_sub_epi8(codes, _mm256_set1_epi8(8));
-                }
-            }
+            __m128i palette = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+            __m256i codes = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+            weight = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(palette), codes);
             break;
         }
         case TRILLIM_DUBGRP_INT6: {
@@ -216,8 +230,10 @@ static PACKED_TARGET bool packed_dot(const Block *block, const int8_t *input, si
         default:
             return false;
         }
+        const int8_t *codes = valid < 32 ? tail : input + k;
+        size_t step = valid < 32 ? 32 : stride;
         for (size_t row = 0; row < rows; ++row) {
-            __m256i x = _mm256_loadu_si256((const __m256i *)(input + row * stride + k));
+            __m256i x = _mm256_loadu_si256((const __m256i *)(codes + row * step));
             // Magnitudes are unsigned, so -128 stays exact. Weight products fit in 16-bit pairs.
             __m256i pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(x), _mm256_sign_epi8(weight, x));
             acc[row] = _mm256_add_epi32(acc[row], _mm256_madd_epi16(pairs, subscale));
@@ -226,7 +242,7 @@ static PACKED_TARGET bool packed_dot(const Block *block, const int8_t *input, si
     for (size_t row = 0; row < rows; ++row) {
         sums[row] = sum_lanes(acc[row]);
     }
-    return full == count || scalar_tail(block, input, stride, rows, full, count, sums);
+    return true;
 }
 
 static PACKED_TARGET TrillimStatus project(void *opaque, size_t tile, size_t worker) {
@@ -234,12 +250,20 @@ static PACKED_TARGET TrillimStatus project(void *opaque, size_t tile, size_t wor
     const Task *task = opaque;
     const Parameters *p = task->p;
     const Layout *layout = task->layout;
-    size_t row = tile / task->column_tiles * PACKED_ROWS;
-    size_t rows = p->tokens - row < PACKED_ROWS ? p->tokens - row : PACKED_ROWS;
+    size_t row = tile / task->column_tiles * task->rows_per_tile;
+    size_t rows = p->tokens - row < task->rows_per_tile ? p->tokens - row : task->rows_per_tile;
     size_t first = tile % task->column_tiles * task->columns;
     size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns;
+    int8_t tail[PACKED_ROWS * 32];
+    size_t remainder = p->width % 32;
+    if (remainder != 0) {
+        memset(tail, 0, sizeof(tail));
+        for (size_t r = 0; r < rows; ++r) {
+            memcpy(tail + r * 32, task->input + (row + r + 1) * p->width - remainder, remainder);
+        }
+    }
     for (size_t column = first; column < end; ++column) {
-        float totals[PACKED_ROWS] = {0};
+        float totals[PACKED_PREFILL_ROWS] = {0};
         for (size_t g = 0; g < task->groups; ++g) {
             size_t k = g * layout->width;
             if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
@@ -253,8 +277,12 @@ static PACKED_TARGET TrillimStatus project(void *opaque, size_t tile, size_t wor
                 task->subscales + index * layout->subscales,
                 p->weight_dtype,
             };
-            int32_t sums[PACKED_ROWS] = {0};
-            if (!packed_dot(&block, task->input + row * p->width + k, p->width, rows, count, sums)) {
+            int32_t sums[PACKED_PREFILL_ROWS];
+            const int8_t *input = task->input + row * p->width + k;
+            if (task->activation_sums != NULL) {
+                packed_centered_dot(&block, input, p->width, task->activation_sums + row * task->groups + g,
+                    task->groups, rows, sums);
+            } else if (!packed_dot(&block, input, p->width, rows, count, tail, sums)) {
                 for (size_t r = 0; r < rows; ++r) {
                     totals[r] = NAN;
                 }
@@ -277,7 +305,6 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_packed_quantized_linear_avx2(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
 ) {
-    (void)scratch;
     const Parameters *p = parameters;
     if (context->is_cancelled(context->cancellation_context)) {
         return TRILLIM_CANCELLED;
@@ -304,13 +331,43 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_packed_quantized_linear_avx2(
         columns = PACKED_COLUMNS;
     }
     size_t tiles = p->outputs / columns + (p->outputs % columns != 0);
-    size_t rows = p->tokens / PACKED_ROWS + (p->tokens % PACKED_ROWS != 0);
-    Task task = {
-        outputs[0], inputs[0], values, scales, high, subscales, inputs[2],
-        p, layout, groups, columns, tiles, context,
-    };
-    return rows * tiles == 1 ? project(&task, 0, 0)
-                            : context->thread_pool->run(context->thread_pool->context, rows * tiles, project, &task);
+    size_t capacity = p->tokens;
+    size_t rows_per_tile = PACKED_ROWS;
+    size_t sum_space = activation_sum_space(p->tokens, groups, p->weight_dtype);
+    if (scratch != NULL && p->width % 32 == 0 && groups <= sum_space / sizeof(int16_t) && p->outputs >= PACKED_COLUMNS) {
+        capacity = sum_space / sizeof(int16_t) / groups;
+        if (p->weight_dtype == TRILLIM_GRP_INT5 && p->tokens >= PACKED_PREFILL_ROWS && tiles >= workers) {
+            rows_per_tile = PACKED_PREFILL_ROWS;
+        }
+    } else {
+        scratch = NULL;
+    }
+    const TrillimThreadPool *pool = context->thread_pool;
+    const size_t itemsize = trillim_itemsize(p->output_dtype);
+    for (size_t first = 0; first < p->tokens;) {
+        Parameters panel = *p;
+        panel.tokens = p->tokens - first < capacity ? p->tokens - first : capacity;
+        Task task = {
+            (uint8_t *)outputs[0] + first * p->outputs * itemsize,
+            (const int8_t *)inputs[0] + first * p->width,
+            values, scales, high, subscales, (const float *)inputs[2] + first,
+            scratch, &panel, layout, groups, columns, tiles, rows_per_tile, context,
+        };
+        if (scratch != NULL) {
+            TrillimStatus status = panel.tokens == 1 ? sum_activation(&task, 0, 0)
+                : pool->run(pool->context, panel.tokens, sum_activation, &task);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        size_t jobs = (panel.tokens / rows_per_tile + (panel.tokens % rows_per_tile != 0)) * tiles;
+        TrillimStatus status = jobs == 1 ? project(&task, 0, 0) : pool->run(pool->context, jobs, project, &task);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        first += panel.tokens;
+    }
+    return TRILLIM_OK;
 }
 
 TRILLIM_KERNEL const char *trillim_x86_packed_quantized_linear_avx2_tdl(void) {
@@ -337,7 +394,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_x86_packed_quantized_linear
     };
     static const size_t inputs[] = {1, 1, 4}, outputs[] = {1};
     static const TrillimParameterSchema schema = {
-        sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), 5, fields, 3, 1, requirements, NULL, inputs, outputs, 1,
+        sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), 5, fields, 3, 1, requirements, NULL, inputs, outputs, 2,
     };
     return &schema;
 }

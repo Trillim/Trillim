@@ -32,15 +32,53 @@ static inline bool packed_activation_quantize(
 ) {
     float values[256];
     float peak = 0.0f;
-    for (size_t i = 0; i < group; ++i) {
-        float value = trillim_load(input, start + i, dtype).f;
-        if (!isfinite(value)) {
-            return false;
+    if (dtype == TRILLIM_BF16 || dtype == TRILLIM_FP32) {
+        const __m256i abs_mask = _mm256_set1_epi32(INT32_MAX);
+        __m256 magnitude = _mm256_setzero_ps();
+        const uint8_t *data = input;
+        for (size_t i = 0; i < group; i += 8) {
+            __m256 value;
+            if (dtype == TRILLIM_BF16) {
+                __m128i bits = _mm_loadu_si128((const __m128i *)(data + (start + i) * 2));
+                value = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+            } else {
+                value = _mm256_loadu_ps((const float *)(data + (start + i) * 4));
+            }
+            __m256i absolute = _mm256_and_si256(_mm256_castps_si256(value), abs_mask);
+            __m256i nonfinite = _mm256_cmpgt_epi32(absolute, _mm256_set1_epi32(0x7f7fffff));
+            if (_mm256_movemask_epi8(nonfinite)) {
+                return false;
+            }
+            magnitude = _mm256_max_ps(magnitude, _mm256_castsi256_ps(absolute));
+            _mm256_storeu_ps(values + i, value);
         }
-        if (fabsf(value) > fabsf(peak)) {
-            peak = value;
+        __m128 maximum = _mm_max_ps(_mm256_castps256_ps128(magnitude), _mm256_extractf128_ps(magnitude, 1));
+        maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
+        maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, _MM_SHUFFLE(1, 1, 1, 1)));
+        peak = _mm_cvtss_f32(maximum);
+        if (group == 256 && peak != 0.0f) {
+            // Q6 uses the sign of the first maximum in input order.
+            for (size_t i = 0; i < group; i += 8) {
+                __m256 value = _mm256_loadu_ps(values + i);
+                __m256 absolute = _mm256_castsi256_ps(_mm256_and_si256(_mm256_castps_si256(value), abs_mask));
+                unsigned matches = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(absolute, _mm256_set1_ps(peak), _CMP_EQ_OQ));
+                if (matches) {
+                    peak = values[i + (size_t)__builtin_ctz(matches)];
+                    break;
+                }
+            }
         }
-        values[i] = value;
+    } else {
+        for (size_t i = 0; i < group; ++i) {
+            float value = trillim_load(input, start + i, dtype).f;
+            if (!isfinite(value)) {
+                return false;
+            }
+            if (fabsf(value) > fabsf(peak)) {
+                peak = value;
+            }
+            values[i] = value;
+        }
     }
     if (peak == 0.0f) {
         *scale = 0.0f;
@@ -52,12 +90,15 @@ static inline bool packed_activation_quantize(
         return false;
     }
     *scale = 1.0f / inverse;
-    for (size_t i = 0; i < group; ++i) {
-        /* Bias the significand to round to nearest, ties to even. */
-        float rounded = values[i] * inverse + 12582912.0f;
-        uint32_t bits;
-        memcpy(&bits, &rounded, sizeof(bits));
-        codes[i] = (int8_t)((int32_t)(bits & UINT32_C(0x007fffff)) - INT32_C(0x00400000));
+    const __m256 multiplier = _mm256_set1_ps(inverse);
+    const __m256 bias = _mm256_set1_ps(12582912.0f);
+    const __m256i bias_bits = _mm256_castps_si256(bias);
+    for (size_t i = 0; i < group; i += 8) {
+        __m256 values8 = _mm256_loadu_ps(values + i);
+        __m256 rounded = _mm256_add_ps(_mm256_mul_ps(values8, multiplier), bias);
+        __m256i integers = _mm256_sub_epi32(_mm256_castps_si256(rounded), bias_bits);
+        __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(integers), _mm256_extracti128_si256(integers, 1));
+        _mm_storel_epi64((__m128i *)(codes + i), _mm_packs_epi16(words, words));
     }
     return true;
 }

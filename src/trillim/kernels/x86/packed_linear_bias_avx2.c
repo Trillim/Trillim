@@ -130,15 +130,53 @@ static inline bool packed_activation_quantize(
 ) {
     float values[256];
     float peak = 0.0f;
-    for (size_t i = 0; i < group; ++i) {
-        float value = trillim_load(input, start + i, dtype).f;
-        if (!isfinite(value)) {
-            return false;
+    if (dtype == TRILLIM_BF16 || dtype == TRILLIM_FP32) {
+        const __m256i abs_mask = _mm256_set1_epi32(INT32_MAX);
+        __m256 magnitude = _mm256_setzero_ps();
+        const uint8_t *data = input;
+        for (size_t i = 0; i < group; i += 8) {
+            __m256 value;
+            if (dtype == TRILLIM_BF16) {
+                __m128i bits = _mm_loadu_si128((const __m128i *)(data + (start + i) * 2));
+                value = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+            } else {
+                value = _mm256_loadu_ps((const float *)(data + (start + i) * 4));
+            }
+            __m256i absolute = _mm256_and_si256(_mm256_castps_si256(value), abs_mask);
+            __m256i nonfinite = _mm256_cmpgt_epi32(absolute, _mm256_set1_epi32(0x7f7fffff));
+            if (_mm256_movemask_epi8(nonfinite)) {
+                return false;
+            }
+            magnitude = _mm256_max_ps(magnitude, _mm256_castsi256_ps(absolute));
+            _mm256_storeu_ps(values + i, value);
         }
-        if (fabsf(value) > fabsf(peak)) {
-            peak = value;
+        __m128 maximum = _mm_max_ps(_mm256_castps256_ps128(magnitude), _mm256_extractf128_ps(magnitude, 1));
+        maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
+        maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, _MM_SHUFFLE(1, 1, 1, 1)));
+        peak = _mm_cvtss_f32(maximum);
+        if (group == 256 && peak != 0.0f) {
+            // Q6 uses the sign of the first maximum in input order.
+            for (size_t i = 0; i < group; i += 8) {
+                __m256 value = _mm256_loadu_ps(values + i);
+                __m256 absolute = _mm256_castsi256_ps(_mm256_and_si256(_mm256_castps_si256(value), abs_mask));
+                unsigned matches = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(absolute, _mm256_set1_ps(peak), _CMP_EQ_OQ));
+                if (matches) {
+                    peak = values[i + (size_t)__builtin_ctz(matches)];
+                    break;
+                }
+            }
         }
-        values[i] = value;
+    } else {
+        for (size_t i = 0; i < group; ++i) {
+            float value = trillim_load(input, start + i, dtype).f;
+            if (!isfinite(value)) {
+                return false;
+            }
+            if (fabsf(value) > fabsf(peak)) {
+                peak = value;
+            }
+            values[i] = value;
+        }
     }
     if (peak == 0.0f) {
         *scale = 0.0f;
@@ -159,12 +197,15 @@ static inline bool packed_activation_quantize(
         }
         inverse = 1.0f / step;
     }
-    for (size_t i = 0; i < group; ++i) {
-        /* Bias the significand to round to nearest, ties to even. */
-        float rounded = values[i] * inverse + 12582912.0f;
-        uint32_t bits;
-        memcpy(&bits, &rounded, sizeof(bits));
-        codes[i] = (int8_t)((int32_t)(bits & UINT32_C(0x007fffff)) - INT32_C(0x00400000));
+    const __m256 multiplier = _mm256_set1_ps(inverse);
+    const __m256 bias = _mm256_set1_ps(12582912.0f);
+    const __m256i bias_bits = _mm256_castps_si256(bias);
+    for (size_t i = 0; i < group; i += 8) {
+        __m256 values8 = _mm256_loadu_ps(values + i);
+        __m256 rounded = _mm256_add_ps(_mm256_mul_ps(values8, multiplier), bias);
+        __m256i integers = _mm256_sub_epi32(_mm256_castps_si256(rounded), bias_bits);
+        __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(integers), _mm256_extracti128_si256(integers, 1));
+        _mm_storel_epi64((__m128i *)(codes + i), _mm_packs_epi16(words, words));
     }
     return true;
 }
@@ -345,6 +386,11 @@ static bool packed(uint32_t dtype) {
     return dtype >= TRILLIM_ROW_INT8 && dtype <= TRILLIM_MXFP4;
 }
 
+static bool quantized_activation(const Parameters *p) {
+    return p->output_dtype == TRILLIM_FP32 ||
+        (p->width >= 256 && p->weight_dtype >= TRILLIM_GRP_INT8 && p->weight_dtype <= TRILLIM_DUBGRP_INT6);
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     *scratch = outputs[0] = 0;
@@ -369,8 +415,9 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     if (!trillim_packed_payload_size(1, p->outputs, p->bias_dtype, inputs + 2)) {
         return TRILLIM_ERROR;
     }
-    if (p->output_dtype == TRILLIM_FP32) {
-        *scratch = packed_activation_space(p->weight_dtype, p->tokens, p->width, p->outputs);
+    if (quantized_activation(p)) {
+        size_t rows = p->output_dtype != TRILLIM_FP32 && p->weight_dtype == TRILLIM_GRP_INT5 ? 1 : p->tokens;
+        *scratch = packed_activation_space(p->weight_dtype, rows, p->width, p->outputs);
     }
     return TRILLIM_OK;
 }
@@ -462,6 +509,49 @@ static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
         ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
+__attribute__((target("avx2"))) static TrillimStatus project_q5_prefill(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    const size_t tiles = p->outputs / TILE_SIZE + (p->outputs % TILE_SIZE != 0);
+    const size_t row = tile / tiles * 4;
+    const size_t rows = p->tokens - row < 4 ? p->tokens - row : 4;
+    const size_t first = tile % tiles * TILE_SIZE;
+    const size_t end = p->outputs - first < TILE_SIZE ? p->outputs : first + TILE_SIZE;
+    const size_t groups = p->width / 32;
+    const size_t blocks = p->outputs * groups;
+    const uint8_t *weight = task->inputs[1];
+    const uint8_t *scales = weight + blocks * 16;
+    const uint8_t *high = scales + blocks * 2;
+    for (size_t column = first; column < end; ++column) {
+        __m256 totals[4] = {0};
+        for (size_t g = 0; g < groups; ++g) {
+            if (g % 8 == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            const size_t block = column * groups + g;
+            __m256 scale = _mm256_set1_ps(trillim_packed_bf16(scales + block * 2));
+            __m256i codes = packed_q8_weights(weight + block * 16, high + block * 4, TRILLIM_GRP_INT5);
+            __m128i lo = _mm256_castsi256_si128(codes);
+            __m128i hi = _mm256_extracti128_si256(codes, 1);
+            __m128i slices[] = {lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8)};
+            for (size_t i = 0; i < 4; ++i) {
+                __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(slices[i])), scale);
+                for (size_t r = 0; r < rows; ++r) {
+                    __m256 x = load8(task->inputs[0], (row + r) * p->width + g * 32 + i * 8, p->input_dtype);
+                    totals[r] = _mm256_add_ps(totals[r], _mm256_mul_ps(x, w));
+                }
+            }
+        }
+        float bias = trillim_load(task->inputs[2], column, p->bias_dtype).f;
+        for (size_t r = 0; r < rows; ++r) {
+            TrillimValue value = {.f = packed_sum_f32(totals[r]) + bias};
+            trillim_store(task->output, (row + r) * p->outputs + column, p->output_dtype, value);
+        }
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_x86_packed_linear_bias(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -475,10 +565,19 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_packed_linear_bias(
         return status;
     }
     const Parameters *p = parameters;
+    if (p->weight_dtype == TRILLIM_GRP_INT5 && p->output_dtype != TRILLIM_FP32 &&
+        p->tokens >= 4 && p->width >= 256 && p->width % 32 == 0) {
+        Task task = {outputs[0], inputs, p, context, {0}};
+        size_t rows = p->tokens / 4 + (p->tokens % 4 != 0);
+        size_t columns = p->outputs / TILE_SIZE + (p->outputs % TILE_SIZE != 0);
+        return rows * columns == 1 ? project_q5_prefill(&task, 0, 0)
+            : context->thread_pool->run(context->thread_pool->context, rows * columns, project_q5_prefill, &task);
+    }
     size_t group = packed_activation_group(p->weight_dtype);
     size_t groups = 0;
     size_t capacity = p->tokens;
-    if (p->output_dtype == TRILLIM_FP32 && scratch != NULL && group != 0 &&
+    if (quantized_activation(p) && scratch != NULL && group != 0 &&
+        (p->output_dtype == TRILLIM_FP32 || p->weight_dtype != TRILLIM_GRP_INT5 || p->tokens == 1) &&
         p->width >= group && p->width <= 65536 && p->width % group == 0 && p->outputs >= 16 &&
         fegetround() == FE_TONEAREST) {
         groups = p->width / group;

@@ -14,7 +14,11 @@
 #pragma GCC optimize ("fp-contract=off")
 #endif
 
-enum { PACKED_ACTIVATION_TILE = 4, PACKED_ACTIVATION_MAX_BYTES = 32 * 1024 * 1024 };
+enum {
+    PACKED_ACTIVATION_TILE = 4,
+    PACKED_Q5_PREFILL_TILE = 8,
+    PACKED_ACTIVATION_MAX_BYTES = 32 * 1024 * 1024,
+};
 
 typedef struct {
     const void *input;
@@ -45,15 +49,53 @@ static inline bool packed_activation_quantize(
 ) {
     float values[256];
     float peak = 0.0f;
-    for (size_t i = 0; i < group; ++i) {
-        float value = trillim_load(input, start + i, dtype).f;
-        if (!isfinite(value)) {
-            return false;
+    if (dtype == TRILLIM_BF16 || dtype == TRILLIM_FP32) {
+        const __m256i abs_mask = _mm256_set1_epi32(INT32_MAX);
+        __m256 magnitude = _mm256_setzero_ps();
+        const uint8_t *data = input;
+        for (size_t i = 0; i < group; i += 8) {
+            __m256 value;
+            if (dtype == TRILLIM_BF16) {
+                __m128i bits = _mm_loadu_si128((const __m128i *)(data + (start + i) * 2));
+                value = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+            } else {
+                value = _mm256_loadu_ps((const float *)(data + (start + i) * 4));
+            }
+            __m256i absolute = _mm256_and_si256(_mm256_castps_si256(value), abs_mask);
+            __m256i nonfinite = _mm256_cmpgt_epi32(absolute, _mm256_set1_epi32(0x7f7fffff));
+            if (_mm256_movemask_epi8(nonfinite)) {
+                return false;
+            }
+            magnitude = _mm256_max_ps(magnitude, _mm256_castsi256_ps(absolute));
+            _mm256_storeu_ps(values + i, value);
         }
-        if (fabsf(value) > fabsf(peak)) {
-            peak = value;
+        __m128 maximum = _mm_max_ps(_mm256_castps256_ps128(magnitude), _mm256_extractf128_ps(magnitude, 1));
+        maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
+        maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, _MM_SHUFFLE(1, 1, 1, 1)));
+        peak = _mm_cvtss_f32(maximum);
+        if (group == 256 && peak != 0.0f) {
+            // Q6 uses the sign of the first maximum in input order.
+            for (size_t i = 0; i < group; i += 8) {
+                __m256 value = _mm256_loadu_ps(values + i);
+                __m256 absolute = _mm256_castsi256_ps(_mm256_and_si256(_mm256_castps_si256(value), abs_mask));
+                unsigned matches = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(absolute, _mm256_set1_ps(peak), _CMP_EQ_OQ));
+                if (matches) {
+                    peak = values[i + (size_t)__builtin_ctz(matches)];
+                    break;
+                }
+            }
         }
-        values[i] = value;
+    } else {
+        for (size_t i = 0; i < group; ++i) {
+            float value = trillim_load(input, start + i, dtype).f;
+            if (!isfinite(value)) {
+                return false;
+            }
+            if (fabsf(value) > fabsf(peak)) {
+                peak = value;
+            }
+            values[i] = value;
+        }
     }
     if (peak == 0.0f) {
         *scale = 0.0f;
@@ -74,12 +116,15 @@ static inline bool packed_activation_quantize(
         }
         inverse = 1.0f / step;
     }
-    for (size_t i = 0; i < group; ++i) {
-        /* Bias the significand to round to nearest, ties to even. */
-        float rounded = values[i] * inverse + 12582912.0f;
-        uint32_t bits;
-        memcpy(&bits, &rounded, sizeof(bits));
-        codes[i] = (int8_t)((int32_t)(bits & UINT32_C(0x007fffff)) - INT32_C(0x00400000));
+    const __m256 multiplier = _mm256_set1_ps(inverse);
+    const __m256 bias = _mm256_set1_ps(12582912.0f);
+    const __m256i bias_bits = _mm256_castps_si256(bias);
+    for (size_t i = 0; i < group; i += 8) {
+        __m256 values8 = _mm256_loadu_ps(values + i);
+        __m256 rounded = _mm256_add_ps(_mm256_mul_ps(values8, multiplier), bias);
+        __m256i integers = _mm256_sub_epi32(_mm256_castps_si256(rounded), bias_bits);
+        __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(integers), _mm256_extracti128_si256(integers, 1));
+        _mm_storel_epi64((__m128i *)(codes + i), _mm_packs_epi16(words, words));
     }
     return true;
 }
@@ -187,7 +232,7 @@ static inline bool packed_activation_ready(const PackedActivation *a, size_t row
 static inline TrillimStatus packed_activation_dot(
     const PackedActivation *a, size_t first_row, size_t rows, const uint8_t *weight,
     uint32_t dtype, size_t outputs, size_t column,
-    float sums[PACKED_ACTIVATION_TILE], bool *used
+    float sums[PACKED_Q5_PREFILL_TILE], bool *used
 ) {
     *used = false;
     for (size_t row = 0; row < rows; ++row) {
@@ -208,7 +253,7 @@ static inline TrillimStatus packed_activation_dot(
     const int8_t *codes = a->codes + first_row * a->width;
     const float *activation_scales = a->scales + first_row * a->groups;
     const __m256i ones = _mm256_set1_epi16(1);
-    __m256 output[PACKED_ACTIVATION_TILE];
+    __m256 output[PACKED_Q5_PREFILL_TILE];
     for (size_t row = 0; row < rows; ++row) {
         output[row] = _mm256_setzero_ps();
     }
@@ -224,7 +269,7 @@ static inline TrillimStatus packed_activation_dot(
         }
         const uint8_t *l = low + g * low_size;
         const uint8_t *h = high + g * high_size;
-        __m256i products[PACKED_ACTIVATION_TILE];
+        __m256i products[PACKED_Q5_PREFILL_TILE];
         if (q6) {
             for (size_t row = 0; row < rows; ++row) {
                 products[row] = _mm256_setzero_si256();
@@ -271,7 +316,7 @@ typedef struct {
     const void *input;
     const uint8_t *weight;
     const Parameters *p;
-    size_t columns;
+    size_t columns, rows_per_tile;
     const TrillimKernelContext *context;
     PackedActivation activation;
 } Task;
@@ -550,13 +595,13 @@ static TrillimStatus project_##NAME(void *opaque, size_t tile, size_t worker) { 
     const Task *task = opaque; \
     const Parameters *p = task->p; \
     size_t tiles = p->outputs / task->columns + (p->outputs % task->columns != 0); \
-    size_t row = tile / tiles * 4; \
-    size_t rows = p->tokens - row < 4 ? p->tokens - row : 4; \
+    size_t row = tile / tiles * task->rows_per_tile; \
+    size_t rows = p->tokens - row < task->rows_per_tile ? p->tokens - row : task->rows_per_tile; \
     size_t first = tile % tiles * task->columns; \
     size_t end = p->outputs - first < task->columns ? p->outputs : first + task->columns; \
     size_t group = group_width(p->weight_dtype); \
     for (size_t column = first; column < end; ++column) { \
-        float sums[4] = {0}; \
+        float sums[PACKED_Q5_PREFILL_TILE] = {0}; \
         bool quantized = false; \
         if (task->activation.scales != NULL) { \
             TrillimStatus status = packed_activation_dot(&task->activation, row, rows, task->weight, \
@@ -573,7 +618,7 @@ static TrillimStatus project_##NAME(void *opaque, size_t tile, size_t worker) { 
             float decoded[256]; \
             decode_block(task, column, k, count, decoded); \
             size_t i = 0; \
-            __m256 accumulators[4] = {_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()}; \
+            __m256 accumulators[PACKED_Q5_PREFILL_TILE] = {0}; \
             for (; count - i >= 8; i += 8) { \
                 __m256 weight = _mm256_loadu_ps(decoded + i); \
                 for (size_t r = 0; r < rows; ++r) { \
@@ -584,15 +629,8 @@ static TrillimStatus project_##NAME(void *opaque, size_t tile, size_t worker) { 
             for (size_t r = 0; r < rows; ++r) sums[r] += sum8(accumulators[r]); \
             for (; i < count; ++i) { \
                 float weight = load_fp32(decoded, i); \
-                sums[0] = multiply_add(LOAD(task->input, row * p->width + k + i), weight, sums[0]); \
-                if (rows > 1) { \
-                    sums[1] = multiply_add(LOAD(task->input, (row + 1) * p->width + k + i), weight, sums[1]); \
-                } \
-                if (rows > 2) { \
-                    sums[2] = multiply_add(LOAD(task->input, (row + 2) * p->width + k + i), weight, sums[2]); \
-                } \
-                if (rows > 3) { \
-                    sums[3] = multiply_add(LOAD(task->input, (row + 3) * p->width + k + i), weight, sums[3]); \
+                for (size_t r = 0; r < rows; ++r) { \
+                    sums[r] = multiply_add(LOAD(task->input, (row + r) * p->width + k + i), weight, sums[r]); \
                 } \
             } \
         } \
@@ -642,19 +680,23 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_block_linear(
     default: return TRILLIM_ERROR;
     }
     size_t capacity = p->tokens;
+    size_t rows_per_tile = PACKED_ACTIVATION_TILE;
     size_t group = packed_activation_group(p->weight_dtype);
     if (p->output_dtype == TRILLIM_FP32 && scratch != NULL && group != 0 &&
         p->width >= group && p->width <= 65536 && p->width % group == 0 && p->outputs >= 16 &&
         fegetround() == FE_TONEAREST) {
         capacity = PACKED_ACTIVATION_MAX_BYTES / (p->width / group * sizeof(float) + p->width);
+        if (p->weight_dtype == TRILLIM_GRP_INT5 && p->tokens >= PACKED_Q5_PREFILL_TILE && tiles >= workers) {
+            rows_per_tile = PACKED_Q5_PREFILL_TILE;
+        }
         if (capacity < p->tokens) {
-            capacity = capacity / PACKED_ACTIVATION_TILE * PACKED_ACTIVATION_TILE;
+            capacity = capacity / rows_per_tile * rows_per_tile;
         }
     }
     for (size_t first = 0; first < p->tokens;) {
         Parameters panel = *p;
         panel.tokens = p->tokens - first < capacity ? p->tokens - first : capacity;
-        Task task = {outputs[0], inputs[0], inputs[1], &panel, columns, context, {0}};
+        Task task = {outputs[0], inputs[0], inputs[1], &panel, columns, rows_per_tile, context, {0}};
         if (first != 0) {
             task.input = (const uint8_t *)inputs[0] + first * p->width * trillim_itemsize(p->input_dtype);
             task.output = (uint8_t *)outputs[0] + first * p->outputs * trillim_itemsize(p->output_dtype);
@@ -667,7 +709,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_block_linear(
                 return status;
             }
         }
-        size_t panel_rows = panel.tokens / PACKED_ACTIVATION_TILE + (panel.tokens % PACKED_ACTIVATION_TILE != 0);
+        size_t panel_rows = panel.tokens / rows_per_tile + (panel.tokens % rows_per_tile != 0);
         status = panel_rows * tiles == 1 ? project(&task, 0, 0)
             : context->thread_pool->run(context->thread_pool->context, panel_rows * tiles, project, &task);
         if (status != TRILLIM_OK) {

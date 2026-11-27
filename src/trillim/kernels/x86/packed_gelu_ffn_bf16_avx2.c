@@ -22,6 +22,7 @@ typedef struct {
     const TrillimKernelContext *context;
     float *scales;
     int8_t *codes;
+    uint8_t *q4_centers;
     size_t width;
     size_t groups;
     uint32_t dtype;
@@ -45,15 +46,53 @@ static inline bool packed_activation_quantize(
 ) {
     float values[256];
     float peak = 0.0f;
-    for (size_t i = 0; i < group; ++i) {
-        float value = trillim_load(input, start + i, dtype).f;
-        if (!isfinite(value)) {
-            return false;
+    if (dtype == TRILLIM_BF16 || dtype == TRILLIM_FP32) {
+        const __m256i abs_mask = _mm256_set1_epi32(INT32_MAX);
+        __m256 magnitude = _mm256_setzero_ps();
+        const uint8_t *data = input;
+        for (size_t i = 0; i < group; i += 8) {
+            __m256 value;
+            if (dtype == TRILLIM_BF16) {
+                __m128i bits = _mm_loadu_si128((const __m128i *)(data + (start + i) * 2));
+                value = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+            } else {
+                value = _mm256_loadu_ps((const float *)(data + (start + i) * 4));
+            }
+            __m256i absolute = _mm256_and_si256(_mm256_castps_si256(value), abs_mask);
+            __m256i nonfinite = _mm256_cmpgt_epi32(absolute, _mm256_set1_epi32(0x7f7fffff));
+            if (_mm256_movemask_epi8(nonfinite)) {
+                return false;
+            }
+            magnitude = _mm256_max_ps(magnitude, _mm256_castsi256_ps(absolute));
+            _mm256_storeu_ps(values + i, value);
         }
-        if (fabsf(value) > fabsf(peak)) {
-            peak = value;
+        __m128 maximum = _mm_max_ps(_mm256_castps256_ps128(magnitude), _mm256_extractf128_ps(magnitude, 1));
+        maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
+        maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, _MM_SHUFFLE(1, 1, 1, 1)));
+        peak = _mm_cvtss_f32(maximum);
+        if (group == 256 && peak != 0.0f) {
+            // Q6 uses the sign of the first maximum in input order.
+            for (size_t i = 0; i < group; i += 8) {
+                __m256 value = _mm256_loadu_ps(values + i);
+                __m256 absolute = _mm256_castsi256_ps(_mm256_and_si256(_mm256_castps_si256(value), abs_mask));
+                unsigned matches = (unsigned)_mm256_movemask_ps(_mm256_cmp_ps(absolute, _mm256_set1_ps(peak), _CMP_EQ_OQ));
+                if (matches) {
+                    peak = values[i + (size_t)__builtin_ctz(matches)];
+                    break;
+                }
+            }
         }
-        values[i] = value;
+    } else {
+        for (size_t i = 0; i < group; ++i) {
+            float value = trillim_load(input, start + i, dtype).f;
+            if (!isfinite(value)) {
+                return false;
+            }
+            if (fabsf(value) > fabsf(peak)) {
+                peak = value;
+            }
+            values[i] = value;
+        }
     }
     if (peak == 0.0f) {
         *scale = 0.0f;
@@ -74,12 +113,15 @@ static inline bool packed_activation_quantize(
         }
         inverse = 1.0f / step;
     }
-    for (size_t i = 0; i < group; ++i) {
-        /* Bias the significand to round to nearest, ties to even. */
-        float rounded = values[i] * inverse + 12582912.0f;
-        uint32_t bits;
-        memcpy(&bits, &rounded, sizeof(bits));
-        codes[i] = (int8_t)((int32_t)(bits & UINT32_C(0x007fffff)) - INT32_C(0x00400000));
+    const __m256 multiplier = _mm256_set1_ps(inverse);
+    const __m256 bias = _mm256_set1_ps(12582912.0f);
+    const __m256i bias_bits = _mm256_castps_si256(bias);
+    for (size_t i = 0; i < group; i += 8) {
+        __m256 values8 = _mm256_loadu_ps(values + i);
+        __m256 rounded = _mm256_add_ps(_mm256_mul_ps(values8, multiplier), bias);
+        __m256i integers = _mm256_sub_epi32(_mm256_castps_si256(rounded), bias_bits);
+        __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(integers), _mm256_extracti128_si256(integers, 1));
+        _mm_storel_epi64((__m128i *)(codes + i), _mm_packs_epi16(words, words));
     }
     return true;
 }
@@ -104,6 +146,11 @@ static inline TrillimStatus packed_activation_row(void *opaque, size_t row, size
             scales[0] = NAN;
             return TRILLIM_OK;
         }
+        if (a->q4_centers != NULL) {
+            __m256i x = _mm256_loadu_si256((const __m256i *)(codes + start));
+            __m256i center = _mm256_maddubs_epi16(_mm256_set1_epi8(8), x);
+            _mm256_storeu_si256((__m256i *)(a->q4_centers + (row * a->groups + g) * sizeof(__m256i)), center);
+        }
     }
     return TRILLIM_OK;
 }
@@ -119,18 +166,21 @@ static size_t packed_activation_space(size_t rows, size_t width, size_t columns,
     /* The compiler reserves scratch at the maximum shape. */
     size_t bounded_width = width < 65536 ? width : 65536;
     size_t groups = bounded_width / group;
-    size_t row_bytes = groups * (group + sizeof(float));
+    size_t row_bytes = groups * (group + sizeof(float) +
+        (weight_dtype == TRILLIM_GRP_INT4 ? sizeof(__m256i) : 0));
     return rows > PACKED_ACTIVATION_MAX_BYTES / row_bytes
         ? PACKED_ACTIVATION_MAX_BYTES : rows * row_bytes;
 }
 
 static inline TrillimStatus packed_activation_prepare(
     PackedActivation *a, void *workspace, const void *input, uint32_t input_dtype,
-    size_t rows, size_t width, size_t groups, const TrillimKernelContext *context
+    size_t rows, size_t width, size_t groups, uint32_t weight_dtype, const TrillimKernelContext *context
 ) {
     float *scales = workspace;
     int8_t *codes = (int8_t *)(scales + rows * groups);
-    *a = (PackedActivation){input, context, scales, codes, width, groups, input_dtype};
+    uint8_t *centers = weight_dtype == TRILLIM_GRP_INT4 && rows == 1
+        ? (uint8_t *)(codes + rows * width) : NULL;
+    *a = (PackedActivation){input, context, scales, codes, centers, width, groups, input_dtype};
     const TrillimThreadPool *pool = context->thread_pool;
     return rows == 1 ? packed_activation_row(a, 0, 0)
                      : pool->run(pool->context, rows, packed_activation_row, a);
@@ -141,7 +191,7 @@ static inline __m256i packed_pair_products(__m256i weight, __m256i input) {
     return _mm256_maddubs_epi16(_mm256_abs_epi8(weight), _mm256_sign_epi8(input, weight));
 }
 
-static inline __m256i packed_q8_weights(const uint8_t *low, const uint8_t *high, uint32_t dtype) {
+static inline __m256i packed_q8_weights(const uint8_t *low, const uint8_t *high, uint32_t dtype, bool centered) {
     if (dtype == TRILLIM_GRP_INT8) {
         return _mm256_loadu_si256((const __m256i *)low);
     }
@@ -158,7 +208,7 @@ static inline __m256i packed_q8_weights(const uint8_t *low, const uint8_t *high,
         __m256i fifth = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, mask), mask);
         codes = _mm256_or_si256(codes, _mm256_and_si256(fifth, _mm256_set1_epi8(16)));
     }
-    return _mm256_sub_epi8(codes, _mm256_set1_epi8((char)center));
+    return centered ? _mm256_sub_epi8(codes, _mm256_set1_epi8((char)center)) : codes;
 }
 
 static inline float packed_sum_f32(__m256 sums) {
@@ -237,8 +287,14 @@ static inline TrillimStatus packed_activation_dot(
                     products[row] = _mm256_add_epi32(products[row], _mm256_madd_epi16(pairs, scale_pair));
                 }
             }
+        } else if (a->q4_centers != NULL) {
+            __m256i w = packed_q8_weights(l, h, dtype, false);
+            __m256i x = _mm256_loadu_si256((const __m256i *)(codes + g * 32));
+            __m256i center = _mm256_loadu_si256((const __m256i *)(a->q4_centers + g * sizeof(__m256i)));
+            __m256i pairs = _mm256_sub_epi16(_mm256_maddubs_epi16(w, x), center);
+            products[0] = _mm256_madd_epi16(pairs, ones);
         } else {
-            __m256i w = packed_q8_weights(l, h, dtype);
+            __m256i w = packed_q8_weights(l, h, dtype, true);
             for (size_t row = 0; row < rows; ++row) {
                 const int8_t *x = codes + row * a->width + g * 32;
                 __m256i pairs = packed_pair_products(w, _mm256_loadu_si256((const __m256i *)x));
@@ -373,11 +429,27 @@ static TrillimStatus accumulate(
         __m256 acc[4] = {
             _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()
         };
-        for (; k < end; k += 8) {
-            __m256 w = decode8(weight, total, block, k - start, dtype);
-            for (size_t r = 0; r < rows; ++r) {
-                __m256 x = load8(input, (row + r) * width + k, bf16_input);
-                acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(x, w));
+        if (dtype == TRILLIM_GRP_INT5 && count == 32) {
+            const uint8_t *scales = weight + total * 16;
+            __m256 scale = _mm256_set1_ps(read_bf16(scales + block * 2));
+            __m256i codes = packed_q8_weights(weight + block * 16, scales + total * 2 + block * 4, dtype, true);
+            __m128i lo = _mm256_castsi256_si128(codes);
+            __m128i hi = _mm256_extracti128_si256(codes, 1);
+            __m128i slices[] = {lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8)};
+            for (size_t i = 0; i < 4; ++i, k += 8) {
+                __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(slices[i])), scale);
+                for (size_t r = 0; r < rows; ++r) {
+                    __m256 x = load8(input, (row + r) * width + k, bf16_input);
+                    acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(x, w));
+                }
+            }
+        } else {
+            for (; k < end; k += 8) {
+                __m256 w = decode8(weight, total, block, k - start, dtype);
+                for (size_t r = 0; r < rows; ++r) {
+                    __m256 x = load8(input, (row + r) * width + k, bf16_input);
+                    acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(x, w));
+                }
             }
         }
         for (size_t r = 0; r < rows; ++r) {
@@ -468,7 +540,8 @@ static TrillimStatus run(const Task *task, void *workspace) {
         group != 0 && task->width >= group && task->width <= 65536 && task->width % group == 0 &&
         task->outputs >= 16 && fegetround() == FE_TONEAREST) {
         size_t row_groups = task->width / group;
-        size_t row_bytes = task->width + row_groups * sizeof(float);
+        size_t row_bytes = task->width + row_groups * (sizeof(float) +
+            (task->dtype == TRILLIM_GRP_INT4 ? sizeof(__m256i) : 0));
         size_t space = packed_activation_space(task->tokens, task->width, task->outputs, task->dtype);
         size_t capacity = space / row_bytes;
         if (capacity < task->tokens) {
@@ -495,7 +568,7 @@ static TrillimStatus run(const Task *task, void *workspace) {
         panel.output = (uint8_t *)task->output + first * output_stride;
         if (groups != 0) {
             TrillimStatus status = packed_activation_prepare(&panel.activation, workspace, panel.input,
-                input_dtype, panel.tokens, panel.width, groups, panel.context);
+                input_dtype, panel.tokens, panel.width, groups, panel.dtype, panel.context);
             if (status != TRILLIM_OK) {
                 return status;
             }
