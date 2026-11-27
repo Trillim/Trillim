@@ -4,6 +4,8 @@
 
 #define SIMD __attribute__((target("avx2,fma")))
 
+enum { QUERY_TILE = 4, MAX_TASKS = 32 };
+
 typedef struct {
     size_t heads;
     size_t kv_heads;
@@ -76,6 +78,11 @@ static bool payload(size_t rows, size_t columns, size_t *bytes) {
     return true;
 }
 
+static size_t query_tiles(const TrillimAttentionParameters *p) {
+    size_t queries = (p->heads / p->kv_heads) * p->queries;
+    return queries / QUERY_TILE + (queries % QUERY_TILE != 0);
+}
+
 static TrillimStatus trillim_attention_requirements(const void *parameters, size_t *inputs, size_t *outputs,
                                                     size_t *scratch) {
     const TrillimAttentionParameters *p = parameters;
@@ -95,15 +102,12 @@ static TrillimStatus trillim_attention_requirements(const void *parameters, size
         !payload(p->q_rows, p->q_columns, &inputs[0]) || !payload(p->k_rows, p->k_columns, &inputs[1]) ||
         !payload(p->v_rows, p->v_columns, &inputs[2]))
         return TRILLIM_ERROR;
-    size_t groups = p->queries / 16 + (p->queries % 16 != 0);
-    if (groups > 4) groups = 4;
-    if (p->heads > SIZE_MAX / groups || (p->length && p->heads * groups > SIZE_MAX / sizeof(float) / p->length))
+    size_t tasks = p->kv_heads * query_tiles(p);
+    tasks = tasks < MAX_TASKS ? tasks : MAX_TASKS;
+    if (p->length > SIZE_MAX / sizeof(float) / QUERY_TILE / tasks) {
         return TRILLIM_ERROR;
-    *scratch = p->heads * groups * p->length * sizeof(float);
-    if (!p->causal && !p->windowed && p->queries >= 4) {
-        if (*scratch > SIZE_MAX / 4) return TRILLIM_ERROR;
-        *scratch *= 4;
     }
+    *scratch = tasks * QUERY_TILE * p->length * sizeof(float);
     outputs[0] = p->heads * p->queries * p->key_dim * trillim_itemsize(p->output_dtype);
     return TRILLIM_OK;
 }
@@ -148,7 +152,8 @@ SIMD static TrillimStatus normalize_scores(float *scores, size_t begin, size_t e
         peak = fmaxf(peak, lanes[i]);
     for (; key < end; ++key)
         peak = fmaxf(peak, scores[key]);
-    maximum = _mm256_set1_ps(peak);
+    maximum = _mm256_set1_ps(peak == -INFINITY ? 0.0f : peak);
+    if (peak == -INFINITY) peak = 0.0f;
     __m256 total = _mm256_setzero_ps();
     key = begin;
     for (; end - key >= 8; key += 8) {
@@ -166,7 +171,71 @@ SIMD static TrillimStatus normalize_scores(float *scores, size_t begin, size_t e
         scores[key] = expf(scores[key] - peak);
         denominator += scores[key];
     }
-    *inverse = 1.0f / denominator;
+    *inverse = denominator > 0.0f ? 1.0f / denominator : 1.0f;
+    return TRILLIM_OK;
+}
+
+typedef struct {
+    float query[QUERY_TILE][128];
+    float *scores[QUERY_TILE];
+    size_t begin[QUERY_TILE], end[QUERY_TILE], output[QUERY_TILE];
+    size_t rows, first_key, last_key;
+} QueryTile;
+
+__attribute__((target("avx2")))
+static inline __m128 load4(const uint16_t *data) {
+    __m128i bits = _mm_loadl_epi64((const __m128i *)data);
+    return _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(bits), 16));
+}
+
+__attribute__((target("avx2")))
+static TrillimStatus compute_scores(const TrillimAttentionTask *task, QueryTile *tile,
+                                   const uint16_t *keys, float scale) {
+    const TrillimAttentionParameters *p = task->parameters;
+    size_t stride = p->k_strides[1];
+    size_t first = tile->first_key;
+    for (size_t key = first; key < tile->last_key;) {
+        if (((key - first) & 31) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        if (tile->last_key - key < 4) {
+            const uint16_t *k = keys + key * stride;
+            for (size_t row = 0; row < tile->rows; ++row) {
+                if (key >= tile->begin[row] && key < tile->end[row]) {
+                    float sum = 0;
+                    for (size_t channel = 0; channel < p->key_dim; ++channel) {
+                        sum += tile->query[row][channel] * trillim_bf16(k[channel]);
+                    }
+                    tile->scores[row][key] = sum * scale;
+                }
+            }
+            ++key;
+            continue;
+        }
+
+        const uint16_t *base = keys + key * stride;
+        __m128 sums[QUERY_TILE] = {_mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps()};
+        /* Each SIMD lane accumulates a key in channel order. */
+        for (size_t channel = 0; channel < p->key_dim; channel += 4) {
+            __m128 k0 = load4(base + channel);
+            __m128 k1 = load4(base + stride + channel);
+            __m128 k2 = load4(base + 2 * stride + channel);
+            __m128 k3 = load4(base + 3 * stride + channel);
+            _MM_TRANSPOSE4_PS(k0, k1, k2, k3);
+            for (size_t row = 0; row < tile->rows; ++row) {
+                const float *q = tile->query[row] + channel;
+                __m128 sum = sums[row];
+                sum = _mm_add_ps(sum, _mm_mul_ps(k0, _mm_set1_ps(q[0])));
+                sum = _mm_add_ps(sum, _mm_mul_ps(k1, _mm_set1_ps(q[1])));
+                sum = _mm_add_ps(sum, _mm_mul_ps(k2, _mm_set1_ps(q[2])));
+                sums[row] = _mm_add_ps(sum, _mm_mul_ps(k3, _mm_set1_ps(q[3])));
+            }
+        }
+        for (size_t row = 0; row < tile->rows; ++row) {
+            _mm_storeu_ps(tile->scores[row] + key, _mm_mul_ps(sums[row], _mm_set1_ps(scale)));
+        }
+        key += 4;
+    }
     return TRILLIM_OK;
 }
 
@@ -185,185 +254,297 @@ SIMD static inline __attribute__((always_inline)) float dot(const float *query, 
     return _mm_cvtss_f32(_mm_hadd_ps(sum, sum));
 }
 
-SIMD static TrillimStatus attend(void *opaque, size_t index, size_t worker) {
-    (void)worker;
-    const TrillimAttentionTask *task = opaque;
+SIMD static inline float sum8(__m256 value) {
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(value), _mm256_extractf128_ps(value, 1));
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(_mm_hadd_ps(sum, sum));
+}
+
+SIMD static TrillimStatus fast_scores(const TrillimAttentionTask *task, const QueryTile *tile,
+                                    const uint16_t *keys, float scale) {
     const TrillimAttentionParameters *p = task->parameters;
-    size_t groups = p->queries / 16 + (p->queries % 16 != 0);
-    if (groups > 4) groups = 4;
-    size_t head = index / groups, kvhead = head / (p->heads / p->kv_heads);
-    size_t per_group = p->queries / groups + (p->queries % groups != 0);
-    size_t first = index % groups * per_group;
-    size_t last = p->queries - first < per_group ? p->queries : first + per_group;
-    float *scores = task->scratch + index * p->length;
-    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
-    for (size_t qi = first; qi < last; ++qi) {
-        if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        float query[128];
-        size_t qbase = head * p->q_strides[0] + qi * p->q_strides[1];
-        for (size_t i = 0; i < p->key_dim; i += 8)
-            _mm256_storeu_ps(query + i, load8(task->query, qbase + i));
-        int64_t position = (int64_t)p->length - (int64_t)p->queries + (int64_t)qi;
-        size_t end = p->causal ? (position < 0 ? 0 : (size_t)position + 1) : p->length;
-        size_t begin =
-            p->windowed && position >= 0 && (size_t)position + 1 > p->window ? (size_t)position + 1 - p->window : 0;
-        for (size_t key = begin; key < end; ++key) {
-            if ((key & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context))
+    size_t stride = p->k_strides[1];
+    if (tile->rows == 1) {
+        for (size_t key = tile->first_key; key < tile->last_key; ++key) {
+            if (((key - tile->first_key) & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
                 return TRILLIM_CANCELLED;
-            scores[key] = dot(query, task->keys, kvhead * p->k_strides[0] + key * p->k_strides[1], p->key_dim) * scale;
-        }
-        float reciprocal;
-        TrillimStatus status = normalize_scores(scores, begin, end, task->context, &reciprocal);
-        if (status != TRILLIM_OK) return status;
-        __m256 inverse = _mm256_set1_ps(reciprocal);
-        size_t output = (qi * p->heads + head) * p->value_dim;
-        for (size_t channel = 0; channel < p->value_dim; channel += 32) {
-            __m256 a = _mm256_setzero_ps(), b = a, c = a, d = a;
-            for (size_t key = begin; key < end; ++key) {
-                if ((key & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context))
-                    return TRILLIM_CANCELLED;
-                size_t value = kvhead * p->v_strides[0] + key * p->v_strides[1] + channel;
-                __m256 probability = _mm256_set1_ps(scores[key]);
-                a = _mm256_fmadd_ps(probability, load8(task->values, value), a);
-                b = _mm256_fmadd_ps(probability, load8(task->values, value + 8), b);
-                c = _mm256_fmadd_ps(probability, load8(task->values, value + 16), c);
-                d = _mm256_fmadd_ps(probability, load8(task->values, value + 24), d);
             }
-            store8(task->output, output + channel, p->output_dtype, _mm256_mul_ps(a, inverse));
-            store8(task->output, output + channel + 8, p->output_dtype, _mm256_mul_ps(b, inverse));
-            store8(task->output, output + channel + 16, p->output_dtype, _mm256_mul_ps(c, inverse));
-            store8(task->output, output + channel + 24, p->output_dtype, _mm256_mul_ps(d, inverse));
+            tile->scores[0][key] = dot(tile->query[0], keys, key * stride, p->key_dim) * scale;
+        }
+        return TRILLIM_OK;
+    }
+    const float *queries[QUERY_TILE];
+    for (size_t row = 0; row < QUERY_TILE; ++row) {
+        queries[row] = tile->query[row < tile->rows ? row : 0];
+    }
+    for (size_t key = tile->first_key; key < tile->last_key; ++key) {
+        if (((key - tile->first_key) & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        __m256 a0 = _mm256_setzero_ps(), b0 = a0;
+        __m256 a1 = a0, b1 = a0, a2 = a0, b2 = a0, a3 = a0, b3 = a0;
+        size_t base = key * stride;
+        for (size_t channel = 0; channel < p->key_dim; channel += 16) {
+            __m256 k0 = load8(keys, base + channel), k1 = load8(keys, base + channel + 8);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[0] + channel), k0, a0);
+            b0 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[0] + channel + 8), k1, b0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[1] + channel), k0, a1);
+            b1 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[1] + channel + 8), k1, b1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[2] + channel), k0, a2);
+            b2 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[2] + channel + 8), k1, b2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[3] + channel), k0, a3);
+            b3 = _mm256_fmadd_ps(_mm256_loadu_ps(queries[3] + channel + 8), k1, b3);
+        }
+        tile->scores[0][key] = sum8(_mm256_add_ps(a0, b0)) * scale;
+        tile->scores[1][key] = sum8(_mm256_add_ps(a1, b1)) * scale;
+        tile->scores[2][key] = sum8(_mm256_add_ps(a2, b2)) * scale;
+        tile->scores[3][key] = sum8(_mm256_add_ps(a3, b3)) * scale;
+    }
+    return TRILLIM_OK;
+}
+
+SIMD static void bind_tile(const TrillimAttentionTask *task, size_t index, size_t tiles, float *scores,
+                           QueryTile *tile, bool load_query) {
+    const TrillimAttentionParameters *p = task->parameters;
+    size_t group = p->heads / p->kv_heads;
+    size_t kv_head = index / tiles;
+    size_t first = index % tiles * QUERY_TILE;
+    size_t rows = group * p->queries - first;
+    tile->rows = rows < QUERY_TILE ? rows : QUERY_TILE;
+    tile->first_key = p->length;
+    tile->last_key = 0;
+    if (scores) {
+        for (size_t row = 0; row < QUERY_TILE; ++row) {
+            tile->scores[row] = scores + row * p->length;
+        }
+    }
+    for (size_t row = 0; row < tile->rows; ++row) {
+        size_t head = kv_head * group + (first + row) / p->queries;
+        size_t qi = (first + row) % p->queries;
+        size_t distance = p->queries - qi;
+        size_t position_end = distance > p->length ? 0 : p->length - distance + 1;
+        tile->begin[row] = p->windowed && position_end > p->window ? position_end - p->window : 0;
+        tile->end[row] = p->causal ? position_end : p->length;
+        tile->output[row] = (qi * p->heads + head) * p->value_dim;
+        if (!p->length) {
+            continue;
+        }
+        if (tile->begin[row] < tile->first_key) tile->first_key = tile->begin[row];
+        if (tile->end[row] > tile->last_key) tile->last_key = tile->end[row];
+        if (!load_query) continue;
+        size_t base = head * p->q_strides[0] + qi * p->q_strides[1];
+        for (size_t channel = 0; channel < p->key_dim; channel += 8) {
+            _mm256_storeu_ps(tile->query[row] + channel, load8(task->query, base + channel));
+        }
+    }
+}
+
+SIMD static TrillimStatus apply_values_one(const TrillimAttentionTask *task, const QueryTile *tile,
+                                           size_t kv_head, float inverse, size_t first_channel, size_t last_channel) {
+    const TrillimAttentionParameters *p = task->parameters;
+    __m256 reciprocal = _mm256_set1_ps(inverse);
+    for (size_t channel = first_channel; channel < last_channel; channel += 32) {
+        __m256 a = _mm256_setzero_ps(), b = a, c = a, d = a;
+        for (size_t key = tile->first_key; key < tile->last_key; ++key) {
+            if (((key - tile->first_key) & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t base = kv_head * p->v_strides[0] + key * p->v_strides[1] + channel;
+            __m256 probability = _mm256_set1_ps(tile->scores[0][key]);
+            a = _mm256_fmadd_ps(probability, load8(task->values, base), a);
+            b = _mm256_fmadd_ps(probability, load8(task->values, base + 8), b);
+            c = _mm256_fmadd_ps(probability, load8(task->values, base + 16), c);
+            d = _mm256_fmadd_ps(probability, load8(task->values, base + 24), d);
+        }
+        size_t output = tile->output[0] + channel;
+        store8(task->output, output, p->output_dtype, _mm256_mul_ps(a, reciprocal));
+        store8(task->output, output + 8, p->output_dtype, _mm256_mul_ps(b, reciprocal));
+        store8(task->output, output + 16, p->output_dtype, _mm256_mul_ps(c, reciprocal));
+        store8(task->output, output + 24, p->output_dtype, _mm256_mul_ps(d, reciprocal));
+    }
+    return TRILLIM_OK;
+}
+
+SIMD static TrillimStatus apply_values_same_mask(const TrillimAttentionTask *task, const QueryTile *tile,
+                                                 size_t kv_head, const float *inverse,
+                                                 size_t first_channel, size_t last_channel) {
+    const TrillimAttentionParameters *p = task->parameters;
+    const float *scores[QUERY_TILE];
+    for (size_t row = 0; row < QUERY_TILE; ++row) {
+        scores[row] = tile->scores[row < tile->rows ? row : 0];
+    }
+    for (size_t channel = first_channel; channel < last_channel; channel += 16) {
+        __m256 a0 = _mm256_setzero_ps(), b0 = a0, a1 = a0, b1 = a0;
+        __m256 a2 = a0, b2 = a0, a3 = a0, b3 = a0;
+        for (size_t key = tile->first_key; key < tile->last_key; ++key) {
+            if (((key - tile->first_key) & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t base = kv_head * p->v_strides[0] + key * p->v_strides[1] + channel;
+            __m256 v0 = load8(task->values, base), v1 = load8(task->values, base + 8);
+            __m256 w0 = _mm256_set1_ps(scores[0][key]), w1 = _mm256_set1_ps(scores[1][key]);
+            __m256 w2 = _mm256_set1_ps(scores[2][key]), w3 = _mm256_set1_ps(scores[3][key]);
+            a0 = _mm256_fmadd_ps(w0, v0, a0);
+            b0 = _mm256_fmadd_ps(w0, v1, b0);
+            a1 = _mm256_fmadd_ps(w1, v0, a1);
+            b1 = _mm256_fmadd_ps(w1, v1, b1);
+            a2 = _mm256_fmadd_ps(w2, v0, a2);
+            b2 = _mm256_fmadd_ps(w2, v1, b2);
+            a3 = _mm256_fmadd_ps(w3, v0, a3);
+            b3 = _mm256_fmadd_ps(w3, v1, b3);
+        }
+        __m256 result[QUERY_TILE][2] = {{a0, b0}, {a1, b1}, {a2, b2}, {a3, b3}};
+        for (size_t row = 0; row < tile->rows; ++row) {
+            __m256 reciprocal = _mm256_set1_ps(inverse[row]);
+            size_t output = tile->output[row] + channel;
+            store8(task->output, output, p->output_dtype, _mm256_mul_ps(result[row][0], reciprocal));
+            store8(task->output, output + 8, p->output_dtype, _mm256_mul_ps(result[row][1], reciprocal));
         }
     }
     return TRILLIM_OK;
 }
 
-SIMD static TrillimStatus attend4(void *opaque, size_t index, size_t worker) {
+SIMD static TrillimStatus apply_values(const TrillimAttentionTask *task, const QueryTile *tile, size_t kv_head,
+                                       const float *inverse, size_t first_channel, size_t last_channel) {
+    const TrillimAttentionParameters *p = task->parameters;
+    if (tile->rows == 1) {
+        return apply_values_one(task, tile, kv_head, inverse[0], first_channel, last_channel);
+    }
+    bool same_mask = true;
+    for (size_t row = 0; row < tile->rows; ++row) {
+        same_mask &= tile->begin[row] == tile->first_key && tile->end[row] == tile->last_key;
+    }
+    if (same_mask) {
+        return apply_values_same_mask(task, tile, kv_head, inverse, first_channel, last_channel);
+    }
+    for (size_t channel = first_channel; channel < last_channel; channel += 16) {
+        __m256 a[QUERY_TILE], b[QUERY_TILE];
+        for (size_t row = 0; row < tile->rows; ++row) {
+            a[row] = b[row] = _mm256_setzero_ps();
+        }
+        for (size_t key = tile->first_key; key < tile->last_key; ++key) {
+            if (((key - tile->first_key) & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t base = kv_head * p->v_strides[0] + key * p->v_strides[1] + channel;
+            __m256 v0 = load8(task->values, base), v1 = load8(task->values, base + 8);
+            for (size_t row = 0; row < tile->rows; ++row) {
+                if (key >= tile->begin[row] && key < tile->end[row]) {
+                    __m256 weight = _mm256_set1_ps(tile->scores[row][key]);
+                    a[row] = _mm256_fmadd_ps(weight, v0, a[row]);
+                    b[row] = _mm256_fmadd_ps(weight, v1, b[row]);
+                }
+            }
+        }
+        for (size_t row = 0; row < tile->rows; ++row) {
+            __m256 reciprocal = _mm256_set1_ps(inverse[row]);
+            store8(task->output, tile->output[row] + channel, p->output_dtype, _mm256_mul_ps(a[row], reciprocal));
+            store8(task->output, tile->output[row] + channel + 8, p->output_dtype, _mm256_mul_ps(b[row], reciprocal));
+        }
+    }
+    return TRILLIM_OK;
+}
+
+SIMD static TrillimStatus attend_tile(const TrillimAttentionTask *task, size_t index, size_t tiles, float *scores) {
+    const TrillimAttentionParameters *p = task->parameters;
+    QueryTile tile;
+    bind_tile(task, index, tiles, scores, &tile, true);
+    if (!p->length) {
+        size_t item = trillim_itemsize(p->output_dtype);
+        for (size_t row = 0; row < tile.rows; ++row) {
+            memset((uint8_t *)task->output + tile.output[row] * item, 0, p->value_dim * item);
+        }
+        return TRILLIM_OK;
+    }
+    size_t kv_head = index / tiles;
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    const uint16_t *keys = (const uint16_t *)task->keys + kv_head * p->k_strides[0];
+    TrillimStatus status;
+    if (tile.rows == 1 || (!p->causal && !p->windowed && p->queries >= 4) ||
+        (p->queries == 1 && tile.last_key - tile.first_key <= 128)) {
+        status = fast_scores(task, &tile, keys, scale);
+    } else {
+        status = compute_scores(task, &tile, keys, scale);
+    }
+    if (status != TRILLIM_OK) return status;
+    float inverse[QUERY_TILE];
+    for (size_t row = 0; row < tile.rows; ++row) {
+        status = normalize_scores(tile.scores[row], tile.begin[row], tile.end[row], task->context, inverse + row);
+        if (status != TRILLIM_OK) return status;
+    }
+    return apply_values(task, &tile, kv_head, inverse, 0, p->value_dim);
+}
+
+typedef struct {
+    const TrillimAttentionTask *task;
+    size_t tiles, work, parts;
+    float inverse[MAX_TASKS][QUERY_TILE];
+} Decode;
+
+enum { DECODE_KEY_TILE = 128, DECODE_CHANNEL_TILE = 32 };
+
+SIMD static TrillimStatus decode_scores(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const Decode *decode = opaque;
+    const TrillimAttentionTask *task = decode->task;
+    const TrillimAttentionParameters *p = task->parameters;
+    size_t group = index % decode->work, part = index / decode->work;
+    float *scores = task->scratch + group * QUERY_TILE * p->length;
+    QueryTile tile;
+    bind_tile(task, group, decode->tiles, scores, &tile, true);
+    size_t blocks = (tile.last_key - tile.first_key) / DECODE_KEY_TILE;
+    size_t tail = (tile.last_key - tile.first_key) % DECODE_KEY_TILE;
+    blocks += tail != 0;
+    size_t per_part = blocks / decode->parts, remainder = blocks % decode->parts;
+    size_t first = part * per_part + (part < remainder ? part : remainder);
+    size_t past = first + per_part + (part < remainder);
+    tile.last_key = past == blocks ? tile.last_key : tile.first_key + past * DECODE_KEY_TILE;
+    tile.first_key += first * DECODE_KEY_TILE;
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    size_t kv_head = group / decode->tiles;
+    const uint16_t *keys = (const uint16_t *)task->keys + kv_head * p->k_strides[0];
+    return tile.rows == 1 ? fast_scores(task, &tile, keys, scale) : compute_scores(task, &tile, keys, scale);
+}
+
+SIMD static TrillimStatus decode_normalize(void *opaque, size_t group, size_t worker) {
+    (void)worker;
+    Decode *decode = opaque;
+    const TrillimAttentionTask *task = decode->task;
+    const TrillimAttentionParameters *p = task->parameters;
+    QueryTile tile;
+    bind_tile(task, group, decode->tiles, task->scratch + group * QUERY_TILE * p->length, &tile, false);
+    for (size_t row = 0; row < tile.rows; ++row) {
+        TrillimStatus status = normalize_scores(tile.scores[row], tile.begin[row], tile.end[row], task->context,
+                                                &decode->inverse[group][row]);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+SIMD static TrillimStatus decode_values(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const Decode *decode = opaque;
+    const TrillimAttentionTask *task = decode->task;
+    const TrillimAttentionParameters *p = task->parameters;
+    size_t group = index % decode->work, first = index / decode->work * DECODE_CHANNEL_TILE;
+    QueryTile tile;
+    bind_tile(task, group, decode->tiles, task->scratch + group * QUERY_TILE * p->length, &tile, false);
+    return apply_values(task, &tile, group / decode->tiles, decode->inverse[group], first, first + DECODE_CHANNEL_TILE);
+}
+
+static TrillimStatus attend(void *opaque, size_t index, size_t worker) {
     (void)worker;
     const TrillimAttentionTask *task = opaque;
     const TrillimAttentionParameters *p = task->parameters;
-    size_t groups = p->queries / 16 + (p->queries % 16 != 0);
-    if (groups > 4) groups = 4;
-    size_t head = index / groups, kvhead = head / (p->heads / p->kv_heads);
-    size_t per_group = p->queries / groups + (p->queries % groups != 0), first = index % groups * per_group;
-    size_t last = p->queries - first < per_group ? p->queries : first + per_group;
-    float *scores = task->scratch + index * p->length * 4;
-    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
-    for (size_t qi = first; qi < last; qi += 4) {
-        size_t rows = last - qi < 4 ? last - qi : 4;
+    size_t tiles = query_tiles(p), work = p->kv_heads * tiles;
+    size_t tasks = work < MAX_TASKS ? work : MAX_TASKS;
+    float *scores = p->length ? task->scratch + index * QUERY_TILE * p->length : NULL;
+    for (size_t tile = index; tile < work; tile += tasks) {
         if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        float query[4][128];
-        for (size_t row = 0; row < 4; ++row) {
-            size_t base = head * p->q_strides[0] + (qi + (row < rows ? row : 0)) * p->q_strides[1];
-            for (size_t i = 0; i < p->key_dim; i += 8)
-                _mm256_storeu_ps(query[row] + i, load8(task->query, base + i));
-        }
-        for (size_t key = 0; key < p->length; ++key) {
-            if ((key & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context))
-                return TRILLIM_CANCELLED;
-            __m256 a0 = _mm256_setzero_ps(), b0 = a0;
-            __m256 a1 = _mm256_setzero_ps(), b1 = a1;
-            __m256 a2 = _mm256_setzero_ps(), b2 = a2;
-            __m256 a3 = _mm256_setzero_ps(), b3 = a3;
-            size_t base = kvhead * p->k_strides[0] + key * p->k_strides[1];
-            for (size_t i = 0; i < p->key_dim; i += 16) {
-                __m256 k0 = load8(task->keys, base + i), k1 = load8(task->keys, base + i + 8);
-                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(query[0] + i), k0, a0);
-                b0 = _mm256_fmadd_ps(_mm256_loadu_ps(query[0] + i + 8), k1, b0);
-                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(query[1] + i), k0, a1);
-                b1 = _mm256_fmadd_ps(_mm256_loadu_ps(query[1] + i + 8), k1, b1);
-                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(query[2] + i), k0, a2);
-                b2 = _mm256_fmadd_ps(_mm256_loadu_ps(query[2] + i + 8), k1, b2);
-                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(query[3] + i), k0, a3);
-                b3 = _mm256_fmadd_ps(_mm256_loadu_ps(query[3] + i + 8), k1, b3);
-            }
-            {
-                __m256 total = _mm256_add_ps(a0, b0);
-                __m128 sum = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
-                sum = _mm_hadd_ps(sum, sum);
-                scores[0 * p->length + key] = _mm_cvtss_f32(_mm_hadd_ps(sum, sum)) * scale;
-            }
-            {
-                __m256 total = _mm256_add_ps(a1, b1);
-                __m128 sum = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
-                sum = _mm_hadd_ps(sum, sum);
-                scores[1 * p->length + key] = _mm_cvtss_f32(_mm_hadd_ps(sum, sum)) * scale;
-            }
-            {
-                __m256 total = _mm256_add_ps(a2, b2);
-                __m128 sum = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
-                sum = _mm_hadd_ps(sum, sum);
-                scores[2 * p->length + key] = _mm_cvtss_f32(_mm_hadd_ps(sum, sum)) * scale;
-            }
-            {
-                __m256 total = _mm256_add_ps(a3, b3);
-                __m128 sum = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
-                sum = _mm_hadd_ps(sum, sum);
-                scores[3 * p->length + key] = _mm_cvtss_f32(_mm_hadd_ps(sum, sum)) * scale;
-            }
-        }
-        float inverses[4];
-        for (size_t row = 0; row < rows; ++row) {
-            TrillimStatus status =
-                normalize_scores(scores + row * p->length, 0, p->length, task->context, &inverses[row]);
-            if (status != TRILLIM_OK) return status;
-        }
-        for (size_t channel = 0; channel < p->value_dim; channel += 16) {
-            __m256 a0 = _mm256_setzero_ps(), b0 = a0;
-            __m256 a1 = _mm256_setzero_ps(), b1 = a1;
-            __m256 a2 = _mm256_setzero_ps(), b2 = a2;
-            __m256 a3 = _mm256_setzero_ps(), b3 = a3;
-            for (size_t key = 0; key < p->length; ++key) {
-                if ((key & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context))
-                    return TRILLIM_CANCELLED;
-                size_t base = kvhead * p->v_strides[0] + key * p->v_strides[1] + channel;
-                __m256 v0 = load8(task->values, base), v1 = load8(task->values, base + 8);
-                {
-                    __m256 probability = _mm256_set1_ps(scores[0 * p->length + key]);
-                    a0 = _mm256_fmadd_ps(probability, v0, a0);
-                    b0 = _mm256_fmadd_ps(probability, v1, b0);
-                }
-                {
-                    __m256 probability = _mm256_set1_ps(scores[1 * p->length + key]);
-                    a1 = _mm256_fmadd_ps(probability, v0, a1);
-                    b1 = _mm256_fmadd_ps(probability, v1, b1);
-                }
-                {
-                    __m256 probability = _mm256_set1_ps(scores[2 * p->length + key]);
-                    a2 = _mm256_fmadd_ps(probability, v0, a2);
-                    b2 = _mm256_fmadd_ps(probability, v1, b2);
-                }
-                {
-                    __m256 probability = _mm256_set1_ps(scores[3 * p->length + key]);
-                    a3 = _mm256_fmadd_ps(probability, v0, a3);
-                    b3 = _mm256_fmadd_ps(probability, v1, b3);
-                }
-            }
-            if (rows > 0) {
-                size_t base = ((qi + 0) * p->heads + head) * p->value_dim + channel;
-                __m256 inverse = _mm256_set1_ps(inverses[0]);
-                store8(task->output, base, p->output_dtype, _mm256_mul_ps(a0, inverse));
-                store8(task->output, base + 8, p->output_dtype, _mm256_mul_ps(b0, inverse));
-            }
-            if (rows > 1) {
-                size_t base = ((qi + 1) * p->heads + head) * p->value_dim + channel;
-                __m256 inverse = _mm256_set1_ps(inverses[1]);
-                store8(task->output, base, p->output_dtype, _mm256_mul_ps(a1, inverse));
-                store8(task->output, base + 8, p->output_dtype, _mm256_mul_ps(b1, inverse));
-            }
-            if (rows > 2) {
-                size_t base = ((qi + 2) * p->heads + head) * p->value_dim + channel;
-                __m256 inverse = _mm256_set1_ps(inverses[2]);
-                store8(task->output, base, p->output_dtype, _mm256_mul_ps(a2, inverse));
-                store8(task->output, base + 8, p->output_dtype, _mm256_mul_ps(b2, inverse));
-            }
-            if (rows > 3) {
-                size_t base = ((qi + 3) * p->heads + head) * p->value_dim + channel;
-                __m256 inverse = _mm256_set1_ps(inverses[3]);
-                store8(task->output, base, p->output_dtype, _mm256_mul_ps(a3, inverse));
-                store8(task->output, base + 8, p->output_dtype, _mm256_mul_ps(b3, inverse));
-            }
-        }
+        TrillimStatus status = attend_tile(task, tile, tiles, scores);
+        if (status != TRILLIM_OK) return status;
     }
     return TRILLIM_OK;
 }
@@ -374,11 +555,26 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_attention_bf16_fma(void *const *outputs
     if (context->is_cancelled(context->cancellation_context)) return TRILLIM_CANCELLED;
     const TrillimAttentionParameters *p = parameters;
     if (!p->heads || !p->queries) return TRILLIM_OK;
-    size_t groups = p->queries / 16 + (p->queries % 16 != 0);
-    if (groups > 4) groups = 4;
+    size_t work = p->kv_heads * query_tiles(p);
+    size_t tasks = work < MAX_TASKS ? work : MAX_TASKS;
     TrillimAttentionTask task = {outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context};
-    return context->thread_pool->run(context->thread_pool->context, p->heads * groups,
-                                     !p->causal && !p->windowed && p->queries >= 4 ? attend4 : attend, &task);
+    const TrillimThreadPool *pool = context->thread_pool;
+    size_t visible = p->windowed && p->window < p->length ? p->window : p->length;
+    if (p->queries == 1 && visible >= 2 * DECODE_KEY_TILE && work == tasks && work <= pool->worker_count / 2) {
+        size_t parts = pool->worker_count / work;
+        size_t blocks = visible / DECODE_KEY_TILE + (visible % DECODE_KEY_TILE != 0);
+        if (parts > blocks) parts = blocks;
+        Decode decode = {.task = &task, .tiles = query_tiles(p), .work = work, .parts = parts};
+        TrillimStatus status = pool->run(pool->context, work * parts, decode_scores, &decode);
+        if (status == TRILLIM_OK) {
+            status = pool->run(pool->context, work, decode_normalize, &decode);
+        }
+        if (status == TRILLIM_OK) {
+            status = pool->run(pool->context, work * (p->value_dim / DECODE_CHANNEL_TILE), decode_values, &decode);
+        }
+        return status;
+    }
+    return pool->run(pool->context, tasks, attend, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_x86_attention_bf16_fma_tdl(void) {

@@ -1,5 +1,11 @@
 #include "common.h"
 #include <immintrin.h>
+#include <stdatomic.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((target("avx2"))), apply_to = function)
 #elif defined(__GNUC__)
@@ -126,6 +132,137 @@ typedef struct {
     const TrillimKernelContext *context;
 } TrillimAttentionTask;
 
+enum { BLAS_QUERY_TILE = 32, BLAS_SLOTS = 32, BLAS_ROW_WORK_LIMIT = 1024 * 1024 };
+#define BLAS_MAX_FLOATS (64 * 1024 * 1024 / sizeof(float))
+
+typedef void (*Sgemm)(int, int, int, int, int, int, float, const float *, int,
+                      const float *, int, float, float *, int);
+
+static Sgemm sgemm;
+static atomic_uint blas_state;
+#ifdef __APPLE__
+static unsigned (*get_threading)(void);
+static int (*set_threading)(unsigned);
+#endif
+
+static void load_blas(void) {
+#ifdef _WIN32
+    static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        HMODULE library = LoadLibraryA(names[i]);
+        if (library == NULL) {
+            continue;
+        }
+        FARPROC symbol = GetProcAddress(library, "cblas_sgemm");
+        if (symbol != NULL) {
+            _Static_assert(sizeof(sgemm) == sizeof(symbol), "function pointer size");
+            memcpy(&sgemm, &symbol, sizeof(sgemm));
+            return;
+        }
+        FreeLibrary(library);
+    }
+#else
+#ifdef __APPLE__
+    static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
+#else
+    static const char *const names[] = {"libopenblas.so.0", "libblas.so.3", "libblas.so"};
+#endif
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);
+        if (library == NULL) {
+            continue;
+        }
+        void *symbol = NULL;
+#ifdef __APPLE__
+        symbol = dlsym(library, "cblas_sgemm$NEWLAPACK");
+#endif
+        if (symbol == NULL) {
+            symbol = dlsym(library, "cblas_sgemm");
+        }
+        if (symbol != NULL) {
+            _Static_assert(sizeof(sgemm) == sizeof(symbol), "function pointer size");
+            memcpy(&sgemm, &symbol, sizeof(sgemm));
+#ifdef __APPLE__
+            void *getter = dlsym(library, "BLASGetThreading");
+            void *setter = dlsym(library, "BLASSetThreading");
+            if (getter != NULL && setter != NULL) {
+                memcpy(&get_threading, &getter, sizeof(get_threading));
+                memcpy(&set_threading, &setter, sizeof(set_threading));
+            }
+#endif
+            return;
+        }
+        dlclose(library);
+    }
+#endif
+}
+
+static bool initialize_blas(const TrillimKernelContext *context) {
+    if (atomic_load_explicit(&blas_state, memory_order_acquire) != 2) {
+        unsigned expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&blas_state, &expected, 1,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            load_blas();
+            atomic_store_explicit(&blas_state, 2, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&blas_state, memory_order_acquire) != 2) {
+                if (context->is_cancelled(context->cancellation_context)) {
+                    return false;
+                }
+                atomic_signal_fence(memory_order_acquire);
+            }
+        }
+    }
+    return sgemm != NULL;
+}
+
+static bool blas_shape(const TrillimAttentionParameters *p) {
+    /* Bound work between cancellation checks around each matrix product. */
+    return p->output_dtype == TRILLIM_BF16 && p->q_dtype == TRILLIM_FP32 &&
+        p->k_dtype == TRILLIM_FP32 && p->v_dtype == TRILLIM_BF16 &&
+        p->queries >= BLAS_QUERY_TILE && p->length >= BLAS_QUERY_TILE &&
+        p->key_dim && p->length <= BLAS_ROW_WORK_LIMIT / p->key_dim &&
+        p->value_dim && p->length <= BLAS_ROW_WORK_LIMIT / p->value_dim &&
+        !p->causal && !p->windowed && !p->softcapped;
+}
+
+static size_t blas_tiles(const TrillimAttentionParameters *p) {
+    return p->queries / BLAS_QUERY_TILE + (p->queries % BLAS_QUERY_TILE != 0);
+}
+
+static size_t blas_slots(const TrillimAttentionParameters *p) {
+    size_t jobs = p->heads * blas_tiles(p);
+    return jobs < BLAS_SLOTS ? jobs : BLAS_SLOTS;
+}
+static bool direct_rows(const size_t *strides, size_t width) {
+    return strides[2] == 1 && strides[1] >= width && strides[1] <= INT32_MAX;
+}
+
+static size_t packed_rows(size_t heads, size_t rows, size_t width, const size_t *strides) {
+    return direct_rows(strides, width) ? 0 : heads * rows * width;
+}
+
+static bool append_workspace(size_t heads, size_t rows, size_t width, size_t *total) {
+    if (width && heads > (BLAS_MAX_FLOATS - *total) / rows / width) {
+        *total = BLAS_MAX_FLOATS;
+        return false;
+    }
+    *total += heads * rows * width;
+    return true;
+}
+
+static bool blas_workspace(const TrillimAttentionParameters *p, bool reserve, size_t *total) {
+    *total = 0;
+    bool direct_q = !reserve && direct_rows(p->q_strides, p->key_dim);
+    bool direct_k = !reserve && direct_rows(p->k_strides, p->key_dim);
+    size_t slots = blas_slots(p);
+    return append_workspace(p->kv_heads, p->length, p->value_dim, total) &&
+        append_workspace(p->kv_heads, p->length, direct_k ? 0 : p->key_dim, total) &&
+        append_workspace(slots, BLAS_QUERY_TILE, direct_q ? 0 : p->key_dim, total) &&
+        append_workspace(slots, BLAS_QUERY_TILE, p->length, total) &&
+        append_workspace(slots, BLAS_QUERY_TILE, p->value_dim, total);
+}
+
 static inline bool trillim_attention_span(const size_t *shape, const size_t *strides, size_t rows, size_t columns) {
     size_t span;
     return (columns == 0 || rows <= SIZE_MAX / columns) &&
@@ -139,7 +276,10 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
     }
     outputs[0] = 0;
     *scratch = 0;
-    if (p->output_dtype != TRILLIM_FP32) {
+    if (p->output_dtype != TRILLIM_FP32 &&
+        (p->output_dtype != TRILLIM_BF16 || p->causal || p->windowed || p->softcapped ||
+         p->q_dtype != TRILLIM_FP32 || p->k_dtype != TRILLIM_FP32 ||
+         p->v_dtype != TRILLIM_BF16)) {
         return TRILLIM_ERROR;
     }
     if (p->heads == 0 || p->queries == 0) {
@@ -184,6 +324,15 @@ static inline TrillimStatus trillim_attention_requirements(const void *parameter
     }
     outputs[0] = p->heads * p->queries * p->value_dim * trillim_itemsize(p->output_dtype);
     *scratch = p->heads * tiles * (p->value_dim + 64) * sizeof(float);
+    /* Keep the arena bound valid if runtime lengths qualify for BLAS. */
+    if (p->output_dtype == TRILLIM_BF16 && p->queries >= BLAS_QUERY_TILE && p->length >= BLAS_QUERY_TILE) {
+        size_t workspace;
+        (void)blas_workspace(p, true, &workspace);
+        size_t bytes = workspace * sizeof(float);
+        if (bytes > *scratch) {
+            *scratch = bytes;
+        }
+    }
     return TRILLIM_OK;
 }
 
@@ -354,6 +503,177 @@ static inline TrillimStatus trillim_attention_task(void *opaque, size_t index, s
     return TRILLIM_OK;
 }
 
+typedef struct {
+    const void *source;
+    float *destination;
+    const size_t *strides;
+    size_t rows, width;
+    uint32_t dtype;
+    const TrillimKernelContext *context;
+} PackTask;
+
+static TrillimStatus pack_rows(const PackTask *task, size_t head, size_t first, size_t count, float *packed) {
+    for (size_t row = 0; row < count; ++row) {
+        size_t offset = head * task->strides[0] + (first + row) * task->strides[1];
+        float *dest = packed + row * task->width;
+        size_t channel = 0;
+        for (; task->strides[2] == 1 && task->width - channel >= 8; channel += 8) {
+            if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            _mm256_storeu_ps(dest + channel, load8(task->source, offset + channel, task->dtype));
+        }
+        for (; channel < task->width; ++channel) {
+            if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            dest[channel] = trillim_load(task->source, offset + channel * task->strides[2], task->dtype).f;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus pack_head_rows(void *opaque, size_t index, size_t worker) {
+    (void)worker;
+    const PackTask *task = opaque;
+    size_t tiles = task->rows / BLAS_QUERY_TILE + (task->rows % BLAS_QUERY_TILE != 0);
+    size_t head = index / tiles, first = index % tiles * BLAS_QUERY_TILE;
+    size_t tail = task->rows - first, count = tail < BLAS_QUERY_TILE ? tail : BLAS_QUERY_TILE;
+    return pack_rows(task, head, first, count, task->destination + (head * task->rows + first) * task->width);
+}
+
+static TrillimStatus normalize_scores(float *scores, size_t mask_offset,
+                                      const TrillimAttentionTask *task, float scale) {
+    const TrillimAttentionParameters *p = task->parameters;
+    float maximum = -INFINITY;
+    for (size_t key = 0; key < p->length; ++key) {
+        if ((key & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        float bias = trillim_load(task->mask, mask_offset + key * p->mask_strides[2], p->mask_dtype).f;
+        scores[key] = scores[key] * scale + bias;
+        maximum = fmaxf(maximum, scores[key]);
+    }
+    if (maximum == -INFINITY) {
+        maximum = 0;
+    }
+    __m256 sum = _mm256_setzero_ps();
+    size_t key = 0;
+    for (; p->length - key >= 8; key += 8) {
+        if ((key & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+            return TRILLIM_CANCELLED;
+        }
+        __m256 weight = exp_negative(_mm256_sub_ps(_mm256_loadu_ps(scores + key), _mm256_set1_ps(maximum)));
+        _mm256_storeu_ps(scores + key, weight);
+        sum = _mm256_add_ps(sum, weight);
+    }
+    float total = sum8(sum);
+    for (; key < p->length; ++key) {
+        scores[key] = expf(scores[key] - maximum);
+        total += scores[key];
+    }
+    if (total > 0) {
+        float inverse = 1.0f / total;
+        key = 0;
+        for (; p->length - key >= 8; key += 8) {
+            if ((key & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            _mm256_storeu_ps(scores + key, _mm256_mul_ps(_mm256_loadu_ps(scores + key), _mm256_set1_ps(inverse)));
+        }
+        for (; key < p->length; ++key) {
+            scores[key] *= inverse;
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus blas_tile(const TrillimAttentionTask *task, size_t index, float *packed_q,
+                              float *scores, float *result) {
+    const TrillimAttentionParameters *p = task->parameters;
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    size_t tiles = blas_tiles(p);
+    size_t head = index / tiles, kv_head = head / (p->heads / p->kv_heads);
+    size_t first = index % tiles * BLAS_QUERY_TILE;
+    size_t tail = p->queries - first, count = tail < BLAS_QUERY_TILE ? tail : BLAS_QUERY_TILE;
+    const float *q;
+    size_t query_stride;
+    if (packed_q) {
+        PackTask packing = {task->query, packed_q, p->q_strides, p->queries, p->key_dim, p->q_dtype, task->context};
+        TrillimStatus status = pack_rows(&packing, head, first, count, packed_q);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        q = packed_q;
+        query_stride = p->key_dim;
+    } else {
+        q = (const float *)task->query + head * p->q_strides[0] + first * p->q_strides[1];
+        query_stride = p->q_strides[1];
+    }
+    bool direct_k = direct_rows(p->k_strides, p->key_dim);
+    size_t key_stride = direct_k ? p->k_strides[1] : p->key_dim;
+    const float *k = direct_k ? (const float *)task->keys + kv_head * p->k_strides[0] :
+        task->scratch + p->kv_heads * p->length * p->value_dim + kv_head * p->length * p->key_dim;
+    const float *v = task->scratch + kv_head * p->length * p->value_dim;
+    sgemm(101, 111, 112, (int)count, (int)p->length, (int)p->key_dim, 1.0f,
+          q, (int)query_stride, k, (int)key_stride, 0.0f, scores, (int)p->length);
+    float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
+    for (size_t row = 0; row < count; ++row) {
+        size_t offset = head * p->mask_strides[0] + (first + row) * p->mask_strides[1];
+        TrillimStatus status = normalize_scores(scores + row * p->length, offset, task, scale);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+    }
+    if (task->context->is_cancelled(task->context->cancellation_context)) {
+        return TRILLIM_CANCELLED;
+    }
+    sgemm(101, 111, 111, (int)count, (int)p->value_dim, (int)p->length, 1.0f,
+          scores, (int)p->length, v, (int)p->value_dim, 0.0f, result, (int)p->value_dim);
+    for (size_t row = 0; row < count; ++row) {
+        uint16_t *dest = (uint16_t *)task->output + ((first + row) * p->heads + head) * p->value_dim;
+        for (size_t channel = 0; channel < p->value_dim; ++channel) {
+            if ((channel & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            dest[channel] = trillim_to_bf16(result[row * p->value_dim + channel]);
+        }
+    }
+    return TRILLIM_OK;
+}
+
+static TrillimStatus blas_task(void *opaque, size_t slot, size_t worker) {
+    (void)worker;
+    const TrillimAttentionTask *task = opaque;
+    const TrillimAttentionParameters *p = task->parameters;
+    size_t slots = blas_slots(p), jobs = p->heads * blas_tiles(p);
+    size_t key_count = packed_rows(p->kv_heads, p->length, p->key_dim, p->k_strides);
+    size_t query_width = direct_rows(p->q_strides, p->key_dim) ? 0 : p->key_dim;
+    float *buffer = task->scratch + p->kv_heads * p->length * p->value_dim + key_count +
+        slot * BLAS_QUERY_TILE * (query_width + p->length + p->value_dim);
+    float *scores = buffer + BLAS_QUERY_TILE * query_width;
+    float *result = scores + BLAS_QUERY_TILE * p->length;
+#ifdef __APPLE__
+    unsigned previous = get_threading != NULL ? get_threading() : 1;
+    bool restore = set_threading != NULL && previous != 1 && set_threading(1) == 0;
+#endif
+    TrillimStatus status = TRILLIM_OK;
+    for (size_t index = slot; index < jobs; index += slots) {
+        status = blas_tile(task, index, query_width ? buffer : NULL, scores, result);
+        if (status != TRILLIM_OK) {
+            break;
+        }
+    }
+#ifdef __APPLE__
+    if (restore) {
+        (void)set_threading(previous);
+    }
+#endif
+    return status;
+}
+
 TRILLIM_KERNEL TrillimStatus trillim_x86_attention_mask(
     void *const *outputs, const void *const *inputs, void *scratch,
     const void *parameters, const TrillimKernelContext *context
@@ -366,6 +686,26 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_attention_mask(
         outputs[0], inputs[0], inputs[1], inputs[2], HAS_MASK ? inputs[3] : NULL,
         HAS_SINKS ? inputs[3 + HAS_MASK] : NULL, scratch, p, context
     };
+    size_t workspace;
+    if (p->heads && blas_shape(p) && blas_workspace(p, false, &workspace) && initialize_blas(context)) {
+        const TrillimThreadPool *pool = context->thread_pool;
+        float *packed = scratch;
+        PackTask values = {inputs[2], packed, p->v_strides, p->length, p->value_dim, p->v_dtype, context};
+        size_t tiles = p->length / BLAS_QUERY_TILE + (p->length % BLAS_QUERY_TILE != 0);
+        TrillimStatus status = pool->run(pool->context, p->kv_heads * tiles, pack_head_rows, &values);
+        if (status != TRILLIM_OK) {
+            return status;
+        }
+        if (!direct_rows(p->k_strides, p->key_dim)) {
+            packed += p->kv_heads * p->length * p->value_dim;
+            PackTask keys = {inputs[1], packed, p->k_strides, p->length, p->key_dim, p->k_dtype, context};
+            status = pool->run(pool->context, p->kv_heads * tiles, pack_head_rows, &keys);
+            if (status != TRILLIM_OK) {
+                return status;
+            }
+        }
+        return pool->run(pool->context, blas_slots(p), blas_task, &task);
+    }
     size_t tiles = p->queries / 16 + (p->queries % 16 != 0);
     return context->thread_pool->run(context->thread_pool->context, p->heads * tiles, trillim_attention_task, &task);
 }
@@ -379,10 +719,13 @@ TRILLIM_KERNEL const char *trillim_x86_attention_mask_tdl(void) {
            "def pattern(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, *, causal: bool = True, scale = None, window = None, softcap = None, dtype: DType = 'fp32') -> tuple[Tensor, ...]:\n"
            "    return (Attention(q, k, v, causal=causal, scale=scale, window=window, softcap=softcap, dtype=dtype, mask=mask),)\n"
            "def bind(context):\n"
-           "    if context.outputs[0].dtype != 'fp32':\n"
-           "        raise ValueError('extended attention requires FP32 output to preserve final-cast semantics')\n"
            "    result = _attention(context)\n"
            "    softcap = context.attrs.get('softcap')\n"
+           "    if context.outputs[0].dtype != 'fp32' and (\n"
+           "        context.outputs[0].dtype != 'bf16' or result['causal'] or result['windowed'] or softcap is not None or\n"
+           "        tuple(context.inputs[name].dtype for name in ('q', 'k', 'v')) != ('fp32', 'fp32', 'bf16')\n"
+           "    ):\n"
+           "        raise ValueError('unsupported masked attention precision or window')\n"
            "    if softcap is not None and (not isinstance(softcap, (int, float)) or not math.isfinite(softcap) or softcap <= 0):\n"
            "        raise ValueError('attention softcap must be finite and positive')\n"
            "    result.update(softcapped=int(softcap is not None), softcap=float(softcap) if softcap is not None else 1.0,\n"

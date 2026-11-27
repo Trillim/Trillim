@@ -168,7 +168,7 @@ static inline int64_t expert_id(const void *indices, size_t token, size_t route,
     return trillim_load(indices, offset, TRILLIM_INT64).i;
 }
 
-enum { ROUTED_ROWS = 4, ROUTED_MAX_ITEMS = 512, ROUTED_MAX_EXPERTS = 128 };
+enum { ROUTED_ROWS = 8, ROUTED_MAX_ITEMS = 512, ROUTED_MAX_EXPERTS = 128 };
 
 __attribute__((target("avx2")))
 static TrillimStatus project_int8(

@@ -54,40 +54,30 @@ TRILLIM_AVX2 static inline __m256 load8(const void *data, size_t index, uint32_t
     return _mm256_xor_ps(value, _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_and_si256(bits, _mm256_set1_epi32(0x8000)), 16)));
 }
 
-TRILLIM_AVX2 static inline void store8(void *data, size_t index, uint32_t dtype, __m256 value) {
-    if (dtype == TRILLIM_FP32) {
-        _mm256_storeu_ps((float *)data + index, value);
-        return;
-    }
+TRILLIM_AVX2 static inline __m256 round_bf16_8(__m256 value) {
     __m256i bits = _mm256_castps_si256(value);
-    __m256i upper = _mm256_srli_epi32(bits, 16);
-    __m256i absolute = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff));
-    __m256i nan = _mm256_cmpgt_epi32(absolute, _mm256_set1_epi32(0x7f800000));
-    __m256i rounded;
-    if (dtype == TRILLIM_BF16) {
-        __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0x7fff), _mm256_and_si256(upper, _mm256_set1_epi32(1)));
-        rounded = _mm256_srli_epi32(_mm256_add_epi32(bits, bias), 16);
-        rounded = _mm256_blendv_epi8(rounded, _mm256_or_si256(upper, _mm256_set1_epi32(0x40)), nan);
-    } else {
-        __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0xfff), _mm256_and_si256(_mm256_srli_epi32(absolute, 13), _mm256_set1_epi32(1)));
-        rounded = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_add_epi32(absolute, bias), 13), _mm256_set1_epi32(112 << 10));
-        rounded = _mm256_min_epi32(rounded, _mm256_set1_epi32(0x7c00));
-        __m256 small = _mm256_mul_ps(_mm256_castsi256_ps(absolute), _mm256_set1_ps(0x1p24f));
-        __m256i subnormal = _mm256_cvttps_epi32(_mm256_round_ps(small, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        rounded = _mm256_blendv_epi8(rounded, subnormal, _mm256_cmpgt_epi32(_mm256_set1_epi32(0x38800000), absolute));
-        __m256i payload = _mm256_or_si256(_mm256_srli_epi32(absolute, 13), _mm256_set1_epi32(0x200));
-        payload = _mm256_and_si256(payload, _mm256_set1_epi32(0x3ff));
-        rounded = _mm256_blendv_epi8(rounded, _mm256_or_si256(payload, _mm256_set1_epi32(0x7c00)), nan);
-        rounded = _mm256_or_si256(rounded, _mm256_and_si256(upper, _mm256_set1_epi32(0x8000)));
-    }
-    _mm_storeu_si128((__m128i *)((uint16_t *)data + index), _mm_packus_epi32(_mm256_castsi256_si128(rounded), _mm256_extracti128_si256(rounded, 1)));
+    __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0x7fff),
+        _mm256_and_si256(_mm256_srli_epi32(bits, 16), _mm256_set1_epi32(1)));
+    return _mm256_castsi256_ps(_mm256_and_si256(_mm256_add_epi32(bits, bias), _mm256_set1_epi32(0xffff0000)));
 }
 
-TRILLIM_AVX2 static __m256 round8(__m256 value, uint32_t dtype) {
-    if (dtype == TRILLIM_FP32) return value;
-    uint16_t bits[16];
-    store8(bits, 0, dtype, value);
-    return load8(bits, 0, dtype);
+TRILLIM_AVX2 static inline __m256 round_fp16_positive8(__m256 value) {
+    __m256i bits = _mm256_castps_si256(value);
+    __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0xfff),
+        _mm256_and_si256(_mm256_srli_epi32(bits, 13), _mm256_set1_epi32(1)));
+    __m256 normal = _mm256_castsi256_ps(_mm256_and_si256(_mm256_add_epi32(bits, bias), _mm256_set1_epi32(0xffffe000)));
+    __m256 small = _mm256_cmp_ps(value, _mm256_set1_ps(0x1p-14f), _CMP_LT_OQ);
+    if (_mm256_movemask_ps(small)) {
+        __m256 scaled = _mm256_mul_ps(value, _mm256_set1_ps(0x1p24f));
+        __m256 rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m256 subnormal = _mm256_mul_ps(rounded, _mm256_set1_ps(0x1p-24f));
+        normal = _mm256_blendv_ps(normal, subnormal, small);
+    }
+    return normal;
+}
+
+TRILLIM_AVX2 static inline __m256 round8(__m256 value, uint32_t dtype) {
+    return dtype == TRILLIM_BF16 ? round_bf16_8(value) : round_fp16_positive8(value);
 }
 
 typedef struct {
@@ -130,20 +120,7 @@ TRILLIM_AVX2 static float sigmoid(float value, uint32_t dtype) {
     return value >= 0.0f ? 1.0f / denominator : round_dtype(e / denominator, dtype);
 }
 
-TRILLIM_AVX2 static float apply(float value, uint32_t dtype) {
-    return sigmoid(value, dtype);
-}
-
-TRILLIM_AVX2 static __m256 exp8(__m256 x) {
-    if (all8(_mm256_and_si256(ge8(x, _mm256_set1_ps(-87.0f)),
-                              le8(x, _mm256_set1_ps(0.0f)))) != UINT32_MAX) {
-        float lanes[8];
-        _mm256_storeu_ps(lanes, x);
-        for (size_t lane = 0; lane < 8; ++lane) {
-            lanes[lane] = expf(lanes[lane]);
-        }
-        return _mm256_loadu_ps(lanes);
-    }
+TRILLIM_AVX2 static __m256 exp_reduced8(__m256 x) {
     /* Cody-Waite reduction leaves |r| <= log(2)/2 for the degree-seven series. */
     __m256i power = _mm256_cvtps_epi32(muln8(x, 1.4426950408889634f));
     __m256 integer = _mm256_cvtepi32_ps(power);
@@ -161,19 +138,78 @@ TRILLIM_AVX2 static __m256 exp8(__m256 x) {
     return _mm256_mul_ps(p, _mm256_castsi256_ps(exponent));
 }
 
-TRILLIM_AVX2 static __m256 sigmoid8(__m256 value, uint32_t dtype) {
-    __m256 e = round8(exp8(neg8(abs8(value))), dtype);
-    __m256 denominator = round8(_mm256_add_ps(e, _mm256_set1_ps(1.0f)), dtype);
+TRILLIM_AVX2 static __m256 exp8(__m256 x) {
+    if (all8(_mm256_and_si256(ge8(x, _mm256_set1_ps(-87.0f)),
+                              le8(x, _mm256_set1_ps(0.0f)))) != UINT32_MAX) {
+        float lanes[8];
+        _mm256_storeu_ps(lanes, x);
+        for (size_t lane = 0; lane < 8; ++lane) {
+            lanes[lane] = expf(lanes[lane]);
+        }
+        return _mm256_loadu_ps(lanes);
+    }
+    return exp_reduced8(x);
+}
+
+TRILLIM_AVX2 static __m256 sigmoid_fp32_8(__m256 value) {
+    __m256 e = exp8(neg8(abs8(value)));
+    __m256 denominator = _mm256_add_ps(e, _mm256_set1_ps(1.0f));
     __m256 positive = _mm256_div_ps(_mm256_set1_ps(1.0f), denominator);
-    __m256 negative = round8(_mm256_div_ps(e, denominator), dtype);
-    return select8(ge8(value, _mm256_set1_ps(0.0f)), positive, negative);
+    __m256 negative = _mm256_div_ps(e, denominator);
+    return select8(ge8(value, _mm256_setzero_ps()), positive, negative);
 }
 
+TRILLIM_AVX2 static __m256 sigmoid8(__m256 value, uint32_t dtype) {
+    __m256 x = neg8(abs8(value));
+    if ((_mm_getcsr() & 0xffc0) != 0x1f80) {
+        float lanes[8];
+        _mm256_storeu_ps(lanes, value);
+        for (size_t lane = 0; lane < 8; ++lane) {
+            lanes[lane] = sigmoid(lanes[lane], dtype);
+        }
+        return _mm256_loadu_ps(lanes);
+    }
 
-TRILLIM_AVX2 static __m256 apply8(__m256 value, uint32_t dtype) {
-    return sigmoid8(value, dtype);
+    __m256 exponential = dtype == TRILLIM_FP16 ?
+        exp_reduced8(_mm256_max_ps(x, _mm256_set1_ps(-18.0f))) : exp8(x);
+    unsigned refine = 0;
+    {
+        /* Resolve expf rounding near a reduced-precision midpoint. */
+        __m256i bits = _mm256_castps_si256(exponential);
+        __m256i margin = _mm256_set1_epi32(8);
+        __m256 near;
+        if (dtype == TRILLIM_BF16) {
+            __m256i low = _mm256_and_si256(bits, _mm256_set1_epi32(0xffff));
+            __m256i distance = _mm256_abs_epi32(_mm256_sub_epi32(low, _mm256_set1_epi32(0x8000)));
+            near = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(65), distance));
+        } else {
+            __m256 lo = round8(_mm256_castsi256_ps(_mm256_sub_epi32(bits, margin)), dtype);
+            __m256 hi = round8(_mm256_castsi256_ps(_mm256_add_epi32(bits, margin)), dtype);
+            near = _mm256_cmp_ps(lo, hi, _CMP_NEQ_OQ);
+        }
+        __m256 normal = _mm256_cmp_ps(x, _mm256_set1_ps(dtype == TRILLIM_FP16 ? -18.0f : -87.0f), _CMP_GE_OQ);
+        near = _mm256_and_ps(near, normal);
+        refine = (unsigned)_mm256_movemask_ps(_mm256_or_ps(near, _mm256_cmp_ps(value, value, _CMP_UNORD_Q)));
+    }
+    __m256 e = round8(exponential, dtype);
+    __m256 one = _mm256_set1_ps(1.0f);
+    __m256 denominator = round8(_mm256_add_ps(e, one), dtype);
+    __m256i positive = ge8(value, _mm256_setzero_ps());
+    __m256 quotient = _mm256_div_ps(select8(positive, one, e), denominator);
+    __m256 result = select8(positive, quotient, round8(quotient, dtype));
+    if (refine) {
+        float input[8], output[8];
+        _mm256_storeu_ps(input, value);
+        _mm256_storeu_ps(output, result);
+        for (size_t lane = 0; lane < 8; ++lane) {
+            if (refine & (1u << lane)) {
+                output[lane] = sigmoid(input[lane], dtype);
+            }
+        }
+        result = _mm256_loadu_ps(output);
+    }
+    return result;
 }
-
 
 TRILLIM_AVX2 static TrillimStatus activate(void *opaque, size_t tile, size_t worker) {
     (void)worker;
@@ -187,11 +223,11 @@ TRILLIM_AVX2 static TrillimStatus activate(void *opaque, size_t tile, size_t wor
     size_t i = begin;
     for (; end - i >= 8; i += 8) {
         __m256 input = load8(task->input, i, p->dtype);
-        store8(task->output, i, TRILLIM_FP32, apply8(input, p->dtype));
+        __m256 result = p->dtype == TRILLIM_FP32 ? sigmoid_fp32_8(input) : sigmoid8(input, p->dtype);
+        _mm256_storeu_ps((float *)task->output + i, result);
     }
     for (; i < end; ++i) {
-        TrillimValue value = {.f = apply(trillim_load(task->input, i, p->dtype).f, p->dtype)};
-        trillim_store(task->output, i, TRILLIM_FP32, value);
+        ((float *)task->output)[i] = sigmoid(trillim_load(task->input, i, p->dtype).f, p->dtype);
     }
     return TRILLIM_OK;
 }
