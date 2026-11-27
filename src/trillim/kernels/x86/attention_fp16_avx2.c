@@ -202,18 +202,24 @@ SIMD static TrillimStatus attend(void *opaque, size_t index, size_t worker) {
     size_t per_group = p->queries / groups + (p->queries % groups != 0);
     size_t first = index % groups * per_group;
     size_t last = p->queries - first < per_group ? p->queries : first + per_group;
-    float *scores = task->scratch + index * p->length;
+    float *scores = p->length ? task->scratch + index * p->length : NULL;
     float scale = p->default_scale ? 1.0f / sqrtf((float)p->key_dim) : p->scale;
     for (size_t qi = first; qi < last; ++qi) {
         if (task->context->is_cancelled(task->context->cancellation_context)) return TRILLIM_CANCELLED;
-        float query[128];
-        size_t qbase = head * p->q_strides[0] + qi * p->q_strides[1];
-        for (size_t i = 0; i < p->key_dim; i += 8)
-            _mm256_storeu_ps(query + i, load8(task->query, qbase + i));
         int64_t position = (int64_t)p->length - (int64_t)p->queries + (int64_t)qi;
         size_t end = p->causal ? (position < 0 ? 0 : (size_t)position + 1) : p->length;
         size_t begin =
             p->windowed && position >= 0 && (size_t)position + 1 > p->window ? (size_t)position + 1 - p->window : 0;
+        size_t output = (qi * p->heads + head) * p->value_dim;
+        if (begin >= end) {
+            size_t item = trillim_itemsize(p->output_dtype);
+            memset((uint8_t *)task->output + output * item, 0, p->value_dim * item);
+            continue;
+        }
+        float query[128];
+        size_t qbase = head * p->q_strides[0] + qi * p->q_strides[1];
+        for (size_t i = 0; i < p->key_dim; i += 8)
+            _mm256_storeu_ps(query + i, load8(task->query, qbase + i));
         for (size_t key = begin; key < end; ++key) {
             if ((key & 63) == 0 && task->context->is_cancelled(task->context->cancellation_context))
                 return TRILLIM_CANCELLED;
@@ -223,7 +229,6 @@ SIMD static TrillimStatus attend(void *opaque, size_t index, size_t worker) {
         TrillimStatus status = normalize_scores(scores, begin, end, task->context, &reciprocal);
         if (status != TRILLIM_OK) return status;
         __m256 inverse = _mm256_set1_ps(reciprocal);
-        size_t output = (qi * p->heads + head) * p->value_dim;
         for (size_t channel = 0; channel < p->value_dim; channel += 32) {
             __m256 a = _mm256_setzero_ps(), b = a, c = a, d = a;
             for (size_t key = begin; key < end; ++key) {
@@ -385,7 +390,7 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_attention_fp16_avx2(void *const *output
     if (groups > 4) groups = 4;
     TrillimAttentionTask task = {outputs[0], inputs[0], inputs[1], inputs[2], scratch, p, context};
     return context->thread_pool->run(context->thread_pool->context, p->heads * groups,
-                                     !p->causal && !p->windowed && p->queries >= 4 ? attend4 : attend, &task);
+                                     p->length && !p->causal && !p->windowed && p->queries >= 4 ? attend4 : attend, &task);
 }
 
 TRILLIM_KERNEL const char *trillim_x86_attention_fp16_avx2_tdl(void) {
