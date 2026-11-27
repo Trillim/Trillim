@@ -25,6 +25,7 @@ class _CompileRequest(BaseModel):
     @field_validator("checkpoints")
     @classmethod
     def _validate_checkpoints(cls, value: dict[str, Path]) -> dict[str, Path]:
+        value = {name: path.expanduser() for name, path in value.items()}
         for name, path in value.items():
             try:
                 mode = path.stat().st_mode
