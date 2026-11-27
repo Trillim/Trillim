@@ -58,7 +58,7 @@ static bool blas_shape(const Parameters *p) {
 
 static void load_blas(void) {
 #ifdef _WIN32
-    static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+    static const char *const names[] = {"libopenblas.dll", "openblas.dll"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         HMODULE library = LoadLibraryA(names[i]);
         if (library == NULL) {
@@ -76,7 +76,7 @@ static void load_blas(void) {
 #ifdef __APPLE__
     static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #else
-    static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+    static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);

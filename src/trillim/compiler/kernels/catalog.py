@@ -123,14 +123,38 @@ def _available_capabilities(backend: _Backend) -> int:
             # Loaded Windows kernels resolve standard math through their CRT.
             available |= flag
         elif name in _SOFTWARE_CAPABILITIES:
-            library = ctypes.util.find_library(name)
-            if library is None:
-                continue
-            try:
-                c.CDLL(library)
-            except OSError:
-                continue
-            available |= flag
+            libraries: tuple[str | None, ...] = (ctypes.util.find_library(name),)
+            if name == "openblas":
+                libraries += (
+                    (
+                        ctypes.util.find_library("libopenblas"),
+                        "libopenblas.dll",
+                        "openblas.dll",
+                    )
+                    if sys.platform == "win32"
+                    else ("libopenblas.dylib",)
+                    if sys.platform == "darwin"
+                    else ("libopenblas.so.0", "libopenblas.so")
+                )
+            elif name == "accelerate":
+                libraries = (
+                    ("/System/Library/Frameworks/Accelerate.framework/Accelerate",)
+                    if sys.platform == "darwin"
+                    else ()
+                )
+            for library in libraries:
+                if library is None:
+                    continue
+                try:
+                    provider = c.CDLL(library)
+                    if name in {"openblas", "accelerate"} and not hasattr(
+                        provider, "cblas_sgemm"
+                    ):
+                        continue
+                except OSError:
+                    continue
+                available |= flag
+                break
     return available
 
 

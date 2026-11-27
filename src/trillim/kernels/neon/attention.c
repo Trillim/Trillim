@@ -2007,7 +2007,7 @@ static bool initialize_blas(const TrillimKernelContext *context) {
 #ifdef __APPLE__
         static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #else
-        static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+        static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
         for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
             void *library = dlopen(names[index], RTLD_LOCAL | RTLD_LAZY);

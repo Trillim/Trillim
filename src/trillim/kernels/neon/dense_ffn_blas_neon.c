@@ -494,7 +494,7 @@ static bool dense_glu_initialize_blas(void) {
     if (atomic_compare_exchange_strong_explicit(&dense_glu_blas_state, &expected, 1,
                                                 memory_order_acq_rel, memory_order_acquire)) {
 #ifdef _WIN32
-        static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+        static const char *const names[] = {"libopenblas.dll", "openblas.dll"};
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             HMODULE library = LoadLibraryA(names[i]);
             if (library != NULL) {
@@ -519,7 +519,7 @@ static bool dense_glu_initialize_blas(void) {
 #ifdef __APPLE__
         static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #else
-        static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+        static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);
@@ -2143,7 +2143,7 @@ static bool dense_initialize_blas(void) {
     if (atomic_compare_exchange_strong_explicit(&dense_blas_state, &expected, 1,
                                                 memory_order_acq_rel, memory_order_acquire)) {
 #ifdef _WIN32
-        static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+        static const char *const names[] = {"libopenblas.dll", "openblas.dll"};
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             HMODULE library = LoadLibraryA(names[i]);
             if (library != NULL) {
@@ -2168,7 +2168,7 @@ static bool dense_initialize_blas(void) {
 #ifdef __APPLE__
         static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #else
-        static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+        static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);
@@ -2874,7 +2874,7 @@ static TrillimStatus requirements(const void *, size_t *, size_t *, size_t *);
 
 static bool provider_available(void) {
 #ifdef _WIN32
-    static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+    static const char *const names[] = {"libopenblas.dll", "openblas.dll"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         HMODULE library = LoadLibraryA(names[i]);
         if (library != NULL) {
@@ -2888,7 +2888,7 @@ static bool provider_available(void) {
 #ifdef __APPLE__
     static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #else
-    static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+    static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         void *library = dlopen(names[i], RTLD_LOCAL | RTLD_LAZY);
@@ -2921,7 +2921,7 @@ static bool initialize(void) {
             base->abi_version == TRILLIM_KERNEL_ABI_VERSION) {
             schema = *component;
             schema.requirements = requirements;
-            capabilities.required = base->required | TRILLIM_CAP_BLAS;
+            capabilities.required = base->required | TRILLIM_CAP_PLATFORM_BLAS;
             available = provider_available();
         }
         atomic_store_explicit(&initialization, 2, memory_order_release);

@@ -5,7 +5,11 @@ from typing import cast
 
 from .kernel_dataclasses import _Backend, _ParameterField, _ParameterSchema
 
-_SOFTWARE_CAPABILITIES = {"m": 1 << 32, "blas": 1 << 33}
+_SOFTWARE_CAPABILITIES = {
+    "m": 1 << 32,
+    "openblas": 1 << 33,
+    "accelerate": 1 << 34,
+}
 _CAPABILITY_FLAGS: dict[_Backend, dict[str, int]] = {
     "scalar": {**_SOFTWARE_CAPABILITIES},
     "x86": {

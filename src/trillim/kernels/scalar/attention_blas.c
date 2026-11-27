@@ -34,9 +34,9 @@ static bool initialize_blas(void) {
 #ifdef __APPLE__
         static const char *const names[] = {"/System/Library/Frameworks/Accelerate.framework/Accelerate"};
 #elif defined(_WIN32)
-        static const char *const names[] = {"libopenblas.dll", "openblas.dll", "blas.dll"};
+        static const char *const names[] = {"libopenblas.dll", "openblas.dll"};
 #else
-        static const char *const names[] = {"libblas.so.3", "libopenblas.so.0", "libblas.so"};
+        static const char *const names[] = {"libopenblas.so.0", "libopenblas.so"};
 #endif
         for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
 #ifdef _WIN32
