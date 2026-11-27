@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Hashable
-from math import isfinite, prod
+from math import prod
 from pathlib import Path
-from statistics import mean, median, pvariance
+from statistics import mean
+from time import monotonic
 
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +21,7 @@ from ...tdl.core.core_pydantic_models import (
     _ReshapeArgs,
     _ScatterArgs,
 )
+from ...tdl.core.graph import Graph
 from ...tdl.core.operator import _Operator
 from ...tdl.core.tensor import Tensor
 from .. import dtype as _codec
@@ -28,20 +29,27 @@ from ..artifacts.artifact_dataclasses import _JSON
 from ..artifacts.parameters import _requirements
 from ..compiler_dataclasses import _Inference, _ShapeExpression
 from ..compiler_pydantic_models import _CompileRequest
-from ..passes.passes_dataclasses import _KernelMatch, _MatchSet
+from ..kernels.build import _build_cpu
+from ..kernels.kernel_dataclasses import _ParameterValue
+from ..passes.match import _shape_rewriter
+from ..passes.passes_dataclasses import _KernelMatch, _MatchSet, _Selection
+from ..passes.select import _INTRINSICS, _anchors, _greedy, _specialization
 from ..weights.packing import _repack_row_int8
 from ..weights.weights_dataclasses import _WeightBinding, _WeightIndex
 from ..weights.weights_pydantic_models import _WeightManifest
 from .bench_dataclasses import (
     _BenchmarkInput,
     _BenchmarkOutput,
-    _BenchmarkResult,
     _ConcreteParameter,
     _Invocation,
     _Tuning,
+    _TuningRegion,
     _TuningState,
 )
 from .benchmark import _MAX_BYTES, _benchmark, _representative_tokens
+
+_LOW_SECONDS = 120.0
+_HIGH_SECONDS = 300.0
 
 
 def _bounded(value: _ShapeExpression, point: int) -> int:
@@ -56,7 +64,7 @@ def _evaluate(
     state: _TuningState,
     active: set[_ShapeExpression] | None = None,
 ) -> int:
-    key = value, point
+    key = value, point, state.history
     if key not in state.dimensions:
         state.dimensions[key] = _calculate(value, point, state, active)
     return state.dimensions[key]
@@ -78,7 +86,7 @@ def _calculate(
     try:
         if value.op == "dimension":
             assert value.tensor is not None and value.axis is not None
-            key = value.tensor, value.axis, point
+            key = value.tensor, value.axis, point, state.history
             if key not in state.dimensions:
                 info = state.inference.tensors[value.tensor]
                 actual = None if info.shape is None else info.shape[value.axis]
@@ -96,7 +104,7 @@ def _calculate(
                 return _evaluate(values[index], point, state, active)
             return _bounded(value, point)
         if value.op == "cache_length":
-            return _bounded(value, point)
+            return _bounded(value, state.history)
         left, right = (
             _evaluate(argument, point, state, active) for argument in value.args
         )
@@ -414,23 +422,6 @@ def _invocation(
     ), descriptions
 
 
-def _signature(candidate: _KernelMatch, point: int, state: _TuningState) -> Hashable:
-    parameters = _parameters(candidate, point, state)
-    return (
-        candidate.kernel.library,
-        candidate.kernel.name,
-        tuple(sorted(parameters.items())),
-        tuple(
-            (state.inference.tensors[value].dtype, _shape(_base(value), point, state))
-            for value in candidate.inputs
-        ),
-        tuple(
-            (state.inference.tensors[value].dtype, _shape(value, point, state))
-            for value in candidate.outputs
-        ),
-    )
-
-
 def _reference(
     candidate: _KernelMatch, candidates: tuple[_KernelMatch, ...]
 ) -> _KernelMatch | None:
@@ -448,15 +439,23 @@ def _reference(
         return result
 
     expected = boundary(candidate)
-    return next(
-        (
-            value
-            for value in candidates
-            if value.kernel.backend == "scalar"
-            and boundary(value) == expected
-            and value.outputs == candidate.outputs
+    family = candidate.kernel.name.removeprefix(
+        f"trillim_{candidate.kernel.backend}_"
+    ).removeprefix("scalar_")
+    references = [
+        value
+        for value in candidates
+        if value.kernel.backend == "scalar"
+        and boundary(value) == expected
+        and value.outputs == candidate.outputs
+    ]
+    return max(
+        references,
+        key=lambda value: (
+            value.kernel.name == f"trillim_scalar_{family}",
+            _specialization(value),
         ),
-        None,
+        default=None,
     )
 
 
@@ -478,11 +477,9 @@ def _priority(
                     ),
                 )
     high_level = any(
-        any(
-            name in value.kernel.name.lower()
-            for name in ("linear", "matmul", "attention", "norm")
-        )
-        for value in candidates
+        operator.op in {"matmul", "conv", "conv_transpose", "softmax"}
+        for candidate in candidates
+        for operator in candidate.covered
     )
     return (
         int(high_level),
@@ -491,28 +488,312 @@ def _priority(
     )
 
 
-def _increment(record: dict[str, _JSON], operator: int) -> None:
-    uses = record["uses"]
-    assert isinstance(uses, int)
-    record["uses"] = uses + 1
-    operators = record["operators"]
-    assert isinstance(operators, list)
-    if len(operators) < 8 and operator not in operators:
-        operators.append(operator)
+def _regions(
+    call: _KernelMatch,
+    matches: _MatchSet,
+    operators: tuple[_Operator, ...],
+    *,
+    high: bool,
+) -> list[tuple[_KernelMatch, ...]]:
+    choices: list[tuple[_KernelMatch, ...]] = [
+        (candidate,)
+        for candidate in matches.candidates.get(call.anchor, ())
+        if candidate.covered == call.covered and candidate != call
+    ]
+    candidates = {
+        operator: tuple(
+            candidate
+            for candidate in matches.candidates.get(operator, ())
+            if candidate.covered < call.covered
+        )
+        for operator in call.covered
+    }
+    local = tuple(operator for operator in operators if operator in call.covered)
+    cuts = [call.anchor] if isinstance(call.anchor.args, _CastArgs) else []
+    if high:
+        cuts.extend(
+            operator
+            for operator in local
+            if operator is not call.anchor
+            and not isinstance(operator.args, _INTRINSICS)
+            and operator not in matches.views
+        )
+    partitions: set[frozenset[frozenset[_Operator]]] = set()
+    for cut in cuts[:16]:
+        neighborhood = _MatchSet(
+            candidates={
+                operator: tuple(
+                    candidate
+                    for candidate in group
+                    if cut not in candidate.covered or candidate.anchor is cut
+                )
+                for operator, group in candidates.items()
+            },
+            views=matches.views,
+        )
+        try:
+            selected = _greedy(local, neighborhood, None)
+        except ValueError:
+            continue
+        missing = call.covered - selected.covered
+        if any(
+            operator not in matches.views and not isinstance(operator.args, _INTRINSICS)
+            for operator in missing
+        ):
+            continue
+        partition = frozenset(value.covered for value in selected.calls.values())
+        if partition in partitions or not selected.calls:
+            continue
+        partitions.add(partition)
+        choices.append(tuple(selected.calls.values()))
+        if len(partitions) >= (4 if high else 1):
+            break
+    return choices
+
+
+def _region_key(
+    region: tuple[_KernelMatch, ...], original: _KernelMatch, state: _TuningState
+) -> Hashable:
+    tensors = dict.fromkeys((*original.inputs, *original.outputs))
+    slots = {tensor: index for index, tensor in enumerate(tensors)}
+
+    def parameter(value: _ParameterValue) -> Hashable:
+        if isinstance(value, _ShapeExpression):
+            return value if state.rewrite is None else state.rewrite(value)
+        if isinstance(value, tuple):
+            return tuple(parameter(item) for item in value)
+        return value
+
+    def binding(tensor: Tensor, candidate: _KernelMatch) -> Hashable:
+        if tensor not in slots:
+            slots[tensor] = len(slots)
+        weight = _weight(tensor, state)
+        info = state.inference.tensors[tensor]
+        return (
+            slots[tensor],
+            info.dtype,
+            None if info.shape is None else parameter(info.shape),
+            info.maximum_shape,
+            None if info.values is None else parameter(info.values),
+            state.inference.value_ranges.get(tensor),
+            candidate.packings.get(tensor, "canonical"),
+            None
+            if weight is None
+            else (weight.dtype, weight.source.method, weight.source.linear_class),
+        )
+
+    # Substitute only shape equalities proved by the selected loop matches.
+    # Unrelated symbols and their bounds remain distinct.
+    return tuple(
+        (
+            candidate.kernel.library,
+            candidate.kernel.name,
+            candidate.kernel.backend,
+            candidate.kernel.capabilities,
+            tuple(
+                (name, parameter(value))
+                for name, value in sorted(candidate.parameters.items())
+            ),
+            tuple(sorted(operator.op for operator in candidate.covered)),
+            tuple(binding(tensor, candidate) for tensor in candidate.inputs),
+            tuple(binding(tensor, candidate) for tensor in candidate.outputs),
+        )
+        for candidate in region
+    )
+
+
+def _region_seconds(
+    region: tuple[_KernelMatch, ...],
+    references: _MatchSet,
+    point: int,
+    state: _TuningState,
+    harness: Path,
+    fixtures: dict[tuple[Tensor, str], bytes | _BenchmarkInput],
+    deadline: float,
+    result: _Tuning,
+    *,
+    incumbent: bool = False,
+) -> float:
+    elapsed = 0.0
+    for candidate in region:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("tuning time budget exhausted")
+        reference = _reference(
+            candidate, references.candidates.get(candidate.anchor, ())
+        )
+        if candidate.kernel.backend != "scalar" and reference is None:
+            raise ValueError("no equivalent scalar reference")
+        invocation, _ = _invocation(candidate, point, state, fixtures)
+        golden = None
+        if candidate.kernel.backend != "scalar" and reference is not None:
+            golden, _ = _invocation(reference, point, state, fixtures)
+        profile = _benchmark(
+            invocation,
+            harness=harness,
+            golden=golden,
+            timeout=min(10.0, remaining),
+            max_bytes=_MAX_BYTES,
+        )
+        result.measured += 1
+        if not profile.correct:
+            if incumbent:
+                raise ArithmeticError(
+                    f"incumbent {candidate.kernel.name} exceeds its numerical error "
+                    f"budget at {point} rows: maximum={profile.maximum_error:g}, "
+                    f"normalized={profile.normalized_error:g}"
+                )
+            raise ValueError("candidate exceeds its numerical error budget")
+        elapsed += profile.median
+    return elapsed
+
+
+def _improve(
+    graph: Graph,
+    matches: _MatchSet,
+    state: _TuningState,
+    harness: Path,
+    result: _Tuning,
+    *,
+    high: bool,
+    seconds: float,
+) -> None:
+    request = state.request
+    native = _MatchSet(
+        candidates={
+            operator: tuple(
+                candidate
+                for candidate in group
+                if candidate.kernel.backend == request.backend
+            )
+            for operator, group in matches.candidates.items()
+        },
+        views=matches.views,
+    )
+    assert graph._region is not None
+    operators = tuple(_anchors(graph._region))
+    points = _representative_tokens("high" if high else "low")
+    deadline = monotonic() + seconds
+    state.rewrite = _shape_rewriter(
+        {
+            tensor: shape
+            for call in result.selection.calls.values()
+            for tensor, shape in call.loop_dimensions.items()
+        }
+    )
+    groups: dict[Hashable, list[_TuningRegion]] = {}
+    for original in result.selection.calls.values():
+        alternatives = _regions(original, native, operators, high=high)
+        if not alternatives:
+            continue
+        choices = {
+            _region_key(region, original, state): region
+            for region in ((original,), *alternatives)
+        }
+        decision_key: Hashable = (
+            request.threads,
+            points,
+            _region_key((original,), original, state),
+            frozenset(choices),
+        )
+        groups.setdefault(decision_key, []).append(_TuningRegion(original, choices))
+    ordered = sorted(
+        groups.items(),
+        key=lambda item: _priority((item[1][0].original,), state),
+        reverse=True,
+    )
+    for key, group in ordered:
+        if monotonic() >= deadline:
+            break
+        representative = group[0]
+        initial = _region_key(
+            (representative.original,), representative.original, state
+        )
+        current = state.decisions.get(key, initial)
+        representatives = group[:1] if len(group) == 1 else [group[0], group[-1]]
+        for alternative in representative.choices if key not in state.decisions else ():
+            if alternative == initial:
+                continue
+            ratios = []
+            try:
+                for member in representatives:
+                    for point in points:
+                        state.history = (
+                            min(request.max_input_size, 512) if point == 1 else 0
+                        )
+                        state.dimensions.clear()
+                        fixtures: dict[tuple[Tensor, str], bytes | _BenchmarkInput] = {}
+                        baseline = _region_seconds(
+                            member.choices[current],
+                            matches,
+                            point,
+                            state,
+                            harness,
+                            fixtures,
+                            deadline,
+                            result,
+                            incumbent=True,
+                        )
+                        proposed = _region_seconds(
+                            member.choices[alternative],
+                            matches,
+                            point,
+                            state,
+                            harness,
+                            fixtures,
+                            deadline,
+                            result,
+                        )
+                        if baseline <= 0:
+                            raise ValueError("invalid incumbent timing")
+                        ratios.append(proposed / baseline)
+                        if ratios[-1] > 1.03:
+                            raise ValueError("candidate regresses a representative")
+            except (
+                ValueError,
+                TypeError,
+                RuntimeError,
+                OSError,
+                OverflowError,
+                TimeoutError,
+            ):
+                continue
+            if (
+                len(ratios) != len(points) * len(representatives)
+                or mean(ratios) >= 0.97
+            ):
+                continue
+            current = alternative
+        state.decisions[key] = current
+        if current == initial:
+            continue
+        calls = dict(result.selection.calls)
+        covered = set(result.selection.covered)
+        for member in group:
+            replacement = member.choices[current]
+            del calls[member.original.anchor]
+            calls.update((candidate.anchor, candidate) for candidate in replacement)
+            covered.difference_update(member.original.covered)
+            covered.update(*(candidate.covered for candidate in replacement))
+        result.accepted += len(group)
+        result.propagated += max(0, len(group) - len(representatives))
+        result.selection = _Selection(calls, covered)
 
 
 def _tune(
+    graph: Graph,
     matches: _MatchSet,
     inference: _Inference,
     weights: _WeightIndex,
     manifest: _WeightManifest,
     bundle: Path,
     request: _CompileRequest,
+    selection: _Selection,
+    structural: _MatchSet,
 ) -> _Tuning:
-    """Measure unique native workloads; share verified costs across model layers."""
-    result = _Tuning()
-    points = _representative_tokens(request.depth)
-    if not points:
+    """Refine the incumbent with freshly measured, non-regressing region choices."""
+    result = _Tuning(selection)
+    if request.depth == "none":
         return result
     state = _TuningState(
         inference,
@@ -523,219 +804,18 @@ def _tune(
         np.random.default_rng(0),
         views=frozenset(matches.views),
     )
-    cache: dict[Hashable, _BenchmarkResult] = {}
-    records: dict[tuple[Hashable, int], dict[str, _JSON]] = {}
-    rejected: set[tuple[_Operator, str]] = set()
-    aggregated: dict[_Operator, dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    groups = sorted(
-        enumerate(matches.candidates.items()),
-        key=lambda item: _priority(item[1][1], state),
-        reverse=True,
-    )
-    for operator_index, (operator, candidates) in groups:
-        ordered = sorted(
-            candidates, key=lambda value: -value.kernel.capabilities.bit_count()
+    with _build_cpu() as harness:
+        _improve(
+            graph, structural, state, harness, result, high=False, seconds=_LOW_SECONDS
         )
-        for point in points:
-            costs = result.per_workload.setdefault(point, {})
-            for candidate in ordered:
-                signature: Hashable | None = None
-                record_key: tuple[Hashable, int] | None = None
-                record: dict[str, _JSON] | None = None
-                try:
-                    reference = _reference(candidate, candidates)
-                    if candidate.kernel.backend != "scalar" and reference is None:
-                        raise ValueError(
-                            "no equivalent scalar candidate is available for numerical validation"
-                        )
-                    signature = _signature(candidate, point, state)
-                    key = (
-                        signature,
-                        (reference.kernel.library, reference.kernel.name)
-                        if candidate.kernel.backend != "scalar"
-                        and reference is not None
-                        else None,
-                    )
-                    profile = cache.get(key)
-                    cache_source = "memory"
-                    record_key = key, point
-                    record = records.get(record_key)
-                    if record is None:
-                        parameters = _parameters(candidate, point, state)
-                        record = {
-                            "tokens": point,
-                            "operator": operator_index,
-                            "operators": [operator_index],
-                            "uses": 1,
-                            "op": operator.op,
-                            "kernel": candidate.kernel.name,
-                            "backend": candidate.kernel.backend,
-                            "threads": request.threads,
-                            "parameters": {
-                                name: list(value) if isinstance(value, tuple) else value
-                                for name, value in parameters.items()
-                            },
-                        }
-                        records[record_key] = record
-                        result.workloads.append(record)
-                    else:
-                        _increment(record, operator_index)
-                    if profile is None:
-                        fixtures: dict[tuple[Tensor, str], bytes | _BenchmarkInput] = {}
-                        invocation, descriptions = _invocation(
-                            candidate, point, state, fixtures
-                        )
-                        golden = None
-                        if (
-                            candidate.kernel.backend != "scalar"
-                            and reference is not None
-                        ):
-                            golden, _ = _invocation(reference, point, state, fixtures)
-                        profile = _benchmark(
-                            invocation,
-                            golden=golden,
-                            max_bytes=_MAX_BYTES,
-                        )
-                        cache[key] = profile
-                        cache_source = "measured"
-                        inputs: list[_JSON] = [
-                            description for description in descriptions
-                        ]
-                        record["inputs"] = inputs
-                        if (
-                            reference is not None
-                            and candidate.kernel.backend != "scalar"
-                            and len(profile.reference_samples) == 3
-                        ):
-                            reference_signature = _signature(reference, point, state)
-                            reference_key = reference_signature, None
-                            assert golden is not None
-                            footprint = _requirements(
-                                reference.kernel.parameter_schema, golden.parameters
-                            )
-                            size = (
-                                sum(
-                                    payload.size
-                                    if isinstance(payload, _BenchmarkInput)
-                                    else len(payload)
-                                    for payload in golden.inputs
-                                )
-                                + sum(footprint.outputs)
-                                + footprint.scratch
-                            )
-                            samples = profile.reference_samples
-                            scalar_profile = _BenchmarkResult(
-                                samples,
-                                mean(samples),
-                                median(samples),
-                                pvariance(samples),
-                                True,
-                                0.0,
-                                size,
-                            )
-                            cache[reference_key] = scalar_profile
-                    if not profile.correct:
-                        rejected.add((operator, candidate.kernel.name))
-                        costs.setdefault(operator, {})[candidate.kernel.name] = float(
-                            "inf"
-                        )
-                        record.update(
-                            status="rejected",
-                            correct=False,
-                            maximum_error=profile.maximum_error
-                            if isfinite(profile.maximum_error)
-                            else None,
-                            normalized_error=profile.normalized_error
-                            if isfinite(profile.normalized_error)
-                            else None,
-                            reason="candidate disagrees with equivalent scalar reference",
-                        )
-                        continue
-                    if not isfinite(profile.median) or profile.median < 0:
-                        raise ValueError("native profile contains an invalid timing")
-                    costs.setdefault(operator, {})[candidate.kernel.name] = (
-                        profile.median
-                    )
-                    aggregated[operator][candidate.kernel.name].append(profile.median)
-                    parameters = _parameters(candidate, point, state)
-                    count = parameters.get(
-                        "tokens", parameters.get("queries", parameters.get("m", 1))
-                    )
-                    tokens = (
-                        int(count)
-                        if isinstance(count, (int, float)) and count > 0
-                        else 1
-                    )
-                    if record.get("status") != "measured":
-                        record.update(
-                            status="measured",
-                            cache=cache_source,
-                            samples_seconds=list(profile.samples),
-                            mean_seconds=profile.mean,
-                            median_seconds=profile.median,
-                            variance_seconds=profile.variance,
-                            seconds_per_token=profile.median / tokens,
-                            correct=True,
-                            maximum_error=profile.maximum_error
-                            if isfinite(profile.maximum_error)
-                            else None,
-                            normalized_error=profile.normalized_error
-                            if isfinite(profile.normalized_error)
-                            else None,
-                            validation="scalar_reference"
-                            if candidate.kernel.backend != "scalar"
-                            else "assumed_scalar",
-                            allocated_bytes=profile.allocated_bytes,
-                        )
-                except (
-                    ValueError,
-                    TypeError,
-                    RuntimeError,
-                    OSError,
-                    OverflowError,
-                    TimeoutError,
-                ) as error:
-                    fallback: Hashable = (
-                        candidate.kernel.name,
-                        tuple(
-                            (
-                                inference.tensors[value].dtype,
-                                inference.tensors[value].maximum_shape,
-                            )
-                            for value in candidate.inputs
-                        ),
-                        str(error),
-                    )
-                    failed_key = record_key or (
-                        signature if signature is not None else fallback,
-                        point,
-                    )
-                    previous = records.get(failed_key)
-                    if previous is not None and previous is not record:
-                        _increment(previous, operator_index)
-                    else:
-                        if record is None:
-                            record = {
-                                "tokens": point,
-                                "operator": operator_index,
-                                "operators": [operator_index],
-                                "uses": 1,
-                                "op": operator.op,
-                                "kernel": candidate.kernel.name,
-                                "backend": candidate.kernel.backend,
-                                "threads": request.threads,
-                            }
-                            records[failed_key] = record
-                            result.workloads.append(record)
-                        record.update(status="skipped", reason=str(error))
-    result.costs = {
-        operator: {name: mean(samples) for name, samples in values.items()}
-        for operator, values in aggregated.items()
-    }
-    for operator, kernel in rejected:
-        result.costs.setdefault(operator, {})[kernel] = float("inf")
-        for costs in result.per_workload.values():
-            costs.setdefault(operator, {})[kernel] = float("inf")
+        if request.depth == "high":
+            _improve(
+                graph,
+                matches,
+                state,
+                harness,
+                result,
+                high=True,
+                seconds=_HIGH_SECONDS - _LOW_SECONDS,
+            )
     return result

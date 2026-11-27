@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -11,9 +11,9 @@ if TYPE_CHECKING:
     import numpy as np
 
     from ...tdl.core.operator import _Operator
-    from ..artifacts.artifact_dataclasses import _JSON
-    from ..compiler_dataclasses import _Inference
+    from ..compiler_dataclasses import _Inference, _ShapeExpression
     from ..compiler_pydantic_models import _CompileRequest
+    from ..passes.passes_dataclasses import _KernelMatch, _Selection
     from ..weights.weights_dataclasses import _WeightIndex
     from ..weights.weights_pydantic_models import _WeightManifest
 
@@ -54,7 +54,6 @@ class _BenchmarkResult:
     maximum_error: float
     allocated_bytes: int
     normalized_error: float = 0.0
-    reference_samples: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,11 +70,16 @@ class _NativeAllocation:
 
 @dataclass(slots=True)
 class _Tuning:
-    costs: dict[_Operator, dict[str, float]] = field(default_factory=dict)
-    workloads: list[dict[str, _JSON]] = field(default_factory=list)
-    per_workload: dict[int, dict[_Operator, dict[str, float]]] = field(
-        default_factory=dict
-    )
+    selection: _Selection
+    measured: int = 0
+    accepted: int = 0
+    propagated: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _TuningRegion:
+    original: _KernelMatch
+    choices: dict[Hashable, tuple[_KernelMatch, ...]]
 
 
 @dataclass(slots=True)
@@ -88,3 +92,6 @@ class _TuningState:
     rng: np.random.Generator
     dimensions: dict[Hashable, int] = field(default_factory=dict)
     views: frozenset[_Operator] = frozenset()
+    history: int = 0
+    decisions: dict[Hashable, Hashable] = field(default_factory=dict)
+    rewrite: Callable[[_ShapeExpression], _ShapeExpression] | None = None

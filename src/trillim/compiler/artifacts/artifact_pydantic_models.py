@@ -54,7 +54,6 @@ class _ExecutableManifest(BaseModel):
     caches: dict[str, dict[str, JsonValue]]
     kernels: dict[str, dict[str, JsonValue]]
     program: list[dict[str, JsonValue]]
-    workloads: list[dict[str, JsonValue]] = Field(default_factory=list)
     transfer_kernel: str | None = None
     workload: dict[str, JsonValue] | None = None
     plans: list[_WorkloadPlan] = Field(default_factory=list)

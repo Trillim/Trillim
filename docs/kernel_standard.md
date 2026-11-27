@@ -4,17 +4,17 @@
 
 `trillim kernels path/to/kernel.c --backend x86` compiles that kernel and relinks it with the installed objects. Multiple source paths are accepted. An existing kernel with the same exported name is replaced; a new name is added. No source paths means a full rebuild, removing previously added custom kernels from that backend.
 
-Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containing `kernels.so`, `backend.o`, `index.json` and an `objects/` directory. The index lists kernel symbols and has format version 1. Individual objects are retained for incremental linking; packages must include them to support updates without the original sources. Kernel discovery loads the library and index without invoking a C compiler or reading kernel sources.
+Each backend is published at `$TRILLIM_HOME/1.0.0/kernels/<backend>/`, containing `kernels.so`, `index.json` and an `objects/` directory. The index lists kernel symbols and has format version 1. Individual objects are retained for incremental linking; packages must include them to support updates without the original sources. Kernel discovery loads the library and index without invoking a C compiler or reading kernel sources.
 
-The runtime and benchmark share the CPU backend's native thread pool, cached under `kernels/cpu/`. Source installations build this helper through the same compiler hierarchy when it is absent.
+The runtime worker and benchmark use the same CPU thread-pool implementation. The worker executable is built separately; compilation builds a temporary benchmark helper and removes it after tuning. Neither benchmark measurements nor helper builds are cached.
 
 Windows benchmark builds statically link Winpthreads and use CRT aligned allocation and QueryPerformanceCounter timing. Zig supplies Winpthreads; other Windows toolchains need its headers and static library. Windows kernels resolve standard mathematical functions through their CRT, so capability detection does not require a separate libm DLL.
 
-Compilers are tried in order: `zig cc`, an explicit `CC` command if set, then `cc`. On Windows, MinGW variants follow; `gcc` and `clang` are additional fallbacks. Unavailable tools are skipped. A failed compiler attempt is discarded before trying the next; compilation fails only after all available candidates fail. The current sources require a GCC-compatible driver, including Zig, GCC, Clang or MinGW.
+Compilers are tried in order: Zig, GCC, Clang, then host MinGW on Windows. An explicit `CC` or `CXX` selects that compiler instead. Unavailable tools are skipped. A failed compiler attempt is discarded before trying the next; compilation fails only after all available candidates fail. The current sources require a GCC-compatible driver, including Zig, GCC, Clang or MinGW.
 
 Kernels compile with `-O3` for the architecture's baseline CPU, including `-mcpu=baseline` with Zig. Optional instructions belong in functions with explicit target attributes and corresponding capability bits; building on a newer CPU must not silently add undeclared instruction requirements.
 
-Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. All build files and Zig caches stay beneath `TRILLIM_HOME`, which defaults to `~/.trillim`.
+Builds of one backend are serialized. Each build prepares a complete directory before atomically replacing the backend symlink. Existing resolved build directories remain available to active compiler and benchmark processes. Failure or cancellation removes the incomplete build and preserves the installed backend. Toolchain scratch, including Zig caches, is confined to temporary build directories and removed after use.
 
 A backend has no dependency on another backend's library. Portable scalar kernels are compiled into each backend's own library.
 

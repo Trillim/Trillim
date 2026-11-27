@@ -6,15 +6,15 @@ Kernel libraries must already be installed. From a source checkout, run `trillim
 
 The public Python modules are `trillim.tdl` (including `core`), `trillim.processing` and `trillim.runtime`. Compilation is exposed through the command above; compiler functions, types and helpers are private.
 
-Generated files use `$TRILLIM_HOME/1.0.0/`, where `TRILLIM_HOME` defaults to `~/.trillim`. Only version 1.0.0 is read. `kernels/` holds backend builds, `bench/` holds the native benchmark helper, and `compiled/` holds model bundles. Benchmark timings are reused only within the current compilation; the executable records the measurements used for selection.
+Generated files use `$TRILLIM_HOME/1.0.0/`, where `TRILLIM_HOME` defaults to `~/.trillim`. Only version 1.0.0 is read. `kernels/` holds compiled kernels and their symbol index, `backends/cpu/` holds the worker executable, and `compiled/` holds model bundles. Measurements are neither cached nor written to manifests or sidecar files. Benchmark helpers and toolchain scratch are temporary and removed after use.
 
 The compiler detects the host backend and writes to `~/.trillim/1.0.0/compiled/<model_name>` by default. With one checkpoint, its directory name supplies `model_name`; for a safetensors file, the parent directory name does. With multiple checkpoints or no checkpoints, the TDL filename supplies the name.
 
 - `--output PATH` chooses another destination.
 - `--backend scalar|x86|neon` overrides host detection. Kernels declare their hardware features separately, such as AVX2, AVX512, VNNI, or NEON dotprod.
-- `--depth none` picks a direct kernel plan with available backend specializations, without benchmarking.
-- `--depth low` compares kernels for the operations in that plan at 1, 8, and 64 tokens.
-- `--depth high` also compares fusion choices and extends workloads through 512, 4096, and 32768 tokens.
+- `--depth none` favors graph coverage, native hardware specialization, and fixed-dtype implementations over generic kernels, without benchmarking. Software-library requirements do not increase specialization rank.
+- `--depth low` refines that plan with fresh region measurements at single-row decode and 64-row prefill workloads, with a 120-second tuning budget. Comparisons include casts and other operations introduced by a split fusion.
+- `--depth high` considers more internal fusion boundaries and adds 512-row prefill workloads, with a 300-second total tuning budget, including the low pass. Both tuned modes retain the incumbent unless a measured replacement improves mean relative cost by at least 3%, with no sampled workload more than 3% slower. Unknown or timed-out alternatives preserve the incumbent. Both emit one plan, avoiding whole-request choices that optimize prefill at the expense of every decode step.
 - `--threads N` overrides the detected CPU thread count.
 - `--max-input-size N` sets the default maximum length of variable input dimensions, defaulting to 4096; explicit TDL `maximum_shape` bounds take precedence. Fixed dimensions and input values are unaffected; cache capacities remain defined in TDL.
 
@@ -22,7 +22,9 @@ The compiler detects the host backend and writes to `~/.trillim/1.0.0/compiled/<
 
 Each `NAME=PATH` supplies a TDL `Model("NAME")` declaration or a processing asset binding. Checkpoint paths must exist, be files or directories, and be accessible; these checks run during argument validation before tracing TDL or creating output.
 
-The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compiler computes scratch and cache requirements without a user-supplied memory budget. Benchmark preparation has an internal memory limit, and individual benchmark workers have a timeout.
+The default depth is `none`. TDL and checkpoint tensors supply dtypes. The compiler computes scratch and cache requirements without a user-supplied memory budget. Benchmark preparation has a 4 GiB memory limit, and individual benchmark workers have a timeout. Numerical comparisons against scalar references use dtype-aware error budgets, including the allowed INT8 activation arithmetic of packed projections. Tuning inherits the process's BLAS settings; use the same settings when compiling and running a tuned model.
+
+Tuning groups repeated regions whose available rewrites, native parameters, symbolic shapes and bounds, dtypes, packing, and tensor wiring agree. Shape comparison uses the equalities already proved by selected loop matches. A choice must pass fresh measurements and scalar validation on two instances when a group has multiple instances, using their actual weights. The selected rewrite then applies to the group. Only decisions are retained within that compilation; timings are discarded and nothing is reused across compilations. Distinct symbolic dependencies remain separate even when sampled dimensions happen to agree.
 
 FP8 safetensors projections using `F8_E4M3`, `weight_scale_inv` tensors and 128-by-128 weight blocks import as `fp8_e4m3`. Compiled weights retain the original E4M3FN codes and their exact scale values, stored in an FP32 block-scale grid. Scalar and ARM Linear kernels consume these packed weights with FP16, BF16 or FP32 activations and FP32 accumulation; FP16/BF16 output casts can be fused. This is FP8 weight storage with floating activation arithmetic. Other FP8 encodings and block layouts are rejected.
 
@@ -50,7 +52,7 @@ Normalization caches expressions and retains links to original tensors and opera
 - `kernels` contain library paths, symbols, parameter layouts, alignment, and a required capability bitmask with readable feature names.
 - `program` contains native calls, views, guards, branches, loops, reductions, and explicit cache accesses. Guards execute where their referenced values exist.
 - `expressions` stores shared shape calculations once; `{"expr": "e0"}` refers to a table entry. Each workload plan has its own expression table.
-- `workloads` contain measured samples, mean, median, variance, reference comparisons, and reasons for skipped measurements. `plans` may provide different kernel coverings for workload ranges; each plan supplies its buffer layout and program.
+- Optional `workload` identifies a variable input dimension. The format supports alternative `plans`, each with its own buffer layout and program; current compilation emits one plan. Measurements are not serialized.
 
 Shapes and parameters use integer expressions. `scalar` reads a tensor using its declared dtype; `dimension` reads a tensor's captured actual shape; `cache_length` reads current cache metadata. Other expressions combine these values using arithmetic or broadcasting rules. Every actual dimension must fit its declared maximum. Non-finite metadata floats use `{"float": "-inf"}`, `{"float": "inf"}`, or `{"float": "nan"}`; tensor constants remain binary.
 

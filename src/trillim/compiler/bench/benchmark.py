@@ -11,7 +11,7 @@ import numpy as np
 
 from ..artifacts.parameters import _pack, _requirements
 from ..dtype import _decode
-from ..kernels.build import _build_cpu
+from ..kernels.bindings import _DTYPE_IDS
 from ..kernels.native import _read_schema
 from .bench_dataclasses import (
     _BenchmarkFailure,
@@ -22,14 +22,14 @@ from .bench_dataclasses import (
     _NativeAllocation,
 )
 
-_MAX_BYTES = 512 * 1024**2
+_MAX_BYTES = 4 * 1024**3
 
 
 def _representative_tokens(level: _BenchmarkLevel) -> tuple[int, ...]:
     return {
         "none": (),
-        "low": (1, 8, 64),
-        "high": (1, 8, 64, 512, 4096, 32768),
+        "low": (1, 64),
+        "high": (1, 64, 512),
     }[level]
 
 
@@ -40,7 +40,7 @@ def _allocation(size: int, alignment: int = 64) -> _NativeAllocation:
 
 
 def _invoke(
-    invocation: _Invocation, harness: Path, max_bytes: int
+    invocation: _Invocation, harness: Path, max_bytes: int, repeats: int = 3
 ) -> tuple[tuple[float, ...], tuple[bytes, ...], int]:
     library = c.CDLL(str(invocation.library))
     schema = _read_schema(library, invocation.kernel)
@@ -117,7 +117,7 @@ def _invoke(
         c.POINTER(c.c_double),
     ]
     native.restype = c.c_int32
-    samples = (c.c_double * 3)()
+    samples = (c.c_double * repeats)()
     output_pointers = (c.c_void_p * len(outputs))(*(item.address for item in outputs))
     input_pointers = (c.c_void_p * len(inputs))(*(item.address for item in inputs))
     try:
@@ -128,7 +128,7 @@ def _invoke(
             input_pointers,
             scratch.address,
             packed.address,
-            3,
+            repeats,
             samples,
         )
     finally:
@@ -154,9 +154,8 @@ def _worker(
         correct = True
         maximum_error = 0.0
         normalized_error = 0.0
-        reference_samples: tuple[float, ...] = ()
         if golden is not None:
-            reference_samples, expected, _ = _invoke(golden, harness, max_bytes)
+            _, expected, _ = _invoke(golden, harness, max_bytes, repeats=1)
             for actual_bytes, expected_bytes, metadata in zip(
                 outputs, expected, invocation.outputs, strict=True
             ):
@@ -175,17 +174,31 @@ def _worker(
                     reference_values = reference.astype(np.float64)
                     finite_reference = reference_values[np.isfinite(reference_values)]
                     scale = max(
-                        1.0,
+                        float(np.finfo(np.float32).tiny),
                         float(np.sqrt(np.mean(finite_reference * finite_reference)))
                         if finite_reference.size
                         else 1.0,
                     )
+                    epsilon = {"bf16": 2.0**-7, "fp16": 2.0**-10}.get(
+                        metadata.dtype, 0.0
+                    )
+                    # Packed projections may round floating activations to INT8.
+                    packed = {
+                        _DTYPE_IDS[dtype]
+                        for dtype in ("grp_int4", "grp_int5", "dubgrp_int6", "grp_int8")
+                    }
+                    if any(
+                        name.endswith("dtype") and value in packed
+                        for name, value in invocation.parameters.items()
+                        if isinstance(value, int)
+                    ):
+                        epsilon = max(epsilon, 1 / 127)
                     correct = correct and bool(
                         np.allclose(
                             actual_values,
                             reference_values,
-                            rtol=2e-4,
-                            atol=2e-5 * scale,
+                            rtol=max(2e-4, 2 * epsilon),
+                            atol=max(2e-5, 2 * epsilon) * scale,
                             equal_nan=True,
                         )
                     )
@@ -213,7 +226,6 @@ def _worker(
             maximum_error,
             allocated,
             normalized_error,
-            reference_samples,
         )
     except (
         ValueError,
@@ -235,11 +247,11 @@ def _worker(
 def _benchmark(
     invocation: _Invocation,
     *,
+    harness: Path,
     golden: _Invocation | None = None,
     timeout: float = 10.0,
     max_bytes: int = _MAX_BYTES,
 ) -> _BenchmarkResult:
-    harness = _build_cpu()
     context = mp.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
     process = context.Process(

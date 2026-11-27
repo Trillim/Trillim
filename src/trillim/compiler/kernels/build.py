@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes as c
-import hashlib
 import os
 import platform
 import re
@@ -10,7 +9,8 @@ import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from ... import _VERSION_ROOT
@@ -32,47 +32,52 @@ _FLAGS = (
 )
 
 
-def _run(command: list[str]) -> None:
-    environment = None
-    if Path(command[0]).stem.lower() == "zig":
-        environment = os.environ.copy()
-        cache = _VERSION_ROOT / "kernels/.zig-cache"
-        environment.setdefault("ZIG_GLOBAL_CACHE_DIR", str(cache / "global"))
-        environment.setdefault("ZIG_LOCAL_CACHE_DIR", str(cache / "local"))
-    creation_flags = 0
-    if sys.platform == "win32":
-        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-    process = subprocess.Popen(
-        command,
-        start_new_session=sys.platform != "win32",
-        creationflags=creation_flags,
-        env=environment,
-    )
-    try:
-        status = process.wait()
-        if status:
-            raise subprocess.CalledProcessError(status, command)
-    except BaseException:
-        if process.poll() is None:
-            try:
-                if sys.platform == "win32":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    os.killpg(process.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
+def _run(command: list[str], *, workspace: Path | None = None) -> None:
+    with ExitStack() as temporary:
+        environment = None
+        if Path(command[0]).stem.lower() == "zig":
+            environment = os.environ.copy()
+            directory = workspace or Path(
+                temporary.enter_context(
+                    tempfile.TemporaryDirectory(prefix="trillim-build-")
+                )
+            )
+            environment["ZIG_GLOBAL_CACHE_DIR"] = str(directory / ".zig/global")
+            environment["ZIG_LOCAL_CACHE_DIR"] = str(directory / ".zig/local")
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        process = subprocess.Popen(
+            command,
+            start_new_session=sys.platform != "win32",
+            creationflags=creation_flags,
+            env=environment,
+        )
+        try:
+            status = process.wait()
+            if status:
+                raise subprocess.CalledProcessError(status, command)
+        except BaseException:
+            if process.poll() is None:
                 try:
                     if sys.platform == "win32":
-                        process.kill()
+                        process.send_signal(signal.CTRL_BREAK_EVENT)
                     else:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        os.killpg(process.pid, signal.SIGTERM)
                 except OSError:
                     pass
-                process.wait()
-        raise
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        if sys.platform == "win32":
+                            process.kill()
+                        else:
+                            os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    process.wait()
+            raise
 
 
 def _host_backend() -> _Backend:
@@ -178,7 +183,8 @@ def _build_backend(
                             str(compiled_source),
                             "-o",
                             str(assembly),
-                        ]
+                        ],
+                        workspace=temporary,
                     )
                     exported = {
                         name.decode("ascii")
@@ -207,7 +213,10 @@ def _build_backend(
                     if name in updated:
                         raise ValueError(f"duplicate kernel symbol: {name}")
                     output = temporary / "kernel.o"
-                    _run([*compiler, "-c", str(assembly), "-o", str(output)])
+                    _run(
+                        [*compiler, "-c", str(assembly), "-o", str(output)],
+                        workspace=temporary,
+                    )
                     output.replace(objects / f"{name}.o")
                     updated.add(name)
                     symbols.add(name)
@@ -222,7 +231,8 @@ def _build_backend(
                         *(str(objects / f"{name}.o") for name in index.symbols),
                         "-o",
                         str(backend_object),
-                    ]
+                    ],
+                    workspace=temporary,
                 )
                 library_path = temporary / "kernels.so"
                 _run(
@@ -233,13 +243,16 @@ def _build_backend(
                         "-lm",
                         "-o",
                         str(library_path),
-                    ]
+                    ],
+                    workspace=temporary,
                 )
                 library = c.CDLL(str(library_path))
                 for name in index.symbols:
                     _read_capabilities(library, name)
                     _read_schema(library, name)
                 (temporary / "index.json").write_text(index.model_dump_json() + "\n")
+                shutil.rmtree(temporary / ".zig", ignore_errors=True)
+                backend_object.unlink()
             except BaseException as error:
                 shutil.rmtree(temporary)
                 if not isinstance(
@@ -274,7 +287,8 @@ def _build_backend(
     return destination
 
 
-def _build_cpu() -> Path:
+@contextmanager
+def _build_cpu() -> Iterator[Path]:
     source = Path(__file__).resolve().parents[2] / "backends/cpu/native.cpp"
     flags = (
         *(flag for flag in _FLAGS if flag != "-std=c11"),
@@ -282,23 +296,11 @@ def _build_cpu() -> Path:
         *(("-pthread",) if sys.platform != "win32" else ()),
         "-dynamiclib" if sys.platform == "darwin" else "-shared",
     )
-    digest = hashlib.sha256(
-        repr((flags, sys.platform, platform.machine())).encode()
-        + Path(__file__).read_bytes()
-        + source.read_bytes()
-        + source.with_suffix(".h").read_bytes()
-        + (_KERNEL_ROOT / "common.h").read_bytes()
-    ).hexdigest()[:16]
-    destination = _VERSION_ROOT / "kernels/cpu" / digest / "native.so"
-    if destination.is_file():
-        return destination
-    destination.parent.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
-    for compiler in _compilers(cxx=True):
-        with tempfile.TemporaryDirectory(
-            prefix=".cpu-", dir=destination.parent
-        ) as name:
-            temporary = Path(name) / "native.so"
+    with tempfile.TemporaryDirectory(prefix="trillim-benchmark-") as name:
+        directory = Path(name)
+        output = directory / "native.so"
+        for compiler in _compilers(cxx=True):
             try:
                 _run(
                     [
@@ -308,16 +310,15 @@ def _build_cpu() -> Path:
                         str(_KERNEL_ROOT),
                         str(source),
                         "-o",
-                        str(temporary),
-                    ]
+                        str(output),
+                    ],
+                    workspace=directory,
                 )
-                library = c.CDLL(str(temporary))
-                for function in ("create", "destroy", "cancel", "run"):
-                    getattr(library, f"trillim_cpu_{function}")
-                temporary.replace(destination)
-                return destination
-            except (OSError, subprocess.CalledProcessError, AttributeError) as error:
+            except (OSError, subprocess.CalledProcessError) as error:
                 failures.append(f"{' '.join(compiler)}: {error}")
+                continue
+            yield output
+            return
     raise RuntimeError(
         "all C++ compilers failed for CPU benchmark helper:\n" + "\n".join(failures)
     )

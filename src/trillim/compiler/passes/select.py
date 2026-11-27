@@ -40,6 +40,21 @@ _INTRINSICS = (
 )
 
 
+def _specialization(candidate: _KernelMatch) -> tuple[int, int, int]:
+    kernel = candidate.kernel
+    native = kernel.backend != "scalar" and not kernel.name.startswith(
+        f"trillim_{kernel.backend}_scalar_"
+    )
+    varying_dtypes = sum(
+        field.name.endswith("dtype") for field in kernel.parameter_schema.fields
+    )
+    return (
+        int(native),
+        (kernel.capabilities & 0xFFFFFFFF).bit_count(),
+        -varying_dtypes,
+    )
+
+
 def _anchors(region: _Region) -> Iterator[_Operator]:
     for operator in reversed(tuple(_ordered_operators(region))):
         yield operator
@@ -74,8 +89,7 @@ def _choices(
         key=lambda item: (
             item[1] / len(item[0].covered),
             -len(item[0].covered),
-            -item[0].kernel.capabilities.bit_count(),
-            item[0].kernel.name,
+            tuple(-rank for rank in _specialization(item[0])),
         ),
     )
 
@@ -143,7 +157,6 @@ def _select(
             key=lambda state: (
                 state.cost,
                 -len(state.covered),
-                tuple(candidate.kernel.name for candidate in state.calls.values()),
             ),
         )[:4]
     return min((best, *states), key=lambda state: (state.cost, len(state.calls)))

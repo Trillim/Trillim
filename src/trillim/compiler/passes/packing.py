@@ -41,6 +41,8 @@ def _set_packings(
     selection: _Selection,
     weights: _WeightIndex,
     costs: _CostModel | None = None,
+    *,
+    fast: bool = True,
 ) -> _Selection:
     required: dict[Tensor, set[str]] = {}
     for call in selection.calls.values():
@@ -72,7 +74,7 @@ def _set_packings(
                 for operator, calls in matches.candidates.items()
             },
         )
-        selection = _select(graph, canonical, costs=costs, fast=True)
+        selection = _select(graph, canonical, costs=costs, fast=fast)
         required.clear()
     for tensor, binding in weights.bindings.items():
         packing = next(iter(required.get(tensor, ("canonical",))))

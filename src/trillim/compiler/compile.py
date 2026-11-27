@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .. import _VERSION_ROOT
-from .artifacts.artifact_pydantic_models import _ExecutableManifest, _WorkloadPlan
+from .artifacts.artifact_pydantic_models import _ExecutableManifest
 from .bench.tune import _tune
 from .compiler_pydantic_models import _CompileRequest
 from .kernels.catalog import _discover
@@ -75,9 +75,8 @@ def _compile_model(
             else (request.backend,)
         )
         kernels = _discover(backends)
-        all_matches = _match(
-            graph, kernels, inference, algebraic=request.depth != "none"
-        )
+        all_matches = _match(graph, kernels, inference, algebraic=False)
+        structural = all_matches
         matches = replace(
             all_matches,
             candidates={
@@ -94,21 +93,11 @@ def _compile_model(
             matches,
             fast=True,
         )
-        if request.depth == "low":
-            all_matches = replace(
-                all_matches,
-                candidates={
-                    operator: tuple(
-                        candidate
-                        for candidate in candidates
-                        if candidate.covered == selection.calls[operator].covered
-                    )
-                    for operator, candidates in all_matches.candidates.items()
-                    if operator in selection.calls
-                },
-            )
+        if request.depth == "high":
+            report("Exploring algebraic fusion alternatives")
+            all_matches = _match(graph, kernels, inference, algebraic=True)
             matches = replace(
-                matches,
+                all_matches,
                 candidates={
                     operator: tuple(
                         candidate
@@ -141,24 +130,25 @@ def _compile_model(
         if request.depth != "none":
             report("Benchmarking representative kernel workloads")
         tuning = _tune(
+            graph,
             all_matches,
             inference,
             weights,
             manifest,
             temporary / "weights.bin",
             request,
+            selection,
+            structural,
         )
-        if tuning.costs:
-            selection = _select(
-                graph,
-                matches,
-                costs=tuning.costs,
-                fast=request.depth != "high",
+        selection = tuning.selection
+        if request.depth != "none":
+            report(
+                f"Measured {tuning.measured} fresh kernel workloads; "
+                f"accepted {tuning.accepted} region improvements "
+                f"({tuning.propagated} propagated to equivalent regions)"
             )
         report("Scheduling selected kernels")
-        selection = _set_packings(
-            graph, matches, selection, weights, tuning.costs or None
-        )
+        selection = _set_packings(graph, matches, selection, weights)
         selected_inference = _selected_loop_inference(inference, selection)
         _schedule(graph, selected_inference, selection)
         report("Allocating intermediate and cache memory")
@@ -190,63 +180,8 @@ def _compile_model(
             ),
             None,
         )
-        variants: list[_WorkloadPlan] = []
-        baseline = tuple(
-            (id(operator), call.kernel.name)
-            for operator, call in selection.calls.items()
-        )
-        all_kernels = dict(executable.kernels)
-        arena_size = executable.arena_size
-        previous = 0
-        for point, costs in tuning.per_workload.items():
-            chosen = _select(
-                graph,
-                matches,
-                costs=costs,
-                fast=request.depth != "high",
-            )
-            chosen = _set_packings(graph, matches, chosen, weights, costs)
-            fingerprint = tuple(
-                (id(operator), call.kernel.name)
-                for operator, call in chosen.calls.items()
-            )
-            if costs and workload is not None and fingerprint != baseline:
-                chosen_inference = _selected_loop_inference(inference, chosen)
-                _schedule(graph, chosen_inference, chosen)
-                variant_layout = _allocate(
-                    graph,
-                    chosen_inference,
-                    chosen,
-                    weights,
-                    manifest,
-                    transfer_kernel=layout.transfer_kernel,
-                )
-                variant = _emit(graph, variant_layout, chosen, request, temporary)
-                dump = variant.model_dump(mode="json")
-                variants.append(
-                    _WorkloadPlan.model_validate(
-                        {
-                            "minimum_tokens": previous + 1,
-                            "maximum_tokens": point,
-                            "buffers": dump["buffers"],
-                            "program": dump["program"],
-                            "expressions": dump["expressions"],
-                            "arena_size": variant.arena_size,
-                        }
-                    )
-                )
-                all_kernels.update(variant.kernels)
-                arena_size = max(arena_size, variant.arena_size)
-            previous = point
         executable = executable.model_copy(
-            update={
-                "processing": processing,
-                "workloads": tuning.workloads,
-                "workload": workload,
-                "plans": variants,
-                "kernels": all_kernels,
-                "arena_size": arena_size,
-            }
+            update={"processing": processing, "workload": workload}
         )
         (temporary / "executable.json").write_text(executable.model_dump_json() + "\n")
         _verify(temporary)

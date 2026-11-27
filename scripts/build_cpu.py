@@ -39,6 +39,14 @@ def main() -> None:
         try:
             with TemporaryDirectory(prefix=".build-", dir=output.parent) as temporary:
                 executable = Path(temporary) / name
+                environment = os.environ.copy()
+                if Path(compiler[0]).stem.lower() == "zig":
+                    environment["ZIG_GLOBAL_CACHE_DIR"] = str(
+                        Path(temporary) / ".zig/global"
+                    )
+                    environment["ZIG_LOCAL_CACHE_DIR"] = str(
+                        Path(temporary) / ".zig/local"
+                    )
                 subprocess.run(
                     [
                         *compiler,
@@ -51,6 +59,7 @@ def main() -> None:
                         str(executable),
                     ],
                     check=True,
+                    env=environment,
                 )
                 executable.replace(output)
         except (subprocess.CalledProcessError, OSError) as error:
