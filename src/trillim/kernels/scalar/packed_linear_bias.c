@@ -241,6 +241,13 @@ static bool packed(uint32_t dtype) {
     return dtype >= TRILLIM_ROW_INT8 && dtype <= TRILLIM_MXFP4;
 }
 
+static bool quantized_activation(const Parameters *p) {
+    return p->output_dtype == TRILLIM_FP32 ||
+        (p->width >= 256 && p->width % 32 == 0 &&
+         p->weight_dtype >= TRILLIM_GRP_INT8 && p->weight_dtype <= TRILLIM_DUBGRP_INT6 &&
+         (p->weight_dtype != TRILLIM_GRP_INT5 || p->tokens == 1));
+}
+
 static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t *outputs, size_t *scratch) {
     const Parameters *p = parameters;
     *scratch = outputs[0] = 0;
@@ -265,7 +272,7 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     if (!trillim_packed_payload_size(1, p->outputs, p->bias_dtype, inputs + 2)) {
         return TRILLIM_ERROR;
     }
-    if (p->output_dtype == TRILLIM_FP32) {
+    if (quantized_activation(p)) {
         *scratch = packed_activation_space(p->weight_dtype, p->tokens, p->width, p->outputs);
     }
     return TRILLIM_OK;
@@ -343,7 +350,7 @@ TRILLIM_KERNEL TrillimStatus trillim_scalar_packed_linear_bias(
     size_t group = packed_activation_group(p->weight_dtype);
     size_t groups = 0;
     size_t capacity = p->tokens;
-    if (p->output_dtype == TRILLIM_FP32 && scratch != NULL && group != 0 &&
+    if (quantized_activation(p) && scratch != NULL && group != 0 &&
         p->width >= group && p->width <= 65536 && p->width % group == 0 && p->outputs >= 16 &&
         fegetround() == FE_TONEAREST) {
         groups = p->width / group;

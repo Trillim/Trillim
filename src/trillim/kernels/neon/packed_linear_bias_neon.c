@@ -3234,6 +3234,11 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
     if (!trillim_packed_payload_size(1, p->outputs, p->bias_dtype, inputs + 2)) {
         return TRILLIM_ERROR;
     }
+    if (p->output_dtype != TRILLIM_FP32 && p->width >= 256 && p->width % 32 == 0 &&
+        p->weight_dtype >= TRILLIM_GRP_INT8 && p->weight_dtype <= TRILLIM_DUBGRP_INT6 &&
+        !trillim_packed_payload_size(p->tokens, p->outputs, TRILLIM_FP32, scratch)) {
+        return TRILLIM_ERROR;
+    }
     return TRILLIM_OK;
 }
 
@@ -3315,8 +3320,7 @@ enum { BIAS_TILE = 256 };
 
 static bool use_grouped_projection(const Task *task) {
     const Parameters *p = task->p;
-    if (p->output_dtype != TRILLIM_FP32 ||
-        (uintptr_t)task->output % _Alignof(float) != 0 ||
+    if ((p->output_dtype == TRILLIM_FP32 && (uintptr_t)task->output % _Alignof(float) != 0) ||
         p->width < 256 || p->width % 32 != 0 ||
         p->weight_dtype < TRILLIM_GRP_INT8 || p->weight_dtype > TRILLIM_DUBGRP_INT6 ||
         task->context->thread_pool->worker_count == 0) {
@@ -3327,18 +3331,37 @@ static bool use_grouped_projection(const Task *task) {
     return fpcr == 0;
 }
 
-static TrillimStatus project_then_add_bias(const Task *task) {
+static inline void store_bias4(void *output, size_t index, uint32_t dtype, float32x4_t value) {
+    if (dtype == TRILLIM_FP32) {
+        memcpy((uint8_t *)output + index * sizeof(float), &value, sizeof(value));
+    } else if (dtype == TRILLIM_BF16) {
+        const uint32x4_t bits = vreinterpretq_u32_f32(value);
+        const uint32x4_t upper = vshrq_n_u32(bits, 16);
+        const uint32x4_t bias = vaddq_u32(vdupq_n_u32(0x7fff), vandq_u32(upper, vdupq_n_u32(1)));
+        const uint32x4_t nan = vcgtq_u32(vandq_u32(bits, vdupq_n_u32(0x7fffffff)), vdupq_n_u32(0x7f800000));
+        const uint16x4_t result = vmovn_u32(vbslq_u32(nan, vorrq_u32(upper, vdupq_n_u32(64)),
+            vshrq_n_u32(vaddq_u32(bits, bias), 16)));
+        memcpy((uint8_t *)output + index * sizeof(uint16_t), &result, sizeof(result));
+    } else {
+        float values[4];
+        vst1q_f32(values, value);
+        for (size_t lane = 0; lane < 4; ++lane) {
+            trillim_store(output, index + lane, dtype, (TrillimValue){.f = values[lane]});
+        }
+    }
+}
+
+static TrillimStatus project_then_add_bias(const Task *task, float *output) {
     const Parameters *p = task->p;
     /* Quantized Matmul and broadcast Add both produce FP32. */
     const LinearParameters parameters = {
         .tokens = p->tokens, .width = p->width, .outputs = p->outputs,
         .input_dtype = p->input_dtype, .weight_dtype = p->weight_dtype, .output_dtype = TRILLIM_FP32,
     };
-    TrillimStatus status = run_linear(task->output, task->inputs[0], task->inputs[1], &parameters, task->context);
+    TrillimStatus status = run_linear(output, task->inputs[0], task->inputs[1], &parameters, task->context);
     if (status != TRILLIM_OK) {
         return status;
     }
-    float *output = task->output;
     const void *bias = task->inputs[2];
     for (size_t row = 0; row < p->tokens; ++row) {
         size_t offset = row * p->outputs;
@@ -3350,10 +3373,11 @@ static TrillimStatus project_then_add_bias(const Task *task) {
             for (; end - column >= 4; column += 4) {
                 float *destination = output + offset + column;
                 float32x4_t value = vaddq_f32(vld1q_f32(destination), trillim_neon_load4(bias, column, p->bias_dtype));
-                vst1q_f32(destination, value);
+                store_bias4(task->output, offset + column, p->output_dtype, value);
             }
             for (; column < end; ++column) {
-                output[offset + column] += trillim_load(bias, column, p->bias_dtype).f;
+                const float value = output[offset + column] + trillim_load(bias, column, p->bias_dtype).f;
+                trillim_store(task->output, offset + column, p->output_dtype, (TrillimValue){.f = value});
             }
         }
     }
@@ -3374,10 +3398,9 @@ TRILLIM_KERNEL TrillimStatus trillim_neon_packed_linear_bias(
         return status;
     }
     const Parameters *p = parameters;
-    (void)scratch;
     Task task = {outputs[0], inputs, p, context};
     if (use_grouped_projection(&task)) {
-        return project_then_add_bias(&task);
+        return project_then_add_bias(&task, p->output_dtype == TRILLIM_FP32 ? outputs[0] : scratch);
     }
     size_t count = p->tokens * p->outputs;
     size_t tiles = count / TILE_SIZE + (count % TILE_SIZE != 0);
@@ -3437,7 +3460,7 @@ TRILLIM_KERNEL const TrillimParameterSchema *trillim_neon_packed_linear_bias_par
     static const size_t inputs[] = {1, 1, 1}, outputs[] = {1};
     static const TrillimParameterSchema schema = {
         sizeof(Parameters), TRILLIM_ALIGNOF(Parameters), sizeof(fields) / sizeof(fields[0]), fields,
-        3, 1, requirements, NULL, inputs, outputs, 1
+        3, 1, requirements, NULL, inputs, outputs, _Alignof(float)
     };
     return &schema;
 }
