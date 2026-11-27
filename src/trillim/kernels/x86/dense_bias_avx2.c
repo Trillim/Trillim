@@ -38,6 +38,13 @@ static bool matrix_span(size_t base, size_t rows, size_t columns, size_t row_str
     return !col_stride || columns - 1 <= (capacity - 1 - base) / col_stride;
 }
 
+enum { PANEL_COLUMNS = 16, PANEL_DEPTH = 512, PANEL_LANES = 32 };
+
+static size_t panel_lanes(size_t columns) {
+    size_t blocks = columns / PANEL_COLUMNS + (columns % PANEL_COLUMNS != 0);
+    return blocks < PANEL_LANES ? blocks : PANEL_LANES;
+}
+
 static bool packed_fp32(const Parameters *p) {
     return p->batches == 1 && p->rank == 0 && p->m >= 16 && p->n >= 16 && p->k >= 32 &&
         p->a_col_stride == 1 && p->b_row_stride == 1 &&
@@ -105,10 +112,8 @@ static TrillimStatus requirements(const void *parameters, size_t *inputs, size_t
 #endif
     outputs[0] = p->batches * p->m * p->n * trillim_itemsize(p->out_dtype);
     if (packed_fp32(p)) {
-        if (p->n > SIZE_MAX - 15 || p->k > SIZE_MAX / sizeof(float) / ((p->n + 15) / 16) / 16) {
-            return TRILLIM_ERROR;
-        }
-        *scratch = ((p->n + 15) / 16) * p->k * 16 * sizeof(float);
+        size_t depth = p->k < PANEL_DEPTH ? p->k : PANEL_DEPTH;
+        *scratch = panel_lanes(p->n) * depth * PANEL_COLUMNS * sizeof(float);
     }
     return TRILLIM_OK;
 }
@@ -187,6 +192,52 @@ DENSE_FAST static inline __attribute__((always_inline)) __m256 fast_load8(const 
         return _mm256_cvtph_ps(bits);
     }
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+}
+
+__attribute__((target("avx2,fma")))
+static TrillimStatus bf16_decode(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t tiles = p->n / 32 + (p->n % 32 != 0);
+    size_t batch = tile / tiles;
+    size_t first = tile % tiles * 32;
+    size_t end = p->n - first < 32 ? p->n : first + 32;
+    size_t a_base = trillim_offset(batch, p->rank, p->batch_shape, p->a_batch_strides);
+    size_t b_base = trillim_offset(batch, p->rank, p->batch_shape, p->b_batch_strides);
+    for (size_t column = first; column < end;) {
+        size_t count = end - column >= 8 ? 8 : 1;
+        __m256 sums[8] = {0};
+        size_t k = 0;
+        for (; p->k - k >= 8; k += 8) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            __m256 x = load8(task->input, a_base + k, TRILLIM_BF16, false);
+            size_t weight = b_base + column * p->b_col_stride + k;
+            if (count == 8) {
+                for (size_t lane = 0; lane < 8; ++lane) {
+                    __m256 w = load8(task->weight, weight + lane * p->b_col_stride, TRILLIM_BF16, false);
+                    sums[lane] = _mm256_fmadd_ps(x, w, sums[lane]);
+                }
+            } else {
+                __m256 w = load8(task->weight, weight, TRILLIM_BF16, false);
+                sums[0] = _mm256_fmadd_ps(x, w, sums[0]);
+            }
+        }
+        for (size_t lane = 0; lane < count; ++lane) {
+            size_t position = b_base + (column + lane) * p->b_col_stride;
+            float value = sum8(sums[lane]);
+            for (size_t depth = k; depth < p->k; ++depth) {
+                float x = trillim_load(task->input, a_base + depth, TRILLIM_BF16).f;
+                float w = trillim_load(task->weight, position + depth, TRILLIM_BF16).f;
+                value += x * w;
+            }
+            store(task, batch * p->n + column + lane, column + lane, value, 0);
+        }
+        column += count;
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
 DENSE_FAST static TrillimStatus fast_dense_project(void *opaque, size_t tile, size_t worker) {
@@ -460,48 +511,38 @@ VECTOR static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
 
-static TrillimStatus pack_columns(void *opaque, size_t block, size_t worker) {
-    (void)worker;
-    const Task *task = opaque;
+__attribute__((target("avx2,fma")))
+static void packed_project(const Task *task, const float *weights, size_t first, size_t row,
+                           size_t begin, size_t depth) {
     const Parameters *p = task->p;
-    size_t first = block * 16;
-    size_t count = p->n - first < 16 ? p->n - first : 16;
-    float *target = task->packed + block * p->k * 16;
-    const float *weight = task->weight;
-    for (size_t k = 0; k < p->k; ++k) {
-        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
-            return TRILLIM_CANCELLED;
-        }
-        for (size_t column = 0; column < 16; ++column) {
-            target[k * 16 + column] = column < count ? weight[(first + column) * p->b_col_stride + k] : 0;
-        }
-    }
-    return TRILLIM_OK;
-}
-
-__attribute__((target("avx2,fma"))) static TrillimStatus packed_project(void *opaque, size_t tile, size_t worker) {
-    (void)worker;
-    const Task *task = opaque;
-    const Parameters *p = task->p;
-    size_t blocks = (p->n + 15) / 16;
-    size_t first = tile % blocks * 16;
-    size_t row = tile / blocks * 6;
     size_t rows = p->m - row < 6 ? p->m - row : 6;
-    const float *input = (const float *)task->input + row * p->a_row_stride;
+    const float *input = (const float *)task->input + row * p->a_row_stride + begin;
     const float *a0 = input;
     const float *a1 = input + (rows > 1 ? p->a_row_stride : 0);
     const float *a2 = input + (rows > 2 ? 2 * p->a_row_stride : 0);
     const float *a3 = input + (rows > 3 ? 3 * p->a_row_stride : 0);
     const float *a4 = input + (rows > 4 ? 4 * p->a_row_stride : 0);
     const float *a5 = input + (rows > 5 ? 5 * p->a_row_stride : 0);
-    const float *weights = task->packed + (tile % blocks) * p->k * 16;
-    __m256 s00 = _mm256_setzero_ps(), s01 = s00, s10 = s00, s11 = s00;
-    __m256 s20 = s00, s21 = s00, s30 = s00, s31 = s00;
-    __m256 s40 = s00, s41 = s00, s50 = s00, s51 = s00;
-    for (size_t k = 0; k < p->k; ++k) {
-        if ((k & 255) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
-            return TRILLIM_CANCELLED;
+    size_t count = p->n - first < PANEL_COLUMNS ? p->n - first : PANEL_COLUMNS;
+    __m256 sums[6][2] = {0};
+    if (begin != 0) {
+        for (size_t r = 0; r < rows; ++r) {
+            const float *output = (const float *)task->output + (row + r) * p->n + first;
+            if (count == PANEL_COLUMNS) {
+                sums[r][0] = _mm256_loadu_ps(output);
+                sums[r][1] = _mm256_loadu_ps(output + 8);
+            } else {
+                float tail[PANEL_COLUMNS] = {0};
+                memcpy(tail, output, count * sizeof(float));
+                sums[r][0] = _mm256_loadu_ps(tail);
+                sums[r][1] = _mm256_loadu_ps(tail + 8);
+            }
         }
+    }
+    __m256 s00 = sums[0][0], s01 = sums[0][1], s10 = sums[1][0], s11 = sums[1][1];
+    __m256 s20 = sums[2][0], s21 = sums[2][1], s30 = sums[3][0], s31 = sums[3][1];
+    __m256 s40 = sums[4][0], s41 = sums[4][1], s50 = sums[5][0], s51 = sums[5][1];
+    for (size_t k = 0; k < depth; ++k) {
         __m256 w0 = _mm256_loadu_ps(weights + k * 16);
         __m256 w1 = _mm256_loadu_ps(weights + k * 16 + 8);
         __m256 x = _mm256_broadcast_ss(a0 + k);
@@ -523,14 +564,22 @@ __attribute__((target("avx2,fma"))) static TrillimStatus packed_project(void *op
         s50 = _mm256_fmadd_ps(x, w0, s50);
         s51 = _mm256_fmadd_ps(x, w1, s51);
     }
-    size_t count = p->n - first < 16 ? p->n - first : 16;
-    float bias[16] = {0};
-    memcpy(bias, (const float *)task->third + first, count * sizeof(float));
-    __m256 b0 = _mm256_loadu_ps(bias), b1 = _mm256_loadu_ps(bias + 8);
-    __m256 sums[6][2] = {{s00,s01},{s10,s11},{s20,s21},{s30,s31},{s40,s41},{s50,s51}};
+    bool last = begin + depth == p->k;
+    __m256 bias_low = _mm256_setzero_ps(), bias_high = bias_low;
+    if (last) {
+        float bias[PANEL_COLUMNS] = {0};
+        memcpy(bias, (const float *)task->third + first, count * sizeof(float));
+        bias_low = _mm256_loadu_ps(bias);
+        bias_high = _mm256_loadu_ps(bias + 8);
+    }
+    __m256 results[6][2] = {{s00, s01}, {s10, s11}, {s20, s21}, {s30, s31}, {s40, s41}, {s50, s51}};
     for (size_t r = 0; r < rows; ++r) {
         float *output = (float *)task->output + (row + r) * p->n + first;
-        __m256 low = _mm256_add_ps(sums[r][0], b0), high = _mm256_add_ps(sums[r][1], b1);
+        __m256 low = results[r][0], high = results[r][1];
+        if (last) {
+            low = _mm256_add_ps(low, bias_low);
+            high = _mm256_add_ps(high, bias_high);
+        }
         if (count == 16) {
             _mm256_storeu_ps(output, low);
             _mm256_storeu_ps(output + 8, high);
@@ -539,6 +588,40 @@ __attribute__((target("avx2,fma"))) static TrillimStatus packed_project(void *op
             _mm256_storeu_ps(tail, low);
             _mm256_storeu_ps(tail + 8, high);
             memcpy(output, tail, count * sizeof(float));
+        }
+    }
+}
+
+static TrillimStatus packed_panels(void *opaque, size_t lane, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Parameters *p = task->p;
+    size_t depth_limit = p->k < PANEL_DEPTH ? p->k : PANEL_DEPTH;
+    size_t lanes = panel_lanes(p->n);
+    size_t blocks = p->n / PANEL_COLUMNS + (p->n % PANEL_COLUMNS != 0);
+    float *panel = task->packed + lane * depth_limit * PANEL_COLUMNS;
+    const float *weight = task->weight;
+    for (size_t block = lane; block < blocks; block += lanes) {
+        size_t first = block * PANEL_COLUMNS;
+        size_t columns = p->n - first < PANEL_COLUMNS ? p->n - first : PANEL_COLUMNS;
+        for (size_t begin = 0; begin < p->k;) {
+            if (task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            size_t depth = p->k - begin < depth_limit ? p->k - begin : depth_limit;
+            for (size_t k = 0; k < depth; ++k) {
+                for (size_t column = 0; column < PANEL_COLUMNS; ++column) {
+                    panel[k * PANEL_COLUMNS + column] = column < columns ?
+                        weight[(first + column) * p->b_col_stride + begin + k] : 0.0f;
+                }
+            }
+            for (size_t row = 0; row < p->m; row += 6) {
+                if (task->context->is_cancelled(task->context->cancellation_context)) {
+                    return TRILLIM_CANCELLED;
+                }
+                packed_project(task, panel, first, row, begin, depth);
+            }
+            begin += depth;
         }
     }
     return TRILLIM_OK;
@@ -558,13 +641,13 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_dense_bias(void *const *outputs, const 
     size_t count = p->batches * (p->m / rows + (p->m % rows != 0)) * (p->n / 32 + (p->n % 32 != 0));
     unsigned features = optional_features();
     Task task = {outputs[0], inputs[0], inputs[1], inputs[2], p, context, (features & (1u << 29)) != 0, (features & (1u << 12)) != 0, scratch};
+    if (task.fma && p->m == 1 && p->n >= 8 && p->k >= 64 &&
+        p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 &&
+        p->a_col_stride == 1 && p->b_row_stride == 1 && p->b_col_stride == p->k) {
+        return context->thread_pool->run(context->thread_pool->context, count, bf16_decode, &task);
+    }
     if (task.fma && packed_fp32(p)) {
-        size_t blocks = (p->n + 15) / 16;
-        status = context->thread_pool->run(context->thread_pool->context, blocks, pack_columns, &task);
-        if (status != TRILLIM_OK) {
-            return status;
-        }
-        return context->thread_pool->run(context->thread_pool->context, ((p->m + 5) / 6) * blocks, packed_project, &task);
+        return context->thread_pool->run(context->thread_pool->context, panel_lanes(p->n), packed_panels, &task);
     }
     return context->thread_pool->run(context->thread_pool->context, count, project, &task);
 }

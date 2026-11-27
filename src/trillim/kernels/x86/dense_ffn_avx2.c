@@ -298,6 +298,57 @@ DENSE_FAST static TrillimStatus fast_glu_project(void *opaque, size_t tile, size
     }
     return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
 }
+DENSE_FAST static TrillimStatus fast_glu_prefill(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const Projection *p = task->p;
+    size_t column_tiles = p->n / 32 + (p->n % 32 != 0);
+    size_t row = tile / column_tiles * 4;
+    size_t rows = p->m - row < 4 ? p->m - row : 4;
+    size_t first = tile % column_tiles * 32, end = p->n - first < 32 ? p->n : first + 32;
+    size_t a_base = row * p->a_row_stride;
+    size_t a1 = rows > 1 ? a_base + p->a_row_stride : a_base;
+    size_t a2 = rows > 2 ? a_base + 2 * p->a_row_stride : a_base;
+    size_t a3 = rows > 3 ? a_base + 3 * p->a_row_stride : a_base;
+    for (size_t column = first; column < end; ++column) {
+        __m256 gate0 = _mm256_setzero_ps(), gate1 = gate0, gate2 = gate0, gate3 = gate0;
+        __m256 up0 = gate0, up1 = gate0, up2 = gate0, up3 = gate0;
+        size_t weight = column * p->b_col_stride;
+        size_t k = 0;
+        for (; p->k - k >= 8; k += 8) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            __m256 gate = fast_load8(task->weight, weight + k, p->b_dtype);
+            __m256 up = fast_load8(task->third, weight + k, p->b_dtype);
+            __m256 x = fast_load8(task->input, a_base + k, p->a_dtype);
+            gate0 = _mm256_fmadd_ps(x, gate, gate0);
+            up0 = _mm256_fmadd_ps(x, up, up0);
+            x = fast_load8(task->input, a1 + k, p->a_dtype);
+            gate1 = _mm256_fmadd_ps(x, gate, gate1);
+            up1 = _mm256_fmadd_ps(x, up, up1);
+            x = fast_load8(task->input, a2 + k, p->a_dtype);
+            gate2 = _mm256_fmadd_ps(x, gate, gate2);
+            up2 = _mm256_fmadd_ps(x, up, up2);
+            x = fast_load8(task->input, a3 + k, p->a_dtype);
+            gate3 = _mm256_fmadd_ps(x, gate, gate3);
+            up3 = _mm256_fmadd_ps(x, up, up3);
+        }
+        const __m256 gates[] = {gate0, gate1, gate2, gate3}, ups[] = {up0, up1, up2, up3};
+        for (size_t r = 0; r < rows; ++r) {
+            float gate = sum8(gates[r]), up = sum8(ups[r]);
+            size_t input = a_base + r * p->a_row_stride;
+            for (size_t depth = k; depth < p->k; ++depth) {
+                float x = trillim_load(task->input, input + depth, p->a_dtype).f;
+                gate += x * trillim_load(task->weight, weight + depth, p->b_dtype).f;
+                up += x * trillim_load(task->third, weight + depth, p->b_dtype).f;
+            }
+            store(task, (row + r) * p->n + column, column, gate, up);
+        }
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
 #endif
 
 VECTOR static TrillimStatus project_columns(const Task *task, size_t a_base, size_t b_base, size_t batch, size_t first_row, size_t rows, size_t first, size_t end) {
@@ -517,7 +568,12 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_dense_ffn(void *const *outputs, const v
     Task gate_task = {scratch, inputs[0], inputs[1], inputs[2], &gate, context, f16c, fma};
     size_t row_tiles = p->rows / 2 + (p->rows % 2 != 0);
     size_t column_tiles = p->hidden_width / 32 + (p->hidden_width % 32 != 0);
-    status = context->thread_pool->run(context->thread_pool->context, row_tiles * column_tiles, project, &gate_task);
+    TrillimTask gate_project = project;
+    if (fma && f16c && p->rows >= 4) {
+        row_tiles = p->rows / 4 + (p->rows % 4 != 0);
+        gate_project = fast_glu_prefill;
+    }
+    status = context->thread_pool->run(context->thread_pool->context, row_tiles * column_tiles, gate_project, &gate_task);
     if (status != TRILLIM_OK) {
         return status;
     }

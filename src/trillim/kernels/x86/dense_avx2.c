@@ -2,6 +2,7 @@
 #include <cpuid.h>
 #include <immintrin.h>
 #define FAST __attribute__((target("avx2,fma,f16c")))
+#define WIDE __attribute__((target("avx2,fma")))
 typedef struct {
     size_t batches;
     size_t m;
@@ -61,7 +62,7 @@ FAST static inline __attribute__((always_inline)) __m256 load8(const void *data,
     if (dtype == TRILLIM_FP16) return _mm256_cvtph_ps(v);
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16));
 }
-FAST static float sum8(__m256 v) {
+WIDE static float sum8(__m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(_mm_hadd_ps(s, s));
@@ -70,6 +71,51 @@ static void store(const Task *t, size_t row, size_t col, float x) {
     TrillimValue value = {.f = x};
     trillim_store(t->output, row * t->p->n + col, t->p->out_dtype, value);
 }
+WIDE static inline __m256 load_bf16(const uint16_t *data) {
+    __m128i bits = _mm_loadu_si128((const __m128i *)data);
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16));
+}
+
+WIDE static TrillimStatus decode_bf16(void *opaque, size_t tile, size_t worker) {
+    (void)worker;
+    const Task *task = opaque;
+    const TrillimMatmulParameters *p = task->p;
+    size_t first = tile * 64;
+    size_t end = p->n - first < 64 ? p->n : first + 64;
+    const uint16_t *input = task->input, *weights = task->weight;
+    for (size_t column = first; column < end;) {
+        size_t count = end - column >= 8 ? 8 : 1;
+        __m256 sums[8] = {0};
+        size_t k = 0;
+        for (; p->k - k >= 8; k += 8) {
+            if ((k & 1023) == 0 && task->context->is_cancelled(task->context->cancellation_context)) {
+                return TRILLIM_CANCELLED;
+            }
+            __m256 x = load_bf16(input + k);
+            const uint16_t *weight = weights + column * p->b_col_stride + k;
+            if (count == 8) {
+                for (size_t lane = 0; lane < 8; ++lane) {
+                    sums[lane] = _mm256_fmadd_ps(x, load_bf16(weight + lane * p->b_col_stride), sums[lane]);
+                }
+            } else {
+                sums[0] = _mm256_fmadd_ps(x, load_bf16(weight), sums[0]);
+            }
+        }
+        for (size_t lane = 0; lane < count; ++lane) {
+            size_t weight = (column + lane) * p->b_col_stride;
+            float value = sum8(sums[lane]);
+            for (size_t depth = k; depth < p->k; ++depth) {
+                float x = trillim_load(input, depth, TRILLIM_BF16).f;
+                float w = trillim_load(weights, weight + depth, TRILLIM_BF16).f;
+                value += x * w;
+            }
+            store(task, 0, column + lane, value);
+        }
+        column += count;
+    }
+    return task->context->is_cancelled(task->context->cancellation_context) ? TRILLIM_CANCELLED : TRILLIM_OK;
+}
+
 FAST static TrillimStatus project(void *opaque, size_t tile, size_t worker) {
     (void)worker;
     const Task *t = opaque;
@@ -145,7 +191,13 @@ TRILLIM_KERNEL TrillimStatus trillim_x86_dense_avx2(void *const *outputs, const 
     // F16C is optional; the portable path keeps the advertised requirements
     // sufficient.
     unsigned eax, ebx, ecx, edx;
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) && (ecx & (1u << 29))) {
+    bool features = __get_cpuid(1, &eax, &ebx, &ecx, &edx);
+    if (features && p->m == 1 && p->n >= 8 && p->k >= 64 &&
+        p->a_dtype == TRILLIM_BF16 && p->b_dtype == TRILLIM_BF16 && p->b_col_stride == p->k) {
+        size_t tiles = p->n / 64 + (p->n % 64 != 0);
+        return context->thread_pool->run(context->thread_pool->context, tiles, decode_bf16, &task);
+    }
+    if (features && (ecx & (1u << 29))) {
         size_t rows = p->m / 4 + (p->m % 4 != 0), tiles = p->n / 64 + (p->n % 64 != 0);
         return context->thread_pool->run(context->thread_pool->context, rows * tiles, project, &task);
     }
