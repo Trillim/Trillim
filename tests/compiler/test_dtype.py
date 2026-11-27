@@ -6,7 +6,7 @@ from typing import get_args
 
 import numpy as np
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from trillim.compiler.dtype import _decode, _encode, _import_mxfp4
@@ -52,7 +52,11 @@ def reference_row(values: list[float], dtype: str) -> list[float]:
     if dtype == "row_int8":
         maximum = max(max(map(abs, values)), 1e-5)
         scale = bf16(maximum / 127)
-        return [max(-127, min(127, round(x * 127 / maximum))) * scale for x in values]
+        multiplier = float(np.float32(127 / maximum))
+        return [
+            max(-127, min(127, round(float(np.float32(x * multiplier))))) * scale
+            for x in values
+        ]
     if dtype == "mat_ternary":
         maximum = max(map(abs, values))
         return [round(x / maximum) * maximum if maximum else 0 for x in values]
@@ -157,7 +161,10 @@ def reference_row(values: list[float], dtype: str) -> list[float]:
                 ideal = bf16(max(max(block) / (bound - 1), -min(block) / bound))
             upper = 127 if dtype == "grp_int8" else bound - 1
             result.extend(
-                max(-bound, min(upper, round(x / ideal))) * bf16(ideal) if ideal else 0
+                max(-bound, min(upper, round(float(np.float32(x / ideal)))))
+                * bf16(ideal)
+                if ideal
+                else 0
                 for x in block
             )
     return result[: len(values)]
@@ -166,6 +173,7 @@ def reference_row(values: list[float], dtype: str) -> list[float]:
 @pytest.mark.parametrize("dtype", PACKED)
 @settings(max_examples=35, deadline=None)
 @given(values=st.lists(st.integers(-1000, 1000), min_size=1, max_size=290))
+@example(values=[240, 480])
 def test_quantization_matches_math(dtype: str, values: list[int]) -> None:
     source = np.array(values, dtype=np.float32) / 8
     actual = _decode(_encode(source, dtype), source.shape).astype(np.float32)
