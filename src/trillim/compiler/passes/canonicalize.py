@@ -548,39 +548,51 @@ def _shape_expression(
     state: _MatchingState,
     context: tuple[Tensor, ...],
 ) -> _Canonical:
+    key = value, id(inference), context
+    cached = state.shape_normal.get(key)
+    if cached is not None:
+        return cached[1]
     if value.op == "const":
         assert value.value is not None
-        return _number(state, value.value)
-    if value.op == "scalar" and value.tensor is not None:
+        result = _number(state, value.value)
+    elif value.op == "scalar" and value.tensor is not None:
         source = _normal(value.tensor, inference, state, context)
         if inference.tensors[value.tensor].shape == ():
-            return source
-        if source.op == "dimensions" and value.axis is not None:
-            return source.arguments[value.axis]
-        return _node(state, "element", (source,), value.axis)
-    if value.op == "dimension" and value.tensor is not None and value.axis is not None:
+            result = source
+        elif source.op == "dimensions" and value.axis is not None:
+            result = source.arguments[value.axis]
+        else:
+            result = _node(state, "element", (source,), value.axis)
+    elif value.op == "dimension" and value.tensor is not None and value.axis is not None:
         shape = inference.tensors[value.tensor].shape
         if shape is not None and shape[value.axis] != value:
-            return _shape_expression(shape[value.axis], inference, state, context)
-        source = replace(
-            _node(state, "leaf", value=value.tensor), sources=(value.tensor,)
+            result = _shape_expression(shape[value.axis], inference, state, context)
+        else:
+            source = replace(
+                _node(state, "leaf", value=value.tensor), sources=(value.tensor,)
+            )
+            result = _node(state, "dimension", (source,), value.axis)
+    else:
+        arguments = tuple(
+            _shape_expression(argument, inference, state, context)
+            for argument in value.args
         )
-        return _node(state, "dimension", (source,), value.axis)
-    arguments = tuple(
-        _shape_expression(argument, inference, state, context)
-        for argument in value.args
-    )
-    if value.op == "add":
-        return _sum(state, arguments)
-    if value.op == "sub":
-        return _sum(
-            state, (arguments[0], _product(state, (_number(state, -1), arguments[1])))
-        )
-    if value.op == "mul":
-        return _product(state, arguments)
-    if value.op in {"min", "max"}:
-        return _extremum(state, value.op, arguments)
-    return _node(state, value.op, arguments, value.cache)
+        if value.op == "add":
+            result = _sum(state, arguments)
+        elif value.op == "sub":
+            result = _sum(
+                state,
+                (arguments[0], _product(state, (_number(state, -1), arguments[1]))),
+            )
+        elif value.op == "mul":
+            result = _product(state, arguments)
+        elif value.op in {"min", "max"}:
+            result = _extremum(state, value.op, arguments)
+        else:
+            result = _node(state, value.op, arguments, value.cache)
+    # Retain the inference along with its identity used in the cache key.
+    state.shape_normal[key] = inference, result
+    return result
 
 
 def _shape_of(

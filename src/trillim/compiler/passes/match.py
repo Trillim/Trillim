@@ -770,12 +770,15 @@ def _algebraic_captures(
     template: _SymbolicPattern, outputs: tuple[Tensor, ...], state: _MatchingState
 ) -> Iterator[dict[str, Tensor]]:
     # Formal expressions discover variables; typed replay checks shapes and semantics.
-    facts = _Inference()
-    for parameter in template.inputs:
-        facts.tensors[parameter] = _TensorInfo(None, None, None)
-    for _, operator in _walk(template.region):
-        for tensor in operator.outputs:
-            facts.tensors[tensor] = _TensorInfo(None, None, tensor.dtype)
+    facts = template.inference
+    if facts is None:
+        facts = _Inference()
+        for parameter in template.inputs:
+            facts.tensors[parameter] = _TensorInfo(None, None, None)
+        for _, operator in _walk(template.region):
+            for tensor in operator.outputs:
+                facts.tensors[tensor] = _TensorInfo(None, None, tensor.dtype)
+        template.inference = facts
 
     def compare(
         p: _Canonical, t: _Canonical, bindings: dict[str, Tensor]

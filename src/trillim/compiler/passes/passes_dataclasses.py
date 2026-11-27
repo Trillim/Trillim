@@ -39,6 +39,7 @@ class _SymbolicPattern:
     outputs: tuple[Tensor, ...]
     region: _Region
     roots: tuple[frozenset[str], ...]
+    inference: _Inference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,9 @@ class _MatchingState:
     normal: dict[tuple[Tensor, tuple[Tensor, ...]], _Canonical] = field(
         default_factory=dict
     )
+    shape_normal: dict[
+        tuple[_ShapeExpression, int, tuple[Tensor, ...]], tuple[_Inference, _Canonical]
+    ] = field(default_factory=dict)
     normal_keys: dict[tuple[str, tuple[int, ...], Hashable | None], int] = field(
         default_factory=dict
     )
