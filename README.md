@@ -1,5 +1,7 @@
 # Trillim
 
+This library is archived as of 11/27/26. Please use [Redwood](https://github.com/Trillim/Redwood), our latest inference engine for future local inference workloads!
+
 Trillim is a local AI stack for CPUs. It gives you a CLI, a Python SDK, and a FastAPI server for running Trillim-formatted LLM bundles, plus optional speech-to-text and text-to-speech support.
 
 Trillim supports both BitNet-style ternary bundles and PrismML's Bonsai (1-bit and ternary) bundles through the same managed model store and runtime surfaces.
